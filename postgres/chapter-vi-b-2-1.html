@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PostgreSQL 인터랙티브 학습 — Chapter VI-B-2-1. Full Text Search</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      { label: "LIKE의 한계", desc: "[Step 1] LIKE '%database%'는 글자가 정확히 일치해야 합니다. 'databases'는 찾지만 '데이터베이스'는 못 찾고, 대소문자도 구별합니다. 대용량에서 인덱스도 쓰지 못해 느립니다.", phase: "like" },
+      { label: "tsvector: 토큰화", desc: "[Step 2] to_tsvector('english', 'The quick brown fox')는 텍스트를 단어 토큰으로 분해합니다. 불용어(the)를 제거하고, 어간(foxes→fox)을 추출합니다. 결과: 'brown':3 'fox':4 'quick':2", phase: "tsvector" },
+      { label: "tsquery: 검색 조건", desc: "[Step 3] to_tsquery('english', 'quick & fox')는 'quick'과 'fox'를 모두 포함하는 문서를 찾는 조건입니다. & (AND), | (OR), ! (NOT)으로 조합합니다.", phase: "tsquery" },
+      { label: "@@ 매칭 연산", desc: "[Step 4] tsvector @@ tsquery는 매칭 여부를 확인합니다. ts_rank()로 관련도 점수를 매기고, ts_headline()으로 매칭된 부분을 하이라이트합니다.", phase: "match" },
+      { label: "GIN 인덱스 + 성능", desc: "[Step 5] tsvector 컬럼에 GIN 인덱스를 만들면 대용량에서도 밀리초 단위로 검색합니다. LIKE '%keyword%'는 100만 행에서 수 초 걸리지만, FTS + GIN은 수 밀리초입니다.", phase: "gin" }
+    ];
+
+    function App() {
+      const [currentStepIdx, setCurrentStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const playIntervalRef = useRef(null);
+      const stepData = STEPS[currentStepIdx];
+      const isEnd = currentStepIdx === STEPS.length - 1;
+
+      const handleNext = () => { setCurrentStepIdx(prev => { if (prev < STEPS.length - 1) return prev + 1; setIsPlaying(false); return prev; }); };
+      const handleNextRef = useRef(handleNext); handleNextRef.current = handleNext;
+      const handlePrev = () => { if (currentStepIdx > 0) { setCurrentStepIdx(prev => prev - 1); setIsPlaying(false); } };
+      const togglePlay = () => { if (isEnd) setCurrentStepIdx(0); setIsPlaying(prev => !prev); };
+
+      useEffect(() => {
+        if (isPlaying) { playIntervalRef.current = setInterval(() => handleNextRef.current(), 5000); }
+        else { clearInterval(playIntervalRef.current); }
+        return () => clearInterval(playIntervalRef.current);
+      }, [isPlaying]);
+
+      const phase = stepData.phase;
+
+      const renderViz = () => {
+        if (phase === 'like') {
+          const searches = [
+            { query: "LIKE '%database%'", targets: ['PostgreSQL database', 'Database Systems', 'databases intro', '데이터베이스'], matches: [true, false, true, false], note: '대소문자 구별, 한국어 불가' },
+            { query: "ILIKE '%database%'", targets: ['PostgreSQL database', 'Database Systems', 'databases intro', '데이터베이스'], matches: [true, true, true, false], note: '대소문자 무시, 한국어 여전히 불가' }
+          ];
+          return (
+            <div className="space-y-4">
+              {searches.map((s, si) => (
+                <div key={si} className="p-3 rounded-lg border border-slate-200">
+                  <div className="font-mono text-sm text-slate-700 mb-2">{s.query} <span className="text-xs text-slate-400">({s.note})</span></div>
+                  <div className="grid grid-cols-4 gap-2">{s.targets.map((t, i) => (
+                    <div key={i} className={`p-2 rounded text-center text-xs ${s.matches[i] ? 'bg-green-100 border border-green-300 text-green-700' : 'bg-red-50 border border-red-200 text-red-500 line-through'}`}>{t}</div>
+                  ))}</div>
+                </div>
+              ))}
+              <div className="bg-red-50 border border-red-300 p-3 rounded-lg text-center text-sm text-red-700">
+                LIKE는 인덱스를 쓰지 못해 <b>100만 행에서 수 초</b> 소요
+              </div>
+            </div>
+          );
+        }
+
+        if (phase === 'tsvector') {
+          const input = "The quick brown fox jumps over the lazy dog";
+          const words = input.split(' ');
+          const stopwords = ['The', 'the', 'over'];
+          const stems = { quick: 'quick', brown: 'brown', fox: 'fox', jumps: 'jump', lazy: 'lazi', dog: 'dog' };
+          const tokens = words.filter(w => !stopwords.includes(w)).map(w => ({ orig: w, stem: stems[w.toLowerCase()] || w.toLowerCase() }));
+
+          return (
+            <div className="space-y-4">
+              <div className="bg-slate-800 text-green-300 p-3 rounded-lg font-mono text-sm">
+                SELECT to_tsvector('english', '{input}');
+              </div>
+              <div className="space-y-3">
+                <div>
+                  <div className="text-xs font-bold text-slate-600 mb-1">1. 원본 텍스트</div>
+                  <div className="flex flex-wrap gap-1">{words.map((w, i) => (
+                    <span key={i} className={`px-2 py-1 rounded text-sm ${stopwords.includes(w) ? 'bg-red-100 text-red-500 line-through' : 'bg-blue-100 text-blue-700'}`}>{w}</span>
+                  ))}</div>
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-slate-600 mb-1">2. 불용어 제거 + 어간 추출</div>
+                  <div className="flex flex-wrap gap-1">{tokens.map((t, i) => (
+                    <div key={i} className="text-center">
+                      <div className="text-xs text-slate-400">{t.orig}</div>
+                      <div className="px-2 py-1 rounded bg-green-100 text-green-700 text-sm font-bold">{t.stem}</div>
+                    </div>
+                  ))}</div>
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-slate-600 mb-1">3. tsvector 결과 (위치 번호 포함)</div>
+                  <div className="bg-green-50 border border-green-300 p-3 rounded-lg font-mono text-sm text-green-700">
+                    'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        if (phase === 'tsquery') {
+          const queries = [
+            { sql: "to_tsquery('quick & fox')", parsed: "quick AND fox", desc: "두 단어 모두 포함" },
+            { sql: "to_tsquery('quick | cat')", parsed: "quick OR cat", desc: "둘 중 하나 포함" },
+            { sql: "to_tsquery('quick & !lazy')", parsed: "quick AND NOT lazy", desc: "quick 포함, lazy 불포함" },
+            { sql: "plainto_tsquery('quick fox')", parsed: "quick AND fox", desc: "자연어 → AND 자동 변환" },
+            { sql: "websearch_to_tsquery('\"quick fox\" -lazy')", parsed: "'quick fox' AND NOT lazy", desc: "웹 검색 문법 지원" }
+          ];
+          return (
+            <div className="space-y-2">
+              {queries.map((q, i) => (
+                <div key={i} className="flex items-center gap-3 p-3 rounded-lg border border-slate-200 bg-slate-50">
+                  <div className="font-mono text-xs text-blue-700 flex-1">{q.sql}</div>
+                  <div className="text-xs text-slate-400">=</div>
+                  <div className="font-mono text-xs font-bold text-green-700 bg-green-50 px-2 py-1 rounded">{q.parsed}</div>
+                  <div className="text-xs text-slate-500 w-36 text-right">{q.desc}</div>
+                </div>
+              ))}
+            </div>
+          );
+        }
+
+        if (phase === 'match') {
+          return (
+            <div className="space-y-4">
+              <div className="bg-slate-800 text-green-300 p-3 rounded-lg font-mono text-sm">
+                <div className="text-slate-400">-- @@ 매칭</div>
+                <div>SELECT title FROM articles</div>
+                <div>WHERE to_tsvector('english', body) <span className="text-yellow-300">@@</span> to_tsquery('database & performance');</div>
+                <div className="mt-2 text-slate-400">-- ts_rank: 관련도 점수</div>
+                <div>SELECT title, <span className="text-yellow-300">ts_rank</span>(tsv, query) AS rank FROM ...;</div>
+                <div className="mt-2 text-slate-400">-- ts_headline: 매칭 하이라이트</div>
+                <div>SELECT <span className="text-yellow-300">ts_headline</span>('english', body, query) FROM ...;</div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="p-3 rounded-lg border-2 border-green-300 bg-green-50">
+                  <div className="text-xs font-bold text-green-600 mb-2">ts_rank 결과 (높을수록 관련도 높음)</div>
+                  <div className="space-y-1 text-sm font-mono">
+                    <div>0.0607 — "Database Performance Tuning"</div>
+                    <div>0.0243 — "PostgreSQL Query Optimization"</div>
+                    <div>0.0152 — "SQL Database Basics"</div>
+                  </div>
+                </div>
+                <div className="p-3 rounded-lg border-2 border-blue-300 bg-blue-50">
+                  <div className="text-xs font-bold text-blue-600 mb-2">ts_headline 결과</div>
+                  <div className="text-sm">
+                    "...optimizing <b className="bg-yellow-200 px-0.5">database</b> <b className="bg-yellow-200 px-0.5">performance</b> requires understanding query plans..."
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        if (phase === 'gin') {
+          return (
+            <div className="space-y-4">
+              <div className="bg-slate-800 text-green-300 p-3 rounded-lg font-mono text-sm">
+                <div className="text-slate-400">-- tsvector 컬럼 추가 + GIN 인덱스</div>
+                <div>ALTER TABLE articles ADD COLUMN tsv tsvector</div>
+                <div>  GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;</div>
+                <div className="mt-1">CREATE INDEX idx_articles_tsv ON articles USING <span className="text-yellow-300">GIN</span>(tsv);</div>
+              </div>
+              <div className="text-sm text-center text-slate-600 mb-2">100만 행 검색 성능 비교</div>
+              <div className="space-y-3">
+                {[
+                  { method: "LIKE '%database%'", time: 2400, color: 'red', note: '순차 탐색' },
+                  { method: "ILIKE '%database%'", time: 3100, color: 'red', note: '순차 탐색 + 대소문자 변환' },
+                  { method: "FTS + GIN 인덱스", time: 3, color: 'green', note: 'GIN 인덱스 탐색' }
+                ].map((m, i) => (
+                  <div key={i} className="flex items-center gap-3">
+                    <div className="w-44 text-right text-xs font-mono text-slate-600">{m.method}</div>
+                    <div className="flex-1 bg-slate-100 rounded-full h-7 overflow-hidden">
+                      <div className={`h-full bg-${m.color}-500 rounded-full flex items-center px-2`}
+                           style={{ width: `${Math.max(m.time / 3100 * 100, 3)}%`, minWidth: '50px' }}>
+                        <span className="text-xs font-bold text-white">{m.time}ms</span>
+                      </div>
+                    </div>
+                    <div className="w-32 text-xs text-slate-500">{m.note}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="bg-green-50 border border-green-300 p-3 rounded-lg text-center text-sm text-green-700">
+                FTS + GIN: LIKE 대비 <b>약 800배</b> 빠른 검색
+              </div>
+            </div>
+          );
+        }
+        return null;
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
+          <div className="max-w-5xl mx-auto space-y-6">
+            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-8 h-8 bg-blue-700 text-white flex items-center justify-center rounded-full font-bold text-xl">P</div>
+                <h1 className="text-2xl font-bold">VI-B-2-1. Full Text Search</h1>
+              </div>
+              <p className="text-slate-600">tsvector로 텍스트를 토큰화하고, tsquery로 검색하고, GIN 인덱스로 성능을 높이는 과정을 체험합니다.</p>
+            </header>
+            <div className="bg-blue-700 text-white p-5 rounded-xl shadow-sm min-h-[90px]">
+              <h3 className="text-xs font-bold text-blue-200 mb-2 uppercase tracking-wider">현재 단계</h3>
+              <p className="text-base font-medium leading-relaxed">{stepData.desc}</p>
+            </div>
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 min-h-[350px] flex flex-col justify-center">{renderViz()}</div>
+            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center justify-between">
+                <button onClick={handlePrev} disabled={currentStepIdx === 0} className="px-5 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg font-medium disabled:opacity-30 disabled:cursor-not-allowed">이전</button>
+                <div className="flex items-center gap-4">
+                  <button onClick={togglePlay} className={`px-5 py-2 rounded-lg font-medium ${isPlaying ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>{isPlaying ? '일시 정지' : (isEnd ? '처음부터' : '자동 실행')}</button>
+                  <div className="flex gap-1">{STEPS.map((_, i) => <button key={i} onClick={() => { setCurrentStepIdx(i); setIsPlaying(false); }} className={`w-3 h-3 rounded-full ${i === currentStepIdx ? 'bg-blue-600' : i < currentStepIdx ? 'bg-blue-300' : 'bg-slate-200'}`} />)}</div>
+                  <span className="text-xs text-slate-400 font-mono">{currentStepIdx + 1}/{STEPS.length}</span>
+                </div>
+                <button onClick={handleNext} disabled={isEnd} className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium disabled:opacity-30 disabled:cursor-not-allowed">다음</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

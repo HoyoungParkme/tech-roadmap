@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Docker 인터랙티브 학습 — 볼륨 백업과 복원</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
+    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
+    @keyframes flowDown { from{opacity:0;transform:translateY(-15px);} to{opacity:1;transform:translateY(0);} }
+    @keyframes compress { 0%{transform:scaleY(1);} 50%{transform:scaleY(0.7);} 100%{transform:scaleY(1);} }
+    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
+    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
+    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
+    .anim-flow { animation: flowDown 0.5s ease-out forwards; }
+    .anim-compress { animation: compress 1s ease-in-out; }
+  </style>
+</head>
+<body class="bg-slate-50">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: "STEP 1 · 볼륨 백업이 필요한 이유",
+        desc: "컨테이너가 삭제되어도 볼륨은 남는다. 하지만 호스트 서버가 망가지거나, 실수로 docker volume rm 또는 docker compose down -v를 치면 볼륨도 사라진다. 재생성 불가능한 데이터는 별도로 백업해야 한다.",
+        phase: "why",
+      },
+      {
+        title: "STEP 2 · tar 백업: 임시 컨테이너 생성",
+        desc: "alpine 경량 이미지로 임시 컨테이너를 띄운다. --rm 옵션으로 작업 완료 후 자동 삭제되게 한다. 이 컨테이너에 볼륨과 호스트 디렉토리를 동시에 마운트한다.",
+        phase: "temp_container",
+      },
+      {
+        title: "STEP 3 · tar 백업: 볼륨 데이터 압축",
+        desc: "-v <볼륨>:/data로 볼륨을 마운트하고, -v $(pwd):/backup으로 호스트 현재 디렉토리를 마운트한다. tar czf로 /data 내용을 압축해 /backup/backup.tar.gz로 저장한다. 호스트에 파일이 생긴다.",
+        phase: "backup",
+      },
+      {
+        title: "STEP 4 · tar 복원: 압축 해제",
+        desc: "복원은 반대 순서다. 새 볼륨을 만들고, 다시 임시 컨테이너를 띄워 tar xzf로 압축을 풀어 볼륨에 쓴다. czf(Create Zipped File)와 xzf(eXtract Zipped File)만 기억하면 된다.",
+        phase: "restore",
+      },
+      {
+        title: "STEP 5 · pg_dump / pg_restore",
+        desc: "PostgreSQL 데이터는 pg_dump가 더 안정적이다. tar는 파일을 그대로 복사하므로 PostgreSQL 버전이 다르면 호환성 문제가 생길 수 있다. pg_dump는 SQL 형태로 내보내기 때문에 버전이 달라도 복원이 가능하다.",
+        phase: "pgdump",
+      },
+      {
+        title: "STEP 6 · 백업 전략 정리",
+        desc: "tar 백업은 모든 볼륨에 적용 가능한 범용 패턴이다. PostgreSQL은 pg_dump가 권장된다. 프로덕션에서는 cron으로 자동 백업하고, S3/GCS에 보관하며, 복원 테스트를 주기적으로 수행한다.",
+        phase: "summary",
+      },
+    ];
+
+    /* ── 명령어 분석 컴포넌트 ── */
+    function CommandBreakdown({ parts, title }) {
+      return (
+        <div className="bg-slate-900 rounded-xl p-4">
+          <div className="text-slate-400 text-xs mb-3">{title}</div>
+          <div className="font-mono text-sm space-y-1">
+            {parts.map((part, i) => (
+              <div key={i} className="flex items-start gap-3 anim-slide" style={{ animationDelay: `${i * 0.1}s` }}>
+                <code className={`px-2 py-0.5 rounded whitespace-nowrap ${part.highlight ? "bg-yellow-900/50 text-yellow-300" : "text-slate-300"}`}>
+                  {part.code}
+                </code>
+                <span className="text-slate-500 text-xs mt-0.5">{part.desc}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── 메인 앱 ── */
+    function App() {
+      const [step, setStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const timerRef = useRef(null);
+      const data = STEPS[step];
+
+      useEffect(() => {
+        if (isPlaying && step < STEPS.length - 1) {
+          timerRef.current = setTimeout(() => setStep(s => s + 1), 4000);
+        } else if (step >= STEPS.length - 1) setIsPlaying(false);
+        return () => clearTimeout(timerRef.current);
+      }, [isPlaying, step]);
+
+      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
+          <div className="max-w-5xl mx-auto space-y-6">
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
+                <h1 className="text-xl font-bold text-slate-800">Chapter V-1-6: 볼륨 백업과 복원</h1>
+              </div>
+              <p className="text-slate-500 text-sm">docker run --rm으로 임시 컨테이너를 띄워 볼륨을 백업하고 복원하는 절차를 시뮬레이션합니다.</p>
+            </header>
+
+            {/* 현재 단계 설명 */}
+            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
+              data.phase === "why" ? "bg-red-600 border-red-700 text-white" :
+              data.phase === "summary" ? "bg-emerald-600 border-emerald-700 text-white" :
+              "bg-blue-600 border-blue-700 text-white"
+            }`}>
+              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
+              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            </div>
+
+            {/* 시각화 영역 */}
+            {data.phase === "why" && (
+              <div key="why" className="anim-fade space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="bg-white border-2 border-slate-200 rounded-xl p-4">
+                    <div className="text-center mb-3">
+                      <div className="text-3xl">💾</div>
+                      <div className="font-bold text-slate-700">볼륨 (pgdata)</div>
+                      <div className="text-xs text-slate-500">PostgreSQL 데이터 저장</div>
+                    </div>
+                    <div className="space-y-1 text-xs">
+                      {["users 테이블", "orders 테이블", "설정 데이터"].map((item, i) => (
+                        <div key={i} className="bg-blue-50 border border-blue-200 rounded px-2 py-1">{item}</div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-sm font-bold text-red-600 mb-2">데이터가 사라지는 상황:</div>
+                    {[
+                      { cmd: "docker volume rm pgdata", risk: "볼륨 직접 삭제" },
+                      { cmd: "docker compose down -v", risk: "-v 옵션으로 볼륨까지 삭제" },
+                      { cmd: "서버 장애 / 디스크 손상", risk: "하드웨어 문제" },
+                    ].map((item, i) => (
+                      <div key={i} className="bg-red-50 border border-red-200 rounded-lg p-3 anim-slide" style={{ animationDelay: `${i * 0.1}s` }}>
+                        <code className="text-xs text-red-700 font-mono">{item.cmd}</code>
+                        <div className="text-xs text-red-500 mt-1">{item.risk}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {data.phase === "temp_container" && (
+              <div key="temp" className="anim-fade">
+                <div className="bg-white border-2 border-blue-200 rounded-xl p-6">
+                  <div className="text-center text-sm font-bold text-slate-600 mb-4">임시 컨테이너 구조</div>
+                  <div className="flex flex-col md:flex-row items-center justify-center gap-4">
+                    {/* 볼륨 */}
+                    <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-4 text-center">
+                      <div className="text-2xl">💾</div>
+                      <div className="font-bold text-blue-800 text-sm">pgdata 볼륨</div>
+                      <div className="text-xs text-blue-500">백업 대상 데이터</div>
+                    </div>
+
+                    <div className="text-blue-400 text-lg font-bold">→ /data</div>
+
+                    {/* 컨테이너 */}
+                    <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 text-center anim-pulse">
+                      <div className="text-2xl">📦</div>
+                      <div className="font-bold text-amber-800 text-sm">alpine 컨테이너</div>
+                      <div className="text-xs text-amber-500">--rm (자동 삭제)</div>
+                      <div className="text-xs text-amber-600 mt-1 font-mono">tar czf ...</div>
+                    </div>
+
+                    <div className="text-emerald-400 text-lg font-bold">/backup →</div>
+
+                    {/* 호스트 */}
+                    <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-4 text-center">
+                      <div className="text-2xl">🖥️</div>
+                      <div className="font-bold text-emerald-800 text-sm">호스트 $(pwd)</div>
+                      <div className="text-xs text-emerald-500">backup.tar.gz 저장</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {data.phase === "backup" && (
+              <div key="backup" className="space-y-4 anim-fade">
+                <CommandBreakdown
+                  title="볼륨 백업 명령 분석"
+                  parts={[
+                    { code: "docker run --rm", desc: "임시 컨테이너 실행 (종료 시 자동 삭제)", highlight: true },
+                    { code: "  -v pgdata:/data", desc: "백업할 볼륨을 /data에 마운트 (읽기 대상)", highlight: true },
+                    { code: "  -v $(pwd):/backup", desc: "호스트 현재 디렉토리를 /backup에 마운트 (저장 위치)", highlight: true },
+                    { code: "  alpine", desc: "경량 리눅스 이미지 (tar 내장)", highlight: false },
+                    { code: "  tar czf /backup/backup.tar.gz -C /data .", desc: "Create Zipped File — /data를 압축해 저장", highlight: true },
+                  ]}
+                />
+                <div className="bg-white border-2 border-blue-200 rounded-xl p-4">
+                  <div className="text-center text-sm font-bold text-slate-600 mb-3">데이터 흐름</div>
+                  <div className="flex items-center justify-center gap-3 flex-wrap">
+                    <span className="bg-blue-100 text-blue-700 px-3 py-2 rounded-lg text-sm font-medium">💾 pgdata 볼륨</span>
+                    <span className="text-blue-400 font-bold">→ /data →</span>
+                    <span className="bg-amber-100 text-amber-700 px-3 py-2 rounded-lg text-sm font-medium anim-compress">tar czf (압축)</span>
+                    <span className="text-emerald-400 font-bold">→ /backup →</span>
+                    <span className="bg-emerald-100 text-emerald-700 px-3 py-2 rounded-lg text-sm font-medium">🖥️ backup.tar.gz</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {data.phase === "restore" && (
+              <div key="restore" className="space-y-4 anim-fade">
+                <CommandBreakdown
+                  title="볼륨 복원 명령 분석"
+                  parts={[
+                    { code: "docker run --rm", desc: "임시 컨테이너 실행", highlight: false },
+                    { code: "  -v new_pgdata:/data", desc: "복원 대상 볼륨을 /data에 마운트 (쓰기 대상)", highlight: true },
+                    { code: "  -v $(pwd):/backup", desc: "백업 파일이 있는 디렉토리를 /backup에 마운트", highlight: false },
+                    { code: "  alpine", desc: "경량 리눅스 이미지", highlight: false },
+                    { code: "  tar xzf /backup/backup.tar.gz -C /data", desc: "eXtract Zipped File — 압축 해제해 볼륨에 쓰기", highlight: true },
+                  ]}
+                />
+                <div className="bg-white border-2 border-emerald-200 rounded-xl p-4">
+                  <div className="text-center text-sm font-bold text-slate-600 mb-3">복원 데이터 흐름 (반대 방향)</div>
+                  <div className="flex items-center justify-center gap-3 flex-wrap">
+                    <span className="bg-emerald-100 text-emerald-700 px-3 py-2 rounded-lg text-sm font-medium">🖥️ backup.tar.gz</span>
+                    <span className="text-emerald-400 font-bold">→ /backup →</span>
+                    <span className="bg-amber-100 text-amber-700 px-3 py-2 rounded-lg text-sm font-medium">tar xzf (해제)</span>
+                    <span className="text-blue-400 font-bold">→ /data →</span>
+                    <span className="bg-blue-100 text-blue-700 px-3 py-2 rounded-lg text-sm font-medium">💾 new_pgdata</span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-center">
+                    <div className="font-mono font-bold text-blue-700">czf</div>
+                    <div className="text-xs text-blue-600 mt-1">Create Zipped File (백업)</div>
+                  </div>
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                    <div className="font-mono font-bold text-emerald-700">xzf</div>
+                    <div className="text-xs text-emerald-600 mt-1">eXtract Zipped File (복원)</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {data.phase === "pgdump" && (
+              <div key="pgdump" className="space-y-4 anim-fade">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="bg-white border-2 border-blue-300 rounded-xl p-4">
+                    <div className="font-bold text-blue-800 mb-2">백업 (pg_dump)</div>
+                    <div className="bg-slate-900 rounded-lg p-3 font-mono text-xs text-slate-300">
+                      <div className="text-slate-500"># SQL 형태로 추출</div>
+                      <div className="text-blue-300">docker compose exec db \</div>
+                      <div className="text-blue-300 pl-2">pg_dump -U app demo {'>'} backup.sql</div>
+                    </div>
+                    <div className="text-xs text-blue-600 mt-2">SQL 형태 → 버전이 달라도 복원 가능</div>
+                  </div>
+                  <div className="bg-white border-2 border-emerald-300 rounded-xl p-4">
+                    <div className="font-bold text-emerald-800 mb-2">복원 (psql)</div>
+                    <div className="bg-slate-900 rounded-lg p-3 font-mono text-xs text-slate-300">
+                      <div className="text-slate-500"># SQL 파일을 DB에 적용</div>
+                      <div className="text-emerald-300">docker compose exec -T db \</div>
+                      <div className="text-emerald-300 pl-2">psql -U app demo {'<'} backup.sql</div>
+                    </div>
+                    <div className="text-xs text-emerald-600 mt-2">-T: 파이프 사용 시 TTY 비활성화 필수</div>
+                  </div>
+                </div>
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                  <div className="text-sm font-bold text-amber-800 mb-2">tar vs pg_dump 비교</div>
+                  <div className="grid grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <div className="font-bold text-slate-600">tar 백업</div>
+                      <ul className="text-slate-500 mt-1 space-y-0.5">
+                        <li>- 모든 볼륨에 적용 가능 (범용)</li>
+                        <li>- 파일 그대로 복사</li>
+                        <li>- DB 버전 호환성 문제 가능</li>
+                      </ul>
+                    </div>
+                    <div>
+                      <div className="font-bold text-slate-600">pg_dump</div>
+                      <ul className="text-slate-500 mt-1 space-y-0.5">
+                        <li>- PostgreSQL 전용</li>
+                        <li>- SQL 형태로 추출</li>
+                        <li>- 버전 간 이식성 높음 (권장)</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {data.phase === "summary" && (
+              <div key="summary" className="bg-gradient-to-r from-emerald-50 to-blue-50 border-2 border-emerald-300 rounded-xl p-6 anim-fade">
+                <div className="text-center">
+                  <div className="text-4xl mb-3">🛡️</div>
+                  <h3 className="text-xl font-bold text-emerald-800 mb-4">볼륨 백업 전략 요약</h3>
+                  <div className="flex flex-wrap justify-center gap-2 mb-4">
+                    {[
+                      "tar: 범용 볼륨 백업",
+                      "pg_dump: PostgreSQL 권장",
+                      "cron: 자동 백업 스케줄",
+                      "S3/GCS: 외부 보관",
+                      "복원 테스트: 주기적 검증",
+                    ].map((item, i) => (
+                      <span key={i} className="bg-emerald-200 text-emerald-800 px-3 py-1.5 rounded-full text-sm font-medium anim-slide" style={{animationDelay:`${i*0.1}s`}}>
+                        {item}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-emerald-700 text-sm">백업은 복원이 성공해야 의미가 있다. 복원 테스트 없이 백업만 하는 것은 불완전하다.</p>
+                </div>
+              </div>
+            )}
+
+            {/* 프로그레스 + 컨트롤 */}
+            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex gap-1.5 mb-4">
+                {STEPS.map((_, i) => (
+                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
+                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
+                ))}
+              </div>
+              <div className="flex items-center justify-center gap-3">
+                <button onClick={() => go(-1)} disabled={step === 0}
+                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
+                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
+                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
+                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
+                </button>
+                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
+                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
+                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

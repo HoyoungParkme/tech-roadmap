@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Docker 인터랙티브 학습 — 레이어 캐싱과 빌드 최적화</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
+    @keyframes shake { 0%,100%{transform:translateX(0);} 25%{transform:translateX(-4px);} 75%{transform:translateX(4px);} }
+    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
+    @keyframes slideUp { from{opacity:0;transform:translateY(20px);} to{opacity:1;transform:translateY(0);} }
+    @keyframes buildLayer { from{opacity:0;transform:scaleY(0);} to{opacity:1;transform:scaleY(1);} }
+    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
+    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
+    .anim-shake { animation: shake 0.4s ease-in-out; }
+    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
+    .anim-up { animation: slideUp 0.4s ease-out forwards; }
+    .anim-build { animation: buildLayer 0.4s ease-out forwards; transform-origin: bottom; }
+  </style>
+</head>
+<body class="bg-slate-50">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    /* ── 레이어 데이터 ── */
+    const BAD_LAYERS = [
+      { cmd: "FROM python:3.12-slim", label: "베이스 이미지", size: "120MB" },
+      { cmd: "WORKDIR /app", label: "작업 디렉토리", size: "0B" },
+      { cmd: "COPY . .", label: "소스 전체 복사", size: "5MB" },
+      { cmd: "RUN pip install -r requirements.txt", label: "의존성 설치", size: "250MB" },
+      { cmd: 'CMD ["python", "main.py"]', label: "실행 명령", size: "0B" },
+    ];
+
+    const GOOD_LAYERS = [
+      { cmd: "FROM python:3.12-slim", label: "베이스 이미지", size: "120MB" },
+      { cmd: "WORKDIR /app", label: "작업 디렉토리", size: "0B" },
+      { cmd: "COPY requirements.txt .", label: "의존성 파일만 복사", size: "1KB" },
+      { cmd: "RUN pip install -r requirements.txt", label: "의존성 설치", size: "250MB" },
+      { cmd: "COPY . .", label: "소스 복사", size: "5MB" },
+      { cmd: 'CMD ["python", "main.py"]', label: "실행 명령", size: "0B" },
+    ];
+
+    /* ── STEPS ── */
+    const STEPS = [
+      {
+        title: "STEP 1 · 레이어 캐시란?",
+        desc: "Docker 이미지는 레이어(층)의 스택이다. Dockerfile의 각 명령어가 하나의 레이어를 만든다. 이전 빌드와 동일한 레이어라고 판단되면 저장된 것을 재사용한다. 이것이 레이어 캐시다.",
+        phase: "intro",
+        layers: GOOD_LAYERS,
+        cacheStatus: [true, true, true, true, true, true],
+        showBad: false,
+        changedFile: null,
+      },
+      {
+        title: "STEP 2 · 나쁜 순서 — 소스 변경 시 pip install 재실행",
+        desc: "소스 전체를 먼저 복사(COPY . .)한 뒤 pip install을 하면, 소스 파일이 한 줄만 바뀌어도 COPY . . 레이어가 무효화되고 그 이후의 pip install도 다시 실행된다. 매번 수십 개의 패키지를 다시 내려받는다.",
+        phase: "bad_order",
+        layers: BAD_LAYERS,
+        cacheStatus: [true, true, false, false, false],
+        showBad: true,
+        changedFile: "main.py 1줄 수정",
+      },
+      {
+        title: "STEP 3 · 좋은 순서 — 의존성 파일만 먼저 복사",
+        desc: "requirements.txt를 먼저 복사하고 pip install을 실행한 뒤, 소스를 나중에 복사한다. 소스가 바뀌어도 requirements.txt가 동일하면 pip install 레이어는 캐시가 유지된다!",
+        phase: "good_order",
+        layers: GOOD_LAYERS,
+        cacheStatus: [true, true, true, true, false, false],
+        showBad: false,
+        changedFile: "main.py 1줄 수정",
+      },
+      {
+        title: "STEP 4 · 캐시 무효화의 핵심 규칙",
+        desc: "중간 레이어 하나라도 캐시가 무효화되면 그 이후의 모든 레이어가 다시 실행된다. 한 층이 무너지면 그 위에 쌓인 층도 모두 다시 쌓아야 하는 것과 같다. '자주 변하는 것은 뒤에, 안 변하는 것은 앞에' 두는 것이 핵심이다.",
+        phase: "rule",
+        layers: GOOD_LAYERS,
+        cacheStatus: [true, true, true, true, false, false],
+        showBad: false,
+        changedFile: null,
+      },
+      {
+        title: "STEP 5 · .dockerignore로 캐시 보호",
+        desc: ".git, node_modules, __pycache__ 같은 파일이 COPY에 포함되면 캐시가 불필요하게 깨진다. .dockerignore 파일로 제외하면 캐시 히트율이 올라가고 이미지 크기도 줄어든다.",
+        phase: "dockerignore",
+        layers: GOOD_LAYERS,
+        cacheStatus: [true, true, true, true, true, true],
+        showBad: false,
+        changedFile: null,
+      },
+      {
+        title: "STEP 6 · 빌드 시간 비교 결과",
+        desc: "순서만 바꿔도 빌드 시간이 극적으로 단축된다. 의존성이 변하지 않을 때 나쁜 순서는 매번 2분, 좋은 순서는 5초만 걸린다. 이 차이가 개발 사이클 속도를 결정한다.",
+        phase: "compare",
+        layers: GOOD_LAYERS,
+        cacheStatus: [true, true, true, true, true, true],
+        showBad: false,
+        changedFile: null,
+      },
+    ];
+
+    /* ── 레이어 스택 시각화 ── */
+    function LayerStack({ layers, cacheStatus, step, changedFile }) {
+      return (
+        <div key={step} className="bg-white rounded-xl border border-slate-200 p-5 anim-fade">
+          <div className="flex items-center justify-between mb-4">
+            <h4 className="text-sm font-bold text-slate-600">Dockerfile 레이어 스택</h4>
+            {changedFile && (
+              <span className="bg-amber-100 text-amber-700 px-2 py-1 rounded text-xs font-medium anim-shake">
+                변경: {changedFile}
+              </span>
+            )}
+          </div>
+          <div className="space-y-2">
+            {layers.map((layer, i) => {
+              const isCached = cacheStatus[i];
+              const isInvalidated = !isCached;
+              return (
+                <div key={i} className="anim-build" style={{ animationDelay: `${i * 0.12}s`, opacity: 0 }}>
+                  <div className={`flex items-center gap-3 rounded-lg px-4 py-3 border-2 transition-all ${
+                    isCached
+                      ? "bg-emerald-50 border-emerald-300"
+                      : "bg-red-50 border-red-300 anim-shake"
+                  }`}>
+                    {/* 레이어 번호 */}
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold flex-shrink-0 ${
+                      isCached ? "bg-emerald-500 text-white" : "bg-red-500 text-white"
+                    }`}>
+                      {i + 1}
+                    </div>
+
+                    {/* 명령어 */}
+                    <div className="flex-1 min-w-0">
+                      <div className="font-mono text-xs text-slate-800 truncate">{layer.cmd}</div>
+                      <div className="text-xs text-slate-500">{layer.label} ({layer.size})</div>
+                    </div>
+
+                    {/* 캐시 상태 */}
+                    <div className={`px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ${
+                      isCached
+                        ? "bg-emerald-200 text-emerald-800"
+                        : "bg-red-200 text-red-800"
+                    }`}>
+                      {isCached ? "Using cache" : "재실행"}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 범례 */}
+          <div className="mt-4 flex gap-4 text-xs">
+            <span className="flex items-center gap-1">
+              <span className="w-3 h-3 rounded bg-emerald-400"></span> 캐시 히트 (건너뜀)
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-3 h-3 rounded bg-red-400"></span> 캐시 미스 (재실행)
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── 나쁜 순서 vs 좋은 순서 비교 ── */
+    function OrderComparison({ step }) {
+      return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 anim-fade">
+          <div className="bg-red-50 border-2 border-red-200 rounded-xl p-4">
+            <h4 className="font-bold text-red-700 text-sm mb-2">나쁜 순서</h4>
+            <div className="font-mono text-xs space-y-1 text-red-800">
+              <div>FROM python:3.12-slim</div>
+              <div>WORKDIR /app</div>
+              <div className="bg-red-200 px-2 py-1 rounded font-bold">COPY . .  ← 소스 전체 (자주 변함)</div>
+              <div className="bg-red-200 px-2 py-1 rounded font-bold">RUN pip install  ← 매번 재실행!</div>
+              <div>CMD ["python", "main.py"]</div>
+            </div>
+          </div>
+          <div className="bg-emerald-50 border-2 border-emerald-200 rounded-xl p-4">
+            <h4 className="font-bold text-emerald-700 text-sm mb-2">좋은 순서</h4>
+            <div className="font-mono text-xs space-y-1 text-emerald-800">
+              <div>FROM python:3.12-slim</div>
+              <div>WORKDIR /app</div>
+              <div className="bg-emerald-200 px-2 py-1 rounded font-bold">COPY requirements.txt .  ← 거의 안 변함</div>
+              <div className="bg-emerald-200 px-2 py-1 rounded font-bold">RUN pip install  ← 캐시 유지!</div>
+              <div>COPY . .  ← 소스는 나중에</div>
+              <div>CMD ["python", "main.py"]</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── .dockerignore ── */
+    function DockerIgnorePanel({ step }) {
+      const patterns = [".git", ".env", "__pycache__", "*.pyc", "node_modules", ".pytest_cache", "dist", "build", "*.log"];
+      return (
+        <div className="bg-gradient-to-r from-blue-50 to-emerald-50 border-2 border-blue-200 rounded-xl p-5 anim-fade">
+          <h4 className="font-bold text-blue-800 mb-3">.dockerignore 파일 예시</h4>
+          <div className="bg-gray-900 rounded-lg p-4 font-mono text-sm text-gray-300 mb-4">
+            <div className="text-slate-500 mb-1"># .dockerignore</div>
+            {patterns.map((p, i) => (
+              <div key={i} className="text-emerald-400 anim-slide" style={{ animationDelay: `${i * 0.08}s`, opacity: 0 }}>{p}</div>
+            ))}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+            <div className="bg-white rounded-lg p-3 border border-blue-100">
+              <div className="font-bold text-blue-700 mb-1">캐시 보호</div>
+              <div className="text-xs text-slate-600">.git 변경이 COPY 레이어 캐시를 깨지 않는다</div>
+            </div>
+            <div className="bg-white rounded-lg p-3 border border-blue-100">
+              <div className="font-bold text-blue-700 mb-1">이미지 크기 감소</div>
+              <div className="text-xs text-slate-600">node_modules 수백 MB가 이미지에 포함되지 않는다</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── 빌드 시간 비교 ── */
+    function ComparePanel({ step }) {
+      return (
+        <div className="bg-gradient-to-r from-emerald-50 to-blue-50 border-2 border-emerald-300 rounded-xl p-6 anim-fade">
+          <div className="text-center mb-4">
+            <div className="text-4xl mb-2">⚡</div>
+            <h3 className="text-xl font-bold text-emerald-800">빌드 시간 비교 (소스만 변경 시)</h3>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* 나쁜 순서 */}
+            <div className="text-center">
+              <div className="font-bold text-red-600 mb-2">나쁜 순서</div>
+              <div className="bg-red-100 rounded-xl p-4">
+                <div className="text-3xl font-bold text-red-700 mb-1">~2분</div>
+                <div className="text-xs text-red-500">pip install 매번 재실행</div>
+                <div className="w-full bg-red-200 rounded-full h-4 mt-3">
+                  <div className="bg-red-500 h-4 rounded-full" style={{width:"100%"}}></div>
+                </div>
+              </div>
+            </div>
+            {/* 좋은 순서 */}
+            <div className="text-center">
+              <div className="font-bold text-emerald-600 mb-2">좋은 순서</div>
+              <div className="bg-emerald-100 rounded-xl p-4">
+                <div className="text-3xl font-bold text-emerald-700 mb-1">~5초</div>
+                <div className="text-xs text-emerald-500">pip install 캐시 히트</div>
+                <div className="w-full bg-emerald-200 rounded-full h-4 mt-3">
+                  <div className="bg-emerald-500 h-4 rounded-full anim-slide" style={{width:"4%", minWidth:"12px"}}></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="text-center mt-4">
+            <span className="bg-emerald-200 text-emerald-800 px-4 py-2 rounded-full text-sm font-bold">
+              순서만 바꿔도 24배 빨라진다!
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── 캐시 규칙 패널 ── */
+    function RulePanel() {
+      const rules = [
+        { num: "1", text: "명령어 텍스트가 이전과 동일한가", icon: "📝" },
+        { num: "2", text: "COPY / ADD 대상 파일의 체크섬이 이전과 동일한가", icon: "📄" },
+        { num: "3", text: "이전 레이어가 캐시 히트였는가 (핵심!)", icon: "⭐" },
+      ];
+      return (
+        <div className="bg-gradient-to-r from-amber-50 to-blue-50 border-2 border-amber-200 rounded-xl p-5 anim-fade">
+          <h4 className="font-bold text-amber-800 mb-3">레이어 캐시 유효 조건 3가지</h4>
+          <div className="space-y-3">
+            {rules.map((rule, i) => (
+              <div key={i} className="flex items-start gap-3 bg-white rounded-lg p-3 border border-amber-100 anim-slide" style={{animationDelay: `${i*0.15}s`, opacity: 0}}>
+                <div className="w-8 h-8 bg-amber-500 text-white rounded-full flex items-center justify-center text-sm font-bold flex-shrink-0">{rule.num}</div>
+                <div className="flex items-center gap-2">
+                  <span className="text-lg">{rule.icon}</span>
+                  <span className="text-sm font-medium text-slate-800">{rule.text}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+            <strong>핵심:</strong> 중간 레이어 하나라도 캐시가 무효화되면 그 이후의 <strong>모든 레이어</strong>가 다시 실행된다
+          </div>
+        </div>
+      );
+    }
+
+    /* ── 메인 앱 ── */
+    function App() {
+      const [step, setStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const timerRef = useRef(null);
+      const data = STEPS[step];
+
+      useEffect(() => {
+        if (isPlaying && step < STEPS.length - 1) {
+          timerRef.current = setTimeout(() => setStep(s => s + 1), 5000);
+        } else if (step >= STEPS.length - 1) setIsPlaying(false);
+        return () => clearTimeout(timerRef.current);
+      }, [isPlaying, step]);
+
+      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
+
+      const bgColor =
+        data.phase === "compare" ? "bg-emerald-600 border-emerald-700 text-white" :
+        data.phase === "bad_order" ? "bg-red-600 border-red-700 text-white" :
+        data.phase === "rule" ? "bg-amber-600 border-amber-700 text-white" :
+        "bg-blue-600 border-blue-700 text-white";
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
+          <div className="max-w-5xl mx-auto space-y-6">
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
+                <h1 className="text-xl font-bold text-slate-800">Chapter IV-1-2: 레이어 캐싱과 빌드 최적화</h1>
+              </div>
+              <p className="text-slate-500 text-sm">Dockerfile 레이어가 쌓이는 과정과 변경 시 캐시 히트/미스를 시각화합니다.</p>
+            </header>
+
+            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${bgColor}`}>
+              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
+              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            </div>
+
+            {/* 레이어 스택 (STEP 1~4) */}
+            {(data.phase === "intro" || data.phase === "good_order" || data.phase === "bad_order") && (
+              <LayerStack layers={data.layers} cacheStatus={data.cacheStatus} step={step} changedFile={data.changedFile} />
+            )}
+
+            {/* 나쁜 순서 비교 (STEP 2) */}
+            {data.showBad && <OrderComparison step={step} />}
+
+            {/* 좋은 순서에서도 비교 표시 (STEP 3) */}
+            {data.phase === "good_order" && <OrderComparison step={step} />}
+
+            {/* 캐시 규칙 (STEP 4) */}
+            {data.phase === "rule" && (
+              <>
+                <LayerStack layers={data.layers} cacheStatus={data.cacheStatus} step={step} changedFile={data.changedFile} />
+                <RulePanel />
+              </>
+            )}
+
+            {/* .dockerignore (STEP 5) */}
+            {data.phase === "dockerignore" && (
+              <>
+                <LayerStack layers={data.layers} cacheStatus={data.cacheStatus} step={step} changedFile={data.changedFile} />
+                <DockerIgnorePanel step={step} />
+              </>
+            )}
+
+            {/* 빌드 시간 비교 (STEP 6) */}
+            {data.phase === "compare" && <ComparePanel step={step} />}
+
+            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex gap-1.5 mb-4">
+                {STEPS.map((_, i) => (
+                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
+                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
+                ))}
+              </div>
+              <div className="flex items-center justify-center gap-3">
+                <button onClick={() => go(-1)} disabled={step === 0}
+                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
+                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
+                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
+                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
+                </button>
+                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
+                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
+                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
