@@ -6,8 +6,16 @@
  * 의존성: Tailwind CSS CDN (각 페이지에서 로드됨)
  */
 (function () {
-  // iframe 안에서 로드되면 사이드바를 표시하지 않음 (허브에서 이미 사이드바 제공)
-  if (window.self !== window.top) return;
+  // iframe 안에서 로드되면 사이드바 + 헤더 + 탭 바를 숨김 (허브에서 이미 제공)
+  if (window.self !== window.top) {
+    var style = document.createElement('style');
+    style.textContent =
+      '#root > div > div > header { display: none !important; }' +
+      '#root > div > div > div:nth-child(2) { display: none !important; }' +
+      '#root > div > div > footer { display: none !important; }';
+    document.head.appendChild(style);
+    return;
+  }
 
   // 전체 목차 데이터
   const TOC = [
