@@ -6,6 +6,9 @@
  * 의존성: Tailwind CSS CDN (각 페이지에서 로드됨)
  */
 (function () {
+  // iframe 안에서 로드되면 사이드바를 표시하지 않음 (허브에서 이미 사이드바 제공)
+  if (window.self !== window.top) return;
+
   // 전체 목차 데이터
   const TOC = [
     { part: 'I', title: '왜 버전 관리인가', color: 'orange', file: 'part-1.html',
