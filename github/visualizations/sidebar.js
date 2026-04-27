@@ -8,12 +8,20 @@
 (function () {
   // iframe 안에서 로드되면 사이드바 + 헤더 + 탭 바를 숨김 (허브에서 이미 제공)
   if (window.self !== window.top) {
-    var style = document.createElement('style');
-    style.textContent =
-      '#root > div > div > header { display: none !important; }' +
-      '#root > div > div > div:nth-child(2) { display: none !important; }' +
-      '#root > div > div > footer { display: none !important; }';
-    document.head.appendChild(style);
+    function hideNavElements() {
+      var style = document.createElement('style');
+      style.textContent =
+        '#root > div > div > header { display: none !important; }' +
+        '#root > div > div > div:nth-child(2) { display: none !important; }' +
+        '#root > div > div > footer { display: none !important; }';
+      document.head.appendChild(style);
+    }
+    // Babel이 React를 렌더링한 후 실행되도록 지연
+    if (document.readyState === 'complete') {
+      hideNavElements();
+    } else {
+      window.addEventListener('load', hideNavElements);
+    }
     return;
   }
 
