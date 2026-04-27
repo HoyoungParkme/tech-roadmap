@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vector DB — IV-2-3. pgvector 운영 — 성능 튜닝과 스케일링</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        desc: "pgvector를 프로덕션에서 운영하려면 엔진 튜닝이 필요합니다. 자동차가 공장 출하 상태로 레이스에 나갈 수 없듯, 기본 설정만으로는 대규모 벡터 검색에 한계가 있습니다. 6가지 튜닝 영역을 하나씩 살펴봅니다.",
+        left: 'overview',
+        right: 'baseline',
+      },
+      {
+        desc: "1단계: 메모리 설정. maintenance_work_mem을 충분히 늘려야 인덱스 빌드가 빨라집니다. shared_buffers와 effective_cache_size도 벡터 검색 성능에 직접 영향을 줍니다.",
+        left: 'memory-config',
+        right: 'memory-impact',
+      },
+      {
+        desc: "2단계: 인덱스 파라미터 튜닝. IVFFlat의 lists/probes, HNSW의 m/ef_construction을 데이터 규모에 맞게 조절합니다. 너무 작으면 recall이 떨어지고, 너무 크면 리소스 낭비입니다.",
+        left: 'index-tuning',
+        right: 'index-benchmark',
+      },
+      {
+        desc: "3단계: VACUUM과 인덱스 유지보수. 대량 INSERT/DELETE 후 인덱스 품질이 저하됩니다. 정기적 VACUUM과 REINDEX가 성능을 유지하는 핵심입니다.",
+        left: 'vacuum-config',
+        right: 'vacuum-schedule',
+      },
+      {
+        desc: "4단계: 테이블 파티셔닝. 1000만 건 이상이면 날짜/카테고리별로 테이블을 분할합니다. 파티션별 인덱스가 생성되어 검색 범위가 줄어듭니다.",
+        left: 'partition-config',
+        right: 'partition-benefit',
+      },
+      {
+        desc: "5단계: 커넥션 풀링과 스케일링. PgBouncer로 커넥션을 관리하고, 읽기 복제본으로 검색 부하를 분산합니다. 100만 → 1000만 벡터 스케일업 시 필수적인 인프라 구성입니다.",
+        left: 'connection-pool',
+        right: 'scale-checklist',
+      },
+    ];
+
+    function App() {
+      const [step, setStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const playRef = useRef(null);
+      const s = STEPS[step];
+      const isEnd = step === STEPS.length - 1;
+
+      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
+      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
+      const nextRef = useRef(next); nextRef.current = next;
+      const prevRef = useRef(prev); prevRef.current = prev;
+      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
+
+      useEffect(() => {
+        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
+        else { clearInterval(playRef.current); }
+        return () => clearInterval(playRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const renderLeft = () => {
+        switch (s.left) {
+          case 'overview':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">6가지 튜닝 영역</div>
+                <div className="space-y-2">
+                  {[
+                    { num: '1', title: '메모리 설정', desc: 'shared_buffers, work_mem, maintenance_work_mem' },
+                    { num: '2', title: '인덱스 파라미터', desc: 'lists, probes, m, ef_construction' },
+                    { num: '3', title: 'VACUUM / REINDEX', desc: '인덱스 품질 유지, dead tuple 정리' },
+                    { num: '4', title: '테이블 파티셔닝', desc: '대규모 데이터 분할, 파티션별 인덱스' },
+                    { num: '5', title: '커넥션 풀링', desc: 'PgBouncer, 읽기 복제본' },
+                    { num: '6', title: '모니터링', desc: '검색 레이턴시, 인덱스 크기, 쿼리 분석' },
+                  ].map((item, i) => (
+                    <div key={i} className={`flex items-start gap-3 p-3 rounded-lg border ${
+                      i === step ? 'bg-blue-50 border-blue-300 shadow-sm' : 'bg-slate-50 border-slate-200'
+                    }`}>
+                      <div className="w-6 h-6 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">{item.num}</div>
+                      <div>
+                        <div className="font-bold text-sm text-slate-800">{item.title}</div>
+                        <div className="text-xs text-slate-500">{item.desc}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          case 'memory-config':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">postgresql.conf 메모리 설정</div>
+                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`# 인덱스 빌드 시 메모리 (중요!)
+maintenance_work_mem = '2GB'
+
+# 공유 버퍼 (전체 RAM의 25%)
+shared_buffers = '4GB'
+
+# 쿼리 실행 시 작업 메모리
+work_mem = '256MB'
+
+# OS 캐시 고려 (전체 RAM의 75%)
+effective_cache_size = '12GB'
+
+# 병렬 쿼리
+max_parallel_workers_per_gather = 4`}</pre>
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+                  <b>maintenance_work_mem</b>이 가장 중요. HNSW 인덱스 빌드 시 이 값이 작으면 매우 느림
+                </div>
+              </div>
+            );
+          case 'index-tuning':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">데이터 규모별 인덱스 설정</div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm border-collapse">
+                    <thead>
+                      <tr className="bg-slate-100">
+                        <th className="p-2 text-left border border-slate-200">규모</th>
+                        <th className="p-2 text-center border border-slate-200">IVFFlat</th>
+                        <th className="p-2 text-center border border-slate-200">HNSW</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[
+                        ['10만', 'lists=316', 'm=16, ef=64'],
+                        ['100만', 'lists=1000', 'm=16, ef=128'],
+                        ['500만', 'lists=2236', 'm=24, ef=200'],
+                        ['1000만', 'lists=3162', 'm=32, ef=256'],
+                      ].map(([scale, ivf, hnsw], i) => (
+                        <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
+                          <td className="p-2 border border-slate-200 font-medium">{scale}건</td>
+                          <td className="p-2 border border-slate-200 text-center text-xs font-mono">{ivf}</td>
+                          <td className="p-2 border border-slate-200 text-center text-xs font-mono">{hnsw}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <pre className="bg-slate-800 text-slate-100 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap mt-3">{`-- 검색 시 파라미터 조정
+SET ivfflat.probes = 32;
+SET hnsw.ef_search = 100;`}</pre>
+              </div>
+            );
+          case 'vacuum-config':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">VACUUM & REINDEX</div>
+                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`-- 일반 VACUUM (경량, 온라인 가능)
+VACUUM ANALYZE documents;
+
+-- VACUUM FULL (테이블 재작성, 잠금 필요)
+VACUUM FULL documents;
+
+-- 인덱스 재구축
+REINDEX INDEX CONCURRENTLY idx_docs_hnsw;
+
+-- dead tuple 확인
+SELECT relname, n_dead_tup, n_live_tup,
+  round(n_dead_tup::numeric /
+    NULLIF(n_live_tup, 0) * 100, 2)
+    AS dead_ratio
+FROM pg_stat_user_tables
+WHERE relname = 'documents';`}</pre>
+              </div>
+            );
+          case 'partition-config':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">테이블 파티셔닝</div>
+                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap">{`-- 날짜별 파티셔닝
+CREATE TABLE documents (
+  id bigserial,
+  content text,
+  embedding vector(1536),
+  created_at date NOT NULL
+) PARTITION BY RANGE (created_at);
+
+-- 월별 파티션 생성
+CREATE TABLE docs_2024_01
+  PARTITION OF documents
+  FOR VALUES FROM ('2024-01-01')
+  TO ('2024-02-01');
+
+CREATE TABLE docs_2024_02
+  PARTITION OF documents
+  FOR VALUES FROM ('2024-02-01')
+  TO ('2024-03-01');
+
+-- 각 파티션에 개별 인덱스
+CREATE INDEX ON docs_2024_01
+  USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX ON docs_2024_02
+  USING hnsw (embedding vector_cosine_ops);`}</pre>
+              </div>
+            );
+          case 'connection-pool':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">PgBouncer + 읽기 복제본</div>
+                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`# pgbouncer.ini
+[databases]
+vectordb = host=127.0.0.1
+  port=5432 dbname=vectordb
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 50
+reserve_pool_size = 10`}</pre>
+                <div className="space-y-2">
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                    <div className="font-bold text-xs text-blue-800">쓰기: Primary</div>
+                    <div className="text-xs text-blue-700">INSERT, UPDATE, DELETE, 인덱스 빌드</div>
+                  </div>
+                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+                    <div className="font-bold text-xs text-emerald-800">읽기: Replica(s)</div>
+                    <div className="text-xs text-emerald-700">벡터 검색 쿼리를 복제본으로 분산</div>
+                  </div>
+                </div>
+              </div>
+            );
+          default: return null;
+        }
+      };
+
+      const renderRight = () => {
+        switch (s.right) {
+          case 'baseline':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">기본값 vs 튜닝 후</div>
+                <div className="space-y-3">
+                  {[
+                    { label: '인덱스 빌드 (100만건)', before: '45분', after: '8분', improvement: '5.6x' },
+                    { label: '검색 레이턴시 (p99)', before: '120ms', after: '15ms', improvement: '8x' },
+                    { label: '동시 검색 처리량', before: '50 qps', after: '300 qps', improvement: '6x' },
+                    { label: 'Recall@10', before: '85%', after: '97%', improvement: '+12%p' },
+                  ].map((item, i) => (
+                    <div key={i} className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                      <div className="font-bold text-xs text-slate-600 mb-2">{item.label}</div>
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 text-center">
+                          <div className="text-xs text-red-500">기본값</div>
+                          <div className="font-mono font-bold text-sm text-red-700">{item.before}</div>
+                        </div>
+                        <div className="text-slate-400 font-bold">→</div>
+                        <div className="flex-1 text-center">
+                          <div className="text-xs text-emerald-500">튜닝 후</div>
+                          <div className="font-mono font-bold text-sm text-emerald-700">{item.after}</div>
+                        </div>
+                        <div className="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs font-bold">{item.improvement}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          case 'memory-impact':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">메모리 설정별 영향</div>
+                <div className="space-y-3">
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                    <div className="font-bold text-xs text-slate-600 mb-2">maintenance_work_mem vs 빌드 시간</div>
+                    {[
+                      { mem: '256MB', time: '45분', bar: 'w-11/12' },
+                      { mem: '1GB', time: '15분', bar: 'w-7/12' },
+                      { mem: '2GB', time: '8분', bar: 'w-4/12' },
+                      { mem: '4GB', time: '6분', bar: 'w-3/12' },
+                    ].map((item, i) => (
+                      <div key={i} className="flex items-center gap-2 mb-1.5">
+                        <span className="text-xs font-mono w-14 text-slate-600">{item.mem}</span>
+                        <div className="flex-1 bg-slate-200 rounded-full h-4 relative">
+                          <div className={`bg-blue-500 h-4 rounded-full ${item.bar} flex items-center justify-end pr-1`}>
+                            <span className="text-[10px] text-white font-bold">{item.time}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700">
+                    <b>권장:</b> 서버 RAM 16GB → maintenance_work_mem = 2GB<br/>
+                    인덱스 빌드 후 원래 값으로 복원해도 됨
+                  </div>
+                </div>
+              </div>
+            );
+          case 'index-benchmark':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">벤치마크 결과 (100만건, 1536차원)</div>
+                <div className="space-y-3">
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                    <div className="font-bold text-xs text-blue-800 mb-2">IVFFlat (lists=1000, probes=32)</div>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div className="bg-white p-2 rounded border"><b>빌드:</b> 3분</div>
+                      <div className="bg-white p-2 rounded border"><b>검색:</b> ~8ms</div>
+                      <div className="bg-white p-2 rounded border"><b>Recall:</b> 94%</div>
+                      <div className="bg-white p-2 rounded border"><b>메모리:</b> 1.2GB</div>
+                    </div>
+                  </div>
+                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
+                    <div className="font-bold text-xs text-purple-800 mb-2">HNSW (m=16, ef_construction=128)</div>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div className="bg-white p-2 rounded border"><b>빌드:</b> 25분</div>
+                      <div className="bg-white p-2 rounded border"><b>검색:</b> ~5ms</div>
+                      <div className="bg-white p-2 rounded border"><b>Recall:</b> 98%</div>
+                      <div className="bg-white p-2 rounded border"><b>메모리:</b> 3.5GB</div>
+                    </div>
+                  </div>
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+                    <b>결론:</b> 메모리 여유 있으면 HNSW, 메모리 제한 시 IVFFlat
+                  </div>
+                </div>
+              </div>
+            );
+          case 'vacuum-schedule':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">VACUUM 운영 스케줄</div>
+                <div className="space-y-3">
+                  {[
+                    { freq: '매일', task: 'VACUUM ANALYZE', desc: '통계 갱신, 경량 정리', color: 'bg-emerald-50 border-emerald-200' },
+                    { freq: '매주', task: 'dead_ratio 확인', desc: '10% 초과 시 VACUUM FULL 고려', color: 'bg-blue-50 border-blue-200' },
+                    { freq: '매월', task: 'REINDEX CONCURRENTLY', desc: '인덱스 품질 복원 (온라인 가능)', color: 'bg-purple-50 border-purple-200' },
+                    { freq: '분기', task: 'VACUUM FULL (점검 시간)', desc: '테이블 재작성, 디스크 반환', color: 'bg-amber-50 border-amber-200' },
+                  ].map((item, i) => (
+                    <div key={i} className={`p-3 rounded-lg border ${item.color}`}>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="font-bold text-sm">{item.freq}</span>
+                        <span className="text-xs font-mono bg-white px-2 py-0.5 rounded border">{item.task}</span>
+                      </div>
+                      <div className="text-xs text-slate-600">{item.desc}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+                  <b>주의:</b> VACUUM FULL은 테이블 잠금 발생. 서비스 점검 시간에 수행
+                </div>
+              </div>
+            );
+          case 'partition-benefit':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">파티셔닝 효과</div>
+                <div className="space-y-3">
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                    <div className="font-bold text-xs text-slate-600 mb-2">검색 범위 축소</div>
+                    <div className="space-y-1.5">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs w-20 text-slate-500">파티셔닝 전:</span>
+                        <div className="flex-1 bg-red-200 rounded h-4 flex items-center justify-center">
+                          <span className="text-[10px] font-bold text-red-800">1000만건 전체 스캔</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs w-20 text-slate-500">파티셔닝 후:</span>
+                        <div className="flex gap-1 flex-1">
+                          <div className="bg-slate-200 rounded h-4 flex-1"></div>
+                          <div className="bg-slate-200 rounded h-4 flex-1"></div>
+                          <div className="bg-blue-400 rounded h-4 flex-1 flex items-center justify-center">
+                            <span className="text-[10px] font-bold text-white">이 달만</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+                    <div className="font-bold text-xs text-emerald-800 mb-1">파티셔닝 이점</div>
+                    <ul className="text-xs text-emerald-700 space-y-1">
+                      <li>- 검색 대상이 줄어 속도 향상</li>
+                      <li>- 파티션별 VACUUM 가능 (전체 잠금 불필요)</li>
+                      <li>- 오래된 파티션 DROP으로 빠른 삭제</li>
+                      <li>- 인덱스 빌드도 파티션 단위로 병렬 가능</li>
+                    </ul>
+                  </div>
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700">
+                    <b>적용 기준:</b> 500만건 이상, 시간 범위 검색이 빈번한 경우
+                  </div>
+                </div>
+              </div>
+            );
+          case 'scale-checklist':
+            return (
+              <div>
+                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">스케일업 체크리스트</div>
+                <div className="space-y-2">
+                  {[
+                    { scale: '10만 → 100만', items: ['HNSW 인덱스 적용', 'maintenance_work_mem 1GB+', 'probes/ef_search 튜닝'] },
+                    { scale: '100만 → 500만', items: ['파티셔닝 도입', 'PgBouncer 적용', '읽기 복제본 구성'] },
+                    { scale: '500만 → 1000만', items: ['m=32, ef_construction=256', 'VACUUM 자동화', '모니터링 대시보드'] },
+                    { scale: '1000만+', items: ['수평 샤딩 검토', 'FAISS 캐시 레이어 도입', 'Citus/Aurora 고려'] },
+                  ].map((tier, i) => (
+                    <div key={i} className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                      <div className="font-bold text-sm text-blue-700 mb-1">{tier.scale}</div>
+                      <div className="space-y-0.5">
+                        {tier.items.map((item, j) => (
+                          <div key={j} className="flex items-center gap-2 text-xs text-slate-600">
+                            <span className="w-4 h-4 bg-blue-100 rounded flex items-center justify-center text-blue-600 text-[10px]">&#10003;</span>
+                            {item}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          default: return null;
+        }
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
+          <div className="max-w-5xl mx-auto space-y-6">
+            <nav className="text-sm">
+              <a href="../index.html" className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 font-medium">
+                <span>&larr;</span> 허브로 돌아가기
+              </a>
+            </nav>
+
+            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. pgvector &gt; Chapter 2. pgvector 실전</div>
+                  <h1 className="text-2xl font-bold text-slate-800">IV-2-3. pgvector 운영 — 성능 튜닝과 스케일링</h1>
+                </div>
+              </div>
+              <p className="text-slate-600">자동차 엔진 튜닝처럼 — <b>메모리 설정, 인덱스 파라미터, VACUUM, 파티셔닝, 커넥션 풀링</b>까지 프로덕션 운영의 핵심을 다룹니다.</p>
+            </header>
+
+            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-blue-700 border-blue-800 text-white">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-200">성능 튜닝 체크리스트</h3>
+                <span className="text-xs text-blue-200">키보드 &larr;/&rarr;로 단계 이동</span>
+              </div>
+              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                {renderLeft()}
+              </div>
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                {renderRight()}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {['VACUUM', 'maintenance_work_mem', 'partitioning', 'connection pool', 'pgbouncer'].map(kw => (
+                <span key={kw} className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full text-sm font-medium border border-blue-200">{kw}</span>
+              ))}
+            </div>
+
+            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <div className="flex items-center space-x-2">
+                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
+                </button>
+                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-blue-600 hover:bg-blue-700">
+                  {isPlaying ? (
+                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>
+                  ) : (
+                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>
+                  )}
+                </button>
+                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
+                </button>
+              </div>
+              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
+            </div>
+
+            <div className="flex justify-between text-sm text-slate-500">
+              <a href="./IV-2-2.html" className="text-blue-600 hover:text-blue-800 font-medium">&larr; IV-2-2. pgvector 실전</a>
+              <a href="../part5/V-1-1.html" className="text-rose-600 hover:text-rose-800 font-medium">Part V. 비교와 선택 → V-1-1 &rarr;</a>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
