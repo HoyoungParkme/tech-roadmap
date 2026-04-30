@@ -151,7 +151,7 @@
 - **선수 지식**: IV-1-2
 - **학습 목표**: 노드 군집을 찾아 단계별 요약을 만든다.
 - **핵심 키워드**: [Louvain, Leiden 알고리즘, 계층 요약]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Community Detection 시각화 보기](part4/IV-2-1.html) — 밀도 차이 → Louvain → 계층 요약 → Leiden 비교 (별자리 비유)
 - **다음 섹션**: IV-2-2
 
 ### Section IV-2-2. 질의 응답(Local vs Global)
@@ -159,7 +159,7 @@
 - **선수 지식**: IV-2-1
 - **학습 목표**: 두 가지 GraphRAG 검색 모드를 구분해 사용한다.
 - **핵심 키워드**: [Local search, Global search, 컨텍스트 조립]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Local vs Global 시각화 보기](part4/IV-2-2.html) — Local 시연 / Global 시연 / 컨텍스트 비교 / 자동 라우팅 (동네 검색 vs 책 요약 비유)
 - **다음 섹션**: IV-3-1
 
 ### Section IV-3-1. 평가 지표
@@ -167,7 +167,7 @@
 - **선수 지식**: IV-2-2
 - **학습 목표**: GraphRAG 답변 품질을 측정하는 지표를 안다.
 - **핵심 키워드**: [정확도, 포괄성, 다양성, RAGAS 확장]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [평가 지표 시각화 보기](part4/IV-3-1.html) — Faithfulness/Comprehensiveness/Diversity 3축 + RAGAS+LLM Judge (성적표 비유)
 - **다음 섹션**: V-1-1
 
 ---
@@ -181,7 +181,7 @@
 - **선수 지식**: IV-3-1
 - **학습 목표**: 마이크로소프트 공식 라이브러리로 GraphRAG 한 사이클을 돌린다.
 - **핵심 키워드**: [Microsoft GraphRAG, settings.yaml, 인덱싱]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Microsoft GraphRAG 시각화 보기](part5/V-1-1.html) — 설치 / settings.yaml / 인덱싱 CLI / Local·Global 질의 (조립 키트 비유)
 - **다음 섹션**: V-1-2
 
 ### Section V-1-2. LangChain GraphRAG 통합
