@@ -1225,7 +1225,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
   `description`은 없어도 되므로 nullable로 설정한다.
   실제 프로젝트에서는 여러 테이블과 관계선(1:N, N:M)이 추가되지만, 첫 번째 ERD는 이 정도로 충분하다.
 - **핵심 키워드**: [ERD, 테이블 설계, PRIMARY KEY, nullable, AUTO INCREMENT]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [ERD 시각화 보기](part6/chapter-06-07-erd.html) — todos 테이블 5컬럼을 ERD 개념 → PK/AUTO INC → nullable → 샘플 row 5단계로 시각화
 - **다음 섹션**: VI-1-4
 
 ---
@@ -1469,7 +1469,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
   `feat:` (새 기능), `fix:` (버그 수정), `docs:` (문서) 같은 접두어를 붙이면 이력을 읽기 쉽다.
   `.env` 파일은 반드시 `.gitignore`에 추가한다 — DB 비밀번호가 GitHub에 공개되면 안 된다.
 - **핵심 키워드**: [Git, gitignore, 커밋 메시지, feat/fix 접두어, .env 보호]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Git 버전 관리 시각화 보기](part6/chapter-06-08-git.html) — 게임 세이브 비유로 init → .gitignore → add → commit → 히스토리 5단계 (3-zone 다이어그램)
 - **다음 섹션**: VI-3-3
 
 ---
@@ -1604,7 +1604,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
   배포 시에는 `.env` 파일 대신 Render 대시보드의 "Environment Variables" 메뉴에서 값을 입력한다.
   `pydantic-settings` 패키지가 필요하다: `pip install pydantic-settings`.
 - **핵심 키워드**: [환경변수, .env, BaseSettings, pydantic-settings, gitignore]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [환경변수 보호 시각화 보기](part7/chapter-07-07-env-vars.html) — 금고/출입증 비유로 위험 시나리오 → .env → .gitignore 차단 → BaseSettings → Render 대시보드 5단계
 - **다음 섹션**: VII-2-2
 
 ---
