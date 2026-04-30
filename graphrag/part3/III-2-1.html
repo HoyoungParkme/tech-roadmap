@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GraphRAG 학습 — Cypher 고급</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-1. Cypher 고급 (관계 탐색)
+    학습 목표: 다단계 관계를 따라가는 쿼리를 작성할 수 있다.
+    핵심 비유: "지하철에서 1~5번 갈아타기" — 가변 길이 경로 표현
+    구조: 4단계 (고정 N-hop / 가변 길이 / shortestPath / path 변수)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5명 인물 일렬 배치 (Alice → Bob → Carol → Dave → Eve)
+    const PEOPLE = [
+      { id: 'alice', name: 'Alice', cx: 100 },
+      { id: 'bob',   name: 'Bob',   cx: 260 },
+      { id: 'carol', name: 'Carol', cx: 420 },
+      { id: 'dave',  name: 'Dave',  cx: 580 },
+      { id: 'eve',   name: 'Eve',   cx: 740 },
+    ];
+
+    // 인접 KNOWS 엣지 (hop별 매치 결정)
+    const EDGES = [
+      { from: 'alice', to: 'bob' },
+      { from: 'bob',   to: 'carol' },
+      { from: 'carol', to: 'dave' },
+      { from: 'dave',  to: 'eve' },
+    ];
+
+    const STEPS = [
+      {
+        title: 'Step 1. 고정 길이 N-hop — 친구의 친구',
+        desc: '관계를 두 번 잇대어 적으면 정확히 2-hop 친구를 찾는다. 패턴이 길어질수록 코드도 길어진다. SQL이라면 friends 테이블을 두 번 self-JOIN해야 한다.',
+        code: 'MATCH (a:Person {name: "Alice"})\n      -[:KNOWS]->(b)-[:KNOWS]->(c)\nRETURN c.name',
+        focus: 'fixed',
+        match: { from: 'alice', to: 'carol', hops: 2 },
+      },
+      {
+        title: 'Step 2. 가변 길이 — *1..5',
+        desc: '`*1..5`를 쓰면 1홉부터 5홉까지의 모든 친구를 한 번에 가져온다. 친구 / 친구의 친구 / ... / 5다리 건너 친구. SQL에선 동등한 표현이 거의 불가능하다. 멀티홉 추론의 핵심.',
+        code: 'MATCH (a:Person {name: "Alice"})\n      -[:KNOWS*1..5]->(c)\nRETURN c.name',
+        focus: 'var',
+        match: { from: 'alice', to: 'eve', hops: 4 },
+      },
+      {
+        title: 'Step 3. shortestPath — 최단 경로',
+        desc: '두 사람 사이 가장 짧은 인맥 경로를 한 줄로 찾는다. shortestPath()는 너비 우선 탐색을 자동으로 적용. "Alice와 Eve를 잇는 최단 인맥은?" 같은 질문에 즉답.',
+        code: 'MATCH p = shortestPath(\n  (a:Person {name:"Alice"})\n  -[:KNOWS*]-(e:Person {name:"Eve"})\n)\nRETURN p',
+        focus: 'short',
+        match: { from: 'alice', to: 'eve', hops: 4, path: true },
+      },
+      {
+        title: 'Step 4. path 변수 — 경로 자체를 데이터로',
+        desc: 'p에 경로를 담으면 length(p), nodes(p), relationships(p)로 메타데이터를 꺼낼 수 있다. "몇 다리 건너인지", "중간에 누가 있는지"를 바로 RETURN. GraphRAG에서 인용 경로 추적의 기반.',
+        code: 'MATCH p = (a:Person {name:"Alice"})\n      -[:KNOWS*1..3]->(c)\nRETURN length(p), [n IN nodes(p) | n.name]',
+        focus: 'path',
+        match: { from: 'alice', to: 'dave', hops: 3, showLength: true },
+      },
+    ];
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const focus = step.focus;
+      const match = step.match;
+
+      // 매치 노드 인덱스 범위
+      const fromIdx = PEOPLE.findIndex(p => p.id === match.from);
+      const toIdx = PEOPLE.findIndex(p => p.id === match.to);
+      const matchedIds = new Set();
+      for (let i = fromIdx; i <= toIdx; i++) matchedIds.add(PEOPLE[i].id);
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Cypher 고급 (관계 탐색)</h1>
+                <p className="text-sm text-slate-500 mt-1">지하철에서 1~5번 갈아타기 — 가변 길이 경로 표현</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* Cypher 코드 */}
+            <div className="bg-slate-900 rounded-xl p-4 mb-4">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">Cypher</span>
+              </div>
+              <pre className="text-emerald-300 font-mono text-sm overflow-x-auto whitespace-pre">
+{step.code}
+              </pre>
+            </div>
+
+            {/* SVG 그래프 — 5명 인물 + KNOWS 체인, 매치 강조 */}
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs font-bold text-slate-700">📊 KNOWS 친구 체인</div>
+                <div className="text-[10px] text-slate-500">매치된 hop 수: <span className="font-bold text-amber-700">{match.hops}-hop</span></div>
+              </div>
+              <svg viewBox="0 0 840 130" className="w-full" style={{ maxHeight: '160px' }}>
+                <defs>
+                  <marker id="arrowHead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#cbd5e1" />
+                  </marker>
+                  <marker id="arrowHeadOrange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#f59e0b" />
+                  </marker>
+                </defs>
+                {/* KNOWS 체인 엣지 */}
+                {EDGES.map((e, i) => {
+                  const fromNode = PEOPLE.find(p => p.id === e.from);
+                  const toNode = PEOPLE.find(p => p.id === e.to);
+                  const isMatched = matchedIds.has(e.from) && matchedIds.has(e.to);
+                  return (
+                    <g key={i}>
+                      <line
+                        x1={fromNode.cx + 30} y1="65"
+                        x2={toNode.cx - 30}   y2="65"
+                        stroke={isMatched ? '#f59e0b' : '#cbd5e1'}
+                        strokeWidth={isMatched ? '4' : '2'}
+                        markerEnd={isMatched ? 'url(#arrowHeadOrange)' : 'url(#arrowHead)'}
+                      />
+                      <text
+                        x={(fromNode.cx + toNode.cx) / 2}
+                        y="55"
+                        textAnchor="middle"
+                        fontSize="9"
+                        fontFamily="monospace"
+                        fill={isMatched ? '#92400e' : '#94a3b8'}
+                      >
+                        :KNOWS
+                      </text>
+                    </g>
+                  );
+                })}
+                {/* 노드 */}
+                {PEOPLE.map((p) => {
+                  const isMatched = matchedIds.has(p.id);
+                  return (
+                    <g key={p.id}>
+                      <circle cx={p.cx} cy="65" r="26" fill={isMatched ? '#3b82f6' : '#cbd5e1'} stroke={isMatched ? '#1d4ed8' : '#94a3b8'} strokeWidth="2" />
+                      <text x={p.cx} y="68" textAnchor="middle" fontSize="11" fontWeight="bold" fill="#fff">{p.name}</text>
+                      {isMatched && p.id === match.from && (
+                        <text x={p.cx} y="105" textAnchor="middle" fontSize="9" fill="#1d4ed8" fontWeight="bold">시작</text>
+                      )}
+                      {isMatched && p.id === match.to && (
+                        <text x={p.cx} y="105" textAnchor="middle" fontSize="9" fill="#1d4ed8" fontWeight="bold">도착</text>
+                      )}
+                    </g>
+                  );
+                })}
+              </svg>
+              <div className="text-[10px] text-slate-500 text-center mt-2">파란 노드 + 주황 엣지 = 쿼리에 매치된 경로</div>
+            </div>
+
+            {/* Step 4 path 메타데이터 */}
+            {match.showLength && (
+              <div className="bg-white rounded-xl shadow-sm border-2 border-emerald-300 p-3 mb-6">
+                <div className="text-xs font-bold text-emerald-700 mb-2">📋 RETURN 결과</div>
+                <table className="w-full text-xs font-mono">
+                  <thead>
+                    <tr className="bg-emerald-50">
+                      <th className="text-left p-2 text-emerald-900">length(p)</th>
+                      <th className="text-left p-2 text-emerald-900">[n IN nodes(p) | n.name]</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="border-t border-emerald-100">
+                      <td className="p-2 text-slate-700">{match.hops}</td>
+                      <td className="p-2 text-slate-700">["Alice", "Bob", "Carol", "Dave"]</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {focus === 'short' && (
+              <div className="bg-white rounded-xl shadow-sm border-2 border-amber-300 p-3 mb-6 text-xs text-amber-900">
+                💡 shortestPath()는 BFS(너비 우선 탐색)를 자동 적용 — 데이터가 커도 최단 경로 빠르게 도달
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
