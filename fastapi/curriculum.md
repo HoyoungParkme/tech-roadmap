@@ -1249,7 +1249,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
   이 표가 구현 전 팀 합의 문서 역할을 한다.
   표가 확정되면 프론트엔드와 백엔드가 동시에 개발을 시작할 수 있다.
 - **핵심 키워드**: [API 설계표, 엔드포인트, HTTP 메서드, 경로 매핑]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [API 설계표 시각화 보기](part6/chapter-06-05-api-design.html) — 사용자 스토리 5개 → 동사 추출 → HTTP 메서드 → URL 매핑 → 완성된 설계표 (5단계)
 - **다음 섹션**: VI-2-1
 
 ---
@@ -1334,7 +1334,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
 
   Router는 요청 수신과 응답 반환만 담당한다. 비즈니스 로직은 Service가, DB 저장은 Repository가 맡는다.
 - **핵심 키워드**: [POST, Pydantic Schema, response_model, 3계층 Create]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Create 3계층 흐름 시각화 보기](part6/chapter-06-06-create-flow.html) — POST 요청이 Schema→Service→Repository→DB를 거쳐 응답으로 돌아오는 6단계 흐름
 - **다음 섹션**: VI-2-3
 
 ---
@@ -1519,7 +1519,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
   FastAPI는 동적 앱이므로 반드시 동적 호스팅이 필요하다.
   Python 코드를 실행할 수 있고, ASGI 서버(Uvicorn)를 띄울 수 있는 환경을 골라야 한다.
 - **핵심 키워드**: [정적 호스팅, 동적 호스팅, ASGI, Uvicorn, 배포 환경]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [정적 vs 동적 호스팅 시각화 보기](part7/chapter-07-05-static-vs-dynamic.html) — GitHub Pages(책 진열대)와 Render(주방) 비유로 두 흐름 좌우 비교 (4단계)
 - **다음 섹션**: VII-1-2
 
 ---
@@ -1542,7 +1542,7 @@ Chapter IV-1에서 비동기(async/await)와 데이터 검증(Pydantic), 자동 
   이번 실습에서는 **Render**를 사용한다.
   무료이고, GitHub 저장소 연결 → 배포가 가장 간단하며, FastAPI 공식 문서에서도 소개하는 플랫폼이다.
 - **핵심 키워드**: [Render, Fly.io, Railway, AWS, 무료 티어, 배포 플랫폼 비교]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [배포 플랫폼 매트릭스 시각화 보기](part7/chapter-07-06-platform-compare.html) — 4개 플랫폼(식당 비유) 비교 + Render 슬립 모드 타임라인 + 시나리오별 추천 (4단계)
 - **다음 섹션**: VII-1-3
 
 ---
