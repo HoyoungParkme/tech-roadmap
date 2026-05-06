@@ -79,19 +79,23 @@
 학습 목표: 학습된 모델을 production에 배포하고 추론 요청을 처리하는 방법.
 
 ### Section III-1-1. 모델 레지스트리 (MLflow Model Registry)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [모델 레지스트리 시각화 보기](part3/III-1-1.html) — 파일 공유 / register_model / Stage 전환 / Production 로드 (도서관 카탈로그 비유)
 - **다음 섹션**: III-1-2
 
 ### Section III-1-2. 서빙 패턴 (Online / Batch / Streaming)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [서빙 패턴 시각화 보기](part3/III-1-2.html) — Online 즉석 / Batch 포장 / Streaming 구독 / 선택 기준 (주문 방식 3종 비유)
 - **다음 섹션**: III-2-1
 
 ### Section III-2-1. 모델 서빙 도구 (Triton / TorchServe / KServe)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [서빙 도구 시각화 보기](part3/III-2-1.html) — Triton 만능 / TorchServe 전용 / KServe K8s / 선택 가이드 (주방 도구 3종 비유)
 - **다음 섹션**: III-2-2
 
 ### Section III-2-2. 배포 전략 (Canary / Shadow / A/B Test)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [배포 전략 시각화 보기](part3/III-2-2.html) — Canary 시식 / Shadow 시연 / A-B 비교 / 순차 조합 (신메뉴 출시 3종 비유)
 - **다음 섹션**: IV-1-1
 
 ---

@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — 배포 전략 (Canary / Shadow / A-B)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-2. 배포 전략 (Canary / Shadow / A-B)
+    학습 목표: 새 모델을 안전하게 운영에 올리는 3가지 방법
+    핵심 비유: "신메뉴 출시 3종" — 시식 코너(Canary), 비밀 시연(Shadow), 메뉴 비교(A-B)
+    구조: 4단계 (Canary 점진 / Shadow 무영향 / A-B 비교 / 선택)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Canary — "시식 코너" (트래픽 일부만)',
+        desc: '신모델(v2)에 트래픽 5% → 안정 확인 → 25% → 100%. 문제 생기면 즉시 0%로 롤백. 광부가 카나리아 새로 가스 누출 감지하던 데서 유래. 가장 보편적인 점진 배포.',
+        block: {
+          kind: 'yaml',
+          code: `# KServe canary — 트래픽 비율로 제어
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fraud-detector
+spec:
+  predictor:
+    canaryTrafficPercent: 5      # v2에 5%만
+    model:
+      storageUri: s3://models/fraud-detector/v2
+
+# 단계별 트래픽 증가
+Day 1:  v1=95%  v2=5%   ← 시식 코너 오픈
+Day 2:  v1=75%  v2=25%  ← 메트릭 OK → 비율 ↑
+Day 3:  v1=50%  v2=50%
+Day 4:  v1=0%   v2=100% ← 완전 전환
+
+# 모니터링 (자동 중단 트리거)
+- v2 latency p99 > v1 + 20% → 중단
+- v2 에러율 > v1 + 0.5% → 롤백
+- v2 비즈니스 KPI 하락 → 일시정지
+
+# 강점: 실제 사용자 일부에게 노출 → 진짜 환경 검증
+# 한계: v2가 사용자에게 직접 영향 (잘못된 결과도 노출)`,
+        },
+        focus: 'canary',
+      },
+      {
+        title: 'Step 2. Shadow — "비밀 시연" (요청 복제, 응답 무시)',
+        desc: 'v2에도 동일 요청을 복사해서 보내되 응답은 사용자에게 안 보내고 로깅만. 사용자 무영향 + v2 성능/정확도 측정 가능. v2 검증용. 비용은 2배(요청 두 번 처리).',
+        block: {
+          kind: 'yaml',
+          code: `# Istio VirtualService — mirror 트래픽
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+spec:
+  http:
+  - route:
+    - destination: { host: fraud-v1 }
+      weight: 100                    # 사용자 응답은 v1만
+    mirror:
+      host: fraud-v2                 # v2에도 복사 전송
+    mirrorPercentage: { value: 100 } # 100% shadow
+
+# 사용자 흐름
+# 사용자 → [라우터] → v1 → 응답 (사용자에게)
+#                 ↘ v2 → 로그만 (사용자 무영향)
+
+# v2 메트릭만 비교
+# - v2 latency: ?ms (실제 부하 기준)
+# - v2 prediction != v1 prediction: 몇 %?
+# - v2 에러율: ?%
+
+# 강점
+# - 사용자 영향 0 (안전)
+# - 실제 트래픽으로 v2 검증
+# - 카나리 직전 단계로 자주 사용
+
+# 한계
+# - 비용 2배 (모든 요청을 v2도 처리)
+# - 부작용 있는 호출(결제 등)에는 부적합`,
+        },
+        focus: 'shadow',
+      },
+      {
+        title: 'Step 3. A/B 테스트 — "메뉴 비교" (사용자 그룹 분리)',
+        desc: '사용자를 두 그룹으로 나눠 그룹A는 v1, 그룹B는 v2 사용. 비즈니스 KPI(클릭율, 전환율)를 통계적으로 비교. Canary는 안정성, A-B는 효과 측정. 최소 1~2주 운영 필요.',
+        block: {
+          kind: 'python',
+          code: `# A/B 라우팅 (사용자 ID 해시 기반)
+def route_user(user_id: int) -> str:
+    # 사용자별 일관된 그룹 할당 (sticky)
+    if hash(user_id) % 100 < 50:
+        return "v1"   # 50% 통제군
+    else:
+        return "v2"   # 50% 실험군
+
+# 결과 측정 (1~2주 후)
+                v1 (통제)    v2 (실험)    p-value
+─────────────────────────────────────────────────
+Click Rate     12.3%        13.8%        0.002 ✅
+Conversion     3.4%         3.6%         0.18  (애매)
+Revenue/User   $4.20        $4.55        0.04  ✅
+Latency p99    45ms         52ms         (악화)
+
+→ "v2가 KPI 개선했지만 latency 악화 → 트레이드오프 결정"
+
+# 강점
+# - 비즈니스 효과를 통계적으로 검증
+# - 재학습 가치 vs 비용 판단 근거
+# - 모델 효과 = 매출 영향까지 추적
+
+# 한계
+# - 통계적 유의성 위해 시간/표본 필요
+# - 사용자 경험 격차 (그룹별 다른 결과)
+# - 외부 요인(시즌성, 이벤트) 통제 어려움`,
+        },
+        focus: 'ab',
+      },
+      {
+        title: 'Step 4. 선택 — "언제 어느 걸 쓸까?"',
+        desc: '실무 표준 흐름: Shadow(무영향 검증) → Canary(점진 노출) → A-B(효과 측정). Shadow는 첫 검증, Canary는 안전 배포, A-B는 KPI 증명. 셋을 순차/동시에 쓰는 게 흔함.',
+        block: {
+          kind: 'shell',
+          code: `# 표준 배포 흐름
+        ┌─────────────────────────────┐
+v2 학습 → │ Shadow (1~3일)             │ "사용자 무영향, v2 안정성 확인"
+        └─────────────────────────────┘
+                    ↓ 메트릭 OK
+        ┌─────────────────────────────┐
+        │ Canary 5% → 25% → 50% (1주) │ "실제 노출, latency/에러 모니터"
+        └─────────────────────────────┘
+                    ↓ 안정
+        ┌─────────────────────────────┐
+        │ A/B 50/50 (2주)             │ "비즈니스 KPI 비교"
+        └─────────────────────────────┘
+                    ↓ KPI 개선 증명
+                  v2 100% 전환
+
+# 어느 걸 고를까
+질문                              → 답
+─────────────────────────────────────────────────
+"v2 처음 운영 노출"                → Shadow (무영향 검증 먼저)
+"안정성만 보면 됨"                 → Canary
+"매출/클릭 증가 증명 필요"         → A/B
+"부작용 있는 호출(결제 등)"        → Canary만 (Shadow 부적합)
+"롤백을 빠르게"                    → Canary (트래픽만 0%로)
+
+# 한 줄 요약
+Shadow  : "사용자 모름, v2 검증"
+Canary  : "사용자 일부, 점진 노출"
+A/B     : "사용자 절반, 효과 측정"
+
+# 다음(Part IV)에서는 운영 모니터링 — 데이터 드리프트 + 모델 성능 감시`,
+        },
+        focus: 'choose',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const STRATEGIES = [
+      { key: 'canary', emoji: '🐤', name: 'Canary', note: '시식 코너 (점진)' },
+      { key: 'shadow', emoji: '👤', name: 'Shadow', note: '비밀 시연 (무영향)' },
+      { key: 'ab',     emoji: '⚖️', name: 'A/B',    note: '메뉴 비교 (KPI)' },
+      { key: 'choose', emoji: '🎯', name: '선택',    note: '순차 조합' },
+    ];
+
+    function StrategyCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🍽️ 신메뉴 출시 3종 (배포 전략)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {STRATEGIES.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-rose-100 border-2 border-rose-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">배포 전략 (Canary / Shadow / A-B)</h1>
+                <p className="text-sm text-slate-500 mt-1">신메뉴 출시 3종 — 시식 / 시연 / 비교</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <StrategyCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'choose' && (
+              <div className="bg-rose-50 border-2 border-rose-300 rounded-xl p-3 mb-6 text-xs text-rose-900">
+                💡 다음(Part IV)에서는 운영 모니터링 — 데이터 드리프트 + 모델 성능 감시
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

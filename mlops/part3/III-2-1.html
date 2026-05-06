@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — 서빙 도구 (Triton / TorchServe / KServe)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-1. 서빙 도구 (Triton / TorchServe / KServe)
+    학습 목표: 모델 서빙 도구 3종 비교 — 어떤 상황에 어떤 도구를 고를까
+    핵심 비유: "주방 도구 3종" — 만능 컴비(Triton), 토치 전용 팬(TorchServe), 주방 전체 시스템(KServe)
+    구조: 4단계 (Triton / TorchServe / KServe / 선택 가이드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Triton — "만능 컴비" (NVIDIA, 멀티 프레임워크)',
+        desc: 'PyTorch / TensorFlow / ONNX / TensorRT 무엇이든 같은 서버에 올림. 동적 배치(dynamic batching), 다중 모델, GPU 효율 최강. 모델별 디렉터리에 config.pbtxt만 만들면 끝. 단점: 설정이 다소 무거움.',
+        block: {
+          kind: 'shell',
+          code: `# 모델 저장소 구조
+models/
+└── fraud-detector/
+    ├── config.pbtxt          ← 모델 메타 (입출력, batch, 인스턴스)
+    └── 1/                    ← 버전 폴더
+        └── model.onnx        ← 실제 모델
+
+# config.pbtxt 예시
+name: "fraud-detector"
+platform: "onnxruntime_onnx"
+max_batch_size: 32
+input [{ name: "features" data_type: TYPE_FP32 dims: [128] }]
+output [{ name: "score" data_type: TYPE_FP32 dims: [1] }]
+instance_group [{ kind: KIND_GPU count: 2 }]
+dynamic_batching { max_queue_delay_microseconds: 100 }
+
+# 실행
+$ docker run --gpus all -p 8000:8000 -p 8001:8001 \\
+    -v ./models:/models nvcr.io/nvidia/tritonserver:24.03 \\
+    tritonserver --model-repository=/models
+
+# 강점
+- 멀티 프레임워크 한 서버
+- Dynamic batching (latency vs throughput 자동 균형)
+- HTTP + gRPC + 메트릭 (Prometheus)
+- 모델 ensemble (전처리→모델→후처리)`,
+        },
+        focus: 'triton',
+      },
+      {
+        title: 'Step 2. TorchServe — "PyTorch 전용 프라이팬"',
+        desc: 'Meta(구 Facebook)가 만든 PyTorch 전용 서버. PyTorch 모델만 배포한다면 가장 자연스러움. .mar(Model Archive) 파일로 패키징. handler.py에 전/후처리 직접 작성. 가볍고 진입장벽 낮음.',
+        block: {
+          kind: 'python',
+          code: `# handler.py — 전/후처리 직접 작성
+from ts.torch_handler.base_handler import BaseHandler
+import torch
+
+class FraudHandler(BaseHandler):
+    def preprocess(self, data):
+        # 입력 JSON → tensor
+        inputs = [d.get("features") for d in data]
+        return torch.tensor(inputs, dtype=torch.float32)
+
+    def inference(self, x):
+        with torch.no_grad():
+            return self.model(x)
+
+    def postprocess(self, output):
+        # tensor → JSON
+        return [{"score": float(s)} for s in output]
+
+# 모델 패키징 (.mar 만들기)
+$ torch-model-archiver --model-name fraud \\
+    --version 1.0 \\
+    --serialized-file model.pt \\
+    --handler handler.py \\
+    --export-path model-store
+
+# 서버 실행
+$ torchserve --start \\
+    --model-store model-store \\
+    --models fraud=fraud.mar
+
+# 강점: PyTorch와 100% 호환, 학습 코드 그대로 이식
+# 한계: PyTorch 외 프레임워크 어려움, 동적 배치는 제한적`,
+        },
+        focus: 'torchserve',
+      },
+      {
+        title: 'Step 3. KServe — "주방 전체 시스템" (K8s 네이티브)',
+        desc: '쿠버네티스 위에서 InferenceService CRD로 배포 — Triton/TorchServe/Sklearn/XGBoost 등을 추상화. Knative 기반 오토스케일(0→N), Istio로 트래픽 분할, 카나리/A-B 배포 내장. K8s 인프라 필수.',
+        block: {
+          kind: 'yaml',
+          code: `# inference-service.yaml — K8s에 한 번에 배포
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fraud-detector
+spec:
+  predictor:
+    minReplicas: 0              # 트래픽 0 → Pod 0 (비용 절감)
+    maxReplicas: 10
+    triton:                     # 내부적으로 Triton 사용 가능
+      storageUri: s3://models/fraud-detector
+      resources:
+        limits: { nvidia.com/gpu: 1 }
+  # 카나리 — v2 모델로 10% 트래픽
+  canaryTrafficPercent: 10
+
+---
+$ kubectl apply -f inference-service.yaml
+$ kubectl get inferenceservice
+NAME             URL                                  READY  PREV  LATEST
+fraud-detector   http://fraud.default.svc.cluster.local  True   90    10
+
+# 강점
+- 0 → N 오토스케일 (Knative)
+- 카나리/A-B 트래픽 분할 내장
+- 표준화된 InferenceService (도구 무관)
+- Explainer, Transformer 파이프라인
+
+# 한계: K8s + Knative + Istio 운영 부담`,
+        },
+        focus: 'kserve',
+      },
+      {
+        title: 'Step 4. 선택 가이드 — "내 상황에 뭐가 맞나?"',
+        desc: '"K8s 안 쓰고 빠르게" → TorchServe 또는 단일 Triton. "GPU 효율 + 멀티 프레임워크" → Triton. "K8s 풀스택 + 카나리/오토스케일" → KServe(내부 Triton 자주 씀). 보통 KServe + Triton 조합이 표준.',
+        block: {
+          kind: 'shell',
+          code: `# 의사결정 매트릭스
+질문                              → 답
+─────────────────────────────────────────────────
+"PyTorch만 쓰는 작은 팀"          → TorchServe
+"여러 프레임워크 (TF/PT/ONNX)"    → Triton
+"GPU 효율, 동적 배치 절실"        → Triton
+"K8s에서 카나리/오토스케일"       → KServe
+"Knative로 0→N 비용 절감"          → KServe
+"단일 VM에 빠르게 배포"            → TorchServe / Triton
+
+# 실무 표준 조합
+KServe (오케스트레이션)
+   └─ Triton (실제 추론 엔진)
+   = K8s 카나리 + GPU 효율 둘 다 챙김
+
+# 도구별 한 줄 요약
+Triton     : "프레임워크 무관 + GPU 최적화 단일 서버"
+TorchServe : "PyTorch 전용, 진입 쉬움"
+KServe     : "K8s 위 표준 추상화, 트래픽 제어 내장"
+
+# 다음(III-2-2)에서는 배포 전략 — Canary / Shadow / A-B 비교`,
+        },
+        focus: 'choose',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const TOOLS = [
+      { key: 'triton',     emoji: '🔧', name: 'Triton',     note: '만능 컴비 (NVIDIA)' },
+      { key: 'torchserve', emoji: '🍳', name: 'TorchServe', note: 'PyTorch 전용' },
+      { key: 'kserve',     emoji: '🏗️', name: 'KServe',     note: 'K8s 표준' },
+      { key: 'choose',     emoji: '🎯', name: '선택 가이드', note: '내 상황은?' },
+    ];
+
+    function ToolCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🍳 주방 도구 3종 (서빙 도구)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {TOOLS.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-rose-100 border-2 border-rose-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">서빙 도구 (Triton / TorchServe / KServe)</h1>
+                <p className="text-sm text-slate-500 mt-1">주방 도구 3종 — 만능 컴비 / 전용 팬 / 주방 시스템</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <ToolCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'choose' && (
+              <div className="bg-rose-50 border-2 border-rose-300 rounded-xl p-3 mb-6 text-xs text-rose-900">
+                💡 다음(III-2-2)에서는 배포 전략 — Canary / Shadow / A-B 비교
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
