@@ -35,7 +35,7 @@
 - **선수 지식**: I-1-2
 - **학습 목표**: 클러스터의 두 종류 노드(Master/Worker)와 핵심 컴포넌트(API Server, Scheduler, kubelet)의 역할을 안다.
 - **핵심 키워드**: [Cluster, Master Node, Worker Node, API Server, Scheduler, kubelet, etcd]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Cluster 시각화 보기](part1/I-2-1.html) — Cluster 개관 / Master 4 컴포넌트 / Worker 3 컴포넌트 / 명령 흐름 (도시 비유)
 - **다음 섹션**: I-2-2
 
 ### Section I-2-2. 선언적 매니페스트 (YAML)
@@ -43,7 +43,7 @@
 - **선수 지식**: I-2-1
 - **학습 목표**: kubectl apply -f가 왜 강력한지(idempotent + 차이만 적용)를 안다.
 - **핵심 키워드**: [apiVersion, kind, metadata, spec, kubectl apply]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [매니페스트 시각화 보기](part1/I-2-2.html) — 명령형 한계 / YAML 4필드 / kubectl apply / idempotent+GitOps (주문서 비유)
 - **다음 섹션**: II-1-1
 
 ---
@@ -171,7 +171,7 @@
 - **선수 지식**: IV-2-2
 - **학습 목표**: get / describe / logs / exec / apply 5개 명령어로 일상 디버깅을 한다.
 - **핵심 키워드**: [kubectl, get, describe, logs, exec, apply]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [kubectl 핵심 시각화 보기](part5/V-1-1.html) — get / describe / logs / apply·exec (스위스 군도 5종 비유)
 - **다음 섹션**: V-1-2
 
 ### Section V-1-2. Helm (패키지 매니저)
@@ -179,7 +179,7 @@
 - **선수 지식**: V-1-1
 - **학습 목표**: 매니페스트 N개를 묶어 values.yaml 한 파일로 환경별 배포하는 방법을 안다.
 - **핵심 키워드**: [Helm, Chart, values.yaml, helm install/upgrade]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Helm 시각화 보기](part5/V-1-2.html) — yaml 폭증 / Chart 구조 / values 환경별 / install·upgrade·rollback (레시피 책 비유)
 - **다음 섹션**: V-2-1
 
 ### Section V-2-1. 모니터링 (Prometheus + Grafana)
@@ -187,7 +187,7 @@
 - **선수 지식**: V-1-2
 - **학습 목표**: 메트릭 수집/시각화의 표준 스택과 핵심 알림(CPU/메모리/Pod 재시작)을 안다.
 - **핵심 키워드**: [Prometheus, Grafana, ServiceMonitor, AlertManager]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [모니터링 시각화 보기](part5/V-2-1.html) — 무모니터링 / Prometheus 수집 / Grafana 대시보드 / AlertManager (건강검진 비유)
 - **다음 섹션**: V-2-2
 
 ### Section V-2-2. 트러블슈팅 체크리스트
@@ -195,7 +195,7 @@
 - **선수 지식**: V-2-1
 - **학습 목표**: Pod가 안 뜰 때(ImagePullBackOff/CrashLoopBackOff/Pending) 단계별 진단 흐름을 안다.
 - **핵심 키워드**: [ImagePullBackOff, CrashLoopBackOff, Pending, Events]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [트러블슈팅 시각화 보기](part5/V-2-2.html) — Pending / ImagePullBackOff / CrashLoopBackOff / OOMKilled (응급실 진단 흐름도 비유)
 - **다음 섹션**: 없음 (커리큘럼 마지막 섹션)
 
 ---

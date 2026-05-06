@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kubernetes 학습 — 트러블슈팅 체크리스트</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-2-2. 트러블슈팅 체크리스트
+    학습 목표: Pod가 안 뜰 때 단계별 진단 흐름.
+    핵심 비유: "응급실 진단 흐름도" — 증상별 4가지 갈래 (Pending/ImagePullBackOff/CrashLoopBackOff/OOMKilled)
+    구조: 4단계 (Pending / ImagePullBackOff / CrashLoopBackOff / OOMKilled)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Pending — "스케줄링 안 됨"',
+        desc: 'Pod가 어떤 노드에도 안 떠지는 상태. 원인은 대부분 자원 부족, NodeSelector 불일치, PVC 미바인딩. describe Events에 "0/3 nodes are available" 메시지가 핵심 단서.',
+        block: {
+          kind: 'shell',
+          code: `# 진단 흐름
+$ kubectl get pods
+NAME      READY   STATUS    RESTARTS   AGE
+web-aa1   0/1     Pending   0          5m
+
+$ kubectl describe pod web-aa1
+Events:
+  Warning  FailedScheduling  default-scheduler
+    0/3 nodes are available: 3 Insufficient memory.
+
+# 흔한 원인
+1. 노드 자원 부족 — kubectl top nodes (메모리/CPU 확인)
+2. NodeSelector 불일치 — spec.nodeSelector 확인
+3. PVC 미바인딩 — kubectl get pvc (Pending인지)
+4. taint/toleration 불일치
+
+# 해결 예시
+- replicas 줄이기, 노드 추가, requests 줄이기
+- 다른 노드로 이동시키기 (spec.nodeSelector 수정)`,
+        },
+        focus: 'pending',
+      },
+      {
+        title: 'Step 2. ImagePullBackOff — "이미지 못 가져옴"',
+        desc: '컨테이너 이미지를 레지스트리에서 못 가져옴. 오타, 비공개 이미지인데 imagePullSecrets 누락, 레지스트리 다운, 네트워크 문제 중 하나.',
+        block: {
+          kind: 'shell',
+          code: `$ kubectl describe pod web-aa1
+Events:
+  Warning  Failed  Failed to pull image "myapp:v1.5":
+           rpc error: code = NotFound desc = manifest unknown
+
+# 흔한 원인
+1. 태그 오타 — "myapp:v1.5" vs "myapp:1.5"
+2. 비공개 레지스트리 + imagePullSecrets 미설정
+3. 사설 레지스트리 인증 만료
+4. 네트워크 정책으로 외부 차단
+
+# 해결 흐름
+$ docker pull myapp:v1.5      # 외부에서 직접 시도해보기 (가능한가?)
+$ kubectl get secrets         # imagePullSecrets 존재?
+$ kubectl edit pod web-aa1    # spec.imagePullSecrets 추가
+
+# 비공개 레지스트리
+imagePullSecrets:
+  - name: regcred`,
+        },
+        focus: 'imagepull',
+      },
+      {
+        title: 'Step 3. CrashLoopBackOff — "시작은 됐는데 즉시 죽음"',
+        desc: '컨테이너가 시작 → 즉시 종료를 반복. 앱 자체 에러, 헬스체크 실패, 환경 변수 누락이 흔한 원인. logs --previous로 죽기 직전 출력 보는 게 핵심.',
+        block: {
+          kind: 'shell',
+          code: `$ kubectl get pods
+NAME      READY   STATUS             RESTARTS   AGE
+web-aa1   0/1     CrashLoopBackOff   5          3m
+
+# 1차: 죽기 직전 로그
+$ kubectl logs --previous web-aa1
+Error: DB_URL environment variable not set
+  at config.py:14
+  exit code: 1
+
+# 2차: describe로 종료 코드 확인
+$ kubectl describe pod web-aa1
+Last State:    Terminated
+  Reason:      Error
+  Exit Code:   1            ← 0이 아니면 비정상 종료
+
+# 흔한 원인
+1. 환경변수 누락 — ConfigMap/Secret 매핑 확인
+2. DB 연결 실패 — Service DNS / NetworkPolicy 확인
+3. readinessProbe/livenessProbe 실패
+4. 앱 자체 에러 — logs로 stack trace 확인`,
+        },
+        focus: 'crashloop',
+      },
+      {
+        title: 'Step 4. OOMKilled — "메모리 초과로 죽음"',
+        desc: '메모리 limits 초과 시 K8s가 즉시 컨테이너 강제 종료(SIGKILL). limits 부족 / 메모리 누수 / GC 부적절이 원인. last state Reason: OOMKilled가 신호.',
+        block: {
+          kind: 'shell',
+          code: `$ kubectl describe pod web-aa1
+Last State:    Terminated
+  Reason:      OOMKilled         ← 핵심
+  Exit Code:   137               ← SIGKILL (128+9)
+
+# 메모리 추세 확인 (Prometheus가 있다면)
+container_memory_working_set_bytes{pod="web-aa1"}
+# → 시간에 따라 우상향 = 메모리 누수 의심
+
+# 해결 옵션
+1. limits 늘리기 — 임시 응급조치
+   resources.limits.memory: 512Mi → 1Gi
+2. requests 조정 — 스케줄링 안정화
+3. 앱 메모리 누수 수정 — 진짜 해결
+4. JVM 앱이면 -Xmx와 cgroup limit 조율 필수
+
+# 종합 트러블슈팅 흐름
+get → 상태 확인 (Pending/Pull/Crash/OOM 어디?)
+describe → Events + Last State 분기
+logs --previous → 앱 자체 에러
+fix → 원인별 대응`,
+        },
+        focus: 'oomkilled',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell: { label: 'Bash', textColor: '#86efac' },
+      yaml:  { label: 'YAML', textColor: '#fde68a' },
+    };
+
+    // 4가지 증상 정적 매핑
+    const SYMPTOMS = [
+      { key: 'pending',    emoji: '⏳', name: 'Pending',           cause: '스케줄링 실패 (자원/NodeSelector)' },
+      { key: 'imagepull',  emoji: '📥', name: 'ImagePullBackOff', cause: '이미지 못 가져옴 (오타/Secret)' },
+      { key: 'crashloop',  emoji: '🔁', name: 'CrashLoopBackOff', cause: '시작 즉시 죽음 (env/probe)' },
+      { key: 'oomkilled',  emoji: '💥', name: 'OOMKilled',         cause: '메모리 limits 초과' },
+    ];
+
+    function ERDiagram({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🚑 응급실 — 4가지 증상별 진단</div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {SYMPTOMS.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-amber-100 border-2 border-amber-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{s.cause}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">트러블슈팅 체크리스트</h1>
+                <p className="text-sm text-slate-500 mt-1">응급실 — 4가지 증상별 진단 흐름</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <ERDiagram focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'oomkilled' && (
+              <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-3 mb-6 text-xs text-emerald-900">
+                🎉 Kubernetes 학습 20/20 100% 완성! Part I 개론 → V 운영까지 한 사이클 완료. 이제 실제 클러스터에서 직접 한 번 배포해보는 것이 다음 단계
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
