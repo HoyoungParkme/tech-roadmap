@@ -133,7 +133,7 @@
 - **선수 지식**: III-2-2
 - **학습 목표**: emptyDir / hostPath / PVC의 차이, dynamic provisioning을 안다.
 - **핵심 키워드**: [Volume, PersistentVolume, PersistentVolumeClaim, StorageClass]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Volume/PV/PVC 시각화 보기](part4/IV-1-1.html) — emptyDir / hostPath / PV+PVC / Dynamic Provisioning (사물함 비유)
 - **다음 섹션**: IV-1-2
 
 ### Section IV-1-2. ConfigMap (설정 외부화)
@@ -141,7 +141,7 @@
 - **선수 지식**: IV-1-1
 - **학습 목표**: 설정값을 이미지에서 분리하는 두 방식(env / volume mount)을 안다.
 - **핵심 키워드**: [ConfigMap, env, volumeMount, hot reload]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [ConfigMap 시각화 보기](part4/IV-1-2.html) — 이미지 박힘 / ConfigMap 생성 / env 주입 / volume mount (공유 메모장 비유)
 - **다음 섹션**: IV-2-1
 
 ### Section IV-2-1. Secret (비밀값 주입)
@@ -149,7 +149,7 @@
 - **선수 지식**: IV-1-2
 - **학습 목표**: ConfigMap과의 차이, base64 인코딩의 한계, 외부 비밀 관리(Vault) 연계 필요성을 안다.
 - **핵심 키워드**: [Secret, base64, encryption-at-rest, sealed-secrets]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Secret 시각화 보기](part4/IV-2-1.html) — Secret 기본 / base64 함정 / etcd 암호화 / SealedSecrets·Vault (금고 비유)
 - **다음 섹션**: IV-2-2
 
 ### Section IV-2-2. Resource Limits & Requests
@@ -157,7 +157,7 @@
 - **선수 지식**: IV-2-1
 - **학습 목표**: Pod 스케줄링을 안정화하는 cpu/memory 요청/한도와 QoS 클래스를 안다.
 - **핵심 키워드**: [requests, limits, QoS, OOMKilled]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Resource Limits & Requests 시각화 보기](part4/IV-2-2.html) — 설정 없음 / requests / + limits / Guaranteed (예약 좌석 비유 + QoS 3 클래스)
 - **다음 섹션**: V-1-1
 
 ---
