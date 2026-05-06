@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — Retraining 트리거</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-2-1. Retraining 트리거
+    학습 목표: 모델을 언제 재학습할까 — 3가지 트리거 방식과 선택 기준
+    핵심 비유: "자동차 정기 점검" — 주행거리/엔진 경고등/사고 발생 3종 트리거
+    구조: 4단계 (수동 / 스케줄 / 임계치 / 이벤트)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 수동 — "필요할 때 사람이 누름"',
+        desc: '학습팀이 "정확도 떨어졌다"는 보고를 받고 손으로 재학습 노트북 실행. 가장 단순하지만 사람 의존 → 늦고 잊힘. 모델이 1~2개일 때만 가능. PoC 단계 권장.',
+        block: {
+          kind: 'shell',
+          code: `# 수동 재학습 흐름
+1. PM: "사기 탐지 정확도 떨어졌대요"
+2. ML 엔지니어: 노트북 열어서 코드 수정
+3. python train.py --new-data --epochs 10
+4. 결과 확인 → MLflow Registry 등록
+5. 운영팀에 "v4 staging 했습니다" 알림
+6. 검증 후 Production 전환
+
+# 한계
+- 사람 일정에 의존 (휴가, 우선순위)
+- 모델 10개 → 매주 누구 재학습할지 헷갈림
+- "재학습 = 큰 일" 분위기 → 미루기 쉬움
+- 최신 데이터 반영 늦어짐
+
+# 언제 OK?
+- PoC 단계 (모델 1~2개)
+- 분기별 재학습이면 충분한 안정 도메인
+- 라벨 수집이 매우 느린 경우`,
+        },
+        focus: 'manual',
+      },
+      {
+        title: 'Step 2. 스케줄 트리거 — "주행거리 5천km마다"',
+        desc: 'Airflow cron으로 매주/매월 자동 재학습. 사람 개입 없이 최신 데이터로 학습. 안정적이지만 "정상이어도 매번 재학습" → 비용 낭비. 변화 빈도가 일정한 도메인에 적합.',
+        block: {
+          kind: 'python',
+          code: `# Airflow DAG — 매주 일요일 새벽 재학습
+from airflow.decorators import dag, task
+from datetime import datetime
+import mlflow
+
+@dag(
+    schedule="0 2 * * 0",      # 매주 일요일 02:00
+    start_date=datetime(2026,1,1),
+    catchup=False
+)
+def weekly_retrain_fraud_detector():
+
+    @task
+    def fetch_last_week_data():
+        return load_data(start=days_ago(7), end=today)
+
+    @task
+    def train_and_register(data):
+        with mlflow.start_run():
+            model = XGBClassifier()
+            model.fit(data.X, data.y)
+            mlflow.log_metric("accuracy", model.score(...))
+            mlflow.register_model(...)
+
+    train_and_register(fetch_last_week_data())
+
+# 강점: 자동 + 예측 가능 (월요일에 새 모델)
+# 한계
+# - 데이터 변화 없어도 매주 학습 (비용)
+# - 갑작스런 드리프트는 다음 주까지 대기
+# - 학습 비용 / 신선도 트레이드오프`,
+        },
+        focus: 'schedule',
+      },
+      {
+        title: 'Step 3. 임계치 트리거 — "엔진 경고등 켜지면"',
+        desc: 'IV-1-1/IV-1-2의 모니터링 결과 (정확도 -5%, PSI > 0.25)가 임계 넘으면 자동으로 retraining DAG 실행. 필요한 만큼만 학습 → 비용 효율. 임계치 튜닝이 핵심.',
+        block: {
+          kind: 'python',
+          code: `# 모니터링 → 임계치 초과 → Retraining DAG 트리거
+@task.branch
+def check_metrics():
+    accuracy_drop = check_accuracy_baseline()    # -0.05 이상이면 True
+    drift_psi    = calculate_psi(ref, current)
+    error_rate   = get_error_rate_7d()
+
+    if accuracy_drop > 0.05:
+        return "trigger_retrain"
+    if drift_psi > 0.25:
+        return "trigger_retrain"
+    if error_rate > 0.02:
+        return "trigger_retrain"
+    return "skip"
+
+trigger = TriggerDagRunOperator(
+    task_id="trigger_retrain",
+    trigger_dag_id="retrain_fraud_detector"
+)
+
+# 가드레일 (남용 방지)
+# - 24시간 내 1회만 트리거 (cooldown)
+# - 데이터 양이 충분할 때만 (min 10k 라벨)
+# - 라벨 수집 지연 고려 (3일 전 데이터로)
+
+# 강점
+# - 필요할 때만 학습 → 비용 ↓
+# - 빠른 대응 (드리프트 감지 즉시)
+
+# 한계
+# - 임계치 튜닝 어려움 (false positive vs late)
+# - 라벨 지연되면 정확도 체크는 늦음`,
+        },
+        focus: 'threshold',
+      },
+      {
+        title: 'Step 4. 이벤트 트리거 — "사고 발생 즉시"',
+        desc: '비즈니스 이벤트(블랙프라이데이, 신규 고객군 유입, 모델 외부 종속성 변경)에 의해 학습. 도메인 지식 기반 수동 트리거지만 즉시성 보장. 실무에서는 3종(스케줄+임계치+이벤트) 혼합.',
+        block: {
+          kind: 'shell',
+          code: `# 이벤트 예시 — 비즈니스/외부 신호
+이벤트                                  → 액션
+─────────────────────────────────────────────────
+블랙프라이데이 직전 (특수 트래픽 예상)   → 사전 재학습
+신규 결제수단 도입 (가상화폐)           → 즉시 재학습
+사기 패턴 새로 발견 (보안팀 신고)       → hotfix 재학습
+업스트림 데이터 소스 변경 (스키마)       → 재학습 필수
+경쟁사가 새 fraud 패턴 도입             → 재학습 + 피처 추가
+
+# 트리거 방식
+$ curl -X POST airflow/api/v1/dags/retrain/dagRuns \\
+    -d '{"conf": {"reason": "black-friday-prep"}}'
+
+# 실무 표준 — 3종 혼합
+1. 스케줄: 월간 baseline 재학습 (안정성)
+2. 임계치: 드리프트/정확도 자동 (빠른 대응)
+3. 이벤트: 비즈니스 사건 (도메인 지식)
+
+# 선택 매트릭스
+도메인               추천 조합
+─────────────────────────────────────
+사기 탐지            스케줄(월) + 임계치(매일) + 이벤트
+추천                 임계치(드리프트) + 이벤트(신규 카테고리)
+신용 평가            스케줄(분기) + 이벤트(법규 변경)
+이상 탐지(IoT)       임계치(즉시) + 이벤트
+
+# 다음(IV-2-2)에서는 거버넌스 — 모델 카드/리니지/감사`,
+        },
+        focus: 'event',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const TRIGGERS = [
+      { key: 'manual',    emoji: '🖐️', name: '수동',     note: '사람이 누름' },
+      { key: 'schedule',  emoji: '📅', name: '스케줄',   note: '주행거리 N km' },
+      { key: 'threshold', emoji: '🚦', name: '임계치',   note: '엔진 경고등' },
+      { key: 'event',     emoji: '⚡', name: '이벤트',   note: '사고 발생' },
+    ];
+
+    function TriggerCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🚗 자동차 정기 점검 (Retraining 트리거)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {TRIGGERS.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-purple-100 border-2 border-purple-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Retraining 트리거</h1>
+                <p className="text-sm text-slate-500 mt-1">자동차 정기 점검 — 수동 / 스케줄 / 임계치 / 이벤트</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <TriggerCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'event' && (
+              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 mb-6 text-xs text-purple-900">
+                💡 다음(IV-2-2)에서는 거버넌스 — 모델 카드 / 리니지 / 감사 로그
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

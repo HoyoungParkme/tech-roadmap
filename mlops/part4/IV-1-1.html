@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — 모델 성능 모니터링</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-1. 모델 성능 모니터링
+    학습 목표: production 모델의 품질을 어떤 지표로 추적하나 — 4종 + 임계치/알람
+    핵심 비유: "건강 검진 대시보드" — 혈압/혈당/심박 수치를 모니터에 띄우고 임계치 알람
+    구조: 4단계 (지표 부재 / 4지표 추가 / 임계치 / 알람 자동화)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 모니터링 부재 — "사고가 나야 안다"',
+        desc: '배포 후 "잘 돌고 있겠지" 가정. 사용자 컴플레인이 들어와야 문제 발견. 그 사이 매출 손실/사용자 이탈. ML 모델은 일반 SW와 달리 "느리게 망가짐" → 즉각 표시 안 남음.',
+        block: {
+          kind: 'shell',
+          code: `# 운영 4주차 — 갑자기 들어온 컴플레인
+사용자 A: "추천 결과가 이상해요"
+사용자 B: "사기 탐지가 멀쩡한 결제를 막아요"
+PM: "어? 언제부터?" → 학습팀 확인 → "2주 전부터 정확도 80→62%"
+
+# 우리가 놓친 것
+- 정확도 (실제 라벨 vs 예측) — 라벨이 늦게 들어와 추적 지연
+- p99 latency — 모델 무거워졌나?
+- 트래픽 (QPS) — 부하 갑자기 늘었나?
+- 에러율 — 입력이 이상해서 모델이 fail?
+
+# 깨달음
+"production 모델은 살아있는 시스템"
+→ 4가지 지표를 실시간 추적해야 함`,
+        },
+        focus: 'blind',
+      },
+      {
+        title: 'Step 2. 4 지표 — "건강 검진의 4가지 수치"',
+        desc: '정확도/지연/처리량/에러율 4종을 prometheus로 수집해 grafana 대시보드에 띄움. 정확도는 라벨 들어오는 만큼 지연이 있으나 다른 3종은 즉시. ML 전용 도구(EvidentlyAI, WhyLabs)로 분포까지.',
+        block: {
+          kind: 'python',
+          code: `# FastAPI 서빙 + Prometheus 메트릭
+from prometheus_client import Counter, Histogram
+import time
+
+prediction_counter = Counter("ml_predictions_total", "Total predictions", ["model", "version"])
+latency_histogram = Histogram("ml_latency_seconds", "Inference latency", ["model"])
+error_counter = Counter("ml_errors_total", "Errors", ["model", "kind"])
+
+@app.post("/predict")
+def predict(payload: dict):
+    start = time.time()
+    try:
+        score = model.predict([payload])[0]
+        prediction_counter.labels(model="fraud", version="v3").inc()
+        latency_histogram.labels(model="fraud").observe(time.time() - start)
+        return {"fraud_score": float(score)}
+    except Exception as e:
+        error_counter.labels(model="fraud", kind=type(e).__name__).inc()
+        raise
+
+# 정확도는 라벨 늦게 들어옴 → 별도 batch 작업으로
+# 매일 새벽: 어제 예측 vs 실제 라벨 join → accuracy 계산 → DB
+$ python eval_yesterday.py
+2026-05-05  accuracy=0.81  (-0.04 vs 1주 전)`,
+        },
+        focus: 'metrics',
+      },
+      {
+        title: 'Step 3. 임계치 — "정상 범위와 위험 신호"',
+        desc: '"이 값 이상이면 위험"을 정의. 예: latency p99 > 200ms, 에러율 > 1%, 정확도 1주 전 대비 -5% 이상 하락. 학습팀과 운영팀이 같이 정함. 비즈니스 KPI 영향까지 고려.',
+        block: {
+          kind: 'yaml',
+          code: `# Prometheus AlertRule (alert.yml)
+groups:
+- name: ml-fraud-detector
+  rules:
+  - alert: HighLatency
+    expr: histogram_quantile(0.99, ml_latency_seconds_bucket) > 0.2
+    for: 5m              # 5분간 지속되면 알람
+    annotations:
+      summary: "추론 p99 latency > 200ms"
+
+  - alert: HighErrorRate
+    expr: rate(ml_errors_total[5m]) / rate(ml_predictions_total[5m]) > 0.01
+    for: 3m
+    annotations:
+      summary: "에러율 > 1%"
+
+  - alert: AccuracyDrop
+    expr: ml_accuracy_daily - ml_accuracy_baseline < -0.05
+    for: 1h
+    annotations:
+      summary: "정확도 1주 전 대비 5%p 이상 하락"
+
+# 임계치는 baseline 측정 후 결정
+# baseline: 운영 첫 1~2주 정상 범위 분포
+# - p99 latency: 평소 80ms → 임계 200ms (2.5배)
+# - 에러율: 평소 0.1% → 임계 1.0% (10배)
+# - 정확도: 평소 ±2%p 변동 → 임계 -5%p 이상 하락`,
+        },
+        focus: 'threshold',
+      },
+      {
+        title: 'Step 4. 알람 자동화 — "위험 즉시 통보"',
+        desc: 'Alertmanager → Slack/PagerDuty/이메일로 자동 통보. "심각도(severity)"별 통보 채널 분기. p99 latency 같은 인프라 알람은 운영팀, 정확도 하락은 학습팀. runbook 링크로 조치 단계 안내.',
+        block: {
+          kind: 'yaml',
+          code: `# Alertmanager 라우팅
+route:
+  receiver: default
+  routes:
+  - match: { severity: critical }
+    receiver: pagerduty           # 새벽이라도 호출
+  - match: { severity: warning, team: ml }
+    receiver: slack-ml            # ML팀 채널
+  - match: { team: ops }
+    receiver: slack-ops           # 운영팀 채널
+
+receivers:
+- name: pagerduty
+  pagerduty_configs:
+  - service_key: <KEY>
+- name: slack-ml
+  slack_configs:
+  - channel: "#ml-alerts"
+    title: "{{ .CommonAnnotations.summary }}"
+    text: |
+      Severity: {{ .CommonLabels.severity }}
+      Runbook: https://wiki/ml-runbook#{{ .CommonLabels.alertname }}
+
+# Slack 알람 예시
+[ML-ALERT] HighLatency
+Severity: warning · Service: fraud-detector
+p99=0.31s (threshold 0.2s, 5min sustained)
+Runbook: https://wiki/ml-runbook#HighLatency
+
+# 다음(IV-1-2)에서는 데이터 드리프트 — 입력 분포 변화 자체를 감지`,
+        },
+        focus: 'alert',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const METRICS = [
+      { key: 'blind',     emoji: '🙈', name: '모니터링 부재', note: '컴플레인으로 발견' },
+      { key: 'metrics',   emoji: '📊', name: '4 지표 추적',   note: '정확도/지연/QPS/에러' },
+      { key: 'threshold', emoji: '🚦', name: '임계치 정의',   note: '정상 vs 위험' },
+      { key: 'alert',     emoji: '🚨', name: '알람 자동화',   note: 'Slack/PagerDuty' },
+    ];
+
+    function MetricCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🩺 건강 검진 대시보드 (성능 모니터링)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {METRICS.map((m) => {
+              const isActive = focus === m.key;
+              return (
+                <div
+                  key={m.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-purple-100 border-2 border-purple-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{m.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{m.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{m.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">모델 성능 모니터링</h1>
+                <p className="text-sm text-slate-500 mt-1">건강 검진 대시보드 — 4지표 + 임계치 + 알람</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <MetricCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'alert' && (
+              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 mb-6 text-xs text-purple-900">
+                💡 다음(IV-1-2)에서는 데이터 드리프트 — 입력 분포 변화 자체를 감지
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
