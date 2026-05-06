@@ -35,7 +35,7 @@
 - **선수 지식**: I-1-2
 - **학습 목표**: 데이터 수집 → 전처리 → 학습 → 평가 → 배포 → 모니터링 사이클을 안다.
 - **핵심 키워드**: [data ingestion, feature engineering, training, evaluation, deployment, monitoring]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [ML 라이프사이클 시각화 보기](part1/I-2-1.html) — Collect / Prepare / Train+Eval / Deploy+Monitor (식물 키우기 사이클 비유)
 - **다음 섹션**: I-2-2
 
 ### Section I-2-2. 성숙도 모델 (Level 0~2)
@@ -43,7 +43,7 @@
 - **선수 지식**: I-2-1
 - **학습 목표**: Google MLOps 성숙도 모델 0(수동)/1(자동)/2(전자동 CI-CD-CT)을 안다.
 - **핵심 키워드**: [Level 0 manual, Level 1 ML pipeline automation, Level 2 CI/CD/CT]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [성숙도 모델 시각화 보기](part1/I-2-2.html) — Level 0 / Level 1 / Level 2 / 비교 가이드 (걷기→자전거→자동차 비유)
 - **다음 섹션**: II-1-1
 
 ---
@@ -131,20 +131,24 @@
 학습 목표: MLflow / Kubeflow / Airflow를 실제 사용할 수 있다.
 
 ### Section V-1-1. MLflow 한 사이클
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [MLflow 한 사이클 시각화 보기](part5/V-1-1.html) — Track / Project / Model / Registry (원스톱 실험실 비유)
 - **다음 섹션**: V-1-2
 
 ### Section V-1-2. Kubeflow Pipelines
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [Kubeflow Pipelines 시각화 보기](part5/V-1-2.html) — Component / Pipeline / Run / Artifact (K8s 컨테이너 조립 라인 비유)
 - **다음 섹션**: V-2-1
 
 ### Section V-2-1. Airflow ML DAG 패턴
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [Airflow ML DAG 시각화 보기](part5/V-2-1.html) — Sensor / Fetch+Train / Evaluate / Deploy (공장 컨베이어 패턴 비유)
 - **다음 섹션**: V-2-2
 
 ### Section V-2-2. 실전 체크리스트
-- **시각화 연결**: 향후 구현 예정
-- **다음 섹션**: 없음 (커리큘럼 마지막 섹션)
+- **난이도**: ★★☆
+- **시각화 연결**: [실전 체크리스트 시각화 보기](part5/V-2-2.html) — Data / Train / Deploy / Govern (비행 전 체크리스트 비유)
+- **다음 섹션**: 없음 (커리큘럼 마지막 섹션, MLOps 100% 완성 🎉)
 
 ---
 

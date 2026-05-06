@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — ML 라이프사이클 6단계</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    I-2-1. ML 라이프사이클 6단계
+    학습 목표: 데이터 수집 → 전처리 → 학습 → 평가 → 배포 → 모니터링 사이클
+    핵심 비유: "식물 키우기 사이클" — 씨앗(수집) → 흙 다지기(전처리) → 자라기(학습) → 수확(평가/배포) → 다시 씨앗(재학습)
+    구조: 4 카드 (collect / prepare / train_eval / deploy_monitor) — 6단계를 4개 그룹으로 묶음
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Collect — "씨앗 모으기" (데이터 수집 + 라벨링)',
+        desc: '사이클의 시작. DB / 외부 API / 이벤트 로그에서 raw 데이터를 모으고 사람이 라벨을 단다. DVC로 데이터 sha를 박아 두면 "어떤 데이터로 학습했나" 1년 후에도 답이 가능.',
+        block: {
+          kind: 'shell',
+          code: `# 1. DB에서 raw 데이터 추출
+$ psql -c "COPY (SELECT * FROM transactions
+            WHERE created_at >= '2026-04-01')
+            TO 'data/raw/tx_2026_04.csv' CSV HEADER"
+
+# 2. 외부 API에서 보강 데이터
+$ python scripts/fetch_external.py \\
+    --source kakao_pay --out data/raw/external.json
+
+# 3. 라벨링 도구 (Label Studio) 결과 가져오기
+$ label-studio export --project fraud --format CSV \\
+    > data/raw/labels.csv
+
+# 4. DVC로 버전 관리 (git처럼 sha 추적)
+$ dvc add data/raw/
+$ git add data/raw.dvc .gitignore
+$ git commit -m "data: 2026-04 raw + labels"
+$ dvc push                    # → S3로 원본 업로드
+data/raw.dvc  hash: 7c9d4b8f...
+
+# 5. 메타데이터 기록 (출처 / 기간 / 행수)
+{ "source": "tx_db", "period": "2026-04", "rows": 1238492 }`,
+        },
+        focus: 'collect',
+      },
+      {
+        title: 'Step 2. Prepare — "흙 다지기" (전처리 + Feature 생성)',
+        desc: '결측치 처리 / 이상치 제거 / 인코딩 / 스케일링 / Feature engineering. Feature Store(Feast 등)에 등록하면 학습-서빙 동일 정의 사용 → "training-serving skew" 사고를 막는다.',
+        block: {
+          kind: 'python',
+          code: `# 전처리 + Feature 생성 (sklearn + pandas)
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from feast import FeatureStore
+
+df = pd.read_csv("data/raw/tx_2026_04.csv")
+
+# 1. 결측치 / 이상치
+df = df[df["amount"] > 0]                     # 음수 금액 제거
+df["device"] = df["device"].fillna("unknown")  # 범주형 결측
+
+# 2. Feature engineering (도메인 지식)
+df["hour"] = pd.to_datetime(df["created_at"]).dt.hour
+df["amount_log"] = (df["amount"] + 1).apply("log")
+df["is_night"] = df["hour"].between(0, 5).astype(int)
+
+# 3. 스케일링 (수치형)
+scaler = StandardScaler()
+num_cols = ["amount_log", "hour"]
+df[num_cols] = scaler.fit_transform(df[num_cols])
+
+# 4. Feature Store에 등록 — 학습/서빙 동일 정의
+fs = FeatureStore(repo_path="feature_repo/")
+fs.apply([fraud_feature_view])      # 정의 등록
+fs.materialize_incremental(end_date=pd.Timestamp.now())
+
+# 학습 시 가져올 때
+train_df = fs.get_historical_features(
+    entity_df=labels_df,
+    features=["fraud_v1:amount_log", "fraud_v1:is_night"],
+).to_df()`,
+        },
+        focus: 'prepare',
+      },
+      {
+        title: 'Step 3. Train + Eval — "자라기 + 수확 검사" (학습 + 평가)',
+        desc: 'sklearn / xgboost / pytorch로 모델을 fit하고 cross-validation + holdout으로 평가. holdout은 마지막에 단 한 번만 — 반복 사용 시 누수. MLflow로 파라미터/메트릭/아티팩트 자동 기록.',
+        block: {
+          kind: 'python',
+          code: `# 학습 + 평가 (sklearn + MLflow)
+import mlflow
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.metrics import roc_auc_score, classification_report
+
+X_train, y_train = load_features(period="2026-01..2026-03")
+X_holdout, y_holdout = load_features(period="2026-04")  # 시간 기반 split
+
+with mlflow.start_run(run_name="fraud-2026-04"):
+    mlflow.log_params({"max_depth": 5, "n_estimators": 200})
+
+    model = GradientBoostingClassifier(max_depth=5, n_estimators=200)
+
+    # 1. Cross-validation (시간 순서 유지)
+    cv = TimeSeriesSplit(n_splits=5)
+    cv_scores = cross_val_score(model, X_train, y_train,
+                                 cv=cv, scoring="roc_auc")
+    mlflow.log_metric("cv_auc_mean", cv_scores.mean())
+    mlflow.log_metric("cv_auc_std", cv_scores.std())
+
+    # 2. 최종 학습
+    model.fit(X_train, y_train)
+
+    # 3. Holdout 평가 — 단 한 번만!
+    y_pred = model.predict_proba(X_holdout)[:, 1]
+    holdout_auc = roc_auc_score(y_holdout, y_pred)
+    mlflow.log_metric("holdout_auc", holdout_auc)
+    mlflow.sklearn.log_model(model, "model")
+
+# CV AUC: 0.913 ± 0.012 / Holdout AUC: 0.907 → 일관됨, 통과`,
+        },
+        focus: 'train_eval',
+      },
+      {
+        title: 'Step 4. Deploy + Monitor — "수확 → 다시 씨앗" (배포 + 모니터링 + 재학습)',
+        desc: '평가 통과 모델을 Registry에 Production으로 등록 → 서빙 → 모니터링 → drift 감지 시 자동 재학습 트리거. 일반 SW와의 결정적 차이는 "수확이 끝이 아니라 다시 씨앗으로" — 무한 루프.',
+        block: {
+          kind: 'python',
+          code: `# Deploy + Monitor + Retrain 트리거
+import mlflow
+from mlflow import MlflowClient
+
+# 1. Registry 등록 + Stage 전환
+client = MlflowClient()
+mv = mlflow.register_model("runs:/abc123/model", "fraud-detector")
+client.transition_model_version_stage(
+    name="fraud-detector", version=mv.version,
+    stage="Production", archive_existing_versions=True,
+)
+
+# 2. 운영 코드는 alias만 참조 (버전 하드코딩 금지)
+model = mlflow.pyfunc.load_model("models:/fraud-detector/Production")
+
+# 3. 추론 + 메트릭 수집 (Prometheus)
+def predict(payload):
+    score = model.predict([payload])[0]
+    prediction_counter.labels(model="fraud").inc()
+    return float(score)
+
+# 4. 모니터링 → drift 감지 시 자동 재학습 (Airflow)
+from evidently.metrics import DataDriftPreset
+from evidently.report import Report
+
+report = Report(metrics=[DataDriftPreset()])
+report.run(reference_data=X_train_ref, current_data=X_recent_prod)
+if report.as_dict()["metrics"][0]["result"]["dataset_drift"]:
+    trigger_airflow_dag("retrain_fraud_model")
+    notify_slack("#ml-ops", "drift detected -> retrain triggered")
+
+# 핵심 — 사이클은 끊임없이 돈다
+# Collect -> Prepare -> Train -> Eval -> Deploy -> Monitor
+#    ^                                                |
+#    +------------- drift / 신규 데이터 -------------+
+# 일반 SW는 "출시 = 끝", ML은 "출시 = 새 사이클의 시작"`,
+        },
+        focus: 'deploy_monitor',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const LIFECYCLE = [
+      { key: 'collect',         emoji: '📥', name: 'Collect',        note: '수집 + 라벨링 (DVC)' },
+      { key: 'prepare',         emoji: '🧹', name: 'Prepare',        note: '전처리 + Feature' },
+      { key: 'train_eval',      emoji: '🎓', name: 'Train+Eval',     note: '학습 + holdout 평가' },
+      { key: 'deploy_monitor',  emoji: '🚀', name: 'Deploy+Monitor', note: '배포 + 재학습 루프' },
+    ];
+
+    function LifecycleCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🔄 식물 키우기 사이클 (씨앗 → 수확 → 다시 씨앗)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {LIFECYCLE.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-fuchsia-100 border-2 border-fuchsia-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">ML 라이프사이클 6단계</h1>
+                <p className="text-sm text-slate-500 mt-1">식물 키우기 사이클 — 수집 → 전처리 → 학습 → 평가 → 배포 → 모니터링</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <LifecycleCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'deploy_monitor' && (
+              <div className="bg-fuchsia-50 border-2 border-fuchsia-300 rounded-xl p-3 mb-6 text-xs text-fuchsia-900">
+                💡 다음(I-2-2)에서는 성숙도 모델 — Level 0(수동) → Level 2(전자동 CI/CD/CT)
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

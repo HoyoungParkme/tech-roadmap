@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — Kubeflow Pipelines</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-1-2. Kubeflow Pipelines (KFP)
+    학습 목표: Kubeflow가 ML 파이프라인을 K8s 컨테이너 DAG로 어떻게 만드는가
+    핵심 비유: "K8s 컨테이너 조립 라인" — 각 단계가 컨테이너, 컨베이어가 DAG
+    구조: 4단계 (Component / Pipeline / Run / Artifact)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Component — "컨테이너 1개 = 1단계"',
+        desc: '@dsl.component 데코레이터로 일반 파이썬 함수를 K8s 컨테이너 단위로 변환. 입력/출력 타입 명시 → KFP가 의존성/직렬화 처리. 학습/전처리/평가가 각자 격리된 컨테이너에서 실행.',
+        block: {
+          kind: 'python',
+          code: `# KFP Component — 함수를 K8s 컨테이너로
+from kfp import dsl
+from kfp.dsl import Input, Output, Dataset, Model, Metrics
+
+@dsl.component(
+    base_image="python:3.11-slim",
+    packages_to_install=["pandas==2.2", "scikit-learn==1.4"],
+)
+def preprocess(
+    raw: Input[Dataset],
+    processed: Output[Dataset],
+):
+    """원본 데이터셋을 학습용으로 정제"""
+    import pandas as pd
+    df = pd.read_csv(raw.path)
+    df = df.dropna().drop_duplicates()
+    df.to_csv(processed.path, index=False)
+
+@dsl.component(
+    base_image="python:3.11-slim",
+    packages_to_install=["scikit-learn==1.4", "joblib"],
+)
+def train(
+    data: Input[Dataset],
+    model: Output[Model],
+    metrics: Output[Metrics],
+    n_estimators: int = 200,
+):
+    """RandomForest 학습 + 메트릭 기록"""
+    from sklearn.ensemble import RandomForestClassifier
+    import joblib, pandas as pd
+    df = pd.read_csv(data.path)
+    X, y = df.drop("label", axis=1), df["label"]
+    clf = RandomForestClassifier(n_estimators=n_estimators)
+    clf.fit(X, y)
+    metrics.log_metric("accuracy", clf.score(X, y))
+    joblib.dump(clf, model.path)
+
+# 각 component → 1 컨테이너 → 독립 Pod 에서 실행
+# 강점 - 단계별 자원(GPU/CPU) 다르게 할당 가능
+# 강점 - 한 단계 실패해도 그 단계만 재실행`,
+        },
+        focus: 'component',
+      },
+      {
+        title: 'Step 2. Pipeline — "DSL로 컨베이어 조립"',
+        desc: '@dsl.pipeline 안에서 component 들을 함수처럼 호출 → 출력을 다음 component 입력으로 연결 → KFP가 DAG 자동 빌드. preprocess → train → evaluate → deploy 4단계가 K8s 위에서 순서대로 실행.',
+        block: {
+          kind: 'python',
+          code: `# KFP Pipeline — component 들을 DAG 로 연결
+from kfp import dsl, compiler
+
+@dsl.pipeline(
+    name="fraud-detector-pipeline",
+    description="전처리 → 학습 → 평가 → 배포",
+)
+def fraud_pipeline(
+    data_path: str = "gs://bucket/transactions.csv",
+    n_estimators: int = 200,
+    accuracy_threshold: float = 0.85,
+):
+    # 1. 전처리
+    pre = preprocess(raw=import_data(data_path).outputs["dataset"])
+
+    # 2. 학습
+    tr = train(
+        data=pre.outputs["processed"],
+        n_estimators=n_estimators,
+    )
+    tr.set_cpu_limit("4").set_memory_limit("8Gi")
+    tr.set_accelerator_type("nvidia-tesla-t4").set_accelerator_limit(1)
+
+    # 3. 평가 + 분기
+    ev = evaluate(model=tr.outputs["model"], data=pre.outputs["processed"])
+
+    with dsl.If(ev.outputs["accuracy"] >= accuracy_threshold):
+        deploy(model=tr.outputs["model"])     # 통과 시만 배포
+
+# Pipeline 컴파일 → YAML (Argo Workflow)
+compiler.Compiler().compile(fraud_pipeline, "fraud_pipeline.yaml")
+
+# 출력 fraud_pipeline.yaml 을 KFP UI 에 업로드 또는
+# kfp.Client() 로 직접 제출 가능
+# 강점 - 의존성 자동 추론 (출력→입력 연결만 보면 DAG 완성)
+# 강점 - dsl.If/ParallelFor 같은 제어 흐름 지원`,
+        },
+        focus: 'pipeline',
+      },
+      {
+        title: 'Step 3. Run — "실행 + 추적"',
+        desc: 'kfp.Client().create_run_from_pipeline_func 로 실행 시작 → KFP UI 에서 실시간 그래프 / 로그 / 메트릭 확인. 같은 pipeline 을 다른 파라미터로 100번 돌려 비교 (HP tuning). MLflow 와 달리 K8s 위 분산 실행이 기본.',
+        block: {
+          kind: 'shell',
+          code: `# Run 제출 — Python SDK
+$ python -c "
+from kfp import Client
+client = Client(host='https://kfp.example.com')
+run = client.create_run_from_pipeline_func(
+    fraud_pipeline,
+    arguments={'n_estimators': 300, 'accuracy_threshold': 0.88},
+    experiment_name='fraud-detector',
+)
+print(run.run_id)
+"
+> abc-123-def-456
+
+# UI 에서 실시간 모니터링
+# https://kfp.example.com/#/runs/details/abc-123-def-456
+#
+#   ┌─ import_data  ✅ 12s
+#   ↓
+#   ├─ preprocess   ✅ 45s   (out: 1.2GB processed)
+#   ↓
+#   ├─ train        ⏳ running ... (GPU Pod, 4분째)
+#   │     └ metrics: accuracy=0.83 (live)
+#   ↓
+#   ├─ evaluate     ⏸ pending
+#   ↓
+#   └─ deploy       ⏸ pending
+
+# CLI 도구로 비교
+$ kfp run list --experiment fraud-detector
+RUN_ID    PARAMS                  STATUS    ACCURACY
+abc-123   n_est=300, thr=0.88     SUCCESS   0.91
+def-456   n_est=200, thr=0.85     SUCCESS   0.87
+ghi-789   n_est=500, thr=0.85     FAILED    -
+
+# 같은 pipeline → 파라미터만 바꿔 100 run → 베스트 자동 선정
+# (Katib + KFP 조합으로 HP tuning 자동화)`,
+        },
+        focus: 'run',
+      },
+      {
+        title: 'Step 4. Artifact — "입출력 메타데이터로 lineage"',
+        desc: 'KFP 의 Input/Output[Dataset|Model|Metrics] 타입은 단순 파일이 아니라 lineage 자동 기록 객체. 어떤 데이터셋이 어떤 모델로 갔는지 KFP UI 에서 거꾸로 추적. ML Metadata(MLMD) 백엔드에 저장.',
+        block: {
+          kind: 'yaml',
+          code: `# Artifact 메타데이터 — KFP가 자동 기록
+artifact:
+  name: fraud_model
+  type: system.Model
+  uri: gs://kfp-artifacts/runs/abc-123/train/model
+  created_at: 2026-05-04T10:23:11Z
+  producer:
+    pipeline: fraud-detector-pipeline
+    run_id: abc-123-def-456
+    component: train
+  metadata:
+    framework: scikit-learn
+    framework_version: "1.4"
+    model_format: joblib
+    accuracy: 0.91
+
+  # lineage — 이 모델이 만들어진 과정 (자동 추적)
+  inputs:
+    - name: processed
+      type: system.Dataset
+      uri: gs://kfp-artifacts/runs/abc-123/preprocess/processed
+      producer: preprocess
+      derived_from:
+        - name: raw
+          uri: gs://bucket/transactions.csv
+          version: v25.3
+
+# 거꾸로 추적 (KFP UI)
+# fraud_model (v3 in Registry)
+#   ← train run abc-123 (n_estimators=300)
+#       ← preprocess run abc-123 (output: processed)
+#           ← raw dataset v25.3 (gs://bucket/transactions.csv)
+#               ← producer: airflow-ingest-dag run-789
+#
+# "이 모델 어떻게 만들어졌어?" → 클릭 한 번에 답
+
+# 다음(V-2-1)에서는 Airflow ML DAG — 표준 워크플로우 엔진으로 ML 파이프라인 짜기`,
+        },
+        focus: 'artifact',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const KFP_PHASES = [
+      { key: 'component', emoji: '🧱', name: 'Component', note: '컨테이너 단위' },
+      { key: 'pipeline',  emoji: '🔗', name: 'Pipeline',  note: 'DSL DAG 조립' },
+      { key: 'run',       emoji: '▶️', name: 'Run',       note: '실행 + 추적' },
+      { key: 'artifact',  emoji: '📁', name: 'Artifact',  note: '입출력 lineage' },
+    ];
+
+    function KFPCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🏭 K8s 컨테이너 조립 라인 (Kubeflow Pipelines)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {KFP_PHASES.map((p) => {
+              const isActive = focus === p.key;
+              return (
+                <div
+                  key={p.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-amber-100 border-2 border-amber-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{p.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{p.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{p.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Kubeflow Pipelines</h1>
+                <p className="text-sm text-slate-500 mt-1">K8s 컨테이너 조립 라인 — Component / Pipeline / Run / Artifact</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <KFPCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'artifact' && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-3 mb-6 text-xs text-amber-900">
+                💡 다음(V-2-1)에서는 Airflow ML DAG — 표준 워크플로우 엔진으로 ML 파이프라인 짜기
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

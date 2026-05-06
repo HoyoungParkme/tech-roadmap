@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — Airflow ML DAG</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-2-1. Airflow ML DAG
+    학습 목표: 일반 워크플로우 엔진 Airflow를 ML에 어떻게 적용하나
+    핵심 비유: "공장 컨베이어 패턴" — 센서(감지) → 가공/조립 → 검수 → 출하
+    구조: 4단계 (Sensor / Fetch+Train / Evaluate / Deploy)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Sensor — "데이터 도착 컨베이어 감지"',
+        desc: 'S3KeySensor / ExternalTaskSensor 로 "어제 데이터가 S3 에 도착했나" 감지. 도착해야 다음 task 시작 → 데이터 누락된 채로 학습되는 사고 방지. poke_interval 로 폴링 간격 조정.',
+        block: {
+          kind: 'python',
+          code: `# Airflow Sensor — 데이터 도착 대기
+from airflow.decorators import dag
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.sensors.external_task import ExternalTaskSensor
+from datetime import datetime, timedelta
+
+@dag(
+    dag_id="fraud_retrain_daily",
+    schedule="0 3 * * *",                  # 매일 03:00
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    default_args={"retries": 2, "retry_delay": timedelta(minutes=5)},
+)
+def fraud_retrain():
+
+    # 1. 어제 거래 데이터가 S3 에 도착했나?
+    wait_data = S3KeySensor(
+        task_id="wait_for_data",
+        bucket_name="fraud-data-prod",
+        bucket_key="transactions/{{ ds }}/data.parquet",
+        aws_conn_id="aws_default",
+        poke_interval=60,                  # 1분마다 확인
+        timeout=60 * 60 * 2,               # 2시간 안 오면 fail
+        mode="reschedule",                 # worker slot 점유 안 함
+    )
+
+    # 2. 업스트림 ETL DAG 가 끝났나?
+    wait_etl = ExternalTaskSensor(
+        task_id="wait_for_etl",
+        external_dag_id="raw_to_feature_etl",
+        external_task_id="export_features",
+        execution_delta=timedelta(0),
+        mode="reschedule",
+    )
+
+    # Sensor 통과 → 다음 단계로 (Step 2 에서 연결)
+    # 강점 - "데이터 안 오면 학습 자동 skip + 알람"
+    # 강점 - 사람이 새벽에 깰 일 없음
+
+fraud_retrain()`,
+        },
+        focus: 'sensor',
+      },
+      {
+        title: 'Step 2. Fetch + Train — "원료 받아 모델 가공"',
+        desc: '@task decorator 로 데이터 fetch 와 학습 task 를 작성. TaskFlow API 가 자동으로 직렬화/의존성 처리. MLflow 와 결합해 학습 결과를 자동 등록. KubernetesExecutor 로 GPU Pod 에서 실행 가능.',
+        block: {
+          kind: 'python',
+          code: `# Fetch + Train task
+from airflow.decorators import task
+import mlflow
+
+@task
+def fetch_data(ds: str) -> dict:
+    """ds (실행 날짜) 기준 최근 7일 데이터 로드"""
+    import pandas as pd
+    df = pd.read_parquet(f"s3://fraud-data-prod/features/{ds}/")
+    return {
+        "rows": len(df),
+        "path": f"/tmp/train-{ds}.parquet",
+        "saved_at": ds,
+    }
+
+@task(executor_config={
+    "pod_override": {                      # KubernetesExecutor 로 GPU Pod
+        "spec": {"containers": [{
+            "name": "base",
+            "resources": {"limits": {"nvidia.com/gpu": "1"}},
+        }]}
+    }
+})
+def train_model(meta: dict) -> str:
+    """학습 + MLflow 자동 로깅 → run_id 반환"""
+    import pandas as pd
+    from xgboost import XGBClassifier
+    df = pd.read_parquet(meta["path"])
+    X, y = df.drop("label", axis=1), df["label"]
+
+    mlflow.set_tracking_uri("http://mlflow:5000")
+    with mlflow.start_run(run_name=f"airflow-{meta['saved_at']}") as run:
+        model = XGBClassifier(n_estimators=300, max_depth=8)
+        model.fit(X, y)
+        mlflow.log_metric("train_accuracy", model.score(X, y))
+        mlflow.log_param("rows", meta["rows"])
+        mlflow.xgboost.log_model(model, "model")
+        return run.info.run_id
+
+# 의존성 — 출력을 다음 task 입력으로 (TaskFlow 자동 처리)
+data_meta = fetch_data()
+run_id    = train_model(data_meta)`,
+        },
+        focus: 'fetch_train',
+      },
+      {
+        title: 'Step 3. Evaluate — "검수 실패 시 라인 정지"',
+        desc: 'BranchPythonOperator 로 정확도 체크 → 임계 미달이면 deploy 건너뛰고 alert task 로 분기. 나쁜 모델이 production 에 올라가는 사고 방지. 평가는 holdout set 또는 last-7d backtest.',
+        block: {
+          kind: 'python',
+          code: `# Evaluate + 분기 — 임계 미달이면 배포 차단
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.empty import EmptyOperator
+import mlflow
+
+@task
+def evaluate(run_id: str) -> dict:
+    """holdout set 으로 검증 → metric dict 반환"""
+    import pandas as pd
+    holdout = pd.read_parquet("s3://fraud-data-prod/holdout/")
+    model = mlflow.pyfunc.load_model(f"runs:/{run_id}/model")
+    preds = model.predict(holdout.drop("label", axis=1))
+    accuracy  = (preds == holdout["label"]).mean()
+    precision = precision_score(holdout["label"], preds)
+    recall    = recall_score(holdout["label"], preds)
+    return {
+        "run_id": run_id,
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+    }
+
+def decide_deploy(metrics: dict) -> str:
+    """임계 통과 여부에 따라 다음 task 결정"""
+    # 임계 정의
+    # - accuracy  >= 0.85
+    # - precision >= 0.80
+    # - recall    >= 0.70
+    if (metrics["accuracy"]  >= 0.85
+        and metrics["precision"] >= 0.80
+        and metrics["recall"]    >= 0.70):
+        return "deploy_to_registry"
+    return "alert_low_quality"
+
+decide = BranchPythonOperator(
+    task_id="decide",
+    python_callable=decide_deploy,
+    op_args=["{{ ti.xcom_pull(task_ids='evaluate') }}"],
+)
+
+skip_alert  = EmptyOperator(task_id="alert_low_quality")
+# 강점 - 자동 게이팅
+# 강점 - 운영팀이 quality 대시보드 안 봐도 안전
+# 한계
+# - 라벨 지연되는 도메인은 holdout 대신 backtest 필요
+# - 임계 너무 빡빡하면 false negative (멀쩡한 모델 거부)`,
+        },
+        focus: 'evaluate',
+      },
+      {
+        title: 'Step 4. Deploy — "Registry 등록 + 출하 알림"',
+        desc: '검수 통과 시 MLflow Registry 에 등록 → Stage 를 Staging→Production 전환 → 이전 버전 Archive → Slack 으로 출하 알림. canary deployment 와 결합해 점진 롤아웃 가능.',
+        block: {
+          kind: 'python',
+          code: `# Deploy task — Registry + Stage + Slack
+from airflow.providers.slack.operators.slack import SlackAPIPostOperator
+from mlflow import MlflowClient
+
+@task(task_id="deploy_to_registry")
+def deploy(metrics: dict):
+    """Registry 등록 + Stage 전환 + 이전 버전 Archive"""
+    client = MlflowClient()
+
+    # 1. Registry 등록
+    result = mlflow.register_model(
+        model_uri=f"runs:/{metrics['run_id']}/model",
+        name="fraud-detector",
+    )
+
+    # 2. Staging → Production (이전 버전 자동 Archive)
+    client.transition_model_version_stage(
+        name="fraud-detector",
+        version=result.version,
+        stage="Production",
+        archive_existing_versions=True,
+    )
+
+    # 3. tag 로 평가 메트릭 첨부
+    client.set_model_version_tag(
+        name="fraud-detector",
+        version=result.version,
+        key="accuracy",
+        value=str(metrics["accuracy"]),
+    )
+
+    return {
+        "version": result.version,
+        "accuracy": metrics["accuracy"],
+    }
+
+# Slack 알림 — 출하 보고
+notify = SlackAPIPostOperator(
+    task_id="notify_slack",
+    channel="#ml-fraud-deploys",
+    text=(
+        "🚀 fraud-detector v{{ ti.xcom_pull(task_ids='deploy_to_registry')['version'] }} "
+        "Production deployed (accuracy "
+        "{{ ti.xcom_pull(task_ids='deploy_to_registry')['accuracy'] }})"
+    ),
+)
+
+# DAG 의존성 — TaskFlow 가 자동 연결
+# wait_data >> wait_etl >> fetch_data >> train_model >> evaluate >> decide
+# decide >> [deploy_to_registry, alert_low_quality]
+# deploy_to_registry >> notify_slack
+
+# 다음(V-2-2)에서는 실전 체크리스트 — MLOps 4축 점검 항목`,
+        },
+        focus: 'deploy',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const AIRFLOW_TASKS = [
+      { key: 'sensor',      emoji: '👁️', name: 'Sensor',     note: '데이터 감지' },
+      { key: 'fetch_train', emoji: '🏗️', name: 'Fetch+Train', note: '데이터→모델' },
+      { key: 'evaluate',    emoji: '✅', name: 'Evaluate',   note: '검수 게이트' },
+      { key: 'deploy',      emoji: '🚀', name: 'Deploy',     note: 'Registry+Slack' },
+    ];
+
+    function AirflowCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🏭 공장 컨베이어 패턴 (Airflow ML DAG)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {AIRFLOW_TASKS.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-amber-100 border-2 border-amber-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Airflow ML DAG</h1>
+                <p className="text-sm text-slate-500 mt-1">공장 컨베이어 패턴 — Sensor / Fetch+Train / Evaluate / Deploy</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <AirflowCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'deploy' && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-3 mb-6 text-xs text-amber-900">
+                💡 다음(V-2-2)에서는 실전 체크리스트 — MLOps 4축 점검 항목
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
