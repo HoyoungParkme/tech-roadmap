@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kubernetes 학습 — NetworkPolicy</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-1. NetworkPolicy
+    학습 목표: 클러스터 안 보안 경계 — default deny → 명시적 허용 전략.
+    핵심 비유: "방화벽" — 모든 출입 차단 → 출입증 있는 사람만 통과
+    구조: 4단계 (전 통신 허용 / Default Deny / 명시 허용 / Egress까지)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 기본 — 모든 Pod끼리 자유 통신',
+        desc: 'NetworkPolicy를 안 만들면 K8s는 "모두 허용". frontend Pod가 db Pod에 직접 접근 가능. compromised pod 1개가 클러스터 전체를 넘볼 수 있는 보안 위험.',
+        block: {
+          kind: 'shell',
+          code: `# 어떤 Pod든 어떤 Pod든 접근 가능
+$ kubectl exec frontend-aa1 -- curl http://db:5432
+# 200 OK    ← 가능
+
+$ kubectl exec malicious-bb2 -- curl http://db:5432
+# 200 OK    ← ⚠ 위험! 어떤 Pod든 DB 접근 가능
+
+# CNI가 NetworkPolicy 지원해야 효력 발생 (Calico, Cilium 등)`,
+        },
+        focus: 'wide-open',
+      },
+      {
+        title: 'Step 2. Default Deny — 모든 Ingress 차단',
+        desc: '먼저 default deny 정책으로 모든 들어오는 트래픽을 차단. 빈 selector + ingress 빈 배열. 이후 필요한 것만 명시 허용. "방화벽 ON" 상태.',
+        block: {
+          kind: 'yaml',
+          code: `apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: default
+spec:
+  podSelector: {}              # 모든 Pod
+  policyTypes:
+    - Ingress
+  # ingress 규칙 없음 = 전부 차단
+
+# 적용 후
+$ kubectl exec frontend-aa1 -- curl http://db:5432
+# (timeout)   ← 차단됨!
+$ kubectl exec malicious-bb2 -- curl http://db:5432
+# (timeout)   ← 차단됨!`,
+        },
+        focus: 'deny-all',
+      },
+      {
+        title: 'Step 3. 명시적 허용 — frontend → db만 OK',
+        desc: 'db Pod에 ingress 규칙 추가: "label app=frontend인 Pod에서 5432포트로 들어오는 것만 허용". 나머지는 차단 유지. "출입증 발급".',
+        block: {
+          kind: 'yaml',
+          code: `apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend     # frontend만 허용
+      ports:
+        - protocol: TCP
+          port: 5432
+
+# 결과
+$ kubectl exec frontend-aa1 -- curl http://db:5432
+# 200 OK    ← 허용
+$ kubectl exec malicious-bb2 -- curl http://db:5432
+# (timeout) ← 여전히 차단`,
+        },
+        focus: 'allow-frontend',
+      },
+      {
+        title: 'Step 4. Egress까지 — DNS / 외부 API만 허용',
+        desc: '나가는 트래픽도 통제. policyTypes에 Egress 추가. DNS(53번), 사내 모니터링, 외부 API 등 명시 허용 외엔 모두 차단. 데이터 유출 차단의 마지막 보루.',
+        block: {
+          kind: 'yaml',
+          code: `apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-strict-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: app
+  policyTypes:
+    - Egress
+  egress:
+    - to:                    # DNS만 허용
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    - to:                    # db만 허용
+        - podSelector:
+            matchLabels:
+              app: db
+      ports:
+        - protocol: TCP
+          port: 5432
+  # 외부 인터넷 호출 모두 차단됨`,
+        },
+        focus: 'egress',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:  { label: 'YAML', textColor: '#fde68a' },
+      shell: { label: 'Bash', textColor: '#86efac' },
+    };
+
+    function FirewallDiagram({ focus }) {
+      // focus별 통신 상태 매핑 (정적)
+      const ARROW_STATE = {
+        'wide-open':       { fa: 'open',  ma: 'open'  },
+        'deny-all':        { fa: 'block', ma: 'block' },
+        'allow-frontend':  { fa: 'open',  ma: 'block' },
+        'egress':          { fa: 'open',  ma: 'block' },
+      };
+      const state = ARROW_STATE[focus];
+      const ARROW_CLASS = {
+        open:  'text-emerald-600 font-bold',
+        block: 'text-red-500 line-through',
+      };
+      const ARROW_LABEL = {
+        open:  '✅ 허용',
+        block: '🚫 차단',
+      };
+
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🔥 방화벽 (NetworkPolicy)</div>
+          <div className="grid grid-cols-3 gap-4 items-center">
+            <div className="text-center">
+              <div className="bg-emerald-100 border-2 border-emerald-400 rounded-lg p-3">
+                <div className="text-2xl">🟢</div>
+                <div className="text-xs font-bold text-emerald-800">frontend</div>
+              </div>
+              <div className={`text-[10px] mt-2 ${ARROW_CLASS[state.fa]}`}>
+                → {ARROW_LABEL[state.fa]}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="bg-violet-100 border-2 border-violet-400 rounded-lg p-3">
+                <div className="text-2xl">🗃️</div>
+                <div className="text-xs font-bold text-violet-800">db</div>
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="bg-red-100 border-2 border-red-400 rounded-lg p-3">
+                <div className="text-2xl">⚠️</div>
+                <div className="text-xs font-bold text-red-800">malicious</div>
+              </div>
+              <div className={`text-[10px] mt-2 ${ARROW_CLASS[state.ma]}`}>
+                → {ARROW_LABEL[state.ma]}
+              </div>
+            </div>
+          </div>
+          <p className="text-center text-[11px] text-slate-500 mt-3">
+            {focus === 'wide-open' && 'NetworkPolicy 없음 — 모든 통신 자유'}
+            {focus === 'deny-all' && 'Default Deny — 모든 트래픽 차단'}
+            {focus === 'allow-frontend' && 'frontend → db 명시 허용'}
+            {focus === 'egress' && 'Ingress + Egress 양방향 통제'}
+          </p>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">NetworkPolicy</h1>
+                <p className="text-sm text-slate-500 mt-1">방화벽 — Default Deny → 명시적 허용</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <FirewallDiagram focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'egress' && (
+              <div className="bg-indigo-50 border-2 border-indigo-300 rounded-xl p-3 mb-6 text-xs text-indigo-900">
+                💡 다음(III-2-2)에서는 Service 이름이 어떻게 자동으로 IP로 해석되는지 — DNS와 Service 디스커버리를 본다 (사내 전화번호부 비유)
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

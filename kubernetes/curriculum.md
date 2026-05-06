@@ -95,7 +95,7 @@
 - **선수 지식**: II-2-2
 - **학습 목표**: ClusterIP / NodePort / LoadBalancer / ExternalName 차이와 선택 기준을 안다.
 - **핵심 키워드**: [ClusterIP, NodePort, LoadBalancer, ExternalName, selector]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Service 4타입 시각화 보기](part3/III-1-1.html) — ClusterIP / NodePort / LoadBalancer / ExternalName (건물 출입문 4종 비유)
 - **다음 섹션**: III-1-2
 
 ### Section III-1-2. Ingress (HTTP 라우팅)
@@ -103,7 +103,7 @@
 - **선수 지식**: III-1-1
 - **학습 목표**: 도메인/경로 기반 라우팅과 TLS 종료를 한 곳에서 처리하는 패턴을 안다.
 - **핵심 키워드**: [Ingress, Ingress Controller, host, path, TLS]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Ingress 시각화 보기](part3/III-1-2.html) — LB N개 한계 / 도메인 라우팅 / 경로 라우팅 / TLS 종료 (안내 데스크 비유)
 - **다음 섹션**: III-2-1
 
 ### Section III-2-1. NetworkPolicy (Pod 간 트래픽 통제)
@@ -111,7 +111,7 @@
 - **선수 지식**: III-1-2
 - **학습 목표**: 보안 경계를 클러스터 안에 만드는 방법(default deny → 명시적 허용)을 안다.
 - **핵심 키워드**: [NetworkPolicy, ingress/egress 규칙, podSelector]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [NetworkPolicy 시각화 보기](part3/III-2-1.html) — 전 통신 허용 / Default Deny / 명시 허용 / Egress (방화벽 비유)
 - **다음 섹션**: III-2-2
 
 ### Section III-2-2. DNS와 Service 디스커버리
@@ -119,7 +119,7 @@
 - **선수 지식**: III-2-1
 - **학습 목표**: `<service>.<namespace>.svc.cluster.local` 이름으로 어떻게 자동 해석되는지 안다.
 - **핵심 키워드**: [CoreDNS, FQDN, namespace, headless service]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [DNS & 디스커버리 시각화 보기](part3/III-2-2.html) — Service 이름 / FQDN / namespace 격리 / Headless (사내 전화번호부 비유)
 - **다음 섹션**: IV-1-1
 
 ---
