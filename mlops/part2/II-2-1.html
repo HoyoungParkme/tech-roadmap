@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLOps 학습 — 학습 파이프라인 (Airflow / Kubeflow)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-2-1. 학습 파이프라인 (Airflow / Kubeflow)
+    학습 목표: ML 단계들을 DAG로 묶어 자동 실행/재시도/스케줄.
+    핵심 비유: "공장 자동화 라인" — 단계마다 사람이 손으로 옮기는 게 아니라 컨베이어 벨트로 연결
+    구조: 4단계 (수동 / DAG 정의 / 의존성 / 스케줄+재시도)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 수동 실행 — 사람이 단계마다 클릭',
+        desc: '데이터 수집 → 전처리 → 학습 → 평가 → 배포 5단계를 사람이 매번 손으로 실행. 어느 단계 실패하면 재시작 어디서? 어제 실행 기록 어디? 새벽 자동 학습 불가능. 공장에 컨베이어 벨트가 없는 상황.',
+        block: {
+          kind: 'shell',
+          code: `# 매주 월요일 새벽 학습 (수동)
+$ python ingest_data.py        # 1. 데이터 수집 (10분)
+                                #    실패 시: ?
+$ python preprocess.py         # 2. 전처리 (5분)
+$ python train.py              # 3. 학습 (2시간)
+$ python evaluate.py           # 4. 평가
+$ python deploy.py             # 5. 배포
+
+# 문제
+- 사람이 항상 대기? 새벽 1시?
+- 3번에서 실패 → 어디서 재시작? 1번부터?
+- 어떤 데이터로 학습됐는지 기록 어디?
+- 다른 팀원이 같은 학습을 어떻게 재현?
+- → 자동화 도구 필요 (Airflow / Kubeflow)`,
+        },
+        focus: 'manual',
+      },
+      {
+        title: 'Step 2. DAG 정의 — 단계를 코드로',
+        desc: 'Airflow DAG는 단계(Task)와 의존성(>>)을 Python 코드로 정의. "공장 라인 설계도" 작성. 매번 같은 흐름이 반복 실행됨. 단계 단위로 재시작 / 모니터링 / 로그 분리.',
+        block: {
+          kind: 'python',
+          code: `# Airflow DAG (dags/ml_pipeline.py)
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+with DAG(
+    "ml_training_pipeline",
+    schedule="0 2 * * 1",       # 매주 월 02:00
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+) as dag:
+
+    ingest = PythonOperator(
+        task_id="ingest_data",
+        python_callable=run_ingest,
+    )
+    preprocess = PythonOperator(
+        task_id="preprocess",
+        python_callable=run_preprocess,
+    )
+    train = PythonOperator(task_id="train", python_callable=run_train)
+    evaluate = PythonOperator(task_id="evaluate", python_callable=run_eval)
+    deploy = PythonOperator(task_id="deploy", python_callable=run_deploy)
+
+    ingest >> preprocess >> train >> evaluate >> deploy`,
+        },
+        focus: 'dag',
+      },
+      {
+        title: 'Step 3. 의존성 + 병렬 — 그래프 구조',
+        desc: 'DAG는 단순 직선이 아닌 그래프 — 여러 단계가 동시에 실행 가능. 데이터 검증과 통계 분석을 병렬 → 학습 → 두 평가(metric/explainability)를 병렬 → 배포. 효율 + 안정성 둘 다.',
+        block: {
+          kind: 'python',
+          code: `# 그래프 의존성 예시
+ingest >> [validate, profile_stats]    # 병렬 실행
+[validate, profile_stats] >> preprocess
+preprocess >> train
+train >> [eval_accuracy, eval_explain] # 병렬 실행
+[eval_accuracy, eval_explain] >> deploy
+
+# Airflow UI에서 그래프 시각화
+#
+#                  ┌─ validate    ─┐
+#  ingest ─────────┤                ├── preprocess ── train ── ┌─ eval_accuracy ─┐
+#                  └─ profile_stats─┘                          └─ eval_explain  ─┴── deploy
+#
+# 한 단계 실패 시 자동 재시도 (retries)
+# 의존 단계는 자동으로 SKIP
+
+train.retries = 3                       # 자동 재시도 3회
+train.retry_delay = timedelta(minutes=5)
+
+# Kubeflow Pipelines도 같은 개념 (K8s 위에서 컴포넌트화)`,
+        },
+        focus: 'graph',
+      },
+      {
+        title: 'Step 4. 스케줄 + 재시도 + 모니터링',
+        desc: '스케줄(매주 월 02시 자동) + 재시도(실패 시 N회) + 알림(Slack) + 로그(단계별 분리). 운영 자동화 풀세트. 사람은 알림 받을 때만 개입. Kubeflow는 같은 개념을 K8s 네이티브로.',
+        block: {
+          kind: 'python',
+          code: `# 운영 자동화 풀세트
+with DAG(
+    "ml_training_pipeline",
+    schedule="0 2 * * 1",                # 매주 월 02:00
+    default_args={
+        "retries": 3,
+        "retry_delay": timedelta(minutes=5),
+        "execution_timeout": timedelta(hours=4),
+        "on_failure_callback": notify_slack,    # 실패 시 알림
+    },
+) as dag:
+    ...
+
+# Airflow UI
+# - 매 실행마다 그래프 색상 (green/red/skipped)
+# - 단계별 로그 클릭 한 번으로 확인
+# - 실패한 단계만 재실행 가능
+# - 과거 실행 이력 1년치 보관
+
+# Kubeflow 차이점
+# - K8s 네이티브 (각 Task가 Pod)
+# - 컴포넌트 재사용성 (다른 파이프라인에 import)
+# - 학습 자체에 더 특화 (Notebook 통합 등)`,
+        },
+        focus: 'schedule',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },  // cyan — python(초록)과 색상 구분
+    };
+
+    const STAGES = [
+      { key: 'manual',   emoji: '🖐️', name: '수동 실행',   note: '사람이 매번 클릭' },
+      { key: 'dag',      emoji: '📋', name: 'DAG 정의',    note: '단계+의존성 코드화' },
+      { key: 'graph',    emoji: '🕸️', name: '그래프 의존', note: '병렬 + 재시도' },
+      { key: 'schedule', emoji: '⏰', name: '스케줄',      note: '자동 + 알림' },
+    ];
+
+    function StageCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🏭 공장 자동화 (Airflow / Kubeflow)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {STAGES.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-pink-100 border-2 border-pink-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">학습 파이프라인 (Airflow / Kubeflow)</h1>
+                <p className="text-sm text-slate-500 mt-1">공장 자동화 — 단계를 DAG로 묶어 자동 실행</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <StageCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'schedule' && (
+              <div className="bg-pink-50 border-2 border-pink-300 rounded-xl p-3 mb-6 text-xs text-pink-900">
+                💡 다음(II-2-2)에서는 매 학습 실행을 자동 기록하는 MLflow Tracking을 본다 — 실험 노트북 비유
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

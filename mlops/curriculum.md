@@ -54,22 +54,22 @@
 
 ### Section II-1-1. 데이터 버전 관리 (DVC)
 - **난이도**: ★★☆
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [DVC 시각화 보기](part2/II-1-1.html) — git 한계 / dvc add / dvc push / 재현 (사진 앨범 버전 비유)
 - **다음 섹션**: II-1-2
 
 ### Section II-1-2. Feature Store
 - **난이도**: ★★★
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Feature Store 시각화 보기](part2/II-1-2.html) — Skew / Feast 등록 / 학습-서빙 일관 / online (공유 부엌 비유)
 - **다음 섹션**: II-2-1
 
 ### Section II-2-1. 학습 파이프라인 (Airflow / Kubeflow)
 - **난이도**: ★★★
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [학습 파이프라인 시각화 보기](part2/II-2-1.html) — 수동 / DAG / 병렬+재시도 / 스케줄 (공장 자동화 비유)
 - **다음 섹션**: II-2-2
 
 ### Section II-2-2. 실험 추적 (MLflow Tracking)
 - **난이도**: ★★☆
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [MLflow Tracking 시각화 보기](part2/II-2-2.html) — 기록 누락 / log_param / UI 비교 / Registry (실험 노트북 비유)
 - **다음 섹션**: III-1-1
 
 ---
