@@ -57,7 +57,7 @@
 - **선수 지식**: I-2-2
 - **학습 목표**: Pod를 N개로 복제하고 롤링 업데이트하는 표준 패턴을 안다.
 - **핵심 키워드**: [Deployment, ReplicaSet, replicas, rolling update]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Deployment & ReplicaSet 시각화 보기](part2/II-1-1.html) — Pod 단독 / ReplicaSet / Deployment / replicas 조절 (공장 생산라인 비유)
 - **다음 섹션**: II-1-2
 
 ### Section II-1-2. 롤링 업데이트와 롤백
@@ -65,7 +65,7 @@
 - **선수 지식**: II-1-1
 - **학습 목표**: 무중단 배포의 흐름과 문제 발생 시 즉시 되돌리는 방법을 안다.
 - **핵심 키워드**: [rollout, maxSurge, maxUnavailable, rollback]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [롤링 업데이트와 롤백 시각화 보기](part2/II-1-2.html) — 안정 v1 / 점진 교체 / 완료 v2 / 롤백 (교대 근무 비유)
 - **다음 섹션**: II-2-1
 
 ### Section II-2-1. StatefulSet (DB, 큐 등 상태 있는 워크로드)
@@ -73,7 +73,7 @@
 - **선수 지식**: II-1-2
 - **학습 목표**: Deployment와 다르게 StatefulSet이 필요한 이유(고유 ID, 순서 보장, 영속 볼륨)를 안다.
 - **핵심 키워드**: [StatefulSet, headless service, persistent volume claim]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [StatefulSet 시각화 보기](part2/II-2-1.html) — Deployment 한계 / 고유 ID / 영속 볼륨 / 순서 보장 (지정석 비유)
 - **다음 섹션**: II-2-2
 
 ### Section II-2-2. DaemonSet & Job & CronJob
@@ -81,7 +81,7 @@
 - **선수 지식**: II-2-1
 - **학습 목표**: 노드별 1개(로그 수집) / 1회성 (마이그레이션) / 주기 작업의 워크로드 타입을 안다.
 - **핵심 키워드**: [DaemonSet, Job, CronJob]
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [DaemonSet & Job & CronJob 시각화 보기](part2/II-2-2.html) — DaemonSet 노드별 / Job 1회 / CronJob 주기 / 4 워크로드 비교
 - **다음 섹션**: III-1-1
 
 ---
