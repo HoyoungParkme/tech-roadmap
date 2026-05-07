@@ -3,256 +3,884 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GraphRAG 학습 — Community Detection</title>
+  <title>GraphRAG 학습 — IV-2-1. Community Detection (Louvain/Leiden)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    IV-2-1. Community Detection (계층 요약)
-    학습 목표: 노드 군집을 찾아 단계별 요약을 만든다.
-    핵심 비유: "별자리 찾기" — 흩어진 노드 중 서로 가까운 군집 발견
-    구조: 4단계 (밀도 차이 / Louvain / 계층 요약 / Leiden 비교)
+    IV-2-1. Community Detection — Louvain / Leiden 알고리즘
+    학습 목표: 100노드 그래프에서 자연 군집(community)을 자동으로 찾아내고,
+              그 군집을 GraphRAG의 "계층 요약 → Global Query" 입력으로 활용한다.
+    핵심 비유: "도시 위성 사진에서 동네 찾기" — 멀리서 보면 빽빽한 구역끼리 자연스럽게
+              뭉쳐있다. 알고리즘이 그 경계를 자동으로 그어준다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 100노드 force-layout SVG) / 우(VSCode CodeViewer)
+    색상: violet base (community: violet / amber / teal / rose 4색)
   -->
   <script type="text/babel">
-    const { useState, useEffect, useRef } = React;
+    const { useState, useEffect, useRef, useMemo } = React;
 
-    // 8명 인물 — 두 군집 (color hex 정적, Tailwind 정적 클래스로 표현 어려워 style prop 예외)
-    const NODES = [
-      { id: 'jobs',    name: 'Jobs',    cx: 130, cy: 80,  community: 'apple' },
-      { id: 'woz',     name: 'Wozniak', cx: 230, cy: 130, community: 'apple' },
-      { id: 'cook',    name: 'Cook',    cx: 130, cy: 200, community: 'apple' },
-      { id: 'ive',     name: 'Ive',     cx: 230, cy: 250, community: 'apple' },
-      { id: 'gates',   name: 'Gates',   cx: 570, cy: 80,  community: 'ms' },
-      { id: 'allen',   name: 'Allen',   cx: 670, cy: 130, community: 'ms' },
-      { id: 'nadella', name: 'Nadella', cx: 570, cy: 200, community: 'ms' },
-      { id: 'ballmer', name: 'Ballmer', cx: 670, cy: 250, community: 'ms' },
+    // ─────────────────────────────────────────────────────
+    // 100 노드 결정적 force-layout 좌표 생성
+    //   4개 군집을 미리 의도해두고, 각 군집 중심 주위에 25개씩 배치
+    //   결정적(시드 고정 PRNG)으로 매 렌더 동일 위치
+    // ─────────────────────────────────────────────────────
+    function mulberry32(seed) {
+      return function () {
+        let t = (seed += 0x6d2b79f5);
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // 4개 군집 의도된 중심 (SVG 800x500 기준)
+    const COMMUNITY_CENTERS = [
+      { id: 0, cx: 220, cy: 160, label: 'A' },
+      { id: 1, cx: 580, cy: 160, label: 'B' },
+      { id: 2, cx: 220, cy: 360, label: 'C' },
+      { id: 3, cx: 580, cy: 360, label: 'D' },
     ];
 
-    // 군집 내부 친밀 엣지 + 군집 간 약한 엣지
-    const EDGES = [
-      { from: 'jobs',   to: 'woz',     intra: true },
-      { from: 'jobs',   to: 'cook',    intra: true },
-      { from: 'cook',   to: 'ive',     intra: true },
-      { from: 'woz',    to: 'ive',     intra: true },
-      { from: 'gates',  to: 'allen',   intra: true },
-      { from: 'gates',  to: 'nadella', intra: true },
-      { from: 'nadella',to: 'ballmer', intra: true },
-      { from: 'allen',  to: 'ballmer', intra: true },
-      { from: 'jobs',   to: 'gates',   intra: false }, // 군집 간 약한 연결
+    // 100 노드 = 군집당 25개 — 중심 주위 가우시안 노이즈
+    const NODES = (() => {
+      const rng = mulberry32(42);
+      const out = [];
+      COMMUNITY_CENTERS.forEach((c) => {
+        for (let i = 0; i < 25; i++) {
+          // 박스-뮬러로 정규분포 (sigma 36)
+          const u1 = Math.max(rng(), 1e-6);
+          const u2 = rng();
+          const r = Math.sqrt(-2 * Math.log(u1)) * 36;
+          const theta = 2 * Math.PI * u2;
+          out.push({
+            id: out.length,
+            cx: c.cx + r * Math.cos(theta),
+            cy: c.cy + r * Math.sin(theta),
+            community: c.id,
+          });
+        }
+      });
+      return out;
+    })();
+
+    // 엣지 — 같은 군집 내부는 거리 가까운 쌍 위주, 군집 사이는 드물게
+    const EDGES = (() => {
+      const rng = mulberry32(7);
+      const out = [];
+      // 군집 내부 — 각 노드마다 같은 군집의 가까운 2~3개와 연결
+      NODES.forEach((n) => {
+        const sameComm = NODES.filter((m) => m.community === n.community && m.id !== n.id);
+        sameComm.sort((a, b) => {
+          const da = (a.cx - n.cx) ** 2 + (a.cy - n.cy) ** 2;
+          const db = (b.cx - n.cx) ** 2 + (b.cy - n.cy) ** 2;
+          return da - db;
+        });
+        const k = 2 + Math.floor(rng() * 2); // 2~3
+        for (let i = 0; i < k; i++) {
+          const m = sameComm[i];
+          if (n.id < m.id) out.push({ from: n.id, to: m.id, intra: true });
+        }
+      });
+      // 군집 사이 — 8개만 약하게
+      for (let i = 0; i < 8; i++) {
+        const a = COMMUNITY_CENTERS[Math.floor(rng() * 4)].id;
+        let b = COMMUNITY_CENTERS[Math.floor(rng() * 4)].id;
+        while (b === a) b = COMMUNITY_CENTERS[Math.floor(rng() * 4)].id;
+        const fromNode = NODES.filter((n) => n.community === a)[Math.floor(rng() * 25)];
+        const toNode = NODES.filter((n) => n.community === b)[Math.floor(rng() * 25)];
+        out.push({ from: fromNode.id, to: toNode.id, intra: false });
+      }
+      return out;
+    })();
+
+    // 4 community 색상 (violet, amber, teal, rose)
+    const COMMUNITY_STYLE = [
+      { fill: '#a78bfa', stroke: '#7c3aed', name: 'Violet',  label: 'Community A — 1970s 창업자' },
+      { fill: '#fbbf24', stroke: '#d97706', name: 'Amber',   label: 'Community B — 90s SW 거인'  },
+      { fill: '#5eead4', stroke: '#0d9488', name: 'Teal',    label: 'Community C — 클라우드 시대' },
+      { fill: '#fb7185', stroke: '#e11d48', name: 'Rose',    label: 'Community D — AI 연구자'     },
     ];
+    const UNCLUSTERED = { fill: '#cbd5e1', stroke: '#94a3b8', name: 'Slate', label: '미분류' };
 
-    const COMMUNITY_COLOR = {
-      apple: { fill: '#a78bfa', stroke: '#7c3aed', label: '애플 창업자 그룹', summary: '잡스/워즈니악이 1976년 창업, 쿡이 CEO 승계, 아이브가 디자인 주도' },
-      ms:    { fill: '#34d399', stroke: '#059669', label: '마이크로소프트 그룹', summary: '게이츠/앨런이 1975년 창업, 발머와 나델라가 후속 CEO' },
-      none:  { fill: '#94a3b8', stroke: '#64748b', label: '미분류', summary: '' },
-    };
-
-    // 알고리즘 비교
-    const ALGO_COMPARE = [
-      {
-        name: 'Louvain',
-        year: 2008,
-        pros: '빠르고 메모리 효율',
-        cons: '드물게 분리된 군집(disconnected) 생성',
-        adoption: '초기 표준',
-      },
-      {
-        name: 'Leiden',
-        year: 2019,
-        pros: 'Louvain 개선판. 항상 connected 군집 보장. 안정적 결과',
-        cons: '약간 느림 (실용 충분)',
-        adoption: 'Microsoft GraphRAG 기본',
-      },
-    ];
-
+    // ─────────────────────────────────────────────────────
+    // 단계별 상태
+    //   colorMode :
+    //     'none'      — 모든 노드 회색
+    //     'partial'   — 일부 그룹화 시작 (각 군집 일부만 색)
+    //     'super'     — 일부 군집은 super-node로 압축 시각화
+    //     'final'     — 4 색 완전 분리 + 영역 박스
+    //     'usage'     — final + Global query 활용 부착
+    //   superNodes  : Step 3에서 압축 모드 사용
+    //   highlightCommunity : Step 5에서 Global query LLM 입력 강조
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. 밀도 차이 — 사람 눈엔 보이는 군집',
-        desc: '8명의 인물이 친구 관계(엣지)로 연결돼 있다. 사람 눈엔 두 그룹(애플/마이크로소프트)이 자연스럽게 보인다 — 군집 안에서는 빽빽하고, 군집 사이는 듬성듬성. 그래프 알고리즘이 이 패턴을 자동 발견하는 게 Community Detection.',
-        focus: 'density',
+        title: 'Step 1. 큰 그래프 — "100 노드, 군집 미식별"',
+        desc: '엔티티 추출 결과로 100개 노드와 200여 엣지가 떴다. 모두 회색 — 아직 어떤 노드가 한 그룹인지 모른다. 사람 눈엔 4 덩어리가 보일 듯 말 듯. 이걸 알고리즘이 자동으로 분리해야 GraphRAG가 "동네별 요약"을 만들 수 있다.',
+        colorMode: 'none',
+        showBoundary: false,
+        modularity: null,
+        passLabel: 'pre-Louvain',
+        showUsage: false,
+        code: {
+          lang: 'python',
+          filename: 'louvain.py',
+          tabs: ['louvain.py', 'leiden.py', 'community-summary.py'],
+          activeTab: 'louvain.py',
+          lines: [
+            '"""',
+            'Community Detection — Louvain 알고리즘 (시작 상태)',
+            '입력: networkx 그래프 G(V=100, E=≈200)',
+            '출력: 노드 → community_id 매핑',
+            '"""',
+            'import networkx as nx',
+            'from networkx.algorithms.community import louvain_communities',
+            '',
+            '# 1) 엔티티 추출 결과를 그래프로 적재',
+            'G = nx.Graph()',
+            'G.add_nodes_from(entities)        # 100 nodes',
+            'G.add_edges_from(relationships)   # ~200 edges',
+            '',
+            'print(G.number_of_nodes())  # 100',
+            'print(G.number_of_edges())  # 207',
+            '',
+            '# 아직 community_id 없음 → 모두 -1 (unclustered)',
+            'for node in G.nodes:',
+            '    G.nodes[node]["community"] = -1',
+            '',
+            '# 다음 단계: louvain_communities(G) 실행 → 군집 자동 발견',
+          ],
+          highlight: [10, 11, 12, 17, 18],
+        },
       },
       {
-        title: 'Step 2. Louvain 알고리즘 — 모듈러리티 최대화',
-        desc: '"군집 안 엣지는 많고, 군집 사이 엣지는 적다"는 모듈러리티 점수를 최대화하도록 노드를 점진 병합한다. 결과: 두 군집이 서로 다른 색으로 분리. 군집 간 약한 연결(점선)은 분리 경계를 가로지르는 엣지.',
-        focus: 'louvain',
+        title: 'Step 2. Louvain 1단계 — "인접 노드 그룹화"',
+        desc: 'Louvain은 욕심쟁이(greedy) — 각 노드가 "내가 어느 이웃 그룹에 들어가야 modularity가 가장 오를까"를 보고 한 명씩 옮겨간다. 1번째 패스 후: 일부 노드가 같은 색으로 뭉치기 시작. 모듈러리티 0.0 → 0.42로 상승. 아직 4색이 완성되진 않았다.',
+        colorMode: 'partial',
+        showBoundary: false,
+        modularity: 0.42,
+        passLabel: 'Pass 1 — local moves',
+        showUsage: false,
+        code: {
+          lang: 'python',
+          filename: 'louvain.py',
+          tabs: ['louvain.py', 'leiden.py', 'community-summary.py'],
+          activeTab: 'louvain.py',
+          lines: [
+            '"""',
+            'Louvain — Phase 1 (local moving)',
+            '각 노드를 이웃 community 중 modularity 증분이 가장 큰 곳으로 이동',
+            '"""',
+            '',
+            'def louvain_phase1(G, partition):',
+            '    """',
+            '    Args:',
+            '        G: networkx Graph',
+            '        partition: dict { node_id: community_id }',
+            '    Returns:',
+            '        업데이트된 partition (modularity 증가 보장)',
+            '    """',
+            '    improved = True',
+            '    while improved:',
+            '        improved = False',
+            '        for node in G.nodes:',
+            '            best_comm = partition[node]',
+            '            best_gain = 0.0',
+            '            # 이웃 community별로 합류 시 modularity 증분 평가',
+            '            for nbr in G.neighbors(node):',
+            '                gain = delta_modularity(G, node, partition[nbr], partition)',
+            '                if gain > best_gain:',
+            '                    best_gain = gain',
+            '                    best_comm = partition[nbr]',
+            '            if best_comm != partition[node]:',
+            '                partition[node] = best_comm',
+            '                improved = True',
+            '    return partition',
+            '',
+            '# Q (modularity) 0.0 → 0.42 — 부분 군집 형성',
+          ],
+          highlight: [21, 22, 23, 24, 25, 26],
+        },
       },
       {
-        title: 'Step 3. 계층(Hierarchical) 요약 — Local에서 Global로',
-        desc: 'Microsoft GraphRAG의 핵심 아이디어. Level 0(노드 자체) → Level 1(군집별 요약) → Level 2(전체 요약). 각 군집을 LLM으로 한 문단 요약. 책 한 권을 인덱싱하면 챕터별 → 책 전체 요약을 자동으로.',
-        focus: 'hierarchy',
+        title: 'Step 3. Louvain 2단계 — "그룹을 super-node로 압축, 다시 그룹화"',
+        desc: 'Phase 2: 1단계에서 만든 그룹을 super-node 1개로 압축한 뒤, super-node끼리 다시 Phase 1을 돌린다. 작은 군집들이 더 큰 군집으로 합쳐진다. 다중 레벨 hierarchy가 자연스럽게 생긴다 — GraphRAG가 "Level 0 → Level 1 → Level 2" 계층 요약을 만들 수 있는 이유.',
+        colorMode: 'super',
+        showBoundary: false,
+        modularity: 0.61,
+        passLabel: 'Pass 2 — aggregation',
+        showUsage: false,
+        code: {
+          lang: 'python',
+          filename: 'louvain.py',
+          tabs: ['louvain.py', 'leiden.py', 'community-summary.py'],
+          activeTab: 'louvain.py',
+          lines: [
+            '"""',
+            'Louvain — Phase 2 (aggregation)',
+            'Phase 1로 만든 community를 super-node로 압축, 다시 Phase 1 반복',
+            '"""',
+            '',
+            'def louvain_phase2(G, partition):',
+            '    """',
+            '    각 community를 super-node 1개로 축약한 새 그래프 H 생성',
+            '    Args:',
+            '        G: 원본 그래프',
+            '        partition: phase1 결과',
+            '    Returns:',
+            '        H: super-graph (node = community id)',
+            '    """',
+            '    H = nx.Graph()',
+            '    # 각 community를 1개 super-node로',
+            '    for comm_id in set(partition.values()):',
+            '        H.add_node(comm_id)',
+            '    # 엣지 가중치 = community 사이 원본 엣지 수',
+            '    for u, v in G.edges:',
+            '        cu, cv = partition[u], partition[v]',
+            '        if cu == cv:',
+            '            continue   # community 내부는 self-loop 생략',
+            '        if H.has_edge(cu, cv):',
+            '            H[cu][cv]["weight"] += 1',
+            '        else:',
+            '            H.add_edge(cu, cv, weight=1)',
+            '    return H',
+            '',
+            '# 50 small comms → 4 large comms 압축',
+            '# Q 0.42 → 0.61 — 군집 경계 더 뚜렷',
+          ],
+          highlight: [16, 17, 18, 23, 24, 25, 26, 27],
+        },
       },
       {
-        title: 'Step 4. Leiden vs Louvain',
-        desc: 'Louvain은 빠르지만 드물게 분리된(disconnected) 군집을 만들 수 있다. Leiden은 그 결함을 수정한 개선판. Microsoft GraphRAG는 Leiden을 기본 채택. 보통 Leiden이면 충분.',
-        focus: 'algo',
+        title: 'Step 4. 결과 — "4 community 식별 (각각 다른 색)"',
+        desc: '최종 결과: 100개 노드가 4개 community로 자동 분리됐다. Violet/Amber/Teal/Rose 4색 — 각 영역에 점선 박스가 그어졌다. 군집 내부 엣지(실선)가 빽빽하고 군집 사이 엣지(점선)는 드물다. Microsoft GraphRAG는 같은 알고리즘의 개선판인 Leiden을 기본 사용 — 항상 connected 군집을 보장.',
+        colorMode: 'final',
+        showBoundary: true,
+        modularity: 0.61,
+        passLabel: 'converged',
+        showUsage: false,
+        code: {
+          lang: 'python',
+          filename: 'leiden.py',
+          tabs: ['louvain.py', 'leiden.py', 'community-summary.py'],
+          activeTab: 'leiden.py',
+          lines: [
+            '"""',
+            'Leiden — Louvain 개선판 (Microsoft GraphRAG 기본)',
+            '핵심 차이: Phase 사이 "refinement" 단계 추가',
+            '         → Louvain의 disconnected community 결함 제거',
+            '"""',
+            'import igraph as ig',
+            'import leidenalg',
+            '',
+            'def detect_communities_leiden(G_nx):',
+            '    """',
+            '    Args:',
+            '        G_nx: networkx 그래프 (V=100)',
+            '    Returns:',
+            '        list[set[int]] — 각 community의 노드 id 집합',
+            '    """',
+            '    # networkx → igraph 변환 (leidenalg가 igraph 입력)',
+            '    G_ig = ig.Graph.from_networkx(G_nx)',
+            '',
+            '    # 1) Local move    — Louvain과 동일',
+            '    # 2) Refinement    — community 내부를 다시 잘게 쪼개 connected 보장 ★',
+            '    # 3) Aggregation   — super-node 압축 (Louvain과 동일)',
+            '    partition = leidenalg.find_partition(',
+            '        G_ig,',
+            '        leidenalg.ModularityVertexPartition,',
+            '        seed=42,',
+            '    )',
+            '',
+            '    return [set(c) for c in partition]',
+            '',
+            '# 결과: 4 communities — 각 25노드 ± 약간',
+            '# - Community A (violet) : 26 nodes',
+            '# - Community B (amber)  : 24 nodes',
+            '# - Community C (teal)   : 25 nodes',
+            '# - Community D (rose)   : 25 nodes',
+            '# Q (modularity) = 0.61',
+          ],
+          highlight: [19, 20, 21, 22, 23, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 5. 활용 — "community별 요약 → Global Query"',
+        desc: '각 community를 LLM으로 한 문단 요약. Global query("이 회사들이 만든 산업 트렌드는?")가 들어오면 노드 100개가 아닌 community 요약 4개만 LLM에 넣는다. 컨텍스트가 100배 작아지고, 답변은 더 응집력 있게 — 이게 GraphRAG가 vanilla RAG보다 Global query에 강한 이유.',
+        colorMode: 'usage',
+        showBoundary: true,
+        modularity: 0.61,
+        passLabel: 'consumed by GraphRAG',
+        showUsage: true,
+        code: {
+          lang: 'python',
+          filename: 'community-summary.py',
+          tabs: ['louvain.py', 'leiden.py', 'community-summary.py'],
+          activeTab: 'community-summary.py',
+          lines: [
+            '"""',
+            'Community Summary → Global Query',
+            '각 community를 LLM 한 번 호출로 요약, Global 질문 시 그 요약만 입력',
+            '"""',
+            'from openai import OpenAI',
+            '',
+            'client = OpenAI()',
+            '',
+            'def summarize_community(nodes, edges):',
+            '    """',
+            '    Args:',
+            '        nodes: 이 community의 엔티티 리스트',
+            '        edges: 이 community 내부 관계 리스트',
+            '    Returns:',
+            '        str — 한 문단 요약 (200자 이내)',
+            '    """',
+            '    prompt = f"""다음 인물/회사와 관계를 한 문단으로 요약하라.',
+            '    엔티티: {nodes}',
+            '    관계:   {edges}"""',
+            '    resp = client.chat.completions.create(',
+            '        model="gpt-4o-mini",',
+            '        messages=[{"role": "user", "content": prompt}],',
+            '    )',
+            '    return resp.choices[0].message.content',
+            '',
+            '# 100 노드 → 4 community 요약 (LLM 호출 4회)',
+            'summaries = [summarize_community(c.nodes, c.edges) for c in communities]',
+            '',
+            'def global_query(question):',
+            '    """',
+            '    Global 질문 → community 요약 4개만 컨텍스트로',
+            '    (전체 100 노드 직접 입력 대비 토큰 ≈ 1/100)',
+            '    """',
+            '    ctx = "\\n\\n".join(summaries)',
+            '    return client.chat.completions.create(',
+            '        model="gpt-4o",',
+            '        messages=[',
+            '            {"role": "system", "content": ctx},',
+            '            {"role": "user",   "content": question},',
+            '        ],',
+            '    )',
+          ],
+          highlight: [26, 27, 32, 33, 34, 35],
+        },
       },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 노드 색상 결정 헬퍼
+    //   - none    : 전부 미분류
+    //   - partial : 각 community 노드 중 일부(40%)만 색 부여
+    //   - super   : 각 community 일부 + 4개 super-node 오버레이
+    //   - final   : 모든 노드 community 색
+    //   - usage   : final 동일
+    // ─────────────────────────────────────────────────────
+    function nodeStyleFor(node, mode, partialMask) {
+      if (mode === 'none') return UNCLUSTERED;
+      if (mode === 'final' || mode === 'usage') return COMMUNITY_STYLE[node.community];
+      if (mode === 'partial' || mode === 'super') {
+        if (partialMask[node.id]) return COMMUNITY_STYLE[node.community];
+        return UNCLUSTERED;
+      }
+      return UNCLUSTERED;
+    }
+
+    // partial 모드용 마스크 — 결정적 (각 community에서 60%만 색)
+    const PARTIAL_MASK = (() => {
+      const rng = mulberry32(99);
+      const m = {};
+      NODES.forEach((n) => {
+        m[n.id] = rng() < 0.6;
+      });
+      return m;
+    })();
+
+    // ─────────────────────────────────────────────────────
+    // SVG 그래프 — 100 노드 force-layout (사전 계산된 좌표)
+    // ─────────────────────────────────────────────────────
+    function GraphSvg({ colorMode, showBoundary }) {
+      const svgW = 800;
+      const svgH = 500;
+
+      // community별 boundary box (point cloud의 bounding box + padding)
+      const boundaries = useMemo(() => {
+        return COMMUNITY_CENTERS.map((c) => {
+          const ns = NODES.filter((n) => n.community === c.id);
+          const xs = ns.map((n) => n.cx);
+          const ys = ns.map((n) => n.cy);
+          const pad = 20;
+          return {
+            id: c.id,
+            x: Math.min(...xs) - pad,
+            y: Math.min(...ys) - pad,
+            w: Math.max(...xs) - Math.min(...xs) + pad * 2,
+            h: Math.max(...ys) - Math.min(...ys) + pad * 2,
+            label: COMMUNITY_STYLE[c.id].label,
+            stroke: COMMUNITY_STYLE[c.id].stroke,
+            fill: COMMUNITY_STYLE[c.id].fill,
+          };
+        });
+      }, []);
+
+      // super-node 모드: 일부 community를 작은 super-node로 표시
+      const showSuper = colorMode === 'super';
+
+      return (
+        <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full h-auto" style={{ maxHeight: '460px' }}>
+          {/* community 영역 박스 (점선) */}
+          {showBoundary && boundaries.map((b) => (
+            <g key={`bd-${b.id}`}>
+              <rect
+                x={b.x}
+                y={b.y}
+                width={b.w}
+                height={b.h}
+                rx="14"
+                fill={b.fill}
+                fillOpacity="0.08"
+                stroke={b.stroke}
+                strokeWidth="2"
+                strokeDasharray="6 4"
+                className="transition-all duration-700"
+              />
+              <text
+                x={b.x + 8}
+                y={b.y - 6}
+                fontSize="11"
+                fontWeight="bold"
+                fill={b.stroke}
+                fontFamily="monospace"
+              >
+                {b.label}
+              </text>
+            </g>
+          ))}
+
+          {/* 엣지 */}
+          {EDGES.map((e, i) => {
+            const f = NODES[e.from];
+            const t = NODES[e.to];
+            return (
+              <line
+                key={`e-${i}`}
+                x1={f.cx}
+                y1={f.cy}
+                x2={t.cx}
+                y2={t.cy}
+                stroke={e.intra ? '#cbd5e1' : '#fda4af'}
+                strokeWidth={e.intra ? 1 : 1.4}
+                strokeDasharray={e.intra ? '0' : '5 3'}
+                opacity={e.intra ? 0.55 : 0.85}
+              />
+            );
+          })}
+
+          {/* 100 노드 */}
+          {NODES.map((n) => {
+            const style = nodeStyleFor(n, colorMode, PARTIAL_MASK);
+            return (
+              <circle
+                key={`n-${n.id}`}
+                cx={n.cx}
+                cy={n.cy}
+                r={5}
+                fill={style.fill}
+                stroke={style.stroke}
+                strokeWidth="1.2"
+                className="transition-all duration-700"
+              />
+            );
+          })}
+
+          {/* super-node 오버레이 (Step 3) */}
+          {showSuper && COMMUNITY_CENTERS.map((c) => {
+            const s = COMMUNITY_STYLE[c.id];
+            return (
+              <g key={`super-${c.id}`}>
+                <circle
+                  cx={c.cx}
+                  cy={c.cy}
+                  r={32}
+                  fill={s.fill}
+                  fillOpacity="0.35"
+                  stroke={s.stroke}
+                  strokeWidth="2.5"
+                  strokeDasharray="3 3"
+                />
+                <text
+                  x={c.cx}
+                  y={c.cy + 4}
+                  textAnchor="middle"
+                  fontSize="11"
+                  fontWeight="bold"
+                  fill={s.stroke}
+                  fontFamily="monospace"
+                >
+                  super-{c.label}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 그래프 + 카운터 + Global query 활용 박스
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const { colorMode, showBoundary, modularity, passLabel, showUsage } = step;
+
+      // community별 노드 수 (final / usage 단계)
+      const communityCounts = useMemo(() => {
+        if (colorMode !== 'final' && colorMode !== 'usage') return null;
+        return COMMUNITY_CENTERS.map((c) => ({
+          id: c.id,
+          count: NODES.filter((n) => n.community === c.id).length,
+          ...COMMUNITY_STYLE[c.id],
+        }));
+      }, [colorMode]);
+
+      const totalColored = useMemo(() => {
+        if (colorMode === 'none') return 0;
+        if (colorMode === 'final' || colorMode === 'usage') return NODES.length;
+        return Object.values(PARTIAL_MASK).filter(Boolean).length;
+      }, [colorMode]);
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">🌌 엔티티 그래프 — 100 nodes</h2>
+            <span className="text-[10px] text-slate-400 font-mono">{passLabel}</span>
+          </div>
+
+          {/* 요약 카운트 */}
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            <div className="rounded-lg bg-violet-50 border border-violet-300 p-2 text-center">
+              <div className="text-[10px] text-violet-700 font-bold uppercase">Nodes</div>
+              <div className="text-xl font-extrabold text-violet-700 tabular-nums">100</div>
+            </div>
+            <div className="rounded-lg bg-slate-50 border border-slate-300 p-2 text-center">
+              <div className="text-[10px] text-slate-600 font-bold uppercase">Clustered</div>
+              <div className="text-xl font-extrabold text-slate-700 tabular-nums">
+                {totalColored}<span className="text-xs text-slate-400">/100</span>
+              </div>
+            </div>
+            <div className="rounded-lg bg-slate-50 border border-slate-300 p-2 text-center">
+              <div className="text-[10px] text-slate-600 font-bold uppercase">Modularity Q</div>
+              <div className="text-xl font-extrabold text-slate-700 tabular-nums">
+                {modularity === null ? '—' : modularity.toFixed(2)}
+              </div>
+            </div>
+          </div>
+
+          {/* SVG 그래프 */}
+          <div className="rounded-lg bg-gradient-to-b from-slate-50 to-violet-50 border border-violet-100 p-2 mb-3">
+            <GraphSvg colorMode={colorMode} showBoundary={showBoundary} />
+          </div>
+
+          {/* community 사이즈 카운터 (Step 4 이후) */}
+          {communityCounts && (
+            <div className="grid grid-cols-4 gap-2 mb-3">
+              {communityCounts.map((c) => (
+                <div
+                  key={c.id}
+                  className="rounded-lg p-2 text-center border-2"
+                  style={{ background: c.fill + '22', borderColor: c.stroke }}
+                >
+                  <div
+                    className="text-[10px] font-bold uppercase tabular-nums"
+                    style={{ color: c.stroke }}
+                  >
+                    {c.name}
+                  </div>
+                  <div className="text-lg font-extrabold tabular-nums" style={{ color: c.stroke }}>
+                    {c.count}
+                  </div>
+                  <div className="text-[9px] text-slate-500">nodes</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Global Query 활용 박스 (Step 5) */}
+          {showUsage && (
+            <div className="rounded-lg bg-violet-50 border-2 border-violet-300 p-3 mb-3 animate-pulse">
+              <div className="text-[11px] font-bold text-violet-800 mb-1">
+                🌍 Global Query 입력 (전체 LLM 컨텍스트 작게)
+              </div>
+              <div className="text-[10px] text-slate-700 leading-relaxed font-mono space-y-0.5">
+                <div>• 4 community 요약 → 컨텍스트 ≈ 800 tokens</div>
+                <div>• cf. 100 노드 직접 입력 → ≈ 80,000 tokens (100배)</div>
+                <div className="text-violet-700 mt-1">
+                  💡 question: "이들이 만든 산업 트렌드는?" → community A,B,C,D 요약만 LLM에
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#cbd5e1' }}></span>미분류
+            </span>
+            {COMMUNITY_STYLE.map((s) => (
+              <span key={s.name} className="flex items-center gap-1">
+                <span
+                  className="w-2.5 h-2.5 rounded-full"
+                  style={{ background: s.fill, border: `1px solid ${s.stroke}` }}
+                ></span>
+                {s.name}
+              </span>
+            ))}
+            <span className="flex items-center gap-1 ml-auto">
+              <span className="w-3 h-0.5 bg-slate-400"></span>intra
+            </span>
+            <span className="flex items-center gap-1">
+              <span
+                className="w-3 h-0.5"
+                style={{ background: 'transparent', borderTop: '1.5px dashed #fda4af' }}
+              ></span>
+              inter
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — 파일명 탭 + highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* 파일명 탭 */}
+          <div className="bg-[#21252b] flex border-b border-slate-700 overflow-x-auto">
+            {code.tabs.map((tabName) => {
+              const isActive = tabName === code.activeTab;
+              return (
+                <div
+                  key={tabName}
+                  className={`px-4 py-2 text-xs font-mono whitespace-nowrap border-r border-slate-700 transition ${
+                    isActive
+                      ? 'bg-[#282c34] text-violet-300 border-t-2 border-t-violet-400'
+                      : 'text-slate-500'
+                  }`}
+                >
+                  {isActive ? '📄 ' : ''}{tabName}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[30rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-violet-500/15 border-l-2 border-violet-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines · {code.activeTab}</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4000);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const focus = step.focus;
-      // 군집 색상 적용 여부 — Step 1(density)에서는 회색 균일, Step 2 이후 두 색으로 분리
-      const isCommunityColored = focus !== 'density';
-
-      const getNode = (id) => NODES.find(n => n.id === id);
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">Community Detection (계층 요약)</h1>
-                <p className="text-sm text-slate-500 mt-1">별자리 찾기 — 군집 발견 + 단계별 요약</p>
-              </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
-            </div>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-violet-700 hover:text-violet-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-1</span>
+            </nav>
 
-            {/* SVG 그래프 — 8명 인물 + 군집 색상 분기 */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-4">
-              <div className="text-xs font-bold text-slate-700 mb-2">📊 인물 친구 그래프</div>
-              <svg viewBox="0 0 800 320" className="w-full" style={{ maxHeight: '360px' }}>
-                {/* 엣지 */}
-                {EDGES.map((e, i) => {
-                  const f = getNode(e.from);
-                  const t = getNode(e.to);
-                  return (
-                    <line
-                      key={'e-' + i}
-                      x1={f.cx} y1={f.cy}
-                      x2={t.cx} y2={t.cy}
-                      stroke={e.intra ? '#94a3b8' : '#cbd5e1'}
-                      strokeWidth={e.intra ? '2' : '1'}
-                      strokeDasharray={e.intra ? '0' : '4 4'}
-                    />
-                  );
-                })}
-                {/* 노드 */}
-                {NODES.map((n) => {
-                  const c = isCommunityColored ? COMMUNITY_COLOR[n.community] : COMMUNITY_COLOR.none;
-                  return (
-                    <g key={n.id}>
-                      <circle cx={n.cx} cy={n.cy} r="26" fill={c.fill} stroke={c.stroke} strokeWidth="2" />
-                      <text x={n.cx} y={n.cy + 3} textAnchor="middle" fontSize="10" fontWeight="bold" fill="#fff">{n.name}</text>
-                    </g>
-                  );
-                })}
-                {/* 군집 라벨 (Step 2 이상) */}
-                {isCommunityColored && (
-                  <g>
-                    <text x="180" y="305" textAnchor="middle" fontSize="11" fontWeight="bold" fill="#7c3aed">애플 창업자 그룹</text>
-                    <text x="620" y="305" textAnchor="middle" fontSize="11" fontWeight="bold" fill="#059669">마이크로소프트 그룹</text>
-                  </g>
-                )}
-              </svg>
-              <div className="text-[10px] text-slate-500 text-center mt-1">
-                {focus === 'density' && '회색 노드 = 군집 미분류 (사람 눈엔 두 그룹 보임)'}
-                {focus === 'louvain' && '두 색상 = Louvain이 발견한 군집. 점선 = 군집 간 약한 연결'}
-                {(focus === 'hierarchy' || focus === 'algo') && '두 군집 식별 완료 — 군집별 요약으로 진행'}
-              </div>
-            </div>
-
-            {/* Step 3 계층 요약 */}
-            {focus === 'hierarchy' && (
-              <div className="bg-white rounded-xl shadow-sm border-2 border-emerald-300 p-4 mb-6">
-                <div className="text-xs font-bold text-emerald-700 mb-3">📚 계층 요약</div>
-                <div className="space-y-2">
-                  <div className="bg-slate-100 rounded p-2">
-                    <div className="text-[10px] font-bold text-slate-600">Level 0 — 노드 (8명)</div>
-                    <div className="text-[11px] text-slate-700">Jobs, Wozniak, Cook, Ive, Gates, Allen, Nadella, Ballmer</div>
-                  </div>
-                  {Object.entries(COMMUNITY_COLOR).filter(([k]) => k !== 'none').map(([key, c]) => (
-                    <div key={key} className="rounded p-2" style={{ background: c.fill + '20', border: `1px solid ${c.stroke}` }}>
-                      <div className="text-[10px] font-bold" style={{ color: c.stroke }}>Level 1 — {c.label}</div>
-                      <div className="text-[11px] text-slate-700">{c.summary}</div>
-                    </div>
-                  ))}
-                  <div className="bg-amber-50 border border-amber-300 rounded p-2">
-                    <div className="text-[10px] font-bold text-amber-800">Level 2 — 전체 요약</div>
-                    <div className="text-[11px] text-slate-700">1970년대 PC 산업의 두 거대 인물 그룹 — 애플과 마이크로소프트</div>
-                  </div>
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-violet-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. 그래프 활용 &gt; Chapter 2. Community Detection</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Community Detection — Louvain / Leiden</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">도시 위성 사진에서 동네 찾기 — 100 노드 그래프에서 자연 군집 자동 발견 → Global Query 컨텍스트 압축</p>
                 </div>
               </div>
-            )}
+            </header>
 
-            {/* Step 4 알고리즘 비교 */}
-            {focus === 'algo' && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-6">
-                {ALGO_COMPARE.map((a) => (
-                  <div key={a.name} className={`bg-white rounded-xl shadow-sm border-2 p-4 ${a.name === 'Leiden' ? 'border-emerald-400' : 'border-slate-200'}`}>
-                    <div className="flex items-baseline justify-between mb-2">
-                      <span className="font-bold text-slate-800 text-base">{a.name}</span>
-                      <span className="text-[10px] text-slate-500">{a.year}</span>
-                    </div>
-                    <div className="text-[11px] space-y-1">
-                      <div><span className="font-bold text-emerald-700">장점:</span> <span className="text-slate-700">{a.pros}</span></div>
-                      <div><span className="font-bold text-rose-700">단점:</span> <span className="text-slate-700">{a.cons}</span></div>
-                      <div className="mt-2 text-[10px] bg-slate-100 rounded px-2 py-1 inline-block">{a.adoption}</div>
-                    </div>
-                  </div>
-                ))}
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-violet-50 border-2 border-violet-300 rounded-xl p-3 text-sm text-violet-900">
+                💡 다음(IV-2-2)에서는 발견된 community를 <strong>실제 Global Query</strong>에 넣어 vanilla RAG와 답변 품질을 비교한다.
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-violet-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-violet-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-violet-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-violet-600 text-white hover:bg-violet-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./IV-1-2.html" className="text-slate-500 hover:text-slate-700">&larr; IV-1-2</a>
+              <a href="./IV-2-2.html" className="text-violet-700 hover:text-violet-900 font-medium">IV-2-2 Global Query 비교 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

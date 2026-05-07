@@ -3,230 +3,822 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GraphRAG 학습 — 엔티티 추출</title>
+  <title>GraphRAG 학습 — IV-1-1. 엔티티 추출</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    IV-1-1. 엔티티 추출 (NER + LLM)
-    학습 목표: 텍스트에서 인물/장소/사건을 자동 추출한다.
-    핵심 비유: "텍스트에 빨간 펜으로 인물/장소 동그라미"
-    구조: 4단계 (원본 / 전통 NER / LLM 함수 호출 / 온톨로지 조합)
+    IV-1-1. 엔티티 추출 (LLM/NER로 텍스트에서 노드 추출)
+    학습 목표: 비정형 텍스트에서 GraphRAG의 노드(엔티티)를 자동 추출하고
+              정규화 + 품질 평가까지 한 사이클로 구축한다.
+    핵심 비유: 글에 빨간 펜으로 인물/회사/도시 동그라미 → 같은 의미끼리 묶기 → 점수
+    패턴: fastapi v1 — 좌(LiveDataPane: 원문 highlight + 엔티티 카드 + F1) / 우(VSCode CodeViewer)
+    색상: graphrag violet
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // 엔티티 라벨 정적 매핑 (Tailwind 정적 클래스로 표현 어려운 hex — style prop 예외 허용)
-    const LABEL_STYLE = {
-      Person:   { bg: '#a78bfa', stroke: '#7c3aed' },
-      Year:     { bg: '#fbbf24', stroke: '#d97706' },
-      Location: { bg: '#60a5fa', stroke: '#2563eb' },
-      Company:  { bg: '#34d399', stroke: '#059669' },
+    // ─────────────────────────────────────────────────────
+    // 원문 토큰 — split() 금지, 명시 배열로 안전 렌더
+    //   text   : 화면에 그릴 글자 조각
+    //   type   : 엔티티 타입 (Person / Company / City) — null이면 일반 텍스트
+    //   group  : 정규화 그룹 키 (Acme/Acme Corp/ACME → 'Acme')
+    // ─────────────────────────────────────────────────────
+    const TOKENS = [
+      { text: 'Alice',     type: 'Person',  group: 'alice' },
+      { text: '는 ',       type: null,      group: null },
+      { text: 'Acme',      type: 'Company', group: 'acme' },
+      { text: '에서 일한다. ', type: null,  group: null },
+      { text: 'Acme Corp', type: 'Company', group: 'acme' },
+      { text: '는 ',       type: null,      group: null },
+      { text: '서울',      type: 'City',    group: 'seoul' },
+      { text: '에 있다. ', type: null,      group: null },
+      { text: 'ACME',      type: 'Company', group: 'acme' },
+      { text: '의 본사도 ', type: null,     group: null },
+      { text: '서울',      type: 'City',    group: 'seoul' },
+      { text: '이다.',     type: null,      group: null },
+    ];
+
+    // 엔티티 타입별 정적 색상 (Tailwind purge 안전 hex)
+    const TYPE_STYLE = {
+      Person:  { bg: '#c4b5fd', stroke: '#7c3aed', text: '#5b21b6', emoji: '👤' },
+      Company: { bg: '#a5f3fc', stroke: '#0891b2', text: '#155e75', emoji: '🏢' },
+      City:    { bg: '#fde68a', stroke: '#d97706', text: '#92400e', emoji: '🏙️' },
     };
 
-    // 토큰 명시 배열 — split() 금지
-    const TOKENS = [
-      { text: '스티브 잡스',   type: 'Person' },
-      { text: '는 ',           type: null },
-      { text: '1976년',        type: 'Year' },
-      { text: ' ',             type: null },
-      { text: '캘리포니아',    type: 'Location' },
-      { text: ' ',             type: null },
-      { text: '쿠퍼티노',      type: 'Location' },
-      { text: '에서 ',         type: null },
-      { text: '스티브 워즈니악', type: 'Person' },
-      { text: '과 함께 ',      type: null },
-      { text: '애플',          type: 'Company' },
-      { text: '을 공동 창업했다.', type: null },
-    ];
+    // 전통 NER (spaCy)이 잘 잡는 라벨 — Step 2에서 사용
+    const NER_LABELS = new Set(['Person', 'Company', 'City']);
 
-    // 전통 NER이 잘 잡는 라벨 (PERSON/LOC/ORG)만
-    const NER_LABELS = new Set(['Person', 'Location', 'Company']);
-    // LLM/온톨로지 단계는 모든 라벨 (Year 포함 + 도메인 자유)
-
-    // LLM 함수 호출 결과 (JSON Schema 강제) — 객체로 보관 후 JSON.stringify로 안전 직렬화
-    const LLM_RESULT = [
-      { entity: '스티브 잡스',     label: 'Person',   properties: { role: 'CEO', born: 1955 } },
-      { entity: '스티브 워즈니악', label: 'Person',   properties: { role: 'Engineer' } },
-      { entity: '애플',            label: 'Company',  properties: { founded: 1976, hq: 'Cupertino' } },
-      { entity: '캘리포니아',      label: 'Location', properties: { type: 'State', country: 'USA' } },
-      { entity: '쿠퍼티노',        label: 'Location', properties: { type: 'City' } },
-      { entity: '1976년',          label: 'Year',     properties: { value: 1976 } },
-    ];
-
-    const LLM_RESULT_JSON = JSON.stringify(LLM_RESULT, null, 2);
-
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — 좌측 LiveDataPane이 dataState를 읽어 그림
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. 원본 텍스트 — 평범한 한 문장',
-        desc: '"스티브 잡스는 1976년 캘리포니아 쿠퍼티노에서 스티브 워즈니악과 함께 애플을 공동 창업했다." 인물 2명, 장소 2개, 회사 1개, 연도 1개가 섞여 있다. 사람은 바로 보이지만, 컴퓨터에게는 단순 글자 나열일 뿐.',
-        focus: 'raw',
+        title: 'Step 1. 원문 텍스트 — "글자만 있고 구조는 없다"',
+        desc: '"Alice는 Acme에서 일한다. Acme Corp는 서울에 있다. ACME의 본사도 서울이다." 사람은 Alice가 인물이고 Acme/Acme Corp/ACME가 같은 회사임을 안다. 컴퓨터에게는 단순 글자 나열일 뿐 — 구조화 시작점.',
+        dataState: {
+          mode: 'raw',                  // 하이라이트 모드
+          highlightTokens: false,       // 원문에 색칠 안 함
+          extracted: [],                // 우측 카드 비어 있음
+          showJson: false,
+          showNormalize: false,
+          showF1: false,
+          f1: null,
+        },
+        code: {
+          lang: 'plaintext',
+          filename: 'text.txt',
+          lines: [
+            '# 비정형 입력 — 평범한 한국어 문장 3개',
+            '',
+            'Alice는 Acme에서 일한다.',
+            'Acme Corp는 서울에 있다.',
+            'ACME의 본사도 서울이다.',
+            '',
+            '# 사람이 보면 보이는 것',
+            '#   - Alice          → 인물 (Person)',
+            '#   - Acme/Acme Corp/ACME → 같은 회사 (Company)',
+            '#   - 서울            → 도시 (City, 중복 등장)',
+            '',
+            '# 컴퓨터가 보는 것',
+            '#   "Alice는 Acme에서 일한다..." (단순 char 배열)',
+            '#   → 노드/엣지로 만들려면 추출이 먼저 필요하다.',
+            '',
+            '# GraphRAG 인덱싱의 첫 단계 = 엔티티 추출',
+            '#   1) NER (전통 — 빠르지만 라벨 한정)',
+            '#   2) LLM (자유롭지만 비싸고 흔들림)',
+            '#   3) 정규화 (같은 의미끼리 묶기)',
+            '#   4) 평가 (Precision/Recall/F1)',
+          ],
+          highlight: [3, 4, 5],
+        },
       },
       {
-        title: 'Step 2. 전통 NER — spaCy / HuggingFace',
-        desc: 'NER(Named Entity Recognition) 모델은 토큰을 PERSON / LOC / ORG 같은 표준 라벨로 분류한다. 정확하지만 사전에 학습된 라벨만 잡는다 — "1976년" 같은 시간이나 도메인 특화 라벨(:Drug, :Symptom)은 약함.',
-        focus: 'ner',
+        title: 'Step 2. NER (spaCy) — "사전 학습된 빠른 추출"',
+        desc: 'spaCy같은 전통 NER 모델은 토큰을 PERSON/ORG/GPE 표준 라벨로 분류한다. 빠르고 무료지만 사전 학습된 라벨에 한정 — 도메인 특화 라벨(:Drug, :Symptom)이나 표기 변형(Acme/ACME)을 묶지 못한다.',
+        dataState: {
+          mode: 'ner',
+          highlightTokens: true,        // 원문에 색칠
+          extracted: [
+            { id: 'p1',  text: 'Alice',     type: 'Person',  group: 'alice' },
+            { id: 'c1',  text: 'Acme',      type: 'Company', group: 'acme' },
+            { id: 'c2',  text: 'Acme Corp', type: 'Company', group: 'acme' },
+            { id: 'ci1', text: '서울',      type: 'City',    group: 'seoul' },
+            { id: 'c3',  text: 'ACME',      type: 'Company', group: 'acme' },
+            { id: 'ci2', text: '서울',      type: 'City',    group: 'seoul' },
+          ],
+          showJson: false,
+          showNormalize: false,
+          showF1: false,
+          f1: null,
+        },
+        code: {
+          lang: 'python',
+          filename: 'spacy-ner.py',
+          lines: [
+            '"""spaCy 기반 전통 NER — 토큰을 PERSON/ORG/GPE로 분류."""',
+            'import spacy',
+            '',
+            'nlp = spacy.load("ko_core_news_lg")  # 한국어 모델',
+            '',
+            'TEXT = (',
+            '    "Alice는 Acme에서 일한다. "',
+            '    "Acme Corp는 서울에 있다. "',
+            '    "ACME의 본사도 서울이다."',
+            ')',
+            '',
+            'doc = nlp(TEXT)',
+            '',
+            'for ent in doc.ents:',
+            '    print(f"{ent.text:10s} :{ent.label_}")',
+            '',
+            '# 출력 (spaCy 표준 라벨)',
+            '#   Alice      :PERSON',
+            '#   Acme       :ORG',
+            '#   Acme Corp  :ORG',
+            '#   서울        :GPE',
+            '#   ACME       :ORG',
+            '#   서울        :GPE',
+            '',
+            '# 한계',
+            '#   - 라벨이 학습 데이터에 종속 (도메인 특화 X)',
+            '#   - 표기 변형 (Acme/ACME) 별개로 추출 → 중복',
+            '#   - 속성(직급, 본사 위치 등) 못 뽑음',
+          ],
+          highlight: [12, 14, 15, 25, 26, 27],
+        },
       },
       {
-        title: 'Step 3. LLM 함수 호출 — 자유로운 라벨 + 속성',
-        desc: 'LLM에 JSON Schema를 함수로 던지면 그 형식대로 추출한다. 라벨도 도메인에 맞춰 자유롭게 정의 가능하고, 속성까지 한 번에 뽑는다. 예시 몇 개만 주면 학습됨 — few-shot 강력.',
-        focus: 'llm',
+        title: 'Step 3. LLM Prompt 추출 (GPT-4) — "JSON Schema로 자유롭게"',
+        desc: 'LLM에 JSON Schema를 함수로 던지면 그 형식대로 추출한다. 도메인에 맞춘 라벨 자유 정의, 속성까지 한 번에 뽑힌다. 단점은 비용/속도/때때로 같은 의미를 다른 라벨로 뽑는 흔들림 — 다음 단계(정규화)가 필요한 이유.',
+        dataState: {
+          mode: 'llm',
+          highlightTokens: true,
+          extracted: [
+            { id: 'p1',  text: 'Alice',     type: 'Person',  group: 'alice', props: { role: 'Employee' } },
+            { id: 'c1',  text: 'Acme',      type: 'Company', group: 'acme',  props: { hq: '서울' } },
+            { id: 'c2',  text: 'Acme Corp', type: 'Company', group: 'acme',  props: { hq: '서울' } },
+            { id: 'ci1', text: '서울',      type: 'City',    group: 'seoul', props: { country: 'KR' } },
+            { id: 'c3',  text: 'ACME',      type: 'Company', group: 'acme',  props: { hq: '서울' } },
+            { id: 'ci2', text: '서울',      type: 'City',    group: 'seoul', props: { country: 'KR' } },
+          ],
+          showJson: true,
+          showNormalize: false,
+          showF1: false,
+          f1: null,
+        },
+        code: {
+          lang: 'python',
+          filename: 'llm-extract.py',
+          lines: [
+            '"""GPT-4 함수 호출로 엔티티 + 속성을 JSON으로 추출."""',
+            'from openai import OpenAI',
+            'import json',
+            '',
+            'client = OpenAI()',
+            '',
+            'SCHEMA = {',
+            '    "name": "extract_entities",',
+            '    "parameters": {',
+            '        "type": "object",',
+            '        "properties": {',
+            '            "entities": {',
+            '                "type": "array",',
+            '                "items": {',
+            '                    "type": "object",',
+            '                    "properties": {',
+            '                        "text":  {"type": "string"},',
+            '                        "type":  {"enum": ["Person", "Company", "City"]},',
+            '                        "props": {"type": "object"},',
+            '                    },',
+            '                },',
+            '            },',
+            '        },',
+            '    },',
+            '}',
+            '',
+            'PROMPT = """다음 한국어 문장에서 엔티티를 뽑아라.',
+            '허용 라벨: Person / Company / City',
+            '속성도 함께 (예: 회사의 hq, 도시의 country).',
+            '"""',
+            '',
+            'resp = client.chat.completions.create(',
+            '    model="gpt-4",',
+            '    messages=[',
+            '        {"role": "system", "content": PROMPT},',
+            '        {"role": "user",   "content": TEXT},',
+            '    ],',
+            '    functions=[SCHEMA],',
+            '    function_call={"name": "extract_entities"},',
+            ')',
+            '',
+            'entities = json.loads(',
+            '    resp.choices[0].message.function_call.arguments',
+            ')["entities"]',
+            '',
+            '# 출력 (JSON Schema 강제)',
+            '#   {"text": "Alice",     "type": "Person",  "props": {"role": "Employee"}}',
+            '#   {"text": "Acme",      "type": "Company", "props": {"hq": "서울"}}',
+            '#   {"text": "Acme Corp", "type": "Company", "props": {"hq": "서울"}}',
+            '#   {"text": "ACME",      "type": "Company", "props": {"hq": "서울"}}',
+            '#   ... (Acme/Acme Corp/ACME 여전히 별개)',
+          ],
+          highlight: [7, 8, 18, 33, 39, 40],
+        },
       },
       {
-        title: 'Step 4. 온톨로지 + LLM — 일관된 라벨',
-        desc: 'LLM은 강력하지만 같은 의미를 다른 라벨로 뽑을 위험(II-2-1의 혼란). 프롬프트에 II-2-1 온톨로지를 주입하면 라벨이 표준화된다. GraphRAG 인덱싱 표준 패턴 — 다음(IV-1-2)에서 관계 구축.',
-        focus: 'onto',
+        title: 'Step 4. 엔티티 정규화 — "같은 의미끼리 묶기 (canonicalize)"',
+        desc: '"Acme" / "Acme Corp" / "ACME"는 같은 회사. 표기 정규화 + 임베딩 유사도(cos > 0.9) + 별칭 사전(alias dict)으로 한 노드로 합친다. 그래프 빌드 전 필수 — 안 하면 동일 회사가 노드 3개로 쪼개짐.',
+        dataState: {
+          mode: 'normalize',
+          highlightTokens: true,
+          extracted: [
+            { id: 'p1',  text: 'Alice',                       type: 'Person',  group: 'alice', props: { role: 'Employee' } },
+            { id: 'c-acme', text: 'Acme (Acme · Acme Corp · ACME)', type: 'Company', group: 'acme',  props: { hq: '서울', aliases: 3 }, merged: true },
+            { id: 'ci-seoul', text: '서울 (×2 → 1)',          type: 'City',    group: 'seoul', props: { country: 'KR', mentions: 2 }, merged: true },
+          ],
+          showJson: false,
+          showNormalize: true,
+          showF1: false,
+          f1: null,
+        },
+        code: {
+          lang: 'python',
+          filename: 'normalize.py',
+          lines: [
+            '"""엔티티 정규화 — 표기 변형을 canonical 한 개로 합친다."""',
+            'from sentence_transformers import SentenceTransformer',
+            'from sklearn.metrics.pairwise import cosine_similarity',
+            'import numpy as np',
+            '',
+            'embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")',
+            '',
+            '# 1) 표기 정규화 (lowercase + 공백/특수문자 제거)',
+            'def normalize_surface(s: str) -> str:',
+            '    return s.lower().replace(" ", "").replace(",", "")',
+            '',
+            '# 2) 별칭 사전 (수작업 or 사내 위키)',
+            'ALIASES = {',
+            '    "acme":      "Acme",',
+            '    "acmecorp":  "Acme",',
+            '    "acmecorp.": "Acme",',
+            '}',
+            '',
+            '# 3) 임베딩 유사도 — 사전에 없는 표기도 0.9 이상이면 같은 그룹',
+            'def canonicalize(entities, threshold=0.9):',
+            '    canonical = {}             # canonical_id → entity',
+            '    embeddings = embedder.encode([e["text"] for e in entities])',
+            '',
+            '    for i, ent in enumerate(entities):',
+            '        key = normalize_surface(ent["text"])',
+            '        if key in ALIASES:',
+            '            cid = ALIASES[key]      # 별칭 사전 hit',
+            '        else:',
+            '            cid = None',
+            '            for cid_existing, e_existing in canonical.items():',
+            '                idx = entities.index(e_existing)',
+            '                sim = cosine_similarity(',
+            '                    [embeddings[i]], [embeddings[idx]],',
+            '                )[0][0]',
+            '                if sim > threshold and ent["type"] == e_existing["type"]:',
+            '                    cid = cid_existing',
+            '                    break',
+            '            cid = cid or ent["text"]',
+            '',
+            '        if cid not in canonical:',
+            '            canonical[cid] = {**ent, "aliases": [ent["text"]]}',
+            '        else:',
+            '            canonical[cid]["aliases"].append(ent["text"])',
+            '    return list(canonical.values())',
+            '',
+            '# 결과: 6개 → 3개 (Acme 3 → 1, 서울 2 → 1)',
+          ],
+          highlight: [9, 10, 13, 14, 15, 16, 20, 35, 36, 46],
+        },
+      },
+      {
+        title: 'Step 5. 추출 품질 측정 — "Precision / Recall / F1"',
+        desc: '정답(gold) 셋과 비교: Precision = 뽑은 것 중 맞은 비율, Recall = 진짜 중 잡은 비율, F1 = 둘의 조화평균. 이 텍스트의 gold = {Alice, Acme, 서울} 3개. 추출 후 정규화한 3개 모두 일치 → P=1.0, R=1.0, F1=1.0. 운영에서는 도메인 별 0.85+를 목표.',
+        dataState: {
+          mode: 'eval',
+          highlightTokens: true,
+          extracted: [
+            { id: 'p1',  text: 'Alice',                       type: 'Person',  group: 'alice', props: { role: 'Employee' }, ok: true },
+            { id: 'c-acme', text: 'Acme (Acme · Acme Corp · ACME)', type: 'Company', group: 'acme',  props: { hq: '서울', aliases: 3 }, merged: true, ok: true },
+            { id: 'ci-seoul', text: '서울 (×2 → 1)',          type: 'City',    group: 'seoul', props: { country: 'KR', mentions: 2 }, merged: true, ok: true },
+          ],
+          showJson: false,
+          showNormalize: false,
+          showF1: true,
+          f1: { precision: 1.0, recall: 1.0, f1: 1.0, tp: 3, fp: 0, fn: 0 },
+        },
+        code: {
+          lang: 'python',
+          filename: 'eval.py',
+          lines: [
+            '"""추출 품질 평가 — gold set 대비 P/R/F1."""',
+            '',
+            '# 정답 (사람이 라벨링한 gold)',
+            'GOLD = {',
+            '    ("Alice",  "Person"),',
+            '    ("Acme",   "Company"),',
+            '    ("서울",   "City"),',
+            '}',
+            '',
+            '# 정규화 결과 (canonical)',
+            'PRED = {',
+            '    ("Alice",  "Person"),',
+            '    ("Acme",   "Company"),',
+            '    ("서울",   "City"),',
+            '}',
+            '',
+            'def prf1(gold, pred):',
+            '    tp = len(gold & pred)            # 둘 다 있음',
+            '    fp = len(pred - gold)            # 헛 추출',
+            '    fn = len(gold - pred)            # 누락',
+            '    precision = tp / (tp + fp) if (tp + fp) else 0',
+            '    recall    = tp / (tp + fn) if (tp + fn) else 0',
+            '    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0',
+            '    return precision, recall, f1, tp, fp, fn',
+            '',
+            'p, r, f, tp, fp, fn = prf1(GOLD, PRED)',
+            'print(f"Precision: {p:.2f}")',
+            'print(f"Recall:    {r:.2f}")',
+            'print(f"F1:        {f:.2f}")',
+            'print(f"TP={tp}  FP={fp}  FN={fn}")',
+            '',
+            '# 출력',
+            '#   Precision: 1.00',
+            '#   Recall:    1.00',
+            '#   F1:        1.00',
+            '#   TP=3  FP=0  FN=0',
+            '',
+            '# 운영 목표',
+            '#   - 도메인 일반: F1 ≥ 0.85',
+            '#   - 의료/법률 :  F1 ≥ 0.92 (오추출 비용 큼)',
+            '#   - F1 낮으면 → 프롬프트 개선 / 별칭 사전 보강 / few-shot 추가',
+          ],
+          highlight: [4, 11, 18, 19, 20, 33, 34, 35],
+        },
       },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 원문 토큰 렌더 — 모드에 따라 색칠 / 그룹 강조
+    // ─────────────────────────────────────────────────────
+    function SourceText({ mode, highlightTokens }) {
+      // 정규화/평가 모드는 같은 group끼리 묶음 표시 (배경 진하게)
+      const groupBoost = mode === 'normalize' || mode === 'eval';
+
+      return (
+        <p className="text-base leading-loose">
+          {TOKENS.map((t, i) => {
+            if (!t.type) {
+              return <span key={i} className="text-slate-700">{t.text}</span>;
+            }
+            const style = TYPE_STYLE[t.type];
+            const lit = highlightTokens;
+            return (
+              <span
+                key={i}
+                className="inline-block px-1.5 py-0.5 mx-0.5 rounded font-bold transition-all duration-500"
+                style={{
+                  background: lit ? style.bg : 'transparent',
+                  color: lit ? style.text : '#334155',
+                  outline: lit ? `2px solid ${style.stroke}` : 'none',
+                  boxShadow: lit && groupBoost ? `0 0 0 3px ${style.stroke}33` : 'none',
+                }}
+              >
+                {t.text}
+                {lit && (
+                  <span className="text-[8px] ml-1 opacity-80">:{t.type}</span>
+                )}
+              </span>
+            );
+          })}
+        </p>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 엔티티 카드 한 개 — 우측 리스트
+    // ─────────────────────────────────────────────────────
+    function EntityCard({ ent, mode }) {
+      const style = TYPE_STYLE[ent.type];
+      const merged = ent.merged;
+
+      return (
+        <div
+          className={`rounded-lg border-2 p-2.5 transition-all duration-500 ${merged ? 'animate-pulse' : ''}`}
+          style={{
+            background: `${style.bg}33`,
+            borderColor: style.stroke,
+          }}
+        >
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span aria-hidden="true">{style.emoji}</span>
+              <span
+                className="text-xs font-bold truncate"
+                style={{ color: style.text }}
+              >
+                {ent.text}
+              </span>
+            </div>
+            <span
+              className="text-[9px] font-bold px-1.5 py-0.5 rounded"
+              style={{ background: style.stroke, color: 'white' }}
+            >
+              :{ent.type}
+            </span>
+          </div>
+          {ent.props && (mode === 'llm' || mode === 'normalize' || mode === 'eval') && (
+            <div className="text-[10px] text-slate-600 font-mono mt-1 space-y-0.5">
+              {Object.entries(ent.props).map(([k, v]) => (
+                <div key={k}>
+                  <span className="text-slate-400">{k}:</span>{' '}
+                  <span style={{ color: style.text }}>{String(v)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {merged && (
+            <div className="text-[9px] text-slate-500 mt-1 italic">
+              ✓ merged · canonical
+            </div>
+          )}
+          {ent.ok && mode === 'eval' && (
+            <div className="text-[9px] text-emerald-700 font-bold mt-1">
+              ✓ matched gold
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 원문 + 우측 추출 카드 + F1
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ dataState, stepIdx }) {
+      const { mode, highlightTokens, extracted, showJson, showNormalize, showF1, f1 } = dataState;
+
+      // JSON 미리보기 (Step 3)
+      const llmJson = JSON.stringify(
+        extracted.map((e) => ({ text: e.text, type: e.type, ...(e.props ? { props: e.props } : {}) })),
+        null, 2,
+      );
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📝 텍스트 → 엔티티 추출</h2>
+            <span className="text-[10px] text-slate-400 font-mono">step {stepIdx + 1}</span>
+          </div>
+
+          {/* 좌(원문) / 우(엔티티) 분할 */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {/* 원문 텍스트 패널 */}
+            <div className="rounded-lg bg-violet-50 border border-violet-200 p-3 min-h-[180px]">
+              <div className="text-[10px] font-bold text-violet-700 uppercase mb-2">📄 원문 (text.txt)</div>
+              <SourceText mode={mode} highlightTokens={highlightTokens} />
+              {mode === 'ner' && (
+                <div className="text-[10px] text-amber-700 mt-3 leading-snug">
+                  ⚠ Acme/Acme Corp/ACME가 별개로 추출. 표기 변형은 NER이 못 묶음.
+                </div>
+              )}
+              {mode === 'normalize' && (
+                <div className="text-[10px] text-violet-700 mt-3 leading-snug">
+                  ✓ 같은 group끼리 box-shadow로 묶음 표시
+                </div>
+              )}
+            </div>
+
+            {/* 엔티티 카드 리스트 */}
+            <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 min-h-[180px]">
+              <div className="text-[10px] font-bold text-slate-700 uppercase mb-2 flex items-center justify-between">
+                <span>🎯 추출된 엔티티</span>
+                <span className="font-mono text-slate-500">{extracted.length}</span>
+              </div>
+              {extracted.length === 0 ? (
+                <div className="text-xs text-slate-400 italic flex items-center justify-center h-32">
+                  (아직 추출 전)
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {extracted.map((ent) => (
+                    <EntityCard key={ent.id} ent={ent} mode={mode} />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* JSON 미리보기 (Step 3) */}
+          {showJson && (
+            <div className="mt-3 rounded-lg bg-slate-900 p-3 overflow-hidden">
+              <div className="text-[10px] text-slate-400 font-mono mb-1.5">
+                LLM 함수 호출 결과 (JSON Schema 강제)
+              </div>
+              <pre className="text-[11px] text-emerald-300 font-mono overflow-x-auto whitespace-pre max-h-40 leading-tight">
+                {llmJson}
+              </pre>
+            </div>
+          )}
+
+          {/* 정규화 박스 (Step 4) */}
+          {showNormalize && (
+            <div className="mt-3 rounded-lg bg-violet-100 border-2 border-violet-300 p-3">
+              <div className="text-[10px] font-bold text-violet-800 uppercase mb-1.5">
+                🔗 canonicalization
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-[11px]">
+                <div className="rounded bg-white border border-violet-200 p-2 text-center">
+                  <div className="text-[9px] text-slate-500">표기 변형 → canonical</div>
+                  <div className="font-mono text-violet-800 font-bold mt-0.5">
+                    Acme · Acme Corp · ACME
+                  </div>
+                  <div className="text-[10px] text-violet-600 mt-0.5">→ "Acme"</div>
+                </div>
+                <div className="rounded bg-white border border-violet-200 p-2 text-center">
+                  <div className="text-[9px] text-slate-500">중복 mention 통합</div>
+                  <div className="font-mono text-violet-800 font-bold mt-0.5">서울 ×2</div>
+                  <div className="text-[10px] text-violet-600 mt-0.5">→ "서울" ×1</div>
+                </div>
+                <div className="rounded bg-white border border-violet-200 p-2 text-center">
+                  <div className="text-[9px] text-slate-500">노드 수</div>
+                  <div className="font-mono text-violet-800 font-bold mt-0.5">6 → 3</div>
+                  <div className="text-[10px] text-violet-600 mt-0.5">−50%</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* F1 점수 (Step 5) */}
+          {showF1 && f1 && (
+            <div className="mt-3 rounded-lg bg-emerald-50 border-2 border-emerald-400 p-3">
+              <div className="text-[10px] font-bold text-emerald-800 uppercase mb-2">
+                📊 추출 품질 (vs gold set)
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div className="rounded bg-white border border-emerald-200 p-2 text-center">
+                  <div className="text-[9px] text-slate-500 uppercase">Precision</div>
+                  <div className="text-2xl font-extrabold text-emerald-700 tabular-nums">
+                    {f1.precision.toFixed(2)}
+                  </div>
+                  <div className="text-[9px] text-slate-500">TP / (TP+FP)</div>
+                </div>
+                <div className="rounded bg-white border border-emerald-200 p-2 text-center">
+                  <div className="text-[9px] text-slate-500 uppercase">Recall</div>
+                  <div className="text-2xl font-extrabold text-emerald-700 tabular-nums">
+                    {f1.recall.toFixed(2)}
+                  </div>
+                  <div className="text-[9px] text-slate-500">TP / (TP+FN)</div>
+                </div>
+                <div className="rounded bg-white border-2 border-emerald-500 p-2 text-center">
+                  <div className="text-[9px] text-emerald-700 uppercase font-bold">F1 Score</div>
+                  <div className="text-2xl font-extrabold text-emerald-700 tabular-nums">
+                    {f1.f1.toFixed(2)}
+                  </div>
+                  <div className="text-[9px] text-slate-500">harmonic mean</div>
+                </div>
+              </div>
+              <div className="text-[10px] text-emerald-800 font-mono mt-2 text-center">
+                TP={f1.tp} · FP={f1.fp} · FN={f1.fn} · 운영 목표 F1 ≥ 0.85
+              </div>
+            </div>
+          )}
+
+          {/* 라벨 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-4 pt-3 border-t border-slate-100 text-slate-500">
+            {Object.entries(TYPE_STYLE).map(([label, s]) => (
+              <span key={label} className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded" style={{ background: s.bg, outline: `1.5px solid ${s.stroke}` }}></span>
+                <span className="font-mono">:{label}</span>
+              </span>
+            ))}
+            <span className="ml-auto font-mono text-slate-400">violet · graphrag</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js + 라인 번호
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-violet-500/15 border-l-2 border-violet-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4000);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const focus = step.focus;
-      const showLLM = focus === 'llm' || focus === 'onto';
-
-      // 토큰 하이라이트 결정
-      const isTokenHighlighted = (type) => {
-        if (!type) return false;
-        if (focus === 'raw') return false;
-        if (focus === 'ner') return NER_LABELS.has(type); // Year 제외
-        return true; // llm/onto: 모두
-      };
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">엔티티 추출 (NER + LLM)</h1>
-                <p className="text-sm text-slate-500 mt-1">텍스트에 빨간 펜으로 인물/장소 동그라미 — 그래프 인덱싱의 첫 단계</p>
-              </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
-            </div>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-violet-700 hover:text-violet-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-1</span>
+            </nav>
 
-            {/* 원본 텍스트 + 토큰 하이라이트 */}
-            <div className="bg-white rounded-xl shadow-sm border-2 border-emerald-200 p-5 mb-4">
-              <div className="text-[11px] font-bold text-slate-500 mb-2">원본 텍스트</div>
-              <p className="text-base leading-loose">
-                {TOKENS.map((t, i) => {
-                  if (!t.type) return <span key={i} className="text-slate-700">{t.text}</span>;
-                  const highlight = isTokenHighlighted(t.type);
-                  const style = LABEL_STYLE[t.type];
-                  return (
-                    <span
-                      key={i}
-                      className="inline-block px-1.5 py-0.5 mx-0.5 rounded font-bold transition-all"
-                      style={{
-                        background: highlight ? style.bg : 'transparent',
-                        color: highlight ? '#fff' : '#334155',
-                        outline: highlight ? `2px solid ${style.stroke}` : 'none',
-                      }}
-                    >
-                      {t.text}
-                      {highlight && (
-                        <span className="text-[8px] ml-1 opacity-90">:{t.type}</span>
-                      )}
-                    </span>
-                  );
-                })}
-              </p>
-              {focus === 'ner' && (
-                <div className="text-[11px] text-rose-700 mt-3">⚠ 전통 NER은 PERSON/LOC/ORG 같은 표준 라벨만 — "1976년" 누락</div>
-              )}
-            </div>
-
-            {/* Step 3, 4: LLM JSON 결과 */}
-            {showLLM && (
-              <div className="bg-slate-900 rounded-xl p-4 mb-4">
-                <div className="text-[10px] text-slate-400 mb-2">{focus === 'onto' ? 'LLM 함수 호출 + 온톨로지 주입 결과' : 'LLM 함수 호출 결과 (JSON Schema 강제)'}</div>
-                <pre className="text-emerald-300 font-mono text-xs overflow-x-auto whitespace-pre">{LLM_RESULT_JSON}</pre>
-              </div>
-            )}
-
-            {/* Step 4: 온톨로지 강조 */}
-            {focus === 'onto' && (
-              <div className="bg-white rounded-xl shadow-sm border-2 border-violet-300 p-4 mb-6">
-                <div className="text-xs font-bold text-violet-700 mb-2">📜 LLM 프롬프트 — 온톨로지 주입</div>
-                <div className="bg-slate-100 rounded p-3 text-xs font-mono text-slate-700">
-                  허용 라벨: {Object.keys(LABEL_STYLE).join(', ')}<br/>
-                  → LLM은 이 라벨 안에서만 추출 → 일관성 보장
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-violet-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. GraphRAG 인덱싱 &gt; Chapter 1. 엔티티 추출</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">엔티티 추출 (LLM/NER로 노드 만들기)</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">텍스트에 빨간 펜 — NER → LLM → 정규화 → F1 평가까지 한 사이클</p>
                 </div>
-                <div className="text-[10px] text-slate-500 mt-3">→ 다음(IV-1-2)에서 추출된 엔티티 사이의 관계를 LLM이 추론</div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane dataState={step.dataState} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-violet-50 border-2 border-violet-300 rounded-xl p-3 text-sm text-violet-900">
+                💡 다음(IV-1-2)에서는 추출된 엔티티 사이의 <strong>관계(엣지)</strong>를 LLM으로 추론해 그래프를 완성한다.
               </div>
             )}
 
-            {/* 라벨 범례 */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-3 mb-6">
-              <div className="text-[10px] font-bold text-slate-500 mb-2">라벨 색상</div>
-              <div className="flex flex-wrap gap-3 text-[10px]">
-                {Object.entries(LABEL_STYLE).map(([label, s]) => (
-                  <div key={label} className="flex items-center gap-1.5">
-                    <span className="w-3 h-3 rounded" style={{ background: s.bg }} />
-                    <span className="text-slate-600 font-mono">:{label}</span>
-                  </div>
-                ))}
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-violet-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-violet-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-violet-200">키보드 &larr;/&rarr;</span>
               </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
               </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-violet-600 text-white hover:bg-violet-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./IV-1-2.html" className="text-violet-700 hover:text-violet-900 font-medium">IV-1-2 관계 추출 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

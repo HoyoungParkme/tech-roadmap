@@ -3,218 +3,694 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GraphRAG 학습 — 인덱스와 성능</title>
+  <title>GraphRAG 학습 — III-2-2. 인덱스와 성능</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     III-2-2. 인덱스와 성능
-    학습 목표: Neo4j 인덱스 종류와 성능 최적화를 안다.
-    핵심 비유: "전화번호부의 ㄱㄴㄷ 색인" — 인덱스 없으면 처음부터 훑기
-    구조: 4단계 (풀스캔 / 단일 인덱스 / 유니크 제약 / EXPLAIN/PROFILE)
+    학습 목표: Neo4j 인덱스 전략과 EXPLAIN/PROFILE로 쿼리를 진단/튜닝한다.
+    핵심 비유: 전화번호부 ㄱㄴㄷ 색인 — 인덱스 없으면 처음부터 한 장씩 훑기
+    패턴: fastapi v1 — 좌(LiveDataPane: 쿼리시간 막대 + 쿼리플랜 트리) / 우(VSCode CodeViewer)
+    색상: graphrag violet
+    5 단계: 1) 인덱스 없는 풀스캔 2) EXPLAIN 플랜 확인 3) 인덱스 생성 4) PROFILE 비교 5) 인덱스 종류
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // 데이터 규모별 응답 시간
-    const PERFORMANCE = [
-      { rows: '1만',    scan: '0.05s',  index: '0.001s', scanWidth: 5,  indexWidth: 1 },
-      { rows: '10만',   scan: '0.5s',   index: '0.001s', scanWidth: 25, indexWidth: 1 },
-      { rows: '100만',  scan: '5s',     index: '0.002s', scanWidth: 80, indexWidth: 1 },
-    ];
-
-    // 쿼리 플랜 비교
-    const PLANS = {
-      noIndex: [
-        { op: 'NodeByLabelScan', cost: '높음 (모든 :Person 노드 스캔)', tone: 'red' },
-        { op: 'Filter',           cost: '중간 (email 속성 비교)',       tone: 'amber' },
-      ],
-      withIndex: [
-        { op: 'NodeIndexSeek',    cost: '낮음 (B-Tree 인덱스 직접 조회)', tone: 'emerald' },
-      ],
-    };
-
-    const TONE_BG = {
-      red:     'bg-rose-50 border-rose-200 text-rose-800',
-      amber:   'bg-amber-50 border-amber-200 text-amber-800',
-      emerald: 'bg-emerald-50 border-emerald-200 text-emerald-800',
-    };
-
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의 — 좌측 LiveDataPane이 읽음
+    //   queryTime: 쿼리 실행 시간 (ms)
+    //   queryHits: DB hit 수 (PROFILE에서 보이는 값)
+    //   plan:      쿼리 플랜 트리 (operator 배열, 하위 → 상위)
+    //   indexKinds: 인덱스 종류 카드 표시 여부 (Step 5)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. 풀스캔 — 인덱스 없으면',
-        desc: 'Cypher 쿼리는 항상 "시작 노드"를 찾는 데서 출발한다. 인덱스가 없으면 :Person 라벨 모든 노드를 훑어 email 속성이 일치하는 것을 찾는다 (NodeByLabelScan + Filter). 100만 노드라면 5초+.',
-        code: 'MATCH (p:Person {email: "alice@x.com"})\nRETURN p',
-        focus: 'noIndex',
+        title: 'Step 1. 인덱스 없음 — 모든 :Person 노드를 훑는다',
+        desc: 'Cypher는 "시작 노드"부터 찾는다. 인덱스가 없으면 :Person 라벨 전체를 NodeByLabelScan으로 스캔하고 Filter에서 name 속성 비교. 100만 노드라면 1000ms+ — 사용자 한 명 검색에 너무 느리다.',
+        queryTime: 1000,
+        queryTimeBefore: null,
+        queryHits: 1000000,
+        plan: [
+          { op: 'NodeByLabelScan', detail: ':Person 전체 1,000,000 노드', tone: 'red' },
+          { op: 'Filter',          detail: 'p.name = "Alice"',            tone: 'amber' },
+          { op: 'ProduceResults',  detail: 'p',                            tone: 'slate' },
+        ],
+        showCompare: false,
+        indexKinds: null,
+        code: {
+          lang: 'cypher',
+          filename: 'slow-query.cypher',
+          lines: [
+            '// ❌ 인덱스 없는 상태 — 100만 :Person 중 한 명 찾기',
+            '//   "전화번호부 처음부터 한 장씩 넘겨 Alice 찾기"',
+            '',
+            'MATCH (p:Person {name: "Alice"})',
+            'RETURN p;',
+            '',
+            '// 실행 결과',
+            '// ─────────────────────────────────────────',
+            '// 1 row · 1,001 ms',
+            '//   ⚠ 1초 — 사용자 단건 조회로는 사용 불가',
+            '//',
+            '// 무엇이 느리게 만드나?',
+            '//   1) :Person 라벨이 있는 모든 노드를 읽는다',
+            '//   2) 각 노드의 name 속성을 비교한다',
+            '//   3) "Alice"가 일치하는 1개를 골라낸다',
+            '//',
+            '// 100만 → 1000만이 되면 10초로 비례 증가',
+            '// → 색인 (인덱스)이 필요하다',
+            '',
+            '// 비교: 전화번호부 비유',
+            '//   인덱스 X: 첫 페이지부터 한 장씩 넘기며 "Alice"',
+            '//   인덱스 O: ㅇ 페이지로 바로 점프 → 한 줄에 발견',
+            '',
+            '// 다음 단계: 먼저 EXPLAIN으로 플랜을 본다 (실행 X)',
+          ],
+          highlight: [4, 9, 10],
+        },
       },
       {
-        title: 'Step 2. 단일 속성 인덱스',
-        desc: '`CREATE INDEX`로 email 속성에 인덱스를 만들면 NodeIndexSeek로 즉시 찾는다. B-Tree 기반이라 O(log n). 100만 노드도 0.002초.',
-        code: 'CREATE INDEX person_email_idx\nFOR (p:Person) ON (p.email)',
-        focus: 'singleIndex',
+        title: 'Step 2. EXPLAIN — 쿼리 플랜 먼저 본다',
+        desc: 'EXPLAIN은 쿼리를 실행하지 않고 플랜만 보여준다. NodeByLabelScan이 보이면 "인덱스 미사용 신호". DB를 건드리지 않으니 production 환경에서도 안전하게 진단 가능. PROFILE은 실제 실행이라 비용 발생.',
+        queryTime: null,
+        queryTimeBefore: 1000,
+        queryHits: null,
+        plan: [
+          { op: 'NodeByLabelScan', detail: ':Person 전체 — index 미사용 ⚠', tone: 'red' },
+          { op: 'Filter',          detail: 'p.name = "Alice"',                tone: 'amber' },
+          { op: 'ProduceResults',  detail: 'p',                                tone: 'slate' },
+        ],
+        showCompare: false,
+        indexKinds: null,
+        code: {
+          lang: 'cypher',
+          filename: 'explain.cypher',
+          lines: [
+            '// EXPLAIN — 쿼리 플랜만 본다 (실행 X)',
+            '//   "이 쿼리, 어떻게 풀려고 하는지 미리보기"',
+            '',
+            'EXPLAIN',
+            'MATCH (p:Person {name: "Alice"})',
+            'RETURN p;',
+            '',
+            '// 출력',
+            '// ─────────────────────────────────────────',
+            '// +-----------------------+',
+            '// | Operator              |',
+            '// +-----------------------+',
+            '// | +ProduceResults       |',
+            '// | |                     |',
+            '// | +Filter               |   <- name 비교',
+            '// | |                     |',
+            '// | +NodeByLabelScan      |   <- ⚠ 풀스캔!',
+            '// +-----------------------+',
+            '//',
+            '// 진단:',
+            '//   NodeByLabelScan이 보이면 "인덱스 미사용"',
+            '//   → 인덱스를 만들어야 한다',
+          ],
+          highlight: [4, 5, 17, 22],
+        },
       },
       {
-        title: 'Step 3. 유니크 제약 = 인덱스 + 검증',
-        desc: '`CREATE CONSTRAINT`는 인덱스를 자동 생성하고 중복까지 차단한다. email은 사용자 식별자이므로 유니크 제약이 더 적합. 인덱스 단독 vs 제약 — 제약이 더 강한 보장.',
-        code: 'CREATE CONSTRAINT person_email_unique\nFOR (p:Person)\nREQUIRE p.email IS UNIQUE',
-        focus: 'constraint',
+        title: 'Step 3. 인덱스 생성 — NodeIndexSeek로 변경',
+        desc: 'CREATE INDEX 한 줄로 :Person(name)에 B-Tree 인덱스를 만든다. 동일 쿼리가 이제 NodeIndexSeek로 변환 — 인덱스에서 "Alice"를 직접 찾고 1개 노드만 읽는다. 풀스캔 대비 200배 빠름.',
+        queryTime: 5,
+        queryTimeBefore: 1000,
+        queryHits: 1,
+        plan: [
+          { op: 'NodeIndexSeek',  detail: ':Person(name = "Alice") — index 사용 ✓', tone: 'emerald' },
+          { op: 'ProduceResults', detail: 'p',                                       tone: 'slate' },
+        ],
+        showCompare: false,
+        indexKinds: null,
+        code: {
+          lang: 'cypher',
+          filename: 'create-index.cypher',
+          lines: [
+            '// ✓ Range 인덱스 생성 — :Person(name)',
+            '//   B-Tree 자료구조 → O(log n) 조회',
+            '',
+            'CREATE INDEX person_name_idx',
+            'FOR (p:Person) ON (p.name);',
+            '',
+            '// 백그라운드로 만들어진다 (대용량은 분~시간)',
+            'SHOW INDEXES;',
+            '// +-------------------+----------+-------+',
+            '// | name              | state    | type  |',
+            '// +-------------------+----------+-------+',
+            '// | person_name_idx   | ONLINE   | RANGE |',
+            '// +-------------------+----------+-------+',
+            '',
+            '// 다시 같은 쿼리를 실행하면 플랜이 변한다',
+            'EXPLAIN',
+            'MATCH (p:Person {name: "Alice"})',
+            'RETURN p;',
+            '',
+            '// → NodeIndexSeek :Person(name = "Alice")',
+            '// → ProduceResults',
+            '//   풀스캔/Filter가 사라졌다',
+          ],
+          highlight: [4, 5, 12, 20],
+        },
       },
       {
-        title: 'Step 4. EXPLAIN / PROFILE — 쿼리 플랜 분석',
-        desc: '`EXPLAIN`은 플랜만 보여주고, `PROFILE`은 실제 실행 + 비용까지. NodeByLabelScan이 보이면 인덱스 미사용. NodeIndexSeek가 보이면 정상. 느린 쿼리 진단의 1번 도구.',
-        code: 'PROFILE\nMATCH (p:Person {email: "alice@x.com"})\nRETURN p',
-        focus: 'profile',
+        title: 'Step 4. PROFILE — 실제 비용을 측정한다',
+        desc: 'PROFILE은 쿼리를 실제로 실행하면서 각 operator의 db hits / rows를 보여준다. 인덱스 전 1,000ms / 1,000,000 hits → 후 5ms / 1 hit. 200배 빨라지고 hit는 백만 분의 1. 측정으로 입증되는 효과.',
+        queryTime: 5,
+        queryTimeBefore: 1000,
+        queryHits: 1,
+        plan: [
+          { op: 'NodeIndexSeek',  detail: ':Person(name = "Alice") · 1 hit',  tone: 'emerald' },
+          { op: 'ProduceResults', detail: 'p · 1 row',                          tone: 'slate' },
+        ],
+        showCompare: true,
+        indexKinds: null,
+        code: {
+          lang: 'cypher',
+          filename: 'profile.cypher',
+          lines: [
+            '// PROFILE — 쿼리 플랜 + 실제 비용 측정',
+            '//   "어디서 얼마나 시간이 걸리는지 정확히"',
+            '',
+            'PROFILE',
+            'MATCH (p:Person {name: "Alice"})',
+            'RETURN p;',
+            '',
+            '// 인덱스 전 (Step 1)',
+            '// +-------------------+-----------+-----------+',
+            '// | Operator          | Rows      | DB Hits   |',
+            '// +-------------------+-----------+-----------+',
+            '// | +ProduceResults   |         1 |         0 |',
+            '// | +Filter           |         1 | 1,000,000 |',
+            '// | +NodeByLabelScan  | 1,000,000 | 1,000,000 |',
+            '// +-------------------+-----------+-----------+',
+            '// total: 1,001 ms · 2,000,000 hits',
+            '',
+            '// 인덱스 후 (Step 3)',
+            '// +-------------------+-----------+-----------+',
+            '// | Operator          | Rows      | DB Hits   |',
+            '// +-------------------+-----------+-----------+',
+            '// | +ProduceResults   |         1 |         0 |',
+            '// | +NodeIndexSeek    |         1 |         1 |',
+            '// +-------------------+-----------+-----------+',
+            '// total: 5 ms · 1 hit  ← 200배 빠르다 ✓',
+          ],
+          highlight: [4, 5, 16, 25, 26],
+        },
+      },
+      {
+        title: 'Step 5. 인덱스 종류 — Range / Text / Point / Composite',
+        desc: '쿼리 패턴별로 적합한 인덱스가 다르다. Range: 동등/범위 (가장 흔함). Text: CONTAINS/STARTS WITH 같은 부분일치. Point: 위경도 거리 검색. Composite: 다중 컬럼 (name + age 동시). 잘못 선택하면 인덱스 만들고도 풀스캔.',
+        queryTime: 3,
+        queryTimeBefore: 1000,
+        queryHits: 1,
+        plan: [
+          { op: 'NodeIndexSeek',  detail: ':Person(name, age) composite · 1 hit', tone: 'violet' },
+          { op: 'ProduceResults', detail: 'p · 1 row',                              tone: 'slate' },
+        ],
+        showCompare: false,
+        indexKinds: [
+          { kind: 'RANGE',     use: '동등 · 범위 비교',  example: 'p.age = 30  ·  p.age > 18',     tone: 'emerald' },
+          { kind: 'TEXT',      use: '부분일치',          example: 'CONTAINS · STARTS WITH',         tone: 'sky' },
+          { kind: 'POINT',     use: '공간 거리',          example: 'point.distance(p.loc, :seoul)', tone: 'amber' },
+          { kind: 'COMPOSITE', use: '다중 컬럼',          example: '(name, age) 동시 매치',          tone: 'violet' },
+        ],
+        code: {
+          lang: 'cypher',
+          filename: 'composite-index.cypher',
+          lines: [
+            '// 인덱스 4 종류 — 쿼리 패턴에 맞춰 선택',
+            '',
+            '// 1) RANGE — 동등 + 범위 (default)',
+            'CREATE INDEX FOR (p:Person) ON (p.age);',
+            '//   사용 쿼리: WHERE p.age = 30  /  p.age > 18',
+            '',
+            '// 2) TEXT — 부분일치 (CONTAINS / STARTS WITH)',
+            'CREATE TEXT INDEX FOR (p:Person) ON (p.name);',
+            '//   사용 쿼리: WHERE p.name STARTS WITH "Al"',
+            '//   ⚠ Range 인덱스는 STARTS WITH 부분만 가능',
+            '',
+            '// 3) POINT — 공간 거리 검색',
+            'CREATE POINT INDEX FOR (p:Person) ON (p.location);',
+            '//   사용 쿼리: WHERE point.distance(p.location, $here) < 1000',
+            '',
+            '// 4) COMPOSITE — 다중 컬럼 동시 매치',
+            'CREATE INDEX person_name_age',
+            'FOR (p:Person) ON (p.name, p.age);',
+            '//   사용 쿼리: WHERE p.name = "Alice" AND p.age = 30',
+            '//   ⚠ AND 조합 시에만 효과 — name 단독 매치는 일부만 활용',
+            '',
+            '// 운영 팁',
+            '//   - 모든 속성에 인덱스 X (쓰기 비용 증가)',
+            '//   - PROFILE로 자주 느린 쿼리만 추가',
+            '//   - SHOW INDEXES로 미사용 인덱스 정리',
+          ],
+          highlight: [4, 8, 13, 17, 18],
+        },
       },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // tone → Tailwind 정적 클래스 매핑 (purge 안전)
+    // ─────────────────────────────────────────────────────
+    const TONE_STYLE = {
+      red:     { bg: 'bg-rose-50',    border: 'border-rose-300',    text: 'text-rose-800',    badge: 'bg-rose-100 text-rose-700',    bar: 'bg-rose-500' },
+      amber:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-800',   badge: 'bg-amber-100 text-amber-700',   bar: 'bg-amber-500' },
+      emerald: { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-100 text-emerald-700', bar: 'bg-emerald-500' },
+      sky:     { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-800',     badge: 'bg-sky-100 text-sky-700',         bar: 'bg-sky-500' },
+      violet:  { bg: 'bg-violet-50',  border: 'border-violet-300',  text: 'text-violet-800',  badge: 'bg-violet-100 text-violet-700',  bar: 'bg-violet-500' },
+      slate:   { bg: 'bg-slate-50',   border: 'border-slate-300',   text: 'text-slate-700',   badge: 'bg-slate-100 text-slate-600',     bar: 'bg-slate-400' },
+    };
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 시각화
+    //   상단: 쿼리시간 막대 (인덱스 전 vs 현재)
+    //   하단: 쿼리 플랜 트리 (operator 박스 → 화살표)
+    //   추가: Step 5 인덱스 종류 4 카드
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const maxBar = 1000; // 1000ms 기준 풀폭
+      const beforeWidth = step.queryTimeBefore != null
+        ? Math.min(100, (step.queryTimeBefore / maxBar) * 100)
+        : 0;
+      const afterWidth = step.queryTime != null
+        ? Math.max(1.5, Math.min(100, (step.queryTime / maxBar) * 100))
+        : 0;
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-bold text-slate-700">📊 쿼리 성능 + 플랜 트리</h2>
+            <span className="text-[10px] text-slate-400 font-mono">EXPLAIN / PROFILE</span>
+          </div>
+
+          {/* 좌상단: 쿼리 시간 막대 */}
+          <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 mb-4">
+            <div className="text-[11px] font-bold text-slate-700 mb-2">⏱ 쿼리 실행 시간</div>
+
+            {/* 인덱스 전 막대 (Step 2~5에서 비교용) */}
+            {step.queryTimeBefore != null && (
+              <div className="mb-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-bold text-rose-700 w-20 shrink-0">인덱스 전</span>
+                  <div className="flex-1 h-3 bg-slate-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-rose-500 rounded-full transition-all duration-700"
+                      style={{ width: `${beforeWidth}%` }}
+                    />
+                  </div>
+                  <span className="text-[10px] font-mono font-bold text-rose-700 w-16 text-right">
+                    {step.queryTimeBefore} ms
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* 현재 시간 막대 */}
+            {step.queryTime != null ? (
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className={`text-[10px] font-bold w-20 shrink-0 ${
+                    step.queryTimeBefore != null ? 'text-emerald-700' : 'text-rose-700'
+                  }`}>
+                    {step.queryTimeBefore != null ? '인덱스 후' : '현재'}
+                  </span>
+                  <div className="flex-1 h-3 bg-slate-200 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-700 ${
+                        step.queryTimeBefore != null ? 'bg-emerald-500' : 'bg-rose-500'
+                      }`}
+                      style={{ width: `${afterWidth}%` }}
+                    />
+                  </div>
+                  <span className={`text-[10px] font-mono font-bold w-16 text-right ${
+                    step.queryTimeBefore != null ? 'text-emerald-700' : 'text-rose-700'
+                  }`}>
+                    {step.queryTime} ms
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-bold text-slate-500 w-20 shrink-0">현재</span>
+                <div className="flex-1 h-3 bg-slate-200 rounded-full overflow-hidden flex items-center justify-center">
+                  <span className="text-[9px] text-slate-500 font-mono">실행 X (EXPLAIN)</span>
+                </div>
+                <span className="text-[10px] font-mono text-slate-500 w-16 text-right">— ms</span>
+              </div>
+            )}
+
+            {/* hits 표시 */}
+            {step.queryHits != null && (
+              <div className="mt-2 pt-2 border-t border-slate-200 flex items-center justify-between">
+                <span className="text-[10px] text-slate-500">DB Hits</span>
+                <span className="text-[11px] font-mono font-bold text-slate-700">
+                  {step.queryHits.toLocaleString()}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* 좌하단: 쿼리 플랜 트리 */}
+          <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 mb-4">
+            <div className="text-[11px] font-bold text-slate-700 mb-2">🌳 쿼리 플랜 (위 → 아래 실행)</div>
+            <div className="space-y-1.5">
+              {step.plan.map((op, i) => {
+                const style = TONE_STYLE[op.tone] || TONE_STYLE.slate;
+                const isFirst = i === 0;
+                return (
+                  <div key={op.op + i}>
+                    {!isFirst && (
+                      <div className="flex justify-center my-0.5" aria-hidden="true">
+                        <span className="text-slate-400 text-xs">↓</span>
+                      </div>
+                    )}
+                    <div className={`rounded-md border-2 ${style.bg} ${style.border} px-3 py-2 transition-all duration-500`}>
+                      <div className="flex items-center justify-between">
+                        <span className={`font-mono font-bold text-xs ${style.text}`}>
+                          {op.op}
+                        </span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${style.badge}`}>
+                          {op.tone === 'red' ? '비싸다' :
+                           op.tone === 'amber' ? '중간' :
+                           op.tone === 'emerald' ? '저렴' :
+                           op.tone === 'violet' ? '저렴 (multi)' : 'meta'}
+                        </span>
+                      </div>
+                      <div className={`text-[10px] mt-1 font-mono ${style.text} opacity-80`}>
+                        {op.detail}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Step 4: 비교 박스 */}
+          {step.showCompare && (
+            <div className="rounded-lg bg-violet-50 border-2 border-violet-300 p-3 mb-4">
+              <div className="text-[11px] font-bold text-violet-800 mb-2">📈 PROFILE 측정 결과</div>
+              <div className="grid grid-cols-2 gap-2 text-center">
+                <div className="rounded bg-white border border-rose-200 p-2">
+                  <div className="text-[9px] text-rose-700 font-bold">인덱스 전</div>
+                  <div className="text-lg font-extrabold text-rose-700 tabular-nums">1,000 ms</div>
+                  <div className="text-[9px] text-slate-500 font-mono">2,000,000 hits</div>
+                </div>
+                <div className="rounded bg-white border border-emerald-200 p-2">
+                  <div className="text-[9px] text-emerald-700 font-bold">인덱스 후</div>
+                  <div className="text-lg font-extrabold text-emerald-700 tabular-nums">5 ms</div>
+                  <div className="text-[9px] text-slate-500 font-mono">1 hit</div>
+                </div>
+              </div>
+              <div className="text-center mt-2 text-[10px] font-bold text-violet-700">
+                ▼ 200배 빠르다 · DB hits 백만분의 1
+              </div>
+            </div>
+          )}
+
+          {/* Step 5: 인덱스 종류 4 카드 */}
+          {step.indexKinds && (
+            <div className="rounded-lg bg-violet-50 border-2 border-violet-300 p-3">
+              <div className="text-[11px] font-bold text-violet-800 mb-2">🗂 인덱스 종류 — 쿼리 패턴별</div>
+              <div className="grid grid-cols-2 gap-2">
+                {step.indexKinds.map((k) => {
+                  const style = TONE_STYLE[k.tone];
+                  return (
+                    <div key={k.kind} className={`rounded border ${style.border} ${style.bg} p-2`}>
+                      <div className="flex items-center justify-between mb-1">
+                        <span className={`text-[10px] font-extrabold font-mono ${style.text}`}>
+                          {k.kind}
+                        </span>
+                        <span className={`text-[8px] px-1 py-0.5 rounded font-mono ${style.badge}`}>
+                          INDEX
+                        </span>
+                      </div>
+                      <div className={`text-[10px] font-bold ${style.text}`}>{k.use}</div>
+                      <div className="text-[9px] text-slate-600 font-mono mt-0.5">{k.example}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[10px] mt-4 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-rose-500"></span>풀스캔
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-amber-500"></span>Filter
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-emerald-500"></span>IndexSeek
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-violet-500"></span>Composite
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js (cypher)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (!codeRef.current || !window.hljs) return;
+        codeRef.current.removeAttribute('data-highlighted');
+        codeRef.current.className = `language-${code.lang}`;
+        // cypher는 hljs 코어에 없을 수 있으므로 sql로 대체 시 유사 컬러
+        try {
+          window.hljs.highlightElement(codeRef.current);
+        } catch (e) {
+          // highlight 실패해도 plain text로 표시
+        }
+        setRenderedLines(codeRef.current.innerHTML.split('\n'));
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-violet-500/10 border-l-2 border-violet-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4000);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const focus = step.focus;
-      const showIndex = focus === 'singleIndex' || focus === 'constraint' || focus === 'profile';
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">인덱스와 성능</h1>
-                <p className="text-sm text-slate-500 mt-1">전화번호부 ㄱㄴㄷ 색인 — 풀스캔 vs 인덱스 시크</p>
-              </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
-            </div>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-violet-700 hover:text-violet-900 font-medium">
+                &larr; 허브로
+              </a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">
+                curriculum III-2-2
+              </span>
+            </nav>
 
-            {/* Cypher 코드 */}
-            <div className="bg-slate-900 rounded-xl p-4 mb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">Cypher</span>
-              </div>
-              <pre className="text-emerald-300 font-mono text-sm overflow-x-auto whitespace-pre">
-{step.code}
-              </pre>
-            </div>
-
-            {/* 성능 비교 막대 */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-4">
-              <div className="text-xs font-bold text-slate-700 mb-3">⏱ 시작 노드 찾기 — 데이터 규모별 응답 시간</div>
-              <div className="space-y-3">
-                {PERFORMANCE.map((p) => (
-                  <div key={p.rows}>
-                    <div className="text-xs font-mono font-bold text-slate-700 mb-1">:Person {p.rows} 노드</div>
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-bold text-rose-700 w-20 shrink-0">풀스캔</span>
-                        <div className="flex-1 h-3 bg-slate-100 rounded-full overflow-hidden">
-                          <div className="h-full bg-rose-400 rounded-full transition-all" style={{ width: p.scanWidth + '%' }} />
-                        </div>
-                        <span className="text-[10px] font-mono text-slate-600 w-14 text-right">{p.scan}</span>
-                      </div>
-                      {showIndex && (
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] font-bold text-emerald-700 w-20 shrink-0">인덱스 시크</span>
-                          <div className="flex-1 h-3 bg-slate-100 rounded-full overflow-hidden">
-                            <div className="h-full bg-emerald-500 rounded-full transition-all" style={{ width: p.indexWidth + '%' }} />
-                          </div>
-                          <span className="text-[10px] font-mono text-slate-600 w-14 text-right">{p.index}</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Step 4 PROFILE 결과 */}
-            {focus === 'profile' && (
-              <div className="bg-white rounded-xl shadow-sm border-2 border-blue-300 p-4 mb-6">
-                <div className="text-xs font-bold text-blue-700 mb-3">🔍 PROFILE 쿼리 플랜</div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <div>
-                    <div className="text-[11px] font-bold text-slate-700 mb-2">❌ 인덱스 없음</div>
-                    <div className="space-y-1.5">
-                      {PLANS.noIndex.map((p) => (
-                        <div key={p.op} className={`rounded border p-2 text-[11px] ${TONE_BG[p.tone]}`}>
-                          <div className="font-mono font-bold">{p.op}</div>
-                          <div className="text-[10px] mt-0.5">{p.cost}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[11px] font-bold text-slate-700 mb-2">✅ 인덱스/제약 있음</div>
-                    <div className="space-y-1.5">
-                      {PLANS.withIndex.map((p) => (
-                        <div key={p.op} className={`rounded border p-2 text-[11px] ${TONE_BG[p.tone]}`}>
-                          <div className="font-mono font-bold">{p.op}</div>
-                          <div className="text-[10px] mt-0.5">{p.cost}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-violet-600 text-white flex items-center justify-center rounded-full font-bold text-sm">
+                  III
                 </div>
-                <div className="text-[10px] text-slate-500 mt-3">→ 느린 쿼리는 PROFILE에서 NodeByLabelScan을 찾아 인덱스 추가</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">
+                    Part III. GraphRAG &gt; Chapter 2. Cypher 쿼리
+                  </div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">인덱스와 성능</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">
+                    전화번호부 ㄱㄴㄷ 색인 — 풀스캔 vs IndexSeek, EXPLAIN/PROFILE 진단
+                  </p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-violet-50 border-2 border-violet-300 rounded-xl p-3 text-sm text-violet-900">
+                💡 다음(III-2-3)에서는 <strong>대용량 그래프 운영</strong> — 클러스터링, 백업, 모니터링
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-violet-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-violet-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-violet-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-violet-600 text-white hover:bg-violet-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./III-2-1.html" className="text-slate-500 hover:text-slate-700">
+                &larr; III-2-1 Cypher 기초
+              </a>
+              <a href="../index.html" className="text-violet-700 hover:text-violet-900 font-medium">
+                허브로 &rarr;
+              </a>
+            </nav>
+
           </div>
         </div>
       );

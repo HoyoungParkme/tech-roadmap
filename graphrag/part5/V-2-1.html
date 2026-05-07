@@ -3,252 +3,725 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GraphRAG 학습 — 비용·성능 튜닝</title>
+  <title>GraphRAG 학습 — V-2-1. 비용·성능 튜닝</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    V-2-1. 비용·성능 튜닝
-    학습 목표: 비용을 줄이는 캐싱/배치/요약 분리 전략을 안다.
-    핵심 비유: "카페 운영 최적화" — 자주 시키는 음료 미리(캐싱), 한꺼번에 갈기(배치), 사장님 일은 사장님만(요약 분리)
-    구조: 4단계 (캐싱 / 배치 추론 / 요약 단계 분리 / 종합 비용 비교)
+    V-2-1. 비용·성능 튜닝 — LLM 호출 최소화 / 캐싱 / 인덱싱 비용
+    학습 목표: GraphRAG 비용 구조(LLM API / Cache / Indexing / Embedding)를 분해하고,
+              4단계 튜닝(Naive → Redis cache → Embedding cache → Model router)으로
+              비용을 100 → 20 수준까지 줄이는 패턴을 익힌다.
+    핵심 비유: 카페 운영 최적화 — 매번 원두 갈지 말고(캐싱), 미리 시럽 만들고(임베딩 캐시),
+              주문 받는 사람과 만드는 사람 분리(작은 모델 라우팅)
+    패턴: fastapi v1 — 좌(LiveDataPane: 비용 막대 + latency 시계 + 누적 카운터) / 우(CodeViewer 4 file tabs)
+    색상: graphrag violet
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // 비용 단위는 데모용 상대값 ($/1000 호출 기준 가공치). 실제 가격 아님 — 비율 학습용
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — 비용 분해 (LLM / Cache / Indexing / Embedding)
+    //   각 단계마다 4개 비용 막대가 변화하고, latency 시계와 누적 카운터도 변화
+    //   비용 단위: 데모용 상대값 (튜닝 전 1000 호출 기준 = 100). 실제 가격 아님
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. 캐싱 — 자주 묻는 질문은 한 번만',
-        desc: '같은 질문이 반복되면 LLM 호출 결과를 키 기반으로 저장. 캐시 히트 시 LLM은 0번 호출 → 비용 0. LangChain `set_llm_cache(SQLiteCache(...))` 한 줄로 적용.',
-        block: {
-          kind: 'python',
-          code: `from langchain.globals import set_llm_cache
-from langchain_community.cache import SQLiteCache
-
-set_llm_cache(SQLiteCache(database_path=".cache.db"))
-
-# 첫 호출: LLM 호출 (비용 발생)
-llm.invoke("톰 행크스가 출연한 영화는?")  # $0.002
-
-# 같은 질문 재호출: 캐시 히트 (비용 0)
-llm.invoke("톰 행크스가 출연한 영화는?")  # $0.000`,
-        },
-        bars: [
-          { label: '캐시 OFF (1000 동일 질문)', cost: 100, tone: 'red' },
-          { label: '캐시 ON (1000 동일 질문)',  cost: 1,   tone: 'green' },
+        title: 'Step 1. Naive — 매 쿼리마다 전체 traverse + LLM 호출',
+        desc: '캐시 없음. 매 질문마다 그래프 전체를 탐색하고 큰 모델(gpt-4o)에 그대로 호출. 같은 질문이 100번 들어와도 100번 LLM 호출. 인덱싱은 매 인입 데이터마다 다시 계산. 비싸고 느리다 — baseline 100%.',
+        files: [
+          { name: 'naive.py', active: true },
+          { name: 'redis-cache.py', active: false, dim: true },
+          { name: 'embedding-cache.py', active: false, dim: true },
+          { name: 'model-router.py', active: false, dim: true },
         ],
-        focus: 'cache',
+        activeFile: 0,
+        cost: {
+          llm:       { value: 70, label: 'LLM API 호출',  state: 'crit',    note: '매 쿼리 gpt-4o' },
+          cache:     { value: 0,  label: 'Cache hit',     state: 'unknown', note: '캐시 없음' },
+          indexing:  { value: 20, label: '인덱싱',        state: 'warn',    note: '매번 재계산' },
+          embedding: { value: 10, label: 'Embedding',     state: 'warn',    note: '매번 재계산' },
+        },
+        totalPct: 100,
+        latencyMs: 4200,
+        cacheHitRate: 0,
+        cumulativeCost: 1000,
+        bgColor: 'bg-rose-50 border-rose-300',
       },
       {
-        title: 'Step 2. 배치 추론 — 한꺼번에 갈기',
-        desc: '엔티티 1만 개를 추출할 때 1만 번 호출하지 말고 한 번에 50~100개씩 묶어 호출. 모델 호출 오버헤드(네트워크 + 시스템 프롬프트)가 N분의 1로. OpenAI Batch API는 50% 추가 할인.',
-        block: {
-          kind: 'python',
-          code: `# Bad — 1만 번 호출
-for chunk in chunks:                   # 10,000회
-    extract_entities(chunk)            # 매번 시스템 프롬프트 재전송
-
-# Good — 100개씩 배치
-for batch in chunked(chunks, 100):     # 100회 (1/100)
-    extract_entities_batch(batch)      # 한 호출에 100개 청크`,
-        },
-        bars: [
-          { label: '단일 호출 ×10,000',   cost: 100, tone: 'red' },
-          { label: '배치 100 묶음 ×100', cost: 12,  tone: 'amber' },
-          { label: 'Batch API (50%)',    cost: 6,   tone: 'green' },
+        title: 'Step 2. 결과 캐싱 (Redis) — 같은 질문은 캐시 hit',
+        desc: '질문 → 답변 결과를 Redis에 키 저장. 같은 질문이 들어오면 LLM 호출 없이 즉시 응답. 30% 캐시 hit 가정 시 LLM 호출 70%로 감소. latency도 캐시 hit 시 ~10ms로 급감.',
+        files: [
+          { name: 'naive.py', active: false, dim: true },
+          { name: 'redis-cache.py', active: true },
+          { name: 'embedding-cache.py', active: false, dim: true },
+          { name: 'model-router.py', active: false, dim: true },
         ],
-        focus: 'batch',
+        activeFile: 1,
+        cost: {
+          llm:       { value: 49, label: 'LLM API 호출',  state: 'warn', note: '70% (30% 캐시 절감)' },
+          cache:     { value: 3,  label: 'Cache hit',     state: 'good', note: 'Redis GET ~1ms' },
+          indexing:  { value: 18, label: '인덱싱',        state: 'warn', note: '여전히 재계산' },
+          embedding: { value: 10, label: 'Embedding',     state: 'warn', note: '여전히 재계산' },
+        },
+        totalPct: 80,
+        latencyMs: 2900,
+        cacheHitRate: 30,
+        cumulativeCost: 800,
+        bgColor: 'bg-amber-50 border-amber-300',
       },
       {
-        title: 'Step 3. 요약 단계 분리 — 비싼 일은 한 번만',
-        desc: 'Community 요약(IV-2-1)은 비싼 모델로 한 번만 생성하고 저장. 사용자 질의(IV-2-2)는 저장된 요약을 가져다 쓰며 작은 모델로 가공. 비싼 모델 호출 횟수가 큰 비용 차이를 만든다.',
-        block: {
-          kind: 'python',
-          code: `# 인덱싱 시 (비싼 모델, 1회만)
-for community in communities:
-    summary = gpt4o.invoke(prompt(community))
-    db.save(community.id, summary)     # 영구 저장
-
-# 질의 시 (싼 모델, N회)
-def query(question):
-    summaries = db.load_relevant(question)   # 그대로 사용
-    return gpt4o_mini.invoke(             # 싼 모델로 답변 합성
-        f"{summaries}\\n\\nQ: {question}"
-    )`,
-        },
-        bars: [
-          { label: '매 질의마다 요약 재생성', cost: 100, tone: 'red' },
-          { label: '인덱싱 1회 + 답변 N회',  cost: 18,  tone: 'green' },
+        title: 'Step 3. Embedding 캐싱 — 노드 임베딩 미리 계산',
+        desc: '그래프 노드의 임베딩 벡터를 인덱싱 시점에 한 번만 계산해 영구 저장. 질의마다 다시 임베딩하지 않는다. 인덱싱 비용은 1회성으로 amortize되고, 질의 시 embedding API 호출 0회 — embedding 비용 ~0.',
+        files: [
+          { name: 'naive.py', active: false, dim: true },
+          { name: 'redis-cache.py', active: false, dim: true },
+          { name: 'embedding-cache.py', active: true },
+          { name: 'model-router.py', active: false, dim: true },
         ],
-        focus: 'split',
+        activeFile: 2,
+        cost: {
+          llm:       { value: 49, label: 'LLM API 호출',  state: 'warn', note: '여전히 70%' },
+          cache:     { value: 3,  label: 'Cache hit',     state: 'good', note: 'Redis 30%' },
+          indexing:  { value: 5,  label: '인덱싱',        state: 'good', note: '1회 amortize' },
+          embedding: { value: 1,  label: 'Embedding',     state: 'good', note: '미리 계산 완료' },
+        },
+        totalPct: 58,
+        latencyMs: 1800,
+        cacheHitRate: 30,
+        cumulativeCost: 580,
+        bgColor: 'bg-violet-50 border-violet-300',
       },
       {
-        title: 'Step 4. 종합 — 셋 다 적용한 결과',
-        desc: '캐싱 + 배치 + 요약 분리를 누적 적용하면 동일 워크로드에서 비용을 한 자릿수 % 수준으로 압축할 수 있다. 실제 절감률은 데이터/질문 분포에 따라 다르므로 측정 필수.',
-        block: {
-          kind: 'text',
-          code: `# 동일 워크로드 (10K 인덱싱 + 1K 질의 / 30% 캐시 히트 가정)
-
-튜닝 전        ████████████████████████████████  $1,000
-캐싱만 적용    ██████████████████████            $700
-+ 배치 추론    ████████                          $250
-+ 요약 분리    ███                               $90  ← 셋 다`,
-        },
-        bars: [
-          { label: '튜닝 전',                cost: 100, tone: 'red' },
-          { label: '+ 캐싱',                 cost: 70,  tone: 'amber' },
-          { label: '+ 배치 추론',            cost: 25,  tone: 'amber' },
-          { label: '+ 요약 분리 (셋 다)',    cost: 9,   tone: 'green' },
+        title: 'Step 4. 작은 모델로 라우팅 — gpt-4o-mini가 분류, gpt-4o는 답만',
+        desc: '질문이 들어오면 먼저 작은 모델(gpt-4o-mini)이 "단순 fact / 복잡 추론" 분류. 단순 질문은 mini가 그대로 답변(가격 1/30). 복잡한 것만 큰 모델로. 평균 LLM 비용이 급감 — 70% → 14%.',
+        files: [
+          { name: 'naive.py', active: false, dim: true },
+          { name: 'redis-cache.py', active: false, dim: true },
+          { name: 'embedding-cache.py', active: false, dim: true },
+          { name: 'model-router.py', active: true },
         ],
-        focus: 'combine',
+        activeFile: 3,
+        cost: {
+          llm:       { value: 11, label: 'LLM API 호출',  state: 'good', note: 'mini 라우팅 1/30' },
+          cache:     { value: 3,  label: 'Cache hit',     state: 'good', note: 'Redis 30%' },
+          indexing:  { value: 5,  label: '인덱싱',        state: 'good', note: '1회 amortize' },
+          embedding: { value: 1,  label: 'Embedding',     state: 'good', note: '미리 계산 완료' },
+        },
+        totalPct: 20,
+        latencyMs: 950,
+        cacheHitRate: 30,
+        cumulativeCost: 200,
+        bgColor: 'bg-emerald-50 border-emerald-300',
+      },
+      {
+        title: 'Step 5. 비용 비교 — Naive 100% → 튜닝 후 20%',
+        desc: '4단계 누적 적용 결과: 같은 워크로드(1000 질의 + 그래프 인덱싱)에서 비용을 100 → 20으로 압축. 평균 latency 4.2s → 0.95s. 핵심은 "비싼 호출(LLM·embedding)을 줄이고, 쌀 수 있는 건 캐시/작은 모델로 우회"하는 4가지 패턴 조합.',
+        files: [
+          { name: 'naive.py', active: false, dim: true },
+          { name: 'redis-cache.py', active: false, dim: true },
+          { name: 'embedding-cache.py', active: false, dim: true },
+          { name: 'model-router.py', active: true },
+        ],
+        activeFile: 3,
+        cost: {
+          llm:       { value: 11, label: 'LLM API 호출',  state: 'good', note: '14% of naive' },
+          cache:     { value: 3,  label: 'Cache hit',     state: 'good', note: '30% hit rate' },
+          indexing:  { value: 5,  label: '인덱싱',        state: 'good', note: 'amortized' },
+          embedding: { value: 1,  label: 'Embedding',     state: 'good', note: 'precomputed' },
+        },
+        totalPct: 20,
+        latencyMs: 950,
+        cacheHitRate: 30,
+        cumulativeCost: 200,
+        bgColor: 'bg-emerald-50 border-emerald-400',
+        showSummary: true,
       },
     ];
 
-    const KIND_STYLE = {
-      python: { label: 'Python', textColor: '#86efac' },
-      text:   { label: 'Text',   textColor: '#fde68a' },
+    // ─────────────────────────────────────────────────────
+    // 4개 파일 코드 (각 단계의 activeFile에 따라 표시)
+    //   파일은 한 번만 정의하고 activeFile 인덱스로 선택
+    // ─────────────────────────────────────────────────────
+    const FILES = [
+      {
+        name: 'naive.py',
+        lang: 'python',
+        lines: [
+          '"""',
+          'GraphRAG Naive 구현 — 캐시/배치/라우팅 없음',
+          '매 쿼리마다 전체 그래프 traverse + 큰 모델 LLM 호출.',
+          '"""',
+          'from langchain_openai import ChatOpenAI, OpenAIEmbeddings',
+          '',
+          'llm = ChatOpenAI(model="gpt-4o")              # 비싼 모델만',
+          'embed = OpenAIEmbeddings(model="text-embedding-3-large")',
+          '',
+          'def query_graph(question: str) -> str:',
+          '    """매 호출마다 임베딩 + 전체 traverse + LLM 호출."""',
+          '    # 1) 매번 질문을 임베딩 (비용 발생)',
+          '    q_vec = embed.embed_query(question)',
+          '',
+          '    # 2) 그래프 전체 traverse (인덱싱 캐시 없음)',
+          '    nodes = graph.traverse_all()',
+          '    relevant = [n for n in nodes if cosine(n.vec, q_vec) > 0.7]',
+          '',
+          '    # 3) 큰 모델로 그대로 호출 (분류 없음)',
+          '    context = "\\n".join(n.text for n in relevant)',
+          '    answer = llm.invoke(f"{context}\\n\\nQ: {question}")',
+          '    return answer.content',
+          '',
+          '# 1000 쿼리 = 1000 LLM 호출 + 1000 embedding + 1000 traverse',
+          '# 비용: 100% (baseline)  ·  평균 latency: 4.2s',
+        ],
+        highlight: [12, 13, 16, 21],
+      },
+      {
+        name: 'redis-cache.py',
+        lang: 'python',
+        lines: [
+          '"""',
+          '결과 캐싱 (Redis) — 같은 질문은 LLM 호출 0회.',
+          'TTL은 데이터 갱신 주기에 맞춘다 (예: 24h).',
+          '"""',
+          'import hashlib, json',
+          'import redis',
+          'from langchain_openai import ChatOpenAI',
+          '',
+          'r = redis.Redis(host="localhost", port=6379, decode_responses=True)',
+          'llm = ChatOpenAI(model="gpt-4o")',
+          '',
+          'def cache_key(question: str) -> str:',
+          '    """질문 텍스트 정규화 + sha256 — 같은 질문은 같은 키."""',
+          '    norm = question.strip().lower()',
+          '    return "qa:" + hashlib.sha256(norm.encode()).hexdigest()[:16]',
+          '',
+          'def query_with_cache(question: str) -> str:',
+          '    """캐시 hit이면 즉시 반환, miss이면 LLM 호출 후 저장."""',
+          '    key = cache_key(question)',
+          '',
+          '    # 1) 캐시 hit — Redis GET ~1ms (LLM 호출 0)',
+          '    if cached := r.get(key):',
+          '        return json.loads(cached)["answer"]',
+          '',
+          '    # 2) 캐시 miss — LLM 호출 후 결과 저장',
+          '    answer = run_graph_rag(question)',
+          '    r.setex(key, 86400, json.dumps({"answer": answer}))   # TTL 24h',
+          '    return answer',
+          '',
+          '# 30% 캐시 hit 가정 → LLM 호출 70%로 감소',
+          '# 비용: 80%  ·  평균 latency: 2.9s',
+        ],
+        highlight: [21, 22, 26, 27],
+      },
+      {
+        name: 'embedding-cache.py',
+        lang: 'python',
+        lines: [
+          '"""',
+          'Embedding 캐싱 — 노드 임베딩을 인덱싱 시점에 미리 계산.',
+          '질의 시 embedding API 호출 0회. 인덱싱 비용은 1회 amortize.',
+          '"""',
+          'from langchain_openai import OpenAIEmbeddings',
+          'import numpy as np',
+          'import pickle',
+          '',
+          'embed = OpenAIEmbeddings(model="text-embedding-3-large")',
+          '',
+          'def build_index(graph) -> None:',
+          '    """인덱싱 시점에 모든 노드 임베딩 계산 후 영구 저장."""',
+          '    texts = [n.text for n in graph.nodes]',
+          '    # batch embedding — N개를 한 호출로',
+          '    vectors = embed.embed_documents(texts)',
+          '    for n, v in zip(graph.nodes, vectors):',
+          '        n.vec = np.array(v)',
+          '    with open("graph_index.pkl", "wb") as f:',
+          '        pickle.dump(graph, f)',
+          '    print(f"indexed {len(texts)} nodes — embedding 1회 amortize")',
+          '',
+          'def load_index() -> "Graph":',
+          '    """이후 질의는 저장된 임베딩 그대로 사용."""',
+          '    with open("graph_index.pkl", "rb") as f:',
+          '        return pickle.load(f)',
+          '',
+          'def query_with_precomputed(graph, question: str) -> str:',
+          '    """질의 시 노드 embedding 재계산 없음 — 질문만 임베딩."""',
+          '    q_vec = np.array(embed.embed_query(question))',
+          '    sims = np.dot(np.stack([n.vec for n in graph.nodes]), q_vec)',
+          '    top_k = np.argsort(sims)[-5:]',
+          '    context = "\\n".join(graph.nodes[i].text for i in top_k)',
+          '    return llm.invoke(f"{context}\\n\\nQ: {question}").content',
+          '',
+          '# 인덱싱 1회 = 모든 노드 embedding · 질의 N회 = 0 노드 embedding',
+          '# 비용: 58%  ·  평균 latency: 1.8s',
+        ],
+        highlight: [13, 14, 15, 19, 30],
+      },
+      {
+        name: 'model-router.py',
+        lang: 'python',
+        lines: [
+          '"""',
+          'Model Router — 작은 모델(gpt-4o-mini)이 분류, 큰 모델(gpt-4o)은 답 생성에만.',
+          'gpt-4o-mini는 gpt-4o의 약 1/30 가격.',
+          '"""',
+          'from langchain_openai import ChatOpenAI',
+          'from pydantic import BaseModel',
+          '',
+          'router_llm = ChatOpenAI(model="gpt-4o-mini")   # 싸고 빠름',
+          'main_llm   = ChatOpenAI(model="gpt-4o")        # 비싸고 정확',
+          '',
+          'class RouteDecision(BaseModel):',
+          '    """라우팅 결과 — 단순 fact는 mini가 답, 복잡 추론은 main으로."""',
+          '    kind: str       # "simple_fact" | "complex_reasoning"',
+          '    answer: str     # simple_fact일 때 mini가 직접 답',
+          '',
+          'def route_query(question: str, context: str) -> str:',
+          '    """라우팅 후 결정에 따라 mini로 끝내거나 main 호출."""',
+          '    decision: RouteDecision = router_llm.with_structured_output(',
+          '        RouteDecision',
+          '    ).invoke(',
+          '        f"분류 + 답변: {question}\\n컨텍스트: {context[:500]}"',
+          '    )',
+          '',
+          '    # 1) 단순 fact — mini가 직접 답 (큰 모델 호출 0)',
+          '    if decision.kind == "simple_fact":',
+          '        return decision.answer',
+          '',
+          '    # 2) 복잡 추론 — 큰 모델로 escalate',
+          '    return main_llm.invoke(',
+          '        f"{context}\\n\\nQ: {question}"',
+          '    ).content',
+          '',
+          '# 평균 80% 질문이 simple_fact라고 가정',
+          '# → main_llm 호출 20%만 발생, 나머지는 mini로 종결',
+          '# 비용: 20%  ·  평균 latency: 0.95s   ← 최종 튜닝 결과',
+        ],
+        highlight: [8, 9, 18, 19, 26, 27],
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 비용 카드 메타 (이름 고정, 값/색은 step.cost에서)
+    // ─────────────────────────────────────────────────────
+    const COST_META = [
+      { key: 'llm',       emoji: '🤖', sub: 'gpt-4o / mini' },
+      { key: 'cache',     emoji: '⚡', sub: 'Redis GET' },
+      { key: 'indexing',  emoji: '🗂️', sub: 'graph traverse' },
+      { key: 'embedding', emoji: '🧮', sub: 'text → vec' },
+    ];
+
+    // 정적 Tailwind 클래스 매핑 (CDN purge 안전)
+    const STATE_STYLE = {
+      unknown: { bar: 'bg-slate-300',    text: 'text-slate-500',    badge: 'bg-slate-200 text-slate-600',    label: '없음' },
+      good:    { bar: 'bg-emerald-500',  text: 'text-emerald-700',  badge: 'bg-emerald-100 text-emerald-700', label: '저비용' },
+      warn:    { bar: 'bg-amber-500',    text: 'text-amber-700',    badge: 'bg-amber-100 text-amber-700',     label: '중비용' },
+      crit:    { bar: 'bg-rose-500',     text: 'text-rose-700',     badge: 'bg-rose-100 text-rose-700',       label: '고비용' },
     };
 
-    // 정적 색상 매핑 (Tailwind Play CDN 안정성)
-    const TONE_BAR = {
-      red:   'bg-red-500',
-      amber: 'bg-amber-500',
-      green: 'bg-emerald-500',
-    };
-    const TONE_LABEL = {
-      red:   'text-red-700',
-      amber: 'text-amber-700',
-      green: 'text-emerald-700',
-    };
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 비용 막대 + Latency 시계 + 누적 카운터
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const { cost, totalPct, latencyMs, cacheHitRate, cumulativeCost, bgColor, showSummary } = step;
 
+      // latency 시계 — 0~5000ms 범위에서 각도 계산 (단순 게이지)
+      // 0ms = -90deg, 5000ms = +90deg (반원 게이지)
+      const latencyAngle = Math.min(180, (latencyMs / 5000) * 180) - 90;
+      const latencyColor =
+        latencyMs > 3000 ? 'text-rose-600' :
+        latencyMs > 1500 ? 'text-amber-600' :
+        'text-emerald-600';
+
+      return (
+        <div className={`rounded-xl border-2 p-5 shadow-sm transition-colors duration-500 ${bgColor}`}>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-bold text-slate-700">💰 GraphRAG 비용 분해</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live cost · 1000 query</span>
+          </div>
+
+          {/* 비용 막대 4개 */}
+          <div className="space-y-2.5 mb-4">
+            {COST_META.map((m) => {
+              const c = cost[m.key];
+              const style = STATE_STYLE[c.state];
+              return (
+                <div key={m.key} className="flex items-center gap-2">
+                  <div className="w-32 flex items-center gap-1.5 shrink-0">
+                    <span aria-hidden="true">{m.emoji}</span>
+                    <div className="flex flex-col">
+                      <span className="text-[11px] font-bold text-slate-700 leading-tight">{c.label}</span>
+                      <span className="text-[9px] text-slate-500 font-mono leading-tight">{m.sub}</span>
+                    </div>
+                  </div>
+                  <div className="flex-1 bg-white/70 rounded-md h-6 overflow-hidden border border-slate-200 relative">
+                    <div
+                      className={`h-full transition-all duration-700 ${style.bar} flex items-center justify-end pr-2`}
+                      style={{ width: `${Math.max(c.value, 2)}%` }}
+                    >
+                      <span className="text-[10px] font-bold text-white tabular-nums">
+                        {c.value}
+                      </span>
+                    </div>
+                  </div>
+                  <span className={`text-[10px] font-mono w-28 shrink-0 ${style.text}`}>
+                    {c.note}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 누적 비용 + Latency 시계 + Cache hit */}
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            {/* 누적 비용 카운터 */}
+            <div className="bg-white rounded-lg p-2.5 border border-violet-200">
+              <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wide">누적 비용</div>
+              <div className="text-2xl font-extrabold text-violet-700 tabular-nums">
+                ${cumulativeCost}
+              </div>
+              <div className="text-[9px] text-slate-500 font-mono">/ 1000 query</div>
+            </div>
+
+            {/* Latency 시계 게이지 */}
+            <div className="bg-white rounded-lg p-2.5 border border-violet-200">
+              <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wide">Latency</div>
+              <div className="relative h-8 flex items-center justify-center">
+                <svg viewBox="0 0 80 40" className="w-20 h-8">
+                  {/* 반원 배경 */}
+                  <path d="M 8 36 A 32 32 0 0 1 72 36" fill="none" stroke="#e5e7eb" strokeWidth="4" />
+                  {/* 게이지 진행 */}
+                  <path
+                    d="M 8 36 A 32 32 0 0 1 72 36"
+                    fill="none"
+                    stroke={latencyMs > 3000 ? '#e11d48' : latencyMs > 1500 ? '#d97706' : '#059669'}
+                    strokeWidth="4"
+                    strokeDasharray="100"
+                    strokeDashoffset={100 - Math.min(100, (latencyMs / 5000) * 100)}
+                    style={{ transition: 'stroke-dashoffset 0.7s ease' }}
+                  />
+                  {/* 바늘 */}
+                  <line
+                    x1="40" y1="36"
+                    x2={40 + 26 * Math.cos((latencyAngle * Math.PI) / 180)}
+                    y2={36 + 26 * Math.sin((latencyAngle * Math.PI) / 180)}
+                    stroke="#1e293b"
+                    strokeWidth="1.5"
+                    style={{ transition: 'all 0.7s ease' }}
+                  />
+                  <circle cx="40" cy="36" r="2" fill="#1e293b" />
+                </svg>
+              </div>
+              <div className={`text-sm font-bold ${latencyColor} tabular-nums text-center`}>
+                {(latencyMs / 1000).toFixed(2)}s
+              </div>
+            </div>
+
+            {/* Cache hit rate */}
+            <div className="bg-white rounded-lg p-2.5 border border-violet-200">
+              <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wide">Cache Hit</div>
+              <div className="text-2xl font-extrabold text-emerald-600 tabular-nums">
+                {cacheHitRate}%
+              </div>
+              <div className="text-[9px] text-slate-500 font-mono">Redis GET</div>
+            </div>
+          </div>
+
+          {/* 총 비용 막대 (= naive 대비) */}
+          <div className="bg-white/80 rounded-lg p-3 border border-violet-200">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[10px] font-bold text-slate-700">vs Naive (=100%)</span>
+              <span className="text-xs font-bold text-violet-700 tabular-nums">{totalPct}%</span>
+            </div>
+            <div className="h-3 bg-slate-200 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-violet-500 to-violet-700 transition-all duration-700"
+                style={{ width: `${totalPct}%` }}
+              />
+            </div>
+          </div>
+
+          {/* 최종 단계 요약 */}
+          {showSummary && (
+            <div className="mt-3 p-3 rounded-lg bg-violet-100 border-2 border-violet-400">
+              <div className="text-[11px] font-bold text-violet-900 mb-1">🎯 4단계 누적 효과</div>
+              <div className="text-[10px] text-violet-800 font-mono leading-relaxed">
+                Naive 100% → Redis 80% → Embedding 58% → Router <strong className="text-violet-900">20%</strong>
+                <br />
+                Latency 4.2s → 0.95s · 평균 1000 query당 <strong className="text-violet-900">$200</strong>
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[10px] mt-3 pt-2 border-t border-slate-200/60 text-slate-500">
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-rose-500"></span>고비용</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-amber-500"></span>중비용</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-emerald-500"></span>저비용</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-slate-300"></span>없음</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode CodeViewer — 4 file tabs + highlight.js python
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ step, stepIdx, total, onTabClick }) {
+      const codeRef = useRef(null);
+      const file = FILES[step.activeFile];
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${file.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [step.activeFile]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-3 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5 mr-2">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <div className="flex gap-0.5 overflow-x-auto">
+              {step.files.map((f, i) => (
+                <button
+                  key={f.name}
+                  onClick={() => onTabClick && onTabClick(i)}
+                  className={`text-[11px] font-mono px-2.5 py-1 rounded-t border-b-2 transition whitespace-nowrap ${
+                    f.active
+                      ? 'bg-[#282c34] text-violet-300 border-violet-400'
+                      : 'bg-transparent text-slate-500 hover:text-slate-300 border-transparent'
+                  } ${f.dim ? 'opacity-50' : ''}`}
+                >
+                  {f.name}
+                </button>
+              ))}
+            </div>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{file.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code (innerHTML 추출) */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${file.lang}`}>{file.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[30rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || file.lines).map((lineHtml, i) => {
+                  const highlighted = file.highlight && file.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${highlighted ? 'bg-violet-500/10 border-l-2 border-violet-400' : ''}`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 — 단계 번호 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{file.lines.length} lines · {file.name}</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
+      const [overrideFile, setOverrideFile] = useState(null);  // 사용자가 탭 클릭 시
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      // step에 overrideFile 적용 (탭 클릭 지원)
+      const baseStep = STEPS[stepIdx];
+      const step = overrideFile !== null
+        ? {
+            ...baseStep,
+            activeFile: overrideFile,
+            files: baseStep.files.map((f, i) => ({
+              ...f,
+              active: i === overrideFile,
+              dim: i !== overrideFile,
+            })),
+          }
+        : baseStep;
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setOverrideFile(null);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => {
+        setOverrideFile(null);
+        setStepIdx((i) => Math.max(0, i - 1));
+      };
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        setOverrideFile(null);
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setOverrideFile(null);
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      const handleTabClick = (i) => {
+        setOverrideFile(i);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">비용·성능 튜닝</h1>
-                <p className="text-sm text-slate-500 mt-1">카페 운영 최적화 — 캐싱 · 배치 · 요약 분리</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-violet-700 hover:text-violet-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-2-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-violet-600 text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. GraphRAG 운영 &gt; Chapter 2. 비용·운영</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">비용·성능 튜닝</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">카페 운영 최적화 — LLM 호출 최소화 · 캐싱 · 인덱싱 비용</p>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer
+                step={step}
+                stepIdx={stepIdx}
+                total={STEPS.length}
+                onTabClick={handleTabClick}
+              />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            {/* 비용 비교 막대 */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-6">
-              <div className="text-xs font-bold text-slate-700 mb-3">📊 상대 비용 (튜닝 전 = 100)</div>
-              <div className="space-y-2">
-                {step.bars.map((bar, i) => (
-                  <div key={i} className="flex items-center gap-3">
-                    <div className={`w-56 text-xs font-bold ${TONE_LABEL[bar.tone]} text-right shrink-0`}>{bar.label}</div>
-                    <div className="flex-1 bg-slate-100 rounded-md h-6 overflow-hidden">
-                      <div
-                        className={`h-full ${TONE_BAR[bar.tone]} transition-all duration-500 flex items-center justify-end pr-2 text-[10px] font-bold text-white`}
-                        style={{ width: `${bar.cost}%` }}
-                      >
-                        {bar.cost}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* 코드 블록 */}
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
-              </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
-            </div>
-
-            {/* 단계별 진행 표시 */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-6">
-              <div className="text-xs font-bold text-slate-700 mb-3">📍 튜닝 누적</div>
-              <div className="grid grid-cols-4 gap-2">
-                {STEPS.map((s, i) => (
-                  <div
-                    key={s.focus}
-                    className={`rounded-lg p-3 text-center transition-all ${i === currentStep ? 'bg-amber-100 border-2 border-amber-400' : 'bg-slate-50 border border-slate-200'}`}
-                  >
-                    <div className="text-[10px] font-bold text-slate-500 mb-1">Step {i + 1}</div>
-                    <div className="text-xs font-bold text-slate-800">{s.focus}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {step.focus === 'combine' && (
-              <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-3 mb-6 text-xs text-amber-900">
-                💡 다음(V-2-2)에서는 운영 단계에서 점검할 체크리스트(데이터 갱신 / 정합성 / 비용 알림)를 본다 — 비용 튜닝이 끝났어도 운영 모니터링 없이는 어느 날 청구서가 폭발한다
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-violet-50 border-2 border-violet-300 rounded-xl p-3 text-sm text-violet-900">
+                💡 다음(V-2-2)에서는 운영 단계의 <strong>점검 체크리스트</strong> — 데이터 갱신·정합성·비용 알림을 본다
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-violet-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-violet-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-violet-200">키보드 &larr;/&rarr; · 탭 클릭 가능</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying && overrideFile === null}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-violet-600 text-white hover:bg-violet-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./V-2-2.html" className="text-violet-700 hover:text-violet-900 font-medium">V-2-2 운영 체크리스트 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
