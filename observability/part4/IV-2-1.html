@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — Jaeger vs Tempo 비교</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-2-1. Jaeger vs Tempo 비교
+    학습 목표: trace 백엔드 두 진영 — 전수 인덱싱 vs 라벨 lookup의 트레이드오프 이해
+    핵심 비유: "여행 경로 시각화" — Jaeger는 세부 검색에 강함, Tempo는 라벨로 빠르게+저렴
+    구조: 4단계 (Jaeger / Tempo / 비용 / 선택)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Jaeger — "모든 갈래길을 지도책에 색인" (Uber 오픈소스)',
+        desc: 'Uber가 만든 분산 트레이싱 백엔드. service/operation/tag 등 거의 모든 span 속성을 색인해 임의 검색이 가능. Cassandra 또는 Elasticsearch가 백엔드. 강력하지만 인덱스가 무거워 비용·운영 부담이 큼.',
+        block: {
+          kind: 'yaml',
+          code: `# jaeger-deployment.yaml — ES 백엔드로 띄운 Jaeger
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger-prod
+spec:
+  strategy: production              # collector/query 분리
+  storage:
+    type: elasticsearch             # 또는 cassandra
+    options:
+      es:
+        server-urls: http://es:9200
+        index-prefix: jaeger
+        num-shards: 5
+        num-replicas: 1
+  collector:
+    replicas: 3                     # span 수신
+  query:
+    replicas: 2                     # UI/API
+  ingester:
+    replicas: 3                     # Kafka → ES 적재
+
+# 강점
+# - service/operation/tag 모두 인덱싱 → 임의 검색 OK
+# - "tag.http.status_code=500 AND duration>1s" 즉시 조회
+# - 성숙한 UI, OpenTracing/OTel 호환
+
+# 약점
+# - ES 인덱스가 원본 trace의 2~3배
+# - JVM/샤딩/롤오버 운영 필요
+# - 대규모에서는 비용 폭발`,
+        },
+        focus: 'jaeger',
+      },
+      {
+        title: 'Step 2. Tempo — "trace_id만 알면 펼쳐 본다" (Grafana Labs)',
+        desc: 'Grafana Labs가 만든 trace 백엔드. 인덱스를 만들지 않고 trace_id로만 lookup. 메트릭(Prometheus)/로그(Loki)에서 exemplar/derived field로 trace_id를 추출해 점프하는 흐름이 핵심. S3 등 object storage에 그대로 적재해 매우 저렴.',
+        block: {
+          kind: 'yaml',
+          code: `# tempo-config.yaml — S3 백엔드 + trace_id lookup
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:                         # OTel collector → tempo
+        http:
+
+ingester:
+  trace_idle_period: 10s
+  max_block_duration: 5m
+
+storage:
+  trace:
+    backend: s3                       # object storage (저렴)
+    s3:
+      bucket: tempo-traces
+      endpoint: s3.us-east-1.amazonaws.com
+    wal:
+      path: /var/tempo/wal
+
+# 사용 패턴 — 항상 "다른 신호에서 점프"
+# 1) Prometheus exemplar
+#    histogram_quantile(0.99, ...) 패널의 점 클릭
+#    → trace_id 자동 전달 → Tempo 트레이스 열림
+# 2) Loki derived field
+#    log line "trace_id=abc123" 정규식 매칭
+#    → 클릭하면 Tempo로 점프
+
+# 강점
+# - 인덱스가 거의 없음 → S3 비용만
+# - Go 단일 바이너리, 운영 단순
+# - Grafana Metrics/Logs/Traces 통합 자연스러움
+
+# 약점
+# - "tag로 임의 검색"이 약함 (TraceQL 보강 중)
+# - trace_id 진입로(메트릭/로그)가 반드시 필요`,
+        },
+        focus: 'tempo',
+      },
+      {
+        title: 'Step 3. 비용·인덱스 — "같은 1TB trace, 디스크는 10배 차이"',
+        desc: '원본 1TB trace를 Jaeger(ES)는 인덱스 포함 약 3TB, Tempo는 압축된 chunk로 약 0.3TB. ES vs S3의 단가 차이까지 합치면 월 비용은 100배까지 벌어질 수 있음. 운영 인력 부담도 다름.',
+        block: {
+          kind: 'shell',
+          code: `# 같은 1TB 원본 trace, 30일 보관 가정
+# ─────────────────────────────────────────────────────────
+# 항목                    Jaeger (ES)      Tempo (S3)
+# ─────────────────────────────────────────────────────────
+# 원본 trace             1.0 TB            1.0 TB
+# 색인/저장 후           ~3.0 TB           ~0.3 TB
+#   └─ inverted index    ~1.0 TB           0 (trace_id만)
+#   └─ replica x1        ~1.0 TB           S3 다중 AZ 기본
+#   └─ 압축              없음/약함         snappy/zstd
+#
+# 스토리지 (월)          ~$300 (EBS gp3)   ~$7  (S3 Standard)
+# 컴퓨트                 JVM heap 64GB+    Go 4~8GB
+# 운영 인력              ES 샤딩/롤오버    거의 무인
+# ─────────────────────────────────────────────────────────
+# 월 운영비 체감          $$$$              $
+# 검색(임의 tag 조건)     ms~수백 ms        지원 약함 (TraceQL 진화 중)
+# 검색(trace_id lookup)   ms                ms
+
+# 핵심 트레이드오프
+# - Jaeger: "비싸지만 무엇이든 직접 검색 가능"
+# - Tempo : "싸지만 다른 신호(메트릭/로그)에서 trace_id로 와야 함"
+
+# 한 줄 요약
+# 임의 검색 빈도 높음 + 운영 여력 충분 → Jaeger
+# 트래픽/비용 큰 환경 + Grafana 스택  → Tempo`,
+        },
+        focus: 'cost',
+      },
+      {
+        title: 'Step 4. 선택 가이드 — "어디서 trace에 들어오는가가 기준"',
+        desc: '들어오는 길이 "tag로 임의 검색"이면 Jaeger, "메트릭/로그에서 trace_id로 점프"면 Tempo. 이미 Prometheus + Loki + Grafana를 쓰고 있다면 Tempo가 자연스러움. 보안/감사처럼 임의 조건 검색이 잦으면 Jaeger.',
+        block: {
+          kind: 'shell',
+          code: `# 의사결정 매트릭스
+# ─────────────────────────────────────────────────────────
+# 상황                                     → 답
+# ─────────────────────────────────────────────────────────
+# "tag.user_id=42 같은 임의 조건 자주 검색" → Jaeger
+# "보안/감사, 컴플라이언스 트레이스 조회"  → Jaeger
+# "OpenTracing 시절부터 운영 중"           → Jaeger
+# "Prometheus exemplar로 trace 점프"       → Tempo
+# "Loki derived field에서 trace_id 점프"   → Tempo
+# "Grafana 단일 화면 운영"                 → Tempo
+# "trace 양 폭발, 비용 압박 큼"            → Tempo
+
+# 실무 패턴
+# 1) Grafana 스택 표준화한 SRE 팀
+#    → Tempo 단독 (Prom + Loki + Tempo + Grafana)
+# 2) 보안/감사 의무가 큰 기업
+#    → Jaeger 단독 또는 Jaeger 중심
+# 3) 대규모 플랫폼
+#    → Tempo(운영) + Jaeger(보안/심층 분석) 병행
+#       OTel Collector로 fan-out
+
+# 한 줄 요약
+# Jaeger: "지도책 — 세부 검색 강력하지만 비싸다"
+# Tempo : "여권 도장 — trace_id만 보고 펼쳐 보고, 저렴하다"`,
+        },
+        focus: 'choose',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const TRACEBE = [
+      { key: 'jaeger', emoji: '🔍', name: 'Jaeger', note: 'Cassandra/ES 인덱싱' },
+      { key: 'tempo',  emoji: '📓', name: 'Tempo',  note: '라벨 기반 + 저렴' },
+      { key: 'cost',   emoji: '💰', name: '비용',   note: '인덱스 트레이드오프' },
+      { key: 'choose', emoji: '🎯', name: '선택',   note: '어느 걸?' },
+    ];
+
+    function TraceBackendCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🗺️ 여행 경로 시각화 (Jaeger vs Tempo)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {TRACEBE.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Jaeger vs Tempo 비교</h1>
+                <p className="text-sm text-slate-500 mt-1">여행 경로 시각화 — 전수 인덱싱의 강력함 vs 라벨 lookup의 가벼움</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <TraceBackendCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'choose' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(IV-2-2)에서는 분산 시스템 디버깅 흐름
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

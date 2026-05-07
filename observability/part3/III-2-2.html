@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — 로그 검색·집계 (LogQL / KQL)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-2. 로그 검색·집계 (LogQL / KQL)
+    학습 목표: 라벨로 stream 좁히고 → 본문 grep → 메트릭 변환 → 집계, 4단계 파이프라인 이해
+    핵심 비유: "도서관 검색대" — 라벨로 책장 좁히고, 본문 검색, 카운터·집계로 통계 산출
+    구조: 4단계 (Stream Selector / Filter / Metric Query / Aggregation)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Stream Selector — 라벨로 stream 좁히기',
+        desc: 'LogQL 의 시작은 항상 { } 안의 라벨 매처. 인덱싱된 라벨만 빠르게 조회된다 (PromQL과 동일 모델). 라벨이 없으면 전체 stream 스캔이라 느림. KQL(Kibana)은 필드 단위 조회.',
+        block: {
+          kind: 'yaml',
+          code: `# LogQL stream selector — { } 안의 라벨 매처
+{app="api", level="error"}
+# → app=api 이고 level=error 인 모든 log stream
+
+# 정규식 매처 (=~) 와 부정 (!=, !~)
+{app=~"api|web", env="prod"}        # api 또는 web
+{app="api", level!="debug"}          # debug 제외
+
+# 결과 형태 (log stream)
+# {app="api", level="error", instance="api-1"}
+#   2026-05-06T10:23:01  ERROR  user_id=42 timeout
+#   2026-05-06T10:23:05  ERROR  user_id=88 db_conn_fail
+#   ...
+
+# 핵심 규칙
+# - 인덱싱된 라벨로만 빠른 조회 (Loki tsdb)
+# - 라벨 카디널리티 폭발 주의 (user_id 라벨 금지)
+# - 라벨 매처 없이 |= 만 쓰면 풀 스캔 → 느림
+
+# KQL (Kibana / Elasticsearch) 는 필드 단위
+#   app:"api" AND level:"error"`,
+        },
+        focus: 'selector',
+      },
+      {
+        title: 'Step 2. Filter — 본문 grep / 정규식 / 제외',
+        desc: '라벨로 stream을 좁힌 뒤, 파이프(|) 로 본문을 필터링한다. |= 는 부분 일치, |~ 는 정규식, != / !~ 는 제외. 여러 단계로 체이닝 가능. 인덱스 없이 순차 스캔이라 좁은 stream 위에서만 빠르다.',
+        block: {
+          kind: 'yaml',
+          code: `# LogQL pipeline — 라벨 → 파이프 필터
+{app="api", level="error"} |= "user_id=123"
+# → 본문에 "user_id=123" 포함된 줄만
+
+# 연산자 4종
+{app="api"} |= "timeout"          # 부분 일치 (포함)
+{app="api"} != "healthcheck"      # 부분 일치 제외
+{app="api"} |~ "user_id=[0-9]+"   # 정규식 매칭
+{app="api"} !~ "debug|trace"      # 정규식 제외
+
+# 체이닝 — 여러 단계 필터
+{app="api", level="error"}
+  |= "timeout"
+  != "retry"
+  |~ "user_id=[0-9]+"
+
+# 파싱 후 라벨 필터 (logfmt / json)
+{app="api"} | logfmt | status="500" | latency > 1s
+{app="api"} | json   | user_id="42"
+
+# 핵심 규칙
+# - 라벨로 좁히지 않고 |= 만 쓰면 전체 스캔 (느림)
+# - 좁은 stream 위에서 grep 한다`,
+        },
+        focus: 'filter',
+      },
+      {
+        title: 'Step 3. Metric Query — log line 을 메트릭으로 변환',
+        desc: '로그 줄을 시간 단위로 카운트하면 메트릭이 된다. count_over_time 은 구간 누적, rate 는 초당 평균. range vector ([5m]) 입력 → instant vector 출력. PromQL 과 동일한 패턴, Grafana에서 그래프로 그릴 수 있다.',
+        block: {
+          kind: 'yaml',
+          code: `# LogQL → metric — log 줄 수를 시계열로
+count_over_time({app="api"}[5m])
+# = 1240   (지난 5분간 1240줄)
+
+# rate — 초당 줄 수 (req/sec 계산에 자주 사용)
+rate({app="api"} |= "error" [5m])
+# = 4.13   (초당 4.13개의 error 로그)
+
+# bytes_over_time / bytes_rate — 바이트 양
+bytes_rate({app="api"}[5m])
+
+# 파싱 + unwrap 으로 숫자 필드 → 메트릭
+sum_over_time(
+  {app="api"} | logfmt | unwrap latency [5m]
+)
+# = 12340  (지난 5분 latency 합계 ms)
+
+# avg_over_time / max_over_time / quantile_over_time
+quantile_over_time(0.99,
+  {app="api"} | logfmt | unwrap latency [5m]
+)
+# = 412    (p99 latency = 412ms)
+
+# 핵심: log line → counter/gauge 로 변환 → Grafana 그래프`,
+        },
+        focus: 'metric',
+      },
+      {
+        title: 'Step 4. Aggregation — sum by / topk 로 집계',
+        desc: 'metric query 결과를 라벨별로 집계. sum by(status) 는 SQL GROUP BY, topk(5, ...) 는 상위 5개. PromQL 과 문법 동일. Grafana 대시보드의 "5xx 비율", "에러 많은 endpoint Top 5" 패널이 이 패턴.',
+        block: {
+          kind: 'yaml',
+          code: `# 1) status 별 초당 에러 수 — 라벨별 집계
+sum by (status) (
+  rate({app="api"} | logfmt | level="error" [5m])
+)
+# {status="500"} 1.8
+# {status="502"} 0.4
+# {status="504"} 0.2
+
+# 2) 에러 많은 endpoint Top 5
+topk(5,
+  sum by (path) (
+    rate({app="api"} | logfmt | level="error" [5m])
+  )
+)
+# {path="/api/users/{id}"}    2.1
+# {path="/api/orders"}         1.4
+# ...
+
+# 3) 5xx 비율 (SLO 식) — log 기반
+sum(rate({app="api"} | logfmt | status=~"5.." [5m]))
+  /
+sum(rate({app="api"}[5m]))
+# = 0.014  (1.4% — SLO 1% 초과 → 알림)
+
+# Grafana 패널에 그대로 붙여 시각화
+# (Loki data source 선택 → LogQL 입력)
+
+# 한 줄 요약
+# 라벨로 stream 좁히기 → grep → metric 변환 → 집계
+# = "도서관 책장 좁히기 → 본문 읽기 → 카운터 → 통계"`,
+        },
+        focus: 'agg',
+      },
+    ];
+
+    // KIND_STYLE 3종 — yaml/python/shell. yaml label은 LogQL로 오버라이드
+    const KIND_STYLE = {
+      yaml:   { label: 'LogQL',  textColor: '#fde68a' },  // amber — 쿼리 강조
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+    };
+
+    const LOGSEARCH = [
+      { key: 'selector', emoji: '🎯', name: 'Stream Selector', note: '라벨 매처' },
+      { key: 'filter',   emoji: '🔍', name: 'Filter',          note: '|= |~ != grep' },
+      { key: 'metric',   emoji: '🔢', name: 'Metric Query',    note: 'count / rate' },
+      { key: 'agg',      emoji: '📊', name: 'Aggregation',     note: 'sum by / topk' },
+    ];
+
+    function LogSearchCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🔎 도서관 검색대 (로그 검색·집계)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {LOGSEARCH.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">로그 검색·집계 (LogQL / KQL)</h1>
+                <p className="text-sm text-slate-500 mt-1">도서관 검색대 — 라벨로 좁히고 → grep → 메트릭 → 집계</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <LogSearchCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'agg' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 Part III 완성. 다음(Part IV)에서는 분산 추적 — Trace/Span/OpenTelemetry/Jaeger
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

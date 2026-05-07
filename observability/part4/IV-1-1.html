@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — Trace / Span 개론</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🚇</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-1. Trace / Span 개론
+    학습 목표: 분산 시스템에서 한 요청의 전체 여정(Trace)과 단위 작업(Span)을 추적하는 모델 이해
+    핵심 비유: "지하철 환승 기록" — 출발지~목적지 전체 여정(Trace) + 각 환승역(Span)
+    구조: 4단계 (trace / span / propagation / tree)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Trace — 한 요청의 전체 여정',
+        desc: '사용자가 "/checkout" 한 번 누르면 API → DB → Cache → 외부 결제까지 여러 정거장을 거친다. 이 모든 단계를 하나의 trace_id로 묶으면 "이 요청 한 건"의 전 여정이 한 줄로 복원된다. 지하철에서 출발역~목적지까지 같은 카드 한 장으로 환승하는 것과 같다.',
+        block: {
+          kind: 'shell',
+          code: `# 한 요청의 trace 전경 — trace_id 하나로 묶인 5개 정거장
+trace_id = 4bf92f3577b34da6a3ce929d0e0e4736
+
+[ 사용자 ] ──HTTP POST /checkout──▶ [ API Gateway ]
+                                          │
+                                          ├─▶ [ Order Service ]
+                                          │         │
+                                          │         ├─▶ [ Postgres ]   (DB call)
+                                          │         └─▶ [ Redis ]      (cache get)
+                                          │
+                                          └─▶ [ Payment Service ] ──▶ [ Stripe API ]
+
+# trace_id 하나만 알면 → 위 5개 호출이 한 화면에 떠오른다
+$ curl jaeger:16686/api/traces/4bf92f3577b34da6a3ce929d0e0e4736
+{
+  "traceID": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "spans": [ {...}, {...}, {...}, {...}, {...} ],   # ← 5개의 정거장
+  "duration": 842ms
+}
+# ✓ 환승 카드 한 장 = trace_id 하나`,
+        },
+        focus: 'trace',
+      },
+      {
+        title: 'Step 2. Span — 한 단위 작업 (DB call, HTTP call …)',
+        desc: '각 정거장이 하나의 span. start/end 시각, 속성(http.method, db.statement, status), 도중 일어난 이벤트, 에러까지 담는다. parent_span_id로 호출 계층을 그린다. 환승역마다 "몇 시 도착, 몇 시 출발, 몇 호선 환승"을 적어두는 것과 같다.',
+        block: {
+          kind: 'python',
+          code: `# opentelemetry SDK — span 직접 생성
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer(__name__)
+
+def fetch_user(user_id: int):
+    # start_as_current_span: 시작/종료 시각 자동 측정 + context 등록
+    with tracer.start_as_current_span("db.fetch_user") as span:
+        # 속성 — 검색/필터에 쓰인다
+        span.set_attribute("db.system", "postgresql")
+        span.set_attribute("db.statement", "SELECT * FROM users WHERE id=%s")
+        span.set_attribute("user.id", user_id)
+
+        # 이벤트 — 타임라인 위 점으로 기록
+        span.add_event("query.start")
+        try:
+            row = db.execute("SELECT * FROM users WHERE id=%s", user_id)
+            span.add_event("query.end", {"rows": 1})
+            return row
+        except Exception as e:
+            # 에러는 status + record_exception 둘 다
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            span.record_exception(e)
+            raise
+
+# 한 span = { trace_id, span_id, parent_span_id,
+#             name, start_time, end_time,
+#             attributes, events, status }
+# parent_span_id가 호출 계층(부모-자식)을 만든다`,
+        },
+        focus: 'span',
+      },
+      {
+        title: 'Step 3. Context Propagation — 서비스 간 trace_id 전달',
+        desc: '서비스 A가 만든 trace_id를 서비스 B가 이어받아야 한 trace로 묶인다. HTTP 헤더 `traceparent`(W3C Trace Context 표준)에 trace_id/span_id를 실어 전달하고, Python에서는 contextvars로 같은 프로세스 내 비동기 호출 사이에도 자동 전파된다. 환승할 때 같은 카드를 다시 찍는 것과 같다.',
+        block: {
+          kind: 'python',
+          code: `# W3C Trace Context — traceparent 헤더로 서비스 간 전파
+# 형식: traceparent: 00-{trace_id}-{parent_span_id}-{flags}
+#   예: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+from opentelemetry import trace, context
+from opentelemetry.propagate import inject, extract
+import requests
+
+# [발신측] 서비스 A — 나가는 요청에 현재 context를 주입
+def call_payment(amount):
+    headers = {}
+    inject(headers)   # ← traceparent 자동 추가
+    # headers == {"traceparent": "00-4bf9...-00f0...-01"}
+    return requests.post("http://payment/charge",
+                         json={"amount": amount}, headers=headers)
+
+# [수신측] 서비스 B — 들어온 요청 헤더에서 context 복원
+@app.post("/charge")
+def charge(request, payload):
+    ctx = extract(request.headers)   # ← traceparent 파싱
+    token = context.attach(ctx)      # 현재 컨텍스트로 활성화
+    try:
+        with tracer.start_as_current_span("payment.charge"):
+            # 이 span의 parent = A에서 보낸 span_id
+            # 이 span의 trace_id = A와 동일 → 한 trace로 묶인다
+            stripe.charge(payload)
+    finally:
+        context.detach(token)
+
+# FastAPI/requests instrumentation을 켜면 inject/extract 자동
+# contextvars 기반이라 asyncio 안에서도 task 간 전파됨`,
+        },
+        focus: 'propagation',
+      },
+      {
+        title: 'Step 4. Trace Tree — 부모-자식 관계와 Critical Path',
+        desc: 'span들을 parent_span_id로 이으면 트리(폭포수)가 된다. 가장 긴 span이 병목이고, 루트~잎까지 시간을 가장 많이 잡아먹는 경로가 Critical Path. "어디서 갈아타느라 늦었나?"를 한눈에 본다. p99 지연의 범인을 1분 안에 지목하는 도구.',
+        block: {
+          kind: 'shell',
+          code: `# Jaeger/Tempo의 trace tree (폭포수) — ASCII 시각화
+trace_id: 4bf9...4736                       total: 842ms
+─────────────────────────────────────────────────────────────────────
+[POST /checkout                                              ] 842ms ◀ root
+├─[validate_cart                ]                              60ms
+├─[order.create                            ]                  120ms
+│  ├─[db.insert_order      ]                                   45ms
+│  └─[redis.lock           ]                                   15ms
+├─[payment.charge                                          ]  640ms ◀◀ 병목
+│  ├─[traceparent inject ]                                      2ms
+│  └─[http POST stripe                                   ]    620ms ◀ 진짜 범인
+│        └─[stripe.api.process                          ]     580ms
+└─[notify.send             ]                                   20ms
+─────────────────────────────────────────────────────────────────────
+Critical Path: /checkout → payment.charge → http POST stripe
+              → stripe.api.process   (842 중 580ms = 69%)
+
+# 읽는 법
+# - 가로 길이 = 그 span이 잡아먹은 시간
+# - 들여쓰기 = parent → child 관계
+# - 가장 긴 leaf span 위쪽 경로 = Critical Path → 최적화 1순위
+
+# 액션
+# → Stripe 호출을 비동기/배치로 → 사용자 응답에서 분리
+# → 또는 결제 사이드카로 캐시/멱등 처리`,
+        },
+        focus: 'tree',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const TRACE = [
+      { key: 'trace',       emoji: '🚇', name: 'Trace',       note: '한 요청의 전체 여정' },
+      { key: 'span',        emoji: '🚉', name: 'Span',        note: '한 단위 작업' },
+      { key: 'propagation', emoji: '🆔', name: 'Propagation', note: 'trace_id/span_id 전달' },
+      { key: 'tree',        emoji: '🌳', name: 'Trace Tree',  note: '부모-자식 관계' },
+    ];
+
+    function TraceCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🚇 지하철 환승 기록 (Trace/Span)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {TRACE.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Trace / Span 개론</h1>
+                <p className="text-sm text-slate-500 mt-1">지하철 환승 기록 — 출발지부터 목적지까지 어디서 갈아탔는지 추적</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <TraceCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'tree' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(IV-1-2)에서는 OpenTelemetry — 표준 SDK + 자동 계측
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

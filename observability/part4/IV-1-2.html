@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — OpenTelemetry 표준</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-2. OpenTelemetry 표준
+    학습 목표: OTel이 왜 표준이 되었고, SDK/Collector/Exporter 구조를 이해한다.
+    핵심 비유: "공용 콘센트(표준 규격)" — 어느 백엔드든 같은 규격으로 꽂으면 동작
+    구조: 4단계 (Spec / SDK / Collector / Vendor 무관)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Spec — "표준 콘센트 규격" (OTLP protocol)',
+        desc: 'OpenTelemetry는 CNCF 졸업 프로젝트로, Trace/Metric/Log를 하나의 표준으로 통합한다. 핵심은 OTLP(OpenTelemetry Protocol) — gRPC 또는 HTTP로 동일한 메시지 포맷을 주고받는다. 어느 SDK든 어느 백엔드든 OTLP만 지키면 서로 연결된다. 220V 콘센트 규격을 정해두면 어느 가전이든 꽂히는 것과 같다.',
+        block: {
+          kind: 'yaml',
+          code: `# OTLP (OpenTelemetry Protocol) 메시지 예시
+# - 전송: gRPC(:4317) 또는 HTTP(:4318)
+# - 포맷: protobuf 정의 (opentelemetry-proto)
+
+resourceSpans:
+  - resource:
+      attributes:
+        - key: service.name
+          value: { stringValue: "checkout-api" }
+        - key: service.version
+          value: { stringValue: "1.4.2" }
+        - key: deployment.environment
+          value: { stringValue: "prod" }
+    scopeSpans:
+      - scope:
+          name: "opentelemetry.instrumentation.fastapi"
+          version: "0.45b0"
+        spans:
+          - traceId: "5b8aa5a2d2c872e8321cf37308d69df2"
+            spanId: "051581bf3cb55c13"
+            name: "POST /checkout"
+            kind: SPAN_KIND_SERVER
+            startTimeUnixNano: "1714972800000000000"
+            endTimeUnixNano: "1714972800142000000"
+            attributes:
+              - key: http.method
+                value: { stringValue: "POST" }
+              - key: http.status_code
+                value: { intValue: 200 }
+            status: { code: STATUS_CODE_OK }
+
+# Trace + Metric + Log 모두 동일한 wire format
+# → SDK와 백엔드가 서로 모르는 사이여도 통신 OK`,
+        },
+        focus: 'spec',
+      },
+      {
+        title: 'Step 2. SDK — "한 줄 자동 계측" (Python/Go/JS)',
+        desc: 'OpenTelemetry SDK는 언어별로 자동 계측(auto-instrumentation) 라이브러리를 제공한다. Python이면 opentelemetry-instrumentation-fastapi 한 줄로 모든 라우터의 span이 자동 생성. requests, redis, sqlalchemy 등도 plugin 형태로 한 줄 추가. 직접 span 코드 안 짜도 80% 커버.',
+        block: {
+          kind: 'python',
+          code: `# pip install opentelemetry-distro opentelemetry-exporter-otlp \\
+#             opentelemetry-instrumentation-fastapi \\
+#             opentelemetry-instrumentation-requests \\
+#             opentelemetry-instrumentation-sqlalchemy
+
+# main.py — FastAPI 자동 계측
+from fastapi import FastAPI
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+app = FastAPI()
+
+# 한 줄로 모든 라우터에 span 자동 부착
+FastAPIInstrumentor.instrument_app(app)
+RequestsInstrumentor().instrument()       # requests 호출 자동 trace
+SQLAlchemyInstrumentor().instrument()     # SQL 쿼리 자동 trace
+
+@app.post("/checkout")
+def checkout(order_id: str):
+    # 이 함수 진입/종료가 자동으로 span 으로 기록됨
+    return {"ok": True}
+
+# 환경 변수만 설정하면 OTLP exporter 자동 활성화
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+# OTEL_SERVICE_NAME=checkout-api
+# OTEL_TRACES_EXPORTER=otlp
+
+# 실행: opentelemetry-instrument python main.py
+# → 코드 변경 없이 모든 trace 가 Collector 로 전송`,
+        },
+        focus: 'sdk',
+      },
+      {
+        title: 'Step 3. Collector — "중앙 허브" (receivers / processors / exporters)',
+        desc: 'OpenTelemetry Collector는 모든 SDK가 보내는 trace/metric/log를 한 곳에서 받아 batch, sampling, 속성 추가(enrichment) 같은 가공을 수행한 후 여러 백엔드로 fan-out 한다. 앱은 Collector 주소만 알면 되고, 백엔드 변경은 Collector 설정만 바꾸면 끝. 멀티탭 + 변압기 역할.',
+        block: {
+          kind: 'yaml',
+          code: `# otel-collector-config.yaml
+receivers:
+  otlp:                           # SDK 들이 보내는 OTLP 수신
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+processors:
+  batch:                          # 배치로 묶어서 효율적 전송
+    timeout: 5s
+    send_batch_size: 512
+  memory_limiter:                 # OOM 방지
+    check_interval: 1s
+    limit_mib: 400
+  resource:                       # 공통 속성 자동 부착
+    attributes:
+      - key: cluster
+        value: prod-seoul
+        action: upsert
+  tail_sampling:                  # 에러/느린 trace 만 샘플링
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow
+        type: latency
+        latency: { threshold_ms: 500 }
+
+exporters:
+  otlp/jaeger:    { endpoint: jaeger:4317, tls: { insecure: true } }
+  otlp/tempo:     { endpoint: tempo:4317,  tls: { insecure: true } }
+  prometheus:     { endpoint: 0.0.0.0:8889 }
+
+service:
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, resource, tail_sampling, batch]
+      exporters:  [otlp/jaeger, otlp/tempo]
+    metrics:
+      receivers:  [otlp]
+      processors: [batch]
+      exporters:  [prometheus]`,
+        },
+        focus: 'collector',
+      },
+      {
+        title: 'Step 4. Vendor 무관 — "백엔드 갈아끼우기" (락인 X)',
+        desc: '같은 SDK 코드 그대로 두고 Collector의 exporter 설정만 바꾸면 Jaeger → Tempo → Honeycomb → Datadog → New Relic 어디로든 보낼 수 있다. 벤더 락인이 사라지므로 백엔드 교체 비용이 사실상 0. 비용/기능에 따라 자유롭게 갈아끼우는 게 OTel의 가장 큰 가치.',
+        block: {
+          kind: 'yaml',
+          code: `# 같은 앱 코드 + 같은 Collector — exporters 만 교체
+exporters:
+  # 1) 오픈소스: Jaeger
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls: { insecure: true }
+
+  # 2) 오픈소스: Grafana Tempo (S3 backed)
+  otlp/tempo:
+    endpoint: tempo-distributor:4317
+    tls: { insecure: true }
+
+  # 3) SaaS: Honeycomb
+  otlp/honeycomb:
+    endpoint: api.honeycomb.io:443
+    headers:
+      x-honeycomb-team: \${env:HONEYCOMB_API_KEY}
+
+  # 4) SaaS: Datadog
+  datadog:
+    api:
+      site: datadoghq.com
+      key: \${env:DD_API_KEY}
+
+  # 5) SaaS: New Relic
+  otlp/newrelic:
+    endpoint: otlp.nr-data.net:4317
+    headers:
+      api-key: \${env:NR_LICENSE_KEY}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      # 동시에 여러 곳으로 fan-out 가능 (마이그레이션 시 유용)
+      exporters: [otlp/jaeger, otlp/honeycomb, datadog]
+
+# 벤더 변경 = exporters 한 줄 수정
+# 앱 코드 / SDK 호출 / 비즈니스 로직: 0 변경`,
+        },
+        focus: 'vendor',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const OTEL = [
+      { key: 'spec',      emoji: '📐', name: 'Spec',        note: 'OTLP 표준 protocol' },
+      { key: 'sdk',       emoji: '🛠️', name: 'SDK',         note: '언어별 자동 계측' },
+      { key: 'collector', emoji: '🔧', name: 'Collector',   note: 'processor + 다중 export' },
+      { key: 'vendor',    emoji: '🔌', name: 'Vendor 무관', note: 'Jaeger/Tempo/Datadog' },
+    ];
+
+    function OtelCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🔌 공용 콘센트 (OpenTelemetry 표준)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {OTEL.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">OpenTelemetry 표준</h1>
+                <p className="text-sm text-slate-500 mt-1">공용 콘센트 — 어느 백엔드든 같은 규격으로 꽂는다</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <OtelCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'vendor' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(IV-2-1)에서는 Jaeger/Tempo — trace 백엔드 비교
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

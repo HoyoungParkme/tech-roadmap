@@ -89,11 +89,13 @@
 - **다음 섹션**: III-2-1
 
 ### Section III-2-1. 로그 수집 파이프라인 (Fluent Bit / Vector)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [로그 수집 시각화 보기](part3/III-2-1.html) — Source / Parser / Filter / Sink (택배 집하장 비유)
 - **다음 섹션**: III-2-2
 
 ### Section III-2-2. 로그 검색·집계 (LogQL / KQL)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [로그 검색·집계 시각화 보기](part3/III-2-2.html) — Selector / Filter / Metric / Aggregation (도서관 검색대 비유)
 - **다음 섹션**: IV-1-1
 
 ---
@@ -103,19 +105,23 @@
 학습 목표: 마이크로서비스 환경에서 요청 흐름을 추적하고 병목을 찾는 방법을 이해한다.
 
 ### Section IV-1-1. Trace / Span 개론
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [Trace/Span 시각화 보기](part4/IV-1-1.html) — Trace / Span / Propagation / Tree (지하철 환승 기록 비유)
 - **다음 섹션**: IV-1-2
 
 ### Section IV-1-2. OpenTelemetry 표준
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [OpenTelemetry 시각화 보기](part4/IV-1-2.html) — Spec / SDK / Collector / Vendor 무관 (공용 콘센트 비유)
 - **다음 섹션**: IV-2-1
 
 ### Section IV-2-1. Jaeger / Tempo
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [Jaeger vs Tempo 시각화 보기](part4/IV-2-1.html) — Jaeger / Tempo / 비용 / 선택 (여행 경로 시각화 비유)
 - **다음 섹션**: IV-2-2
 
 ### Section IV-2-2. 분산 시스템 디버깅 흐름
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [분산 디버깅 시각화 보기](part4/IV-2-2.html) — Alert / Isolate / Logs / Root (병원 내원 기록 역추적 비유)
 - **다음 섹션**: V-1-1
 
 ---
@@ -125,20 +131,24 @@
 학습 목표: SLO 정의부터 incident 대응까지 실전 SRE 사이클을 안다.
 
 ### Section V-1-1. SLO 정책 + Burn Rate 알람
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★★
+- **시각화 연결**: [Burn Rate 시각화 보기](part5/V-1-1.html) — SLO Recap / Burn Rate / Multi-Window / Alert (가스 게이지 + 비상 알림 비유)
 - **다음 섹션**: V-1-2
 
 ### Section V-1-2. Incident Response (감지→해결→포스트모템)
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [Incident Response 시각화 보기](part5/V-1-2.html) — Detect / Mitigate / Resolve / Postmortem (응급실 트리아지 비유)
 - **다음 섹션**: V-2-1
 
 ### Section V-2-1. OnCall + Runbook
-- **시각화 연결**: 향후 구현 예정
+- **난이도**: ★★☆
+- **시각화 연결**: [OnCall + Runbook 시각화 보기](part5/V-2-1.html) — Rotation / Runbook / Response / Healthy (당직 의사 + 매뉴얼 비유)
 - **다음 섹션**: V-2-2
 
 ### Section V-2-2. 실전 체크리스트
-- **시각화 연결**: 향후 구현 예정
-- **다음 섹션**: 없음 (커리큘럼 마지막 섹션)
+- **난이도**: ★★☆
+- **시각화 연결**: [실전 체크리스트 시각화 보기](part5/V-2-2.html) — Metrics / Logs / Traces / SRE 4축 (관제 센터 점검표 비유)
+- **다음 섹션**: 없음 (커리큘럼 마지막 섹션, Observability 100% 완성 🎉)
 
 ---
 

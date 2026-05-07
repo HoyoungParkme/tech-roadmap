@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — SLO 정책 + Burn Rate 알람</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-1-1. SLO 정책 + Burn Rate 알람
+    학습 목표: SLO 약속을 운영 정책으로 — Error Budget 소진 속도(burn rate)로 알람 임계 설계
+    핵심 비유: "가스 게이지 + 비상 알림" — 연료(예산) 줄어드는 속도가 빠르면 새벽이라도 호출
+    구조: 4단계 (SLO Recap / Burn Rate / Multi-Window / Alert)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. SLO Recap — "이번 달 가스 한도 다시 확인"',
+        desc: 'SLO 99.9%는 30일 중 43.2분만 down 허용 = Error Budget 0.1%. 이번 주에 절반(21.6분)을 써버렸다면 다음 주는 매우 위험. 50% 소진 시 freeze 정책이 발동되어 신규 배포 중단 → 안정화 sprint로 전환한다.',
+        block: {
+          kind: 'shell',
+          code: `# SLO 99.9% 시나리오별 의사결정 표 (월 30일 = 43.2분 예산)
+# 파일: docs/slo_policy.md
+시나리오             기간    소진 분  소진 %   상태       조치
+─────────────────────────────────────────────────────────────────────────
+정상 운영            1주차    5분     11.6%   🟢 안전    배포/실험 OK
+큰 장애 1회 + 회복   2주차   18분     41.7%   🟡 주의    위험한 변경 자제
+연속 장애            3주차   25분     57.9%   🔴 freeze  신규 배포 중단
+복구 실패            4주차   45분    104.2%   ⛔ 초과    postmortem + SLO 재협상
+
+# 정책 4단계 (Google SRE — Error Budget Policy)
+# 1. 0~25%   소진 → 정상. 위험 감수 OK (실험/카나리)
+# 2. 25~50%  소진 → 경계. 배포 리뷰 강화
+# 3. 50~100% 소진 → freeze. 신규 기능 중단, 안정화만
+# 4. 100% 초과    → postmortem 의무, 인프라 보강 또는 SLO 하향
+
+# 핵심 — "예산 = 의사결정 도구". 다 쓰면 위험한 일을 할 수 없다
+# 연료 게이지 비유: 게이지 = 누적 소진, 다음 step의 burn rate = 소진 속도`,
+        },
+        focus: 'recap',
+      },
+      {
+        title: 'Step 2. Burn Rate — "지금 속도면 며칠 못 버티나"',
+        desc: 'Burn Rate = 현재 실패율 / SLO 허용 실패율. burn=1이면 정상 속도(월 예산을 한 달에 소진), burn=2면 2배 빠른 소진(15일에 소진), burn=14.4면 ~2시간만에 한 달 예산 소진. "남은 양"보다 "속도"가 빠른 신호다.',
+        block: {
+          kind: 'yaml',
+          code: `# Burn Rate 계산식 + Prometheus recording rule
+# 파일: rules/burn_rate.yml
+#
+# burn_rate = (1 - SLI) / (1 - SLO)
+#           = 현재 실패율 / SLO 허용 실패율
+#
+# 예) SLO 99.9% (허용 실패율 0.001 = 0.1%)
+#     실제 실패율 1.44% → burn = 0.0144 / 0.001 = 14.4
+#     → 30일 예산을 30일/14.4 ≈ 2시간 만에 소진
+
+groups:
+  - name: slo_burn_rate
+    interval: 30s
+    rules:
+      # 5분 윈도우 burn rate (FAST burn 감지용)
+      - record: slo:burn_rate_5m
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m]))
+          ) / 0.001          # 0.001 = (1 - 0.999) = SLO 허용 실패율
+
+      # 1시간 윈도우 burn rate (확정용)
+      - record: slo:burn_rate_1h
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total[1h]))
+          ) / 0.001
+
+# Burn Rate 직관표 (월 예산 소진까지 남은 시간)
+# burn=1     → 30일   (정상)
+# burn=2     → 15일   (1.5배 빠름)
+# burn=6     → 5일    (ticket 임계)
+# burn=14.4  → ~2시간 (page 임계, 새벽이라도 호출)`,
+        },
+        focus: 'burnrate',
+      },
+      {
+        title: 'Step 3. Multi-Window — "짧은 윈도우 + 긴 윈도우 동시 검사"',
+        desc: '5분만 보면 일시적 spike에 false alarm. 1시간만 보면 늦게 감지. 두 윈도우(짧음+김) 모두 임계 초과해야 발화 → spike는 무시, 진짜 burn만 잡는다. Google SRE workbook이 이 패턴을 표준으로 권장한다.',
+        block: {
+          kind: 'yaml',
+          code: `# Multi-window multi-burn-rate alert (Google SRE 표준)
+# 파일: alerts/slo_multiwindow.yml
+#
+# 원리: 짧은 윈도우(빠른 감지) AND 긴 윈도우(false positive 차단)
+#       둘 다 임계 초과해야 alert 발화
+#       → 5분 spike만 있고 1시간 평균은 정상이면 무시
+groups:
+  - name: slo_multiwindow
+    rules:
+
+      # FAST page — 5m + 1h 둘 다 burn>14.4
+      - alert: ErrorBudgetBurnFast
+        expr: |
+          (
+            slo:burn_rate_5m  > 14.4
+            and
+            slo:burn_rate_1h  > 14.4
+          )
+        for: 2m
+        labels:
+          severity: critical
+          window: short
+        annotations:
+          summary: "FAST burn 14.4x — 5m+1h 동시 초과"
+          description: "이 속도면 ~2시간 안에 월 예산 소진"
+
+      # SLOW ticket — 30m + 6h 둘 다 burn>6
+      - alert: ErrorBudgetBurnSlow
+        expr: |
+          (
+            slo:burn_rate_30m > 6
+            and
+            slo:burn_rate_6h  > 6
+          )
+        for: 15m
+        labels:
+          severity: warning
+          window: long
+        annotations:
+          summary: "SLOW burn 6x — 30m+6h 동시 초과"
+
+# 왜 multi-window인가
+# - 짧은 윈도우만: 일시 spike에 false page (운영자 짜증)
+# - 긴 윈도우만:  진짜 burn 시작 후 30분~1시간 늦게 감지
+# - 둘 다 AND:    빠르되 정확. SRE workbook 6.5 권장 패턴`,
+        },
+        focus: 'window',
+      },
+      {
+        title: 'Step 4. Alert — "14.4x → PagerDuty, 6x → ticket"',
+        desc: 'Burn rate 크기에 따라 대응 채널을 차등한다. 14.4x는 critical(밤에도 깨움) → PagerDuty. 6x는 warning(업무 시간) → Slack/Jira. 1x 이하는 정상 — 알람 없음. ratio별로 라우팅을 매트릭스화하면 운영팀이 헷갈리지 않는다.',
+        block: {
+          kind: 'yaml',
+          code: `# Prometheus alert + Alertmanager 라우팅 (severity 차등)
+# 파일: alerts/slo_burn_routing.yml + alertmanager.yml
+
+# (1) Alert에 severity 라벨 부여
+- alert: ErrorBudgetBurnFast
+  expr: slo:burn_rate_5m > 14.4 and slo:burn_rate_1h > 14.4
+  for: 2m
+  labels:
+    severity: page          # 즉시 호출
+    slo: api-availability
+
+- alert: ErrorBudgetBurnSlow
+  expr: slo:burn_rate_30m > 6 and slo:burn_rate_6h > 6
+  for: 15m
+  labels:
+    severity: ticket        # 업무 시간 처리
+
+# (2) Alertmanager 라우팅 (severity별 분기)
+route:
+  group_by: [alertname, slo]
+  routes:
+  - match: { severity: page }
+    receiver: pagerduty-oncall   # 전화/SMS, 새벽도 OK
+  - match: { severity: ticket }
+    receiver: slack-and-jira     # 슬랙 + Jira 자동 생성
+
+# (3) 대응 매트릭스 (운영 위키에 표로)
+# burn rate    윈도우       severity   채널          응답 시간   조치
+# ─────────────────────────────────────────────────────────────────────
+# > 14.4x      5m + 1h      page       PagerDuty     5분 이내    rollback/incident
+# > 6x         30m + 6h     ticket     Slack+Jira    1시간       원인 조사 + 패치
+# > 3x         2h + 24h     info       Slack         업무일 내   리뷰 only
+# <= 1x        ─            (none)     ─             ─           정상
+
+# 핵심 — burn rate가 클수록 빠르게, 작을수록 차분하게
+# alert fatigue 방지: page는 정말 잠 깨워야 하는 것만`,
+        },
+        focus: 'alert',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+    };
+
+    const BURNRATE = [
+      { key: 'recap',    emoji: '🎯', name: 'SLO Recap',    note: '예산 = 100%-SLO' },
+      { key: 'burnrate', emoji: '⛽', name: 'Burn Rate',    note: '소진 속도' },
+      { key: 'window',   emoji: '🪟', name: 'Multi-Window', note: '짧+긴 AND' },
+      { key: 'alert',    emoji: '🚨', name: 'Alert',        note: '14.4x / 6x' },
+    ];
+
+    function BurnRateCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">⛽ 가스 게이지 + 비상 알림 (Burn Rate Alerts)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {BURNRATE.map((b) => {
+              const isActive = focus === b.key;
+              return (
+                <div
+                  key={b.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{b.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{b.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{b.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">SLO 정책 + Burn Rate 알람</h1>
+                <p className="text-sm text-slate-500 mt-1">가스 게이지 + 비상 알림 — SLO Recap / Burn Rate / Multi-Window / Alert</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <BurnRateCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'alert' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(V-1-2)에서는 Incident Response — 응급실 트리아지
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

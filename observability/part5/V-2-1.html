@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — OnCall + Runbook</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-2-1. OnCall + Runbook
+    학습 목표: 24/7 당직 로테이션 + 표준 진료 절차서 — 새벽 호출에도 매뉴얼 따라 빠르게 처리
+    핵심 비유: "당직 의사 + 진료 매뉴얼" — Rotation / Runbook / Response Time / Healthy OnCall
+    구조: 4단계 (rotation / runbook / response / healthy)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Rotation — "주별 1차/2차 당직 교대"',
+        desc: '당직은 한 사람이 계속 떠안으면 망가진다. 주 단위로 1차(primary) / 2차(secondary) 로테이션. 글로벌 팀이면 follow-the-sun(시간대 분산)으로 새벽 호출을 줄인다. 휴가/병가는 swap 가능해야. PagerDuty/OpsGenie의 schedule + escalation policy로 코드화 → 휴먼 에러 차단.',
+        block: {
+          kind: 'yaml',
+          code: `# PagerDuty schedule (Terraform 예시)
+# 핵심: 주별 교대 + 2차 백업 + 시간대 분산
+resource "pagerduty_schedule" "ops_primary" {
+  name      = "ops-primary-weekly"
+  time_zone = "Asia/Seoul"
+
+  layer {
+    name                         = "primary-rotation"
+    start                        = "2026-05-04T09:00:00+09:00"
+    rotation_virtual_start       = "2026-05-04T09:00:00+09:00"
+    rotation_turn_length_seconds = 604800   # 7일 = 1주
+
+    users = [                               # 4명 → 4주마다 한 바퀴
+      "user-hong", "user-kim",
+      "user-park", "user-lee"
+    ]
+  }
+}
+
+# Escalation Policy — 5분 무응답 시 2차 호출
+resource "pagerduty_escalation_policy" "ops" {
+  name = "ops-escalation"
+
+  rule {                                    # 1차: primary 즉시
+    escalation_delay_in_minutes = 5
+    target { id = pagerduty_schedule.ops_primary.id }
+  }
+  rule {                                    # 2차: 5분 후 secondary
+    escalation_delay_in_minutes = 10
+    target { id = pagerduty_schedule.ops_secondary.id }
+  }
+  rule {                                    # 3차: 15분 후 팀 리드
+    escalation_delay_in_minutes = 0
+    target { type = "user", id = "user-team-lead" }
+  }
+}
+
+# 운영 규칙
+# - 휴가/병가 → schedule override로 swap (slack-bot으로 신청)
+# - follow-the-sun: 한국 9-18, 미국 18-03, 유럽 03-09
+# - 절대 1명 schedule 금지 (휴가 = 무방비)`,
+        },
+        focus: 'rotation',
+      },
+      {
+        title: 'Step 2. Runbook — "알람별 진료 매뉴얼"',
+        desc: '새벽 3시에 호출된 사람이 "이게 뭐지" 5분 헤매면 SLA 깨진다. 모든 alert에 runbook URL 필수 — annotations.runbook 링크가 없으면 alert를 머지하지 않는다(PR review 룰). 템플릿: 증상 / 영향 / 즉시 조치 / 진단 단계 / 에스컬레이션. 5분 안에 첫 조치 가능해야.',
+        block: {
+          kind: 'yaml',
+          code: `# Runbook 템플릿 (wiki/runbook/HighErrorRate.md)
+# Alertmanager의 annotations.runbook → 이 페이지로 링크
+---
+title: HighErrorRate (5xx > 5%)
+severity: critical
+owner: ops-team
+last_reviewed: 2026-04-15
+---
+
+## 1. 증상 (Symptom)
+- 5xx 에러율 5% 초과 5분 지속
+- Grafana 링크: https://grafana/d/api-errors
+
+## 2. 영향 (Impact)
+- 사용자 결제 실패 / 주문 누락
+- 매출 영향 시간당 ~500만원 추정
+
+## 3. 즉시 조치 (5분 안에) ⚠️
+1. Slack #incident 채널에 ack: "/ack HighErrorRate"
+2. Grafana 대시보드 확인 → 어느 endpoint?
+3. 최근 30분 배포 있었나? → ArgoCD 확인
+4. YES → 즉시 rollback ("kubectl rollout undo deploy/api")
+5. NO → Step 4 진단으로
+
+## 4. 진단 단계 (10~30분)
+- [ ] Loki 로그 검색: {app="api"} |= "ERROR" | json
+- [ ] Tempo trace에서 슬로우 endpoint 확인
+- [ ] DB connection pool 포화 여부 (max_conn vs active)
+- [ ] 외부 API 응답 시간 (결제 PG 등)
+
+## 5. 에스컬레이션 (30분 미해결)
+- 2차: @backend-lead 호출
+- 비즈니스 영향: PM @hong 통보
+- 1시간 미해결: 인시던트 commander 지명
+
+## 6. 사후
+- postmortem 템플릿으로 24시간 내 작성
+- runbook 자체 개선점 PR
+
+# 절대 규칙
+# - alert 추가 PR에 runbook URL 없으면 reject
+# - 분기마다 runbook 리뷰 (오래된 명령어 방지)`,
+        },
+        focus: 'runbook',
+      },
+      {
+        title: 'Step 3. Response Time — "Sev1 ack 5분 / 완화 30분"',
+        desc: 'Severity별 SLA를 명시하고 MTTA(평균 ack 시간) / MTTR(평균 복구 시간)로 추적. 단순히 알람 받는 게 아니라 "얼마나 빠르게 대응했는가"가 oncall 품질. PagerDuty analytics로 자동 측정 → 주간 retrospective에서 검토. SLA 미달 시 로테이션/runbook 개선.',
+        block: {
+          kind: 'shell',
+          code: `# Severity별 SLA (반드시 합의된 표)
+Severity   | 정의                    | Ack 목표 | Mitigation 목표 | Resolution
+─────────────────────────────────────────────────────────────────────────────
+Sev1 (P0)  | 전체 서비스 다운        | 5분      | 30분            | 4시간
+Sev2 (P1)  | 부분 다운 / 매출 영향   | 15분     | 2시간           | 1일
+Sev3 (P2)  | 단일 기능 장애          | 1시간    | 1일             | 1주
+Sev4 (P3)  | 사용자 영향 없음 / 경고 | 4시간    | 1주             | 협의
+
+# 측정 방법 (PagerDuty API → Grafana)
+# MTTA = ack_time - triggered_time 평균
+# MTTR = resolved_time - triggered_time 평균
+
+$ curl -H "Authorization: Token <KEY>" \\
+    "https://api.pagerduty.com/analytics/metrics/incidents/all" \\
+    -d '{"filters":{"team_ids":["TEAM-OPS"],
+                    "created_at_start":"2026-04-01",
+                    "created_at_end":"2026-04-30"}}'
+
+# 응답 예시
+{
+  "data": [{
+    "mean_seconds_to_engage":   180,    # MTTA = 3분 ✓ (목표 5분)
+    "mean_seconds_to_resolve": 1620,    # MTTR = 27분 ✓ (목표 30분)
+    "total_incident_count":      24,
+    "total_business_hour_interruption_seconds": 0
+  }]
+}
+
+# 주간 oncall retrospective 체크
+# - SLA 위반 incident 리스트 + 원인
+# - runbook이 부족했나? → runbook 보강 PR
+# - 알람 자체가 잘못됐나? → SLO 재조정
+# - 다음 주 oncall에게 공유 (handoff doc)
+
+# Slack bot 자동 알림
+# /sla-report → 이번 주 MTTA/MTTR + 위반 건수`,
+        },
+        focus: 'response',
+      },
+      {
+        title: 'Step 4. Healthy OnCall — "번아웃 방지 체크리스트"',
+        desc: 'oncall이 지옥이면 좋은 엔지니어가 떠난다. 알람 피로(alert fatigue) 감지 → 1주 페이저 5회 초과면 SLO/임계치 재검토. 호출당 휴가 보상(comp time). 신입은 2~3주 shadowing 후 primary. oncall handoff 문서 의무화. 이건 매니저 책임이다.',
+        block: {
+          kind: 'shell',
+          code: `# Healthy OnCall 체크리스트 (분기별 점검)
+
+[ 알람 피로 (Alert Fatigue) ]
+☐ 1주 야간(22~07) 페이저 5회 초과한 사람 있나?
+   → YES: 해당 alert SLO/임계치 재검토 회의 (다음 주)
+☐ 같은 alert가 한 주에 3회 이상 반복되나?
+   → 자동화 (auto-rollback / auto-scaling) 가능한가?
+☐ false positive 비율 > 20%?
+   → for 시간 늘리거나 expr 조정
+
+[ 보상 + 인정 ]
+☐ Sev1 호출당 comp time(대체 휴가) 부여 (최소 0.5일)
+☐ 주말/공휴일 oncall은 별도 수당 or 보상휴가
+☐ 분기별 oncall MVP 발표 (사내 인정)
+☐ "조용한 주"도 OK — 알람 없는 주 = 운영 잘된 주
+
+[ 신입/온보딩 ]
+☐ 신입은 secondary로 2~3주 shadowing
+☐ primary 전 shadow 기간 runbook 최소 5개 직접 실행
+☐ buddy 1명 지정 (같은 주 secondary로 함께)
+☐ oncall 첫 주 후 1:1로 피드백 수집
+
+[ Handoff 문서 (필수) ]
+☐ 매주 금요일 17시 handoff doc 작성
+   - 이번 주 incident 요약 (Sev1/2)
+   - 진행 중인 mitigation
+   - 다음 주 예정 작업/배포
+   - 알려진 flaky alert
+☐ 다음 oncall과 15분 동기화 미팅
+
+[ 매니저 책임 ]
+☐ oncall 시간을 sprint capacity에서 차감 (50%)
+☐ oncall 주에는 신규 feature 작업 배정 금지
+☐ 분기마다 oncall 만족도 설문 (anonymous)
+☐ 1년 oncall 누적 시간 추적 (소수 인원 집중 방지)
+
+# 안티패턴 (즉시 시정)
+✗ "그 사람이 잘 아니까 항상 oncall" → 지식 단일점 + 번아웃
+✗ "알람 무시하면 자동으로 사라져요" → 학습된 무력감
+✗ "oncall도 그냥 일이지" → 보상 없으면 이직`,
+        },
+        focus: 'healthy',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+    };
+
+    const ONCALL = [
+      { key: 'rotation', emoji: '🔁', name: 'Rotation',      note: '주별 1차/2차 교대' },
+      { key: 'runbook',  emoji: '📖', name: 'Runbook',       note: '알람별 표준 절차' },
+      { key: 'response', emoji: '⏱️', name: 'Response Time', note: 'Sev1 ack 5분' },
+      { key: 'healthy',  emoji: '🌱', name: 'Healthy',       note: '번아웃 방지' },
+    ];
+
+    function OnCallCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">👨‍⚕️ 당직 의사 + 매뉴얼 (OnCall + Runbook)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {ONCALL.map((o) => {
+              const isActive = focus === o.key;
+              return (
+                <div
+                  key={o.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{o.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{o.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{o.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">OnCall + Runbook</h1>
+                <p className="text-sm text-slate-500 mt-1">당직 의사 + 진료 매뉴얼 — Rotation / Runbook / Response / Healthy</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <OnCallCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'healthy' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(V-2-2)에서는 실전 체크리스트 — Observability 4축 종합
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — Incident Response (감지→완화→해결→포스트모템)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-1-2. Incident Response (감지→완화→해결→포스트모템)
+    학습 목표: 사고 발생 시 표준 4단계 흐름과 각 단계의 핵심 액션
+    핵심 비유: "응급실 트리아지" — 분류 → 응급조치 → 정밀치료 → 사례 회의
+    구조: 4단계 (Detect / Mitigate / Resolve / Postmortem)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Detect — "환자 분류 (Sev1/2/3 + IC 지정)"',
+        desc: '알람·티켓이 들어오면 가장 먼저 severity를 분류한다. on-call이 5분 안에 ack(인지)하지 못하면 escalation. Incident Commander(IC)를 1명 정해서 의사결정 권한을 모은다. Slack `#incident-NNN` 채널을 자동 생성해 모든 대화를 한 곳에 모아 타임라인 추적이 가능하게 한다.',
+        block: {
+          kind: 'shell',
+          code: `# 1) Severity 분류 표 (조직마다 정의 필요)
+Sev   영향 범위                  대응 속도          예시
+─────────────────────────────────────────────────────────────
+Sev1  전체 사용자 / 매출 직격    즉시 IC + 전사 알림  결제 다운, 데이터 손실
+Sev2  일부 기능 / 다수 사용자    1h 내 대응         로그인 일부 실패, latency 2x
+Sev3  소수 사용자 / 우회 가능    영업시간 내        UI 버그, 비핵심 기능
+
+# 2) PagerDuty alert → on-call 호출 흐름
+$ pd-cli incident list --status=triggered
+ID          Severity  Title                       Ack
+INC-1042    Sev1      checkout 5xx rate > 10%     PENDING (3m)
+
+# 3) on-call ack (5분 룰)
+$ pd-cli incident ack INC-1042 --by=hong@team.com
+# → ack 안 되면 5m 후 secondary, 10m 후 manager로 escalation
+
+# 4) Slack incident 채널 자동 생성 (PD/Incident.io 연동)
+[Incident.io] 🚨 INC-1042 Sev1 declared
+  Channel: #incident-1042  (auto-created)
+  Commander: @hong   ← IC 1명 지정 (의사결정자)
+  Comms Lead: @sumi  ← 외부/내부 커뮤니케이션
+  Scribe: @joon      ← 타임라인 기록
+
+# 절대 규칙
+# - IC는 직접 디버깅하지 않는다 (조율만)
+# - 모든 결정은 #incident-NNN 채널에 기록 (포스트모템 근거)
+# - Sev1은 5분 ack, 안 되면 자동 escalation`,
+        },
+        focus: 'detect',
+      },
+      {
+        title: 'Step 2. Mitigate — "원인 찾기 전에 먼저 멈춤 (응급조치)"',
+        desc: '응급실 1순위는 출혈을 멈추는 것. 사고 대응의 1순위는 "사용자 영향 최소화"다. 근본 원인은 나중에 찾는다. 카나리/최근 배포 즉시 롤백, 트래픽 우회, feature flag off 같은 빠른 차단 카드를 먼저 쓴다. 5분 내 mitigate가 목표.',
+        block: {
+          kind: 'shell',
+          code: `# Mitigation 우선순위 (빠른 것부터)
+# 1) 최근 배포 롤백 (가장 흔한 원인 = 방금 나간 배포)
+
+# Kubernetes rollout undo — 직전 ReplicaSet으로 즉시 복귀
+$ kubectl rollout undo deployment/checkout -n prod
+deployment.apps/checkout rolled back
+
+$ kubectl rollout status deployment/checkout -n prod
+deployment "checkout" successfully rolled out
+# → 30초~2분 내 사용자 영향 차단
+
+# 2) Feature flag off (코드 배포 없이 기능만 차단)
+$ growthbook-cli flag set new-checkout-flow --value=false --env=prod
+[OK] flag 'new-checkout-flow' = false (rolled out 100%)
+# → 앱 재배포 없이 즉시 적용 (가장 안전)
+
+# 3) 트래픽 우회 (문제 region/instance 격리)
+$ kubectl cordon node-az-1a-3   # 신규 트래픽 차단
+$ kubectl drain  node-az-1a-3 --ignore-daemonsets
+
+# Istio로 region 비중 0
+$ istioctl proxy-config route ... --weight=us-east-1=100,us-west-2=0
+
+# 4) Rate limit / circuit breaker 강화 (downstream 보호)
+$ curl -X PATCH api/admin/ratelimit -d '{"rps":50}'  # 200→50
+
+# 5) Slack에 mitigate 선언 (영향 멈췄다고 명시)
+[#incident-1042] @hong: MITIGATED at 14:32 KST
+  - Action: rollout undo checkout v2.4.1 → v2.4.0
+  - User impact: 5xx rate 12% → 0.3% (정상화)
+  - 다음 단계: 근본 원인 디버깅 (Sev2로 다운그레이드)
+
+# 핵심 원칙
+# - "먼저 멈추고, 나중에 분석" (Mitigate first, investigate later)
+# - 롤백 결정에 토론하지 마라 (5분 내 못하면 IC가 단독 결정)
+# - Mitigate ≠ Resolve (영향만 멈춘 것, 원인은 아직)`,
+        },
+        focus: 'mitigate',
+      },
+      {
+        title: 'Step 3. Resolve — "근본 원인 fix + 점진 재배포"',
+        desc: '사용자 영향이 멈춘 뒤 진짜 디버깅이 시작된다. Part IV 흐름(메트릭→로그→트레이스)으로 root cause 좁히고, fix PR + 회귀 테스트 추가 + canary로 점진 배포한다. mitigate가 임시 봉합이라면 resolve는 정식 봉합.',
+        block: {
+          kind: 'python',
+          code: `# 시나리오: checkout 5xx — 원인 = Stripe 응답 timeout 미설정
+# Part IV 디버깅 흐름으로 root cause 확인 후 fix
+
+# stripe_client.py — Before (문제 코드)
+import stripe
+
+def charge(amount: int, token: str) -> dict:
+    # timeout 미설정 → 기본 무한 대기
+    return stripe.Charge.create(amount=amount, source=token)
+
+# stripe_client.py — After (fix)
+import stripe
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# 5초 timeout + 3회 재시도 + 지수 백오프
+@retry(stop=stop_after_attempt(3),
+       wait=wait_exponential(multiplier=1, min=1, max=4))
+def charge(amount: int, token: str) -> dict:
+    """Stripe 결제 — timeout 5s, 실패 시 3회 재시도."""
+    return stripe.Charge.create(
+        amount=amount,
+        source=token,
+        timeout=5,                # 핵심 fix
+    )
+
+# tests/test_stripe_client.py — 회귀 테스트 (재발 방지)
+def test_charge_timeout_raises(monkeypatch):
+    """Stripe timeout 시 ReadTimeout 발생 검증."""
+    def mock_create(**kw):
+        raise stripe.error.APIConnectionError("timeout")
+    monkeypatch.setattr(stripe.Charge, "create", mock_create)
+    with pytest.raises(stripe.error.APIConnectionError):
+        charge(1000, "tok_test")
+
+# 점진 배포 (Sev1 fix는 절대 100% 한 번에 X)
+# Step A: PR review → CI 통과 → staging 검증
+# Step B: prod canary 5% (10분 모니터)
+#   - error_rate, p99_latency, stripe_timeout_count 비교
+# Step C: 25% → 50% → 100% (각 단계 10분 대기)
+
+# $ kubectl set image deployment/checkout \\
+#     checkout=registry/checkout:v2.4.2 -n prod
+# $ kubectl rollout status deployment/checkout -n prod
+
+# Slack에 resolved 선언
+# [#incident-1042] @hong: RESOLVED at 16:48 KST
+#   Root cause: stripe SDK timeout 미설정 → 무한 대기 → worker 고갈
+#   Fix: timeout=5s + retry 3회 (PR #4521, deployed v2.4.2)
+#   다음: postmortem 24h 내 (jira OPS-9912)
+
+# 원칙
+# - 회귀 테스트 없이 fix 머지 금지 (같은 사고 재발이 가장 흔한 패턴)
+# - resolve도 canary로 (fix가 또 다른 버그를 만들 수 있다)`,
+        },
+        focus: 'resolve',
+      },
+      {
+        title: 'Step 4. Postmortem — "blameless 회고 (사람 X, 시스템 O)"',
+        desc: '사고 후 24~72h 내 포스트모템을 연다. 핵심은 "비난 없는(blameless)" — 누가 잘못했냐가 아니라 어떤 시스템이 그 실수를 가능하게 했냐를 본다. 5 Whys, Timeline, Action Items 3 종이 표준 구성. action item은 owner + 기한 필수.',
+        block: {
+          kind: 'yaml',
+          code: `# postmortem-INC-1042.yaml (Google SRE 스타일 템플릿)
+incident: INC-1042
+title: "Checkout 5xx 급증 (Stripe 응답 timeout 미설정)"
+severity: Sev1
+status: closed
+
+# 1) 요약 (3줄)
+summary: |
+  v2.4.1 배포 후 Stripe API 일시 지연으로 checkout worker가
+  무한 대기 → 풀 고갈 → 5xx 12%. rollback으로 mitigate,
+  timeout=5s + retry 추가로 resolve.
+
+# 2) 영향 (정량 측정)
+impact:
+  duration: "1h 47m (14:01 ~ 15:48 KST)"
+  users_affected: "약 3,200명 (전체 결제 시도의 38%)"
+  failed_transactions: 4180
+  estimated_revenue_loss: "$28,400"
+
+# 3) 타임라인 (Slack 채널에서 자동 추출)
+timeline:
+  - "14:01  Prometheus alert HighErrorRate fired (Sev1)"
+  - "14:04  on-call hong ack, IC 선언, #incident-1042 생성"
+  - "14:08  checkout v2.4.1 의심 → kubectl rollout undo"
+  - "14:32  MITIGATED (5xx 12% → 0.3%)"
+  - "15:20  root cause 식별 (Stripe timeout 미설정)"
+  - "16:48  v2.4.2 canary → 100% 완료, RESOLVED"
+
+# 4) 5 Whys (근본 원인 파고들기)
+five_whys:
+  - q: "왜 5xx가 급증했나?"
+    a: "checkout worker 풀이 고갈됨"
+  - q: "왜 worker 풀이 고갈됐나?"
+    a: "Stripe API 호출이 응답 없이 hang"
+  - q: "왜 hang이 발생했나?"
+    a: "Stripe SDK timeout 미설정 → 무한 대기"
+  - q: "왜 timeout 미설정이 운영까지 갔나?"
+    a: "외부 API 호출 timeout 강제 lint 룰 없음"
+  - q: "왜 lint 룰이 없었나?"
+    a: "외부 호출 표준이 문서화 안 됨"
+  # → 사람 잘못 X, 시스템(룰/문서) 부재 O
+
+# 5) Action Items (owner + 기한 필수, jira 연동)
+action_items:
+  - owner: "@hong"
+    title: "외부 API 호출 timeout 강제 lint 룰 추가"
+    due: "2026-05-13"
+    jira: "OPS-9913"
+  - owner: "@sumi"
+    title: "stripe_timeout_count 메트릭 + 알람 추가"
+    due: "2026-05-10"
+    jira: "OPS-9914"
+  - owner: "@joon"
+    title: "외부 API 호출 표준 wiki 문서화"
+    due: "2026-05-20"
+    jira: "OPS-9915"
+
+# 6) blameless 원칙 (문서 마지막에 명시)
+blameless_note: |
+  이 포스트모템은 개인을 비난하지 않는다.
+  '왜 사람이 그렇게 했나'가 아니라
+  '어떤 시스템이 그 행동을 가능하게 했나'를 묻는다.
+
+# 공유: 전사 wiki + 엔지니어링 all-hands에서 발표
+# Sev1은 24h 내, Sev2는 72h 내 작성 의무`,
+        },
+        focus: 'postmortem',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+    };
+
+    const INCIDENT = [
+      { key: 'detect',     emoji: '🚨', name: 'Detect',     note: '알람·Sev 분류' },
+      { key: 'mitigate',   emoji: '🩹', name: 'Mitigate',   note: '롤백/플래그 off' },
+      { key: 'resolve',    emoji: '🔧', name: 'Resolve',    note: '근본 원인 fix' },
+      { key: 'postmortem', emoji: '📝', name: 'Postmortem', note: 'blameless 회고' },
+    ];
+
+    function IncidentCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🚑 응급실 트리아지 (Incident Response)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {INCIDENT.map((i) => {
+              const isActive = focus === i.key;
+              return (
+                <div
+                  key={i.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{i.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{i.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{i.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Incident Response (감지→완화→해결→포스트모템)</h1>
+                <p className="text-sm text-slate-500 mt-1">응급실 트리아지 — Detect / Mitigate / Resolve / Postmortem</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <IncidentCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'postmortem' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(V-2-1)에서는 OnCall + Runbook — 당직 로테이션과 표준 대응 매뉴얼
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
