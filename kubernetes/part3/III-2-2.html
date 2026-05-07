@@ -3,245 +3,773 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kubernetes 학습 — DNS와 Service 디스커버리</title>
+  <title>Kubernetes 학습 — III-2-2. DNS와 Service 디스커버리</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    III-2-2. DNS와 Service 디스커버리
-    학습 목표: <service>.<namespace>.svc.cluster.local 자동 해석 메커니즘.
-    핵심 비유: "사내 전화번호부" — 부서명만 알면 내선이 자동 안내
-    구조: 4단계 (Service 이름 / FQDN / namespace 분리 / Headless)
+    III-2-2. DNS와 Service 디스커버리 — CoreDNS와 FQDN
+    학습 목표: Pod가 변하는 IP를 외우지 않고 Service 이름으로 호출하는 메커니즘.
+              <service>.<namespace>.svc.cluster.local 4 부분의 의미를 분해해서 본다.
+    핵심 비유: 사내 전화번호부 — 부서명만 알면 내선이 자동 안내
+    패턴: fastapi v1 — 좌(LiveDataPane: caller → CoreDNS → target Service 다이어그램)
+                      우(VSCode CodeViewer: yaml/bash 탭 + highlight.js)
+    색상: cyan
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의 — DNS 해석 5단계
+    //   callerName  : 좌측 caller Pod 라벨
+    //   callerNs    : caller가 속한 namespace
+    //   callString  : 화살표 위에 표시되는 호출 문자열 (단계마다 길어짐)
+    //   targetName  : 우측 target Service 라벨
+    //   targetNs    : target Service가 속한 namespace
+    //   targetIp    : DNS 해석 결과 IP (없으면 ?)
+    //   parts       : callString을 부분별로 분해 (각 부분 색상 라벨)
+    //   showCoreDns : 가운데 CoreDNS 박스 표시 여부
+    //   coreDnsState: CoreDNS 박스 상태 ('off' | 'idle' | 'resolving' | 'resolved')
+    //   problem     : 문제 메시지 (Step 1 IP 변동)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. Service 이름이 곧 호스트명',
-        desc: 'Service를 만들면 자동으로 DNS 레코드가 생긴다. 같은 namespace의 Pod는 그냥 service 이름으로 부르면 끝. CoreDNS가 클러스터 내부 DNS를 담당.',
-        block: {
-          kind: 'shell',
-          code: `# default namespace에서 web Service 생성
-$ kubectl create svc clusterip web --tcp=80:8080
-
-# 같은 namespace의 Pod에서
-$ kubectl exec frontend-aa1 -- curl http://web
-# 200 OK    ← 서비스 이름 그대로 통함!
-
-# 내부 동작
-# 1. frontend Pod가 "web" 호스트 조회
-# 2. CoreDNS가 web.default.svc.cluster.local로 해석
-# 3. ClusterIP 10.0.5.21 반환
-# 4. frontend → 10.0.5.21:80 → Pod 중 하나로 분산`,
+        title: 'Step 1. IP 호출의 한계 — "오늘은 .42, 내일은 .87"',
+        desc: 'Pod는 죽고 살기를 반복한다. 매번 새 Pod IP가 발급되니 caller가 IP를 하드코딩하면 며칠 뒤 통신이 끊긴다. "이름"으로 부를 수단이 필요하다 — 바로 Service + DNS.',
+        callerName: 'frontend-aa1',
+        callerNs: 'default',
+        callString: 'http://10.244.2.42',
+        targetName: 'api Pod',
+        targetNs: 'default',
+        targetIp: '10.244.2.87',
+        parts: [
+          { text: '10.244.2.42', color: 'gray', label: '하드코딩 IP', strike: true },
+        ],
+        showCoreDns: false,
+        coreDnsState: 'off',
+        problem: 'IP 변동 — Pod 재기동 시 .42 → .87 로 바뀜 → 통신 단절',
+        code: {
+          lang: 'yaml',
+          filename: 'caller-deployment.yaml',
+          lines: [
+            '# 🚨 잘못된 방식 — Pod IP 하드코딩',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: frontend',
+            'spec:',
+            '  replicas: 3',
+            '  selector:',
+            '    matchLabels: { app: frontend }',
+            '  template:',
+            '    metadata:',
+            '      labels: { app: frontend }',
+            '    spec:',
+            '      containers:',
+            '      - name: app',
+            '        image: myorg/frontend:1.0',
+            '        env:',
+            '        # ❌ Pod IP 직접 박음 — 재기동되면 끝',
+            '        - name: API_URL',
+            '          value: "http://10.244.2.42:8080"',
+            '',
+            '# Pod 재기동 시나리오',
+            '#   t=0   api Pod IP = 10.244.2.42  → 정상',
+            '#   t=1d  Node 재시작 / OOMKilled',
+            '#         → 새 api Pod IP = 10.244.2.87',
+            '#   frontend는 여전히 .42 호출 → connection refused',
+            '#',
+            '# 해결: "이름"으로 부르자 → Service + CoreDNS',
+            '',
+            '# 참고: Pod IP 직접 호출이 깨지는 다른 시나리오',
+            '#   - HPA 스케일 아웃: 새 Pod IP 추가 → caller는 모름',
+            '#   - rolling update: 이전 Pod 종료 → 새 IP 재발급',
+            '#   - Node drain: 다른 노드로 Pod 이주 → IP 변경',
+            '#   - CrashLoopBackOff 회복: 같은 Pod도 새 IP 받음',
+            '#',
+            '# 따라서 IP 하드코딩은 "단기 PoC"에만 허용',
+            '# 운영 환경 = 반드시 Service 이름 호출',
+          ],
+          highlight: [18, 19, 20, 23, 24, 25, 26, 27]
         },
-        focus: 'service-name',
       },
       {
-        title: 'Step 2. FQDN — <svc>.<ns>.svc.cluster.local',
-        desc: '다른 namespace에 접근할 땐 FQDN. web.production.svc.cluster.local. 일부만 적어도 됨 — web.production이면 같은 클러스터 가정. 개발 환경 분리에 핵심.',
-        block: {
-          kind: 'shell',
-          code: `# Pod의 /etc/resolv.conf
-$ cat /etc/resolv.conf
-# search default.svc.cluster.local
-#        svc.cluster.local
-#        cluster.local
-# nameserver 10.96.0.10           ← CoreDNS
-
-# 단축 이름 모두 통함
-$ curl http://web                          # 같은 namespace
-$ curl http://web.production               # 다른 ns
-$ curl http://web.production.svc           # 좀 더 명시
-$ curl http://web.production.svc.cluster.local  # 풀 FQDN`,
+        title: 'Step 2. CoreDNS 도입 — "이름 → IP 자동 안내"',
+        desc: 'Service를 만들면 CoreDNS가 자동으로 DNS 레코드를 등록한다. caller는 "api-svc"라는 이름만 부르면 끝. CoreDNS가 ClusterIP를 돌려주고, kube-proxy가 실제 Pod로 분배한다.',
+        callerName: 'frontend-aa1',
+        callerNs: 'default',
+        callString: 'http://api-svc',
+        targetName: 'api-svc',
+        targetNs: 'default',
+        targetIp: '10.96.180.21',
+        parts: [
+          { text: 'api-svc', color: 'cyan', label: 'service-name' },
+        ],
+        showCoreDns: true,
+        coreDnsState: 'resolving',
+        problem: null,
+        code: {
+          lang: 'bash',
+          filename: 'dns-test.sh',
+          lines: [
+            '# 1) Service 생성 (ClusterIP)',
+            '$ kubectl create svc clusterip api-svc --tcp=80:8080',
+            'service/api-svc created',
+            '',
+            '# 2) Service 확인 — ClusterIP 자동 할당',
+            '$ kubectl get svc api-svc',
+            'NAME      TYPE        CLUSTER-IP      PORT(S)',
+            'api-svc   ClusterIP   10.96.180.21    80/TCP',
+            '',
+            '# 3) Pod 안에서 nslookup — CoreDNS가 답한다',
+            '$ kubectl exec frontend-aa1 -- nslookup api-svc',
+            'Server:    10.96.0.10            # ← CoreDNS의 ClusterIP',
+            'Address:   10.96.0.10#53',
+            '',
+            'Name:      api-svc.default.svc.cluster.local',
+            'Address:   10.96.180.21          # ← Service ClusterIP',
+            '',
+            '# 4) 실제 호출 — 이름만 알면 통한다',
+            '$ kubectl exec frontend-aa1 -- curl http://api-svc',
+            'HTTP/1.1 200 OK',
+            '',
+            '# 동작 흐름',
+            '#   frontend → "api-svc" 조회 → CoreDNS',
+            '#   CoreDNS → 10.96.180.21 응답',
+            '#   frontend → 10.96.180.21:80 → kube-proxy → Pod',
+            '',
+            '# 5) CoreDNS Pod 위치 확인',
+            '$ kubectl get pods -n kube-system -l k8s-app=kube-dns',
+            'NAME                       READY   STATUS    AGE',
+            'coredns-558bd4d5db-4gh2k   1/1     Running   12d',
+            'coredns-558bd4d5db-9xr7p   1/1     Running   12d',
+            '',
+            '# 6) CoreDNS 로그 — 실제 조회 trace',
+            '$ kubectl logs -n kube-system coredns-558bd4d5db-4gh2k | tail -3',
+            '[INFO] 10.244.1.5:50284 - "A IN api-svc.default.svc.cluster.local."',
+            '[INFO] 10.244.1.5:50284 - 1 1.2ms 124 NOERROR qr,aa,rd 102',
+            '#       └ 답변 1개, 1.2ms 응답, NOERROR = 정상',
+          ],
+          highlight: [11, 12, 15, 16, 19, 20, 25, 28, 29]
         },
-        focus: 'fqdn',
       },
       {
-        title: 'Step 3. Namespace = 격리 + 도메인 prefix',
-        desc: 'namespace는 환경/팀 격리 도구. dev/staging/production 같은 namespace에 같은 이름의 Service를 두어도 충돌 없다. DNS는 namespace prefix로 구분.',
-        block: {
-          kind: 'yaml',
-          code: `# 같은 이름 "web" Service가 ns별로 따로
-# ns: dev        → web.dev.svc.cluster.local
-# ns: staging    → web.staging.svc.cluster.local
-# ns: production → web.production.svc.cluster.local
-
-# Pod (in dev ns)에서
-$ curl http://web                  # 자기 ns의 web (=dev/web)
-$ curl http://web.production       # production의 web
-
-# kubectl 컨텍스트
-$ kubectl get pods -n production
-$ kubectl describe svc web -n staging`,
+        title: 'Step 3. 같은 namespace — 단순 이름으로 끝',
+        desc: 'caller와 target이 같은 namespace에 있으면 "api-svc" 한 단어면 충분. /etc/resolv.conf의 search 도메인 첫 줄이 "<자기ns>.svc.cluster.local"이라 자동으로 붙는다.',
+        callerName: 'frontend-aa1',
+        callerNs: 'default',
+        callString: 'http://api-svc',
+        targetName: 'api-svc',
+        targetNs: 'default',
+        targetIp: '10.96.180.21',
+        parts: [
+          { text: 'api-svc', color: 'cyan', label: 'service-name' },
+        ],
+        showCoreDns: true,
+        coreDnsState: 'resolved',
+        problem: null,
+        code: {
+          lang: 'bash',
+          filename: 'dns-test.sh',
+          lines: [
+            '# Pod의 /etc/resolv.conf — DNS 단축 검색 규칙',
+            '$ kubectl exec frontend-aa1 -- cat /etc/resolv.conf',
+            'search default.svc.cluster.local svc.cluster.local cluster.local',
+            'nameserver 10.96.0.10',
+            'options ndots:5',
+            '',
+            '# search 의미: 짧은 이름은 다음 순서로 시도',
+            '#   1. api-svc.default.svc.cluster.local',
+            '#   2. api-svc.svc.cluster.local',
+            '#   3. api-svc.cluster.local',
+            '',
+            '# 같은 ns이므로 1번에서 바로 찾음',
+            '$ curl http://api-svc',
+            '# → CoreDNS 조회',
+            '#   "api-svc" + search[0] = "api-svc.default.svc.cluster.local"',
+            '#   ✓ 매치 → 10.96.180.21',
+            'HTTP/1.1 200 OK',
+            '',
+            '# kube-dns Service (CoreDNS Pod 앞단)',
+            '$ kubectl get svc -n kube-system kube-dns',
+            'NAME       TYPE        CLUSTER-IP    PORT(S)',
+            'kube-dns   ClusterIP   10.96.0.10    53/UDP,53/TCP',
+            '',
+            '# 모든 Pod의 nameserver는 10.96.0.10 (= kube-dns ClusterIP)',
+            '',
+            '# ndots:5 의미 — 점이 5개 미만이면 search 도메인 먼저 시도',
+            '#   "api-svc"        → 점 0개 → search 시도 (✓)',
+            '#   "api.example.com"→ 점 2개 → search 시도 후 실패 시 그대로',
+            '#   "a.b.c.d.e.f"    → 점 5개 → search 안 거치고 그대로',
+            '#',
+            '# 외부 도메인 호출 시 search 우선이라 약간 느려짐',
+            '#   curl https://google.com → google.com.default.svc... 4번 NXDOMAIN',
+            '#   → 5번째에서 google.com 직접 조회 → 성공',
+            '#',
+            '# 최적화: 외부 호출 잦은 Pod는 dnsConfig로 ndots:2 낮추기',
+            '#   spec.dnsConfig.options: [{ name: ndots, value: "2" }]',
+          ],
+          highlight: [3, 7, 8, 9, 10, 13, 14, 15, 16, 26, 27, 28, 29]
         },
-        focus: 'namespace',
       },
       {
-        title: 'Step 4. Headless Service — Pod IP 직접 받기',
-        desc: 'clusterIP: None으로 두면 가상 IP 없이 Pod IP들이 직접 DNS에 등록. StatefulSet과 결합해 mydb-0/mydb-1/mydb-2 각자에 직접 연결할 때. 분산 DB 클러스터링 필수.',
-        block: {
-          kind: 'yaml',
-          code: `apiVersion: v1
-kind: Service
-metadata:
-  name: mydb-headless
-spec:
-  clusterIP: None              # ← 핵심 (가상 IP 없음)
-  selector:
-    app: mydb
-  ports:
-    - port: 5432
-
-# DNS 조회 결과
-$ nslookup mydb-headless
-# Name: mydb-headless.default.svc.cluster.local
-# Address 1: 10.244.1.5    ← Pod IP 직접
-# Address 2: 10.244.2.7
-# Address 3: 10.244.3.9
-
-# StatefulSet과 결합
-# mydb-0.mydb-headless → 10.244.1.5 (특정 Pod)
-# 클라이언트가 마스터-레플리카를 직접 구분 가능`,
+        title: 'Step 4. 다른 namespace — "api-svc.production"',
+        desc: 'production ns의 Service를 default ns Pod에서 부르려면 namespace를 명시해야 한다. "api-svc"만 쓰면 default.svc.cluster.local 안에서 찾다 실패. "api-svc.production"이 정답.',
+        callerName: 'frontend-aa1',
+        callerNs: 'default',
+        callString: 'http://api-svc.production',
+        targetName: 'api-svc',
+        targetNs: 'production',
+        targetIp: '10.96.207.42',
+        parts: [
+          { text: 'api-svc',    color: 'cyan',  label: 'service-name' },
+          { text: '.',          color: 'slate', label: '·' },
+          { text: 'production', color: 'amber', label: 'namespace' },
+        ],
+        showCoreDns: true,
+        coreDnsState: 'resolved',
+        problem: null,
+        code: {
+          lang: 'bash',
+          filename: 'dns-test.sh',
+          lines: [
+            '# 시나리오: default ns Pod → production ns Service 호출',
+            '',
+            '# 1) production ns에 같은 이름의 Service가 따로 있다',
+            '$ kubectl get svc api-svc -n production',
+            'NAME      TYPE        CLUSTER-IP      PORT(S)',
+            'api-svc   ClusterIP   10.96.207.42    80/TCP',
+            '',
+            '# 2) 단순 이름은 실패 — default ns에서 찾기 때문',
+            '$ kubectl exec frontend-aa1 -- curl http://api-svc',
+            '# → "api-svc.default.svc.cluster.local" 조회',
+            '# → default ns에는 production 버전 없음 → 다른 IP',
+            '',
+            '# 3) namespace 붙이면 production으로 라우팅',
+            '$ kubectl exec frontend-aa1 -- nslookup api-svc.production',
+            'Name:    api-svc.production.svc.cluster.local',
+            'Address: 10.96.207.42          # ← production Service IP',
+            '',
+            '$ kubectl exec frontend-aa1 -- curl http://api-svc.production',
+            'HTTP/1.1 200 OK',
+            'X-Pod-Namespace: production    # 응답 헤더 확인',
+            '',
+            '# 4) ns별 격리 = 같은 이름 Service가 환경별로 따로',
+            '#   default     → api-svc → dev 버전',
+            '#   staging     → api-svc → staging 버전',
+            '#   production  → api-svc → prod 버전',
+            '',
+            '# 5) 가능한 모든 단축형 — search 도메인이 자동 보완',
+            '$ curl http://api-svc                              # ❌ default ns로 감',
+            '$ curl http://api-svc.production                   # ✓ ns 명시',
+            '$ curl http://api-svc.production.svc               # ✓ 객체 종류까지',
+            '$ curl http://api-svc.production.svc.cluster.local # ✓ 풀 FQDN',
+            '',
+            '# 6) NetworkPolicy로 ns 간 호출을 통제할 수도 있다',
+            '#   default ns → production ns 호출 차단 가능',
+            '#   apiVersion: networking.k8s.io/v1',
+            '#   kind: NetworkPolicy',
+            '#   spec:',
+            '#     podSelector: {}',
+            '#     ingress:',
+            '#     - from: [{ namespaceSelector: { matchLabels: { name: prod } } }]',
+            '',
+            '# 7) ExternalName Service — 외부 도메인을 클러스터 이름으로 alias',
+            '$ kubectl get svc external-db -o yaml',
+            '#   spec:',
+            '#     type: ExternalName',
+            '#     externalName: db.amazonaws.com',
+            '#   → curl http://external-db → CNAME → db.amazonaws.com',
+          ],
+          highlight: [13, 14, 15, 16, 18, 19, 20, 27, 28, 29, 30, 41, 42, 43, 44, 45]
         },
-        focus: 'headless',
+      },
+      {
+        title: 'Step 5. FQDN 분해 — 4 부분의 의미',
+        desc: 'api-svc.production.svc.cluster.local — 풀 FQDN의 4 부분을 색으로 분해한다. 1) Service 이름  2) namespace  3) "svc"는 Kubernetes Service 종류 표시  4) cluster.local은 클러스터 도메인.',
+        callerName: 'frontend-aa1',
+        callerNs: 'default',
+        callString: 'http://api-svc.production.svc.cluster.local',
+        targetName: 'api-svc',
+        targetNs: 'production',
+        targetIp: '10.96.207.42',
+        parts: [
+          { text: 'api-svc',       color: 'cyan',    label: 'service-name' },
+          { text: '.',             color: 'slate',   label: '·' },
+          { text: 'production',    color: 'amber',   label: 'namespace' },
+          { text: '.',             color: 'slate',   label: '·' },
+          { text: 'svc',           color: 'fuchsia', label: 'object-kind' },
+          { text: '.',             color: 'slate',   label: '·' },
+          { text: 'cluster.local', color: 'emerald', label: 'cluster-domain' },
+        ],
+        showCoreDns: true,
+        coreDnsState: 'resolved',
+        problem: null,
+        code: {
+          lang: 'yaml',
+          filename: 'coredns-corefile.yaml',
+          lines: [
+            '# CoreDNS 설정 — kube-system/coredns ConfigMap',
+            'apiVersion: v1',
+            'kind: ConfigMap',
+            'metadata:',
+            '  name: coredns',
+            '  namespace: kube-system',
+            'data:',
+            '  Corefile: |',
+            '    .:53 {',
+            '        errors',
+            '        health { lameduck 5s }',
+            '        ready',
+            '',
+            '        # ★ 핵심: cluster.local 도메인은 kubernetes 플러그인이 처리',
+            '        kubernetes cluster.local in-addr.arpa ip6.arpa {',
+            '          pods insecure',
+            '          fallthrough in-addr.arpa ip6.arpa',
+            '          ttl 30',
+            '        }',
+            '',
+            '        # 클러스터 외부 도메인은 upstream(/etc/resolv.conf)으로',
+            '        forward . /etc/resolv.conf',
+            '        cache 30',
+            '        loop',
+            '        reload',
+            '        loadbalance',
+            '    }',
+            '',
+            '# FQDN 분해: api-svc.production.svc.cluster.local',
+            '#   ┌────────┬──────────┬─────┬─────────────┐',
+            '#   │ api-svc│production│ svc │cluster.local│',
+            '#   ├────────┼──────────┼─────┼─────────────┤',
+            '#   │ Service│namespace │종류 │ 클러스터    │',
+            '#   │ 이름   │          │표시 │ 도메인      │',
+            '#   └────────┴──────────┴─────┴─────────────┘',
+            '#',
+            '# "svc"는 Service 객체용 — Pod라면 "pod"가 들어간다',
+            '#   pod-ip-10-244-1-5.default.pod.cluster.local',
+            '#',
+            '# cluster.local은 kubeadm 기본값 — kubelet --cluster-domain 으로 변경 가능',
+            '',
+            '# SRV 레코드 — 포트까지 한 번에 받기 (포트명 _http._tcp 사용)',
+            '$ kubectl exec frontend-aa1 -- nslookup -q=SRV _http._tcp.api-svc.production',
+            '_http._tcp.api-svc.production.svc.cluster.local',
+            '    service = 0 100 80 api-svc.production.svc.cluster.local',
+            '#                ^^                ^                       ',
+            '#                │                 └ 호스트',
+            '#                └ priority weight port',
+            '',
+            '# 검증 명령 모음',
+            '$ kubectl run -it --rm dnsutils --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 \\',
+            '    --restart=Never -- bash',
+            '$ nslookup api-svc.production.svc.cluster.local',
+            '$ dig +short api-svc.production.svc.cluster.local',
+            '$ getent hosts api-svc.production',
+            '',
+            '# 운영 팁',
+            '#   1) 항상 "<svc>.<ns>" 형태로 쓰자 — search 의존 줄이고 명시적',
+            '#   2) 외부 도메인은 ndots:2로 낮춰 latency 감소',
+            '#   3) CoreDNS Pod 2개 이상 — 단일 장애점 회피',
+            '#   4) 클러스터 도메인 바꿀 때는 kubelet + CoreDNS Corefile 동시에',
+            '',
+            '# 보너스: Headless Service — Pod IP 직접 받기',
+            '#   spec.clusterIP: None → ClusterIP 없이 Pod IP가 바로 등록',
+            '#   StatefulSet과 결합 시 mydb-0/mydb-1/mydb-2 개별 호출 가능',
+            '#',
+            '# $ nslookup mydb-headless',
+            '#   Address 1: 10.244.1.5    ← Pod 0',
+            '#   Address 2: 10.244.2.7    ← Pod 1',
+            '#   Address 3: 10.244.3.9    ← Pod 2',
+            '#',
+            '# $ nslookup mydb-0.mydb-headless',
+            '#   Address: 10.244.1.5      ← 특정 Pod 직접 (StatefulSet 식별자)',
+            '',
+            '# 보너스 2: Pod DNS — Service 없이 Pod 자체도 DNS 등록 가능',
+            '#   <pod-ipv4-with-dashes>.<namespace>.pod.cluster.local',
+            '#   예: 10-244-1-5.default.pod.cluster.local',
+            '#   대시(-)가 점(.)을 대체 — 거의 안 쓰지만 디버깅용',
+          ],
+          highlight: [14, 15, 16, 17, 18, 19, 30, 31, 32, 33, 34, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 60, 61, 70, 71, 72]
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      yaml:  { label: 'YAML', textColor: '#fde68a' },
-      shell: { label: 'Bash', textColor: '#86efac' },
+    // ─────────────────────────────────────────────────────
+    // 부분 색상 스타일 (정적 Tailwind — purge 안전)
+    //   text  : 부분 텍스트 색상
+    //   chip  : 라벨 칩 배경
+    //   bdr   : 라벨 칩 테두리
+    // ─────────────────────────────────────────────────────
+    const PART_STYLE = {
+      cyan:    { text: 'text-cyan-700',    chip: 'bg-cyan-100 text-cyan-800',     bdr: 'border-cyan-300' },
+      amber:   { text: 'text-amber-700',   chip: 'bg-amber-100 text-amber-800',   bdr: 'border-amber-300' },
+      fuchsia: { text: 'text-fuchsia-700', chip: 'bg-fuchsia-100 text-fuchsia-800', bdr: 'border-fuchsia-300' },
+      emerald: { text: 'text-emerald-700', chip: 'bg-emerald-100 text-emerald-800', bdr: 'border-emerald-300' },
+      slate:   { text: 'text-slate-500',   chip: 'bg-slate-100 text-slate-600',   bdr: 'border-slate-200' },
+      gray:    { text: 'text-slate-400',   chip: 'bg-slate-100 text-slate-500',   bdr: 'border-slate-200' },
     };
 
-    function PhonebookDiagram({ focus }) {
-      // focus별 강조 항목 정적 매핑
-      const ENTRIES = [
-        { key: 'service-name', name: 'web',                          ns: 'default',     ip: '10.0.5.21',   highlight: 'service-name' },
-        { key: 'fqdn',         name: 'web.default.svc.cluster.local', ns: 'default',     ip: '10.0.5.21',   highlight: 'fqdn' },
-        { key: 'namespace',    name: 'web.production',                ns: 'production',  ip: '10.0.7.42',   highlight: 'namespace' },
-        { key: 'headless',     name: 'mydb-0.mydb-headless',          ns: 'default',     ip: '10.244.1.5',  highlight: 'headless' },
-      ];
+    const CORE_DNS_STATE_STYLE = {
+      off:       { card: 'bg-slate-100 border-slate-300 opacity-50', label: 'CoreDNS (미사용)', sub: 'IP 직접 호출 — 이름 해석 안 함', emoji: '📵' },
+      idle:      { card: 'bg-cyan-50 border-cyan-300',                label: 'CoreDNS',          sub: '대기 중',                       emoji: '📞' },
+      resolving: { card: 'bg-cyan-100 border-cyan-500 animate-pulse', label: 'CoreDNS · 조회중', sub: 'name → IP 해석',                emoji: '🔍' },
+      resolved:  { card: 'bg-cyan-50 border-cyan-400',                label: 'CoreDNS · 응답',   sub: 'ClusterIP 반환 완료',           emoji: '✅' },
+    };
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — caller → CoreDNS → target 다이어그램
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const dnsStyle = CORE_DNS_STATE_STYLE[step.coreDnsState];
 
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">📞 사내 전화번호부 (CoreDNS)</div>
-          <div className="space-y-1 font-mono text-xs">
-            {ENTRIES.map((e) => {
-              const isActive = focus === e.highlight;
-              return (
-                <div
-                  key={e.key}
-                  className={`grid grid-cols-3 gap-2 px-3 py-2 rounded-md transition-all ${isActive ? 'bg-indigo-100 border-2 border-indigo-400 font-bold text-indigo-900' : 'bg-slate-50 border border-slate-200 text-slate-600'}`}
-                >
-                  <div className="truncate">{e.name}</div>
-                  <div className="text-center">[{e.ns}]</div>
-                  <div className="text-right">→ {e.ip}</div>
-                </div>
-              );
-            })}
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-bold text-slate-700">📞 사내 전화번호부 (CoreDNS)</h2>
+            <span className="text-[10px] text-slate-400 font-mono">caller → CoreDNS → target</span>
           </div>
-          <p className="text-center text-[11px] text-slate-500 mt-3">
-            {focus === 'service-name' && '같은 ns 안 — Service 이름 그대로 호출'}
-            {focus === 'fqdn' && 'FQDN — 단축/완전 이름 모두 동작'}
-            {focus === 'namespace' && 'namespace prefix로 환경 격리'}
-            {focus === 'headless' && 'Headless — 가상 IP 없음, Pod IP 직접 등록'}
-          </p>
+
+          {/* 호출 문자열 분해 라벨 (단계마다 길어짐) */}
+          <div className="mb-4 p-3 rounded-lg bg-slate-900 border border-slate-700">
+            <div className="text-[10px] text-slate-400 font-mono mb-2">호출 문자열 분해</div>
+            <div className="font-mono text-base flex flex-wrap items-center">
+              <span className="text-slate-400">http://</span>
+              {step.parts.map((p, i) => {
+                const s = PART_STYLE[p.color] || PART_STYLE.slate;
+                return (
+                  <span
+                    key={i}
+                    className={`font-bold ${s.text.replace('text-', 'text-')} ${p.strike ? 'line-through opacity-60' : ''}`}
+                    style={{
+                      color:
+                        p.color === 'cyan' ? '#0e7490' :
+                        p.color === 'amber' ? '#b45309' :
+                        p.color === 'fuchsia' ? '#a21caf' :
+                        p.color === 'emerald' ? '#047857' :
+                        p.color === 'gray' ? '#94a3b8' :
+                        '#64748b',
+                    }}
+                  >
+                    {p.text}
+                  </span>
+                );
+              })}
+            </div>
+            {/* 라벨 칩 */}
+            <div className="flex flex-wrap gap-1.5 mt-3">
+              {step.parts
+                .filter((p) => p.label !== '·')
+                .map((p, i) => {
+                  const s = PART_STYLE[p.color] || PART_STYLE.slate;
+                  return (
+                    <span
+                      key={i}
+                      className={`text-[10px] font-mono px-2 py-0.5 rounded border ${s.chip} ${s.bdr}`}
+                    >
+                      {p.label}
+                    </span>
+                  );
+                })}
+            </div>
+          </div>
+
+          {/* caller → CoreDNS → target 3단 가로 다이어그램 */}
+          <div className="grid grid-cols-7 gap-2 items-center mb-4">
+            {/* Caller Pod */}
+            <div className="col-span-2 rounded-lg bg-cyan-50 border-2 border-cyan-400 p-2 text-center">
+              <div className="text-[10px] text-cyan-600 font-mono">caller Pod</div>
+              <div className="text-xs font-bold text-cyan-900 truncate">{step.callerName}</div>
+              <div className="text-[10px] text-slate-500 mt-0.5">ns: {step.callerNs}</div>
+            </div>
+
+            {/* 화살표 1 */}
+            <div className="col-span-1 flex flex-col items-center">
+              <div className="text-[9px] text-slate-500 font-mono mb-0.5">name?</div>
+              <div className="w-full border-t-2 border-dashed border-cyan-400 relative">
+                <span className="absolute -right-1 -top-2 text-cyan-600 text-sm">▶</span>
+              </div>
+            </div>
+
+            {/* CoreDNS */}
+            <div className={`col-span-1 rounded-lg border-2 p-2 text-center transition-all duration-500 ${dnsStyle.card}`}>
+              <div className="text-base">{dnsStyle.emoji}</div>
+              <div className="text-[10px] font-bold text-slate-800 leading-tight">{dnsStyle.label}</div>
+            </div>
+
+            {/* 화살표 2 */}
+            <div className="col-span-1 flex flex-col items-center">
+              <div className="text-[9px] text-slate-500 font-mono mb-0.5">→ IP</div>
+              <div className="w-full border-t-2 border-dashed border-cyan-400 relative">
+                <span className="absolute -right-1 -top-2 text-cyan-600 text-sm">▶</span>
+              </div>
+            </div>
+
+            {/* Target Service */}
+            <div className="col-span-2 rounded-lg bg-emerald-50 border-2 border-emerald-400 p-2 text-center">
+              <div className="text-[10px] text-emerald-600 font-mono">target Service</div>
+              <div className="text-xs font-bold text-emerald-900 truncate">{step.targetName}</div>
+              <div className="text-[10px] text-slate-500 mt-0.5">ns: {step.targetNs}</div>
+              <div className="text-[10px] font-mono text-emerald-700 mt-0.5">{step.targetIp}</div>
+            </div>
+          </div>
+
+          {/* CoreDNS 상태 부가 설명 */}
+          <div className="text-[11px] text-slate-500 mb-3 px-2">
+            <span className="font-mono">CoreDNS:</span> {dnsStyle.sub}
+          </div>
+
+          {/* 문제 박스 (Step 1만) */}
+          {step.problem && (
+            <div className="p-3 rounded-lg bg-red-50 border-2 border-red-300">
+              <div className="flex items-center gap-2 text-red-800 font-bold text-sm">
+                <span className="text-lg">🚨</span>
+                <span>문제</span>
+              </div>
+              <div className="text-[12px] text-red-700 mt-1 font-mono">{step.problem}</div>
+            </div>
+          )}
+
+          {/* 단계별 부가 설명 */}
+          {!step.problem && (
+            <div className="p-3 rounded-lg bg-cyan-50 border border-cyan-200">
+              <div className="text-[11px] text-cyan-900 leading-relaxed">
+                <span className="font-bold">FQDN 규칙:</span>{' '}
+                <span className="font-mono">&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</span>
+                <br />
+                <span className="text-slate-600">
+                  앞 부분만 적어도 search 도메인이 자동 보완. 풀 FQDN은 명시적이라 디버깅에 유리.
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[10px] mt-4 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-cyan-400"></span>service</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-amber-400"></span>namespace</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-fuchsia-400"></span>object-kind</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-emerald-400"></span>cluster-domain</span>
+          </div>
         </div>
       );
     }
 
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code (innerHTML 추출) */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-cyan-500/15 border-l-2 border-cyan-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">DNS와 Service 디스커버리</h1>
-                <p className="text-sm text-slate-500 mt-1">사내 전화번호부 — Service 이름이 곧 호스트명</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-cyan-700 hover:text-cyan-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-cyan-600 text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. Service &amp; Networking &gt; Chapter 2. DNS 디스커버리</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">DNS와 Service 디스커버리</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">CoreDNS와 FQDN — &lt;service&gt;.&lt;namespace&gt;.svc.cluster.local 분해</p>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <PhonebookDiagram focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
-              </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
-            </div>
-
-            {step.focus === 'headless' && (
-              <div className="bg-indigo-50 border-2 border-indigo-300 rounded-xl p-3 mb-6 text-xs text-indigo-900">
-                💡 Part III Service & Networking 4/4 완성! 다음(IV-1-1)부터는 Pod 데이터를 영구 보존하는 Volume / PV / PVC를 본다
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-cyan-50 border-2 border-cyan-300 rounded-xl p-3 text-sm text-cyan-900">
+                💡 Part III Service &amp; Networking 완성! 다음(IV-1-1)부터는 <strong>Volume / PV / PVC</strong> — Pod 데이터를 영구 보존하는 스토리지를 본다
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-cyan-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-cyan-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-cyan-600 text-white hover:bg-cyan-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./III-2-1.html" className="text-slate-500 hover:text-slate-700">&larr; III-2-1 Service Type</a>
+              <a href="../../index.html" className="text-cyan-700 hover:text-cyan-900 font-medium">허브 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

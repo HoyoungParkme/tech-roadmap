@@ -3,243 +3,794 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kubernetes 학습 — 롤링 업데이트와 롤백</title>
+  <title>Kubernetes 학습 — II-1-2. 롤링 업데이트와 롤백</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    II-1-2. 롤링 업데이트와 롤백
-    학습 목표: 무중단 배포의 흐름과 문제 발생 시 즉시 롤백하는 방법을 안다.
+    II-1-2. 롤링 업데이트와 롤백 — 무중단 배포 + 즉시 복귀
+    학습 목표: maxSurge / maxUnavailable로 v1 → v2를 점진 교체하고, 문제 시 kubectl rollout undo로 즉시 v1 복귀.
     핵심 비유: "교대 근무 교체" — v1 직원을 한 명씩 v2 직원으로 교체. 문제 시 즉시 v1로 복귀
-    구조: 4단계 (안정 v1 / 점진 교체 / 완료 v2 / 문제 + 롤백)
+    패턴: fastapi v1 — 좌(LiveDataPane: SVG Pod 박스 + 카운터) / 우(VSCode CodeViewer)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // 4단계 STEPS — 각 단계별 Pod 상태 (v1: green / v2: blue / failing: red)
+    // ─────────────────────────────────────────────────────
+    // 6단계 STEPS — Pod 상태 + 카운터 + 코드
+    //   pod 상태: 'v1' | 'v2' | 'v1-term' | 'v2-fail' | 'empty'
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. 안정 상태 — v1 Pod 4개',
-        desc: '롤링 업데이트 시작 전. Deployment가 v1 image의 Pod 4개를 유지 중. 트래픽은 4개에 분산.',
-        block: {
-          kind: 'shell',
-          code: `kubectl get deploy/web -o wide
-# NAME   READY   IMAGE         AGE
-# web    4/4     myapp:v1      30d
-
-kubectl get pods -l app=web
-# web-v1-aa1   Running
-# web-v1-aa2   Running
-# web-v1-aa3   Running
-# web-v1-aa4   Running`
+        title: 'Step 1. 안정 상태 — v1 Pod 5개 정상 운영',
+        desc: 'Deployment가 myapp:v1 image로 5 replicas 유지 중. 트래픽이 5개 Pod에 균등 분산. ReplicaSet은 v1 하나만 활성. 다음 배포 전까지 이 상태가 정상.',
+        pods: [
+          { v: 'v1' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' },
+        ],
+        counter: { desired: 5, current: 5, upToDate: 5, available: 5 },
+        rsRows: [
+          { name: 'web-v1-5b6c8e', desired: 5, current: 5, ready: 5, image: 'myapp:v1', active: true },
+        ],
+        eventBox: null,
+        code: {
+          lang: 'yaml',
+          filename: 'deployment-v1.yaml',
+          lines: [
+            '# 현재 운영 중인 Deployment (v1, replicas=5)',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: web',
+            '  labels: { app: web }',
+            '  annotations:',
+            '    kubernetes.io/change-cause: "initial v1 deploy"',
+            'spec:',
+            '  replicas: 5',
+            '  revisionHistoryLimit: 10   # 롤백용으로 보관할 ReplicaSet 수',
+            '  selector:',
+            '    matchLabels: { app: web }',
+            '  strategy:',
+            '    type: RollingUpdate',
+            '    rollingUpdate:',
+            '      maxSurge: 2          # 배포 중 추가로 띄울 수 있는 최대 Pod',
+            '      maxUnavailable: 2    # 배포 중 동시에 죽일 수 있는 최대 Pod',
+            '  minReadySeconds: 5       # Ready 후 N초 더 기다려서 안정 확인',
+            '  progressDeadlineSeconds: 600  # 10분 안에 진척 없으면 실패',
+            '  template:',
+            '    metadata:',
+            '      labels: { app: web }',
+            '    spec:',
+            '      containers:',
+            '        - name: app',
+            '          image: myapp:v1   # 현재 버전',
+            '          ports: [{ containerPort: 8080 }]',
+            '          readinessProbe:',
+            '            httpGet: { path: /healthz, port: 8080 }',
+            '            initialDelaySeconds: 3',
+            '            periodSeconds: 5',
+            '          livenessProbe:',
+            '            httpGet: { path: /livez, port: 8080 }',
+            '            periodSeconds: 10',
+            '          lifecycle:',
+            '            preStop:',
+            '              exec:',
+            '                command: ["sh","-c","sleep 10"]  # graceful drain',
+            '',
+            '# kubectl get deploy/web',
+            '# NAME   READY   UP-TO-DATE   AVAILABLE   AGE',
+            '# web    5/5     5            5           30d',
+          ],
+          highlight: [10, 14, 15, 16, 17, 18, 28, 36, 37, 38, 39],
         },
-        focus: 'stable',
-        pods: ['v1','v1','v1','v1'],
       },
       {
-        title: 'Step 2. 점진 교체 — v1 1개 ↓, v2 1개 ↑',
-        desc: 'image: myapp:v2로 변경 후 apply. K8s가 한꺼번에 4개를 바꾸지 않고 maxSurge=1, maxUnavailable=1 기본 정책으로 한 번에 1개씩 교체. 사용자는 무중단 경험.',
-        block: {
-          kind: 'yaml',
-          code: `spec:
-  replicas: 4
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1            # 한 번에 1개 추가 가능
-      maxUnavailable: 1      # 한 번에 1개 다운 허용
-  template:
-    spec:
-      containers:
-        - name: app
-          image: myapp:v2     # v1 → v2
-
-# kubectl apply -f deployment.yaml
-# kubectl rollout status deployment/web
-# Waiting for deployment "web" rollout to finish:
-#   2 of 4 updated replicas are available...`
+        title: 'Step 2. v2 배포 시작 — maxSurge=2 → v2 Pod 2개 추가',
+        desc: 'image를 myapp:v2로 변경하고 apply. 핵심: K8s는 v1을 죽이기 전에 v2를 먼저 띄운다. maxSurge=2 → 추가로 2개 더 → 총 7개 (v1 5개 + v2 2개). 사용자 무중단.',
+        pods: [
+          { v: 'v1' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' },
+          { v: 'v2' }, { v: 'v2' },
+        ],
+        counter: { desired: 5, current: 7, upToDate: 2, available: 5 },
+        rsRows: [
+          { name: 'web-v1-5b6c8e', desired: 5, current: 5, ready: 5, image: 'myapp:v1', active: true },
+          { name: 'web-v2-7d9f8c', desired: 2, current: 2, ready: 2, image: 'myapp:v2', active: true },
+        ],
+        eventBox: { kind: 'info', text: '🔵 ScalingReplicaSet · v2 ReplicaSet up to 2', detail: 'maxSurge=2 → 추가 Pod 2개 생성 (총 7개)' },
+        code: {
+          lang: 'yaml',
+          filename: 'deployment-v2.yaml',
+          lines: [
+            '# v2 배포용 매니페스트 — image 한 줄만 변경',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: web',
+            '  annotations:',
+            '    kubernetes.io/change-cause: "release v2 (feat: search)"',
+            'spec:',
+            '  replicas: 5',
+            '  strategy:',
+            '    type: RollingUpdate',
+            '    rollingUpdate:',
+            '      maxSurge: 2            # ★ 핵심 — 추가 2개까지 일시 허용',
+            '      maxUnavailable: 2      # ★ 핵심 — 동시에 2개까지 다운',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: app',
+            '          image: myapp:v2    # ⬅ v1 → v2',
+            '',
+            '# 적용 — 둘 중 한 가지',
+            '# (a) kubectl apply -f deployment-v2.yaml',
+            '# (b) kubectl set image deployment/web app=myapp:v2 --record',
+            '',
+            '# 진행 모니터링',
+            '# $ kubectl rollout status deployment/web',
+            '# Waiting for deployment "web" rollout to finish:',
+            '#   2 of 5 updated replicas are available...',
+            '',
+            '# ReplicaSet 변화 — v1 그대로 + v2 새로 생성',
+            '# $ kubectl get rs -l app=web',
+            '# NAME              DESIRED   CURRENT   READY   IMAGE',
+            '# web-v1-5b6c8e     5         5         5       myapp:v1',
+            '# web-v2-7d9f8c     2         2         2       myapp:v2  ← NEW',
+            '',
+            '# Pod 수: 5 → 7 (maxSurge=2 적용)',
+            '# $ kubectl get pods -l app=web --no-headers | wc -l',
+            '# 7',
+            '',
+            '# Events',
+            '# Normal  ScalingReplicaSet   Scaled up replica set web-v2 to 2',
+          ],
+          highlight: [13, 14, 19, 20, 23, 33, 34, 35],
         },
-        focus: 'rolling',
-        pods: ['v1','v1','v2','v2'],
       },
       {
-        title: 'Step 3. 완료 — v2 Pod 4개',
-        desc: '4개 Pod 모두 v2로 교체 완료. v1 ReplicaSet은 replicas=0으로 유지(롤백용). v2 ReplicaSet이 활성. 사용자 무중단.',
-        block: {
-          kind: 'shell',
-          code: `kubectl rollout status deployment/web
-# deployment "web" successfully rolled out
-
-kubectl get rs -l app=web
-# NAME              DESIRED   CURRENT   READY
-# web-v2-7d9f8c5b   4         4         4
-# web-v1-5b6c8e4d   0         0         0      # 롤백용 보관
-
-kubectl get pods -l app=web
-# web-v2-aa1   Running
-# web-v2-aa2   Running
-# web-v2-aa3   Running
-# web-v2-aa4   Running`
+        title: 'Step 3. v1 Pod 2개 종료 — 점진 교체 시작',
+        desc: 'v2 Pod 2개가 Ready 통과 → maxUnavailable=2 활용해 v1 2개 Terminating. 트래픽은 readiness 통과한 v2 + 남은 v1 5개로 흐름. 여전히 5개가 정상 동작.',
+        pods: [
+          { v: 'v1-term' }, { v: 'v1-term' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' },
+          { v: 'v2' }, { v: 'v2' },
+        ],
+        counter: { desired: 5, current: 7, upToDate: 2, available: 5 },
+        rsRows: [
+          { name: 'web-v1-5b6c8e', desired: 3, current: 5, ready: 3, image: 'myapp:v1', active: true },
+          { name: 'web-v2-7d9f8c', desired: 2, current: 2, ready: 2, image: 'myapp:v2', active: true },
+        ],
+        eventBox: { kind: 'warn', text: '🟠 Killing v1 Pod x 2', detail: 'v2 readiness OK → v1 2개 SIGTERM (graceful 30s)' },
+        code: {
+          lang: 'bash',
+          filename: 'rollout-progress.sh',
+          lines: [
+            '# v2 Pod readiness 통과 후 — v1 Terminating 시작',
+            'kubectl get pods -l app=web',
+            '# NAME             READY   STATUS        RESTARTS   AGE',
+            '# web-v1-aa1       1/1     Terminating   0          30d   ← 종료 중',
+            '# web-v1-aa2       1/1     Terminating   0          30d   ← 종료 중',
+            '# web-v1-aa3       1/1     Running       0          30d',
+            '# web-v1-aa4       1/1     Running       0          30d',
+            '# web-v1-aa5       1/1     Running       0          30d',
+            '# web-v2-bb1       1/1     Running       0          40s',
+            '# web-v2-bb2       1/1     Running       0          40s',
+            '',
+            '# v1 Pod에 보낸 SIGTERM — preStop hook + grace period',
+            'kubectl describe pod web-v1-aa1 | grep -A4 Events',
+            '# Normal  Killing  Stopping container app',
+            '#                  preStop hook → drain in-flight requests',
+            '#                  SIGTERM → app graceful shutdown',
+            '#                  terminationGracePeriodSeconds=30 카운트다운',
+            '',
+            '# Service Endpoints — 종료 중인 Pod는 자동 제외',
+            'kubectl get endpoints web',
+            '# NAME   ENDPOINTS                                        AGE',
+            '# web    10.1.0.7,10.1.0.8,10.1.0.9,10.1.1.4,10.1.1.5    30d',
+            '# (v1 ready 3 + v2 ready 2 = 5 IPs)',
+            '',
+            '# 핵심',
+            '#  - 사용자는 종료 중인 Pod로 새 요청을 받지 않는다',
+            '#  - Endpoints에서 먼저 빠지고, in-flight 요청만 drain',
+            '#  - preStop sleep 10s → load balancer 갱신 대기 시간 확보',
+            '#  - 그 다음 SIGTERM → 앱이 graceful shutdown',
+          ],
+          highlight: [4, 5, 14, 15, 16, 17, 22, 23, 28, 29],
         },
-        focus: 'done',
-        pods: ['v2','v2','v2','v2'],
       },
       {
-        title: 'Step 4. 문제 발생 → kubectl rollout undo',
-        desc: 'v2가 버그가 있었다? 한 줄로 v1으로 즉시 복귀. v1 ReplicaSet의 replicas를 다시 4로 늘리고 v2 replicas를 0으로. 무중단 롤백.',
-        block: {
-          kind: 'shell',
-          code: `# v2 운영 중 에러 발견 (5xx 급증)
-kubectl logs -l app=web --tail=20
-# Error: undefined is not a function...
-
-# 즉시 롤백
-kubectl rollout undo deployment/web
-
-# 30초 뒤
-kubectl get pods -l app=web
-# web-v1-bb1   Running    ← v1 복귀!
-# web-v1-bb2   Running
-# web-v1-bb3   Running
-# web-v1-bb4   Running
-
-# 특정 버전으로 복귀
-# kubectl rollout undo deployment/web --to-revision=3`
+        title: 'Step 4. 진행 — v1 1개 + v2 4개 (다음 교체 라운드)',
+        desc: 'v1 2개 종료 완료 → 그 자리에 v2 2개 추가 생성. 현재 v2가 4개, v1 1개 남음. K8s는 한 라운드씩 desired에 도달할 때까지 반복.',
+        pods: [
+          { v: 'v1' }, { v: 'v2' }, { v: 'v2' }, { v: 'v2' }, { v: 'v2' },
+        ],
+        counter: { desired: 5, current: 5, upToDate: 4, available: 5 },
+        rsRows: [
+          { name: 'web-v1-5b6c8e', desired: 1, current: 1, ready: 1, image: 'myapp:v1', active: true },
+          { name: 'web-v2-7d9f8c', desired: 4, current: 4, ready: 4, image: 'myapp:v2', active: true },
+        ],
+        eventBox: { kind: 'info', text: '🔵 ScalingReplicaSet · v1 down to 1 / v2 up to 4', detail: 'desired 5 유지, available 5 보장' },
+        code: {
+          lang: 'bash',
+          filename: 'rollout-status.sh',
+          lines: [
+            '# 두 번째 교체 라운드 진행 중',
+            'kubectl rollout status deployment/web',
+            '# Waiting for deployment "web" rollout to finish:',
+            '#   4 of 5 updated replicas are available...',
+            '',
+            '# 현재 ReplicaSet 분포',
+            'kubectl get rs -l app=web',
+            '# NAME              DESIRED   CURRENT   READY   IMAGE',
+            '# web-v1-5b6c8e     1         1         1       myapp:v1',
+            '# web-v2-7d9f8c     4         4         4       myapp:v2',
+            '',
+            '# Deployment 상태 — UP-TO-DATE 4/5',
+            'kubectl get deploy web',
+            '# NAME   READY   UP-TO-DATE   AVAILABLE',
+            '# web    5/5     4            5',
+            '#                ▲',
+            '#                └─ v2 image로 갱신된 replica 수',
+            '',
+            '# 다음 라운드: v1 마지막 1개 → Terminating',
+            '#              v2 1개 추가 → 5/5 도달 시 완료',
+            '',
+            '# 일시정지 / 재개 — 단계별 검증이 필요할 때',
+            '# kubectl rollout pause  deployment/web   # 진행 멈춤',
+            '# kubectl rollout resume deployment/web   # 진행 재개',
+            '',
+            '# 진행이 멈췄을 때 진단',
+            '# kubectl describe deploy web | grep -A2 Conditions',
+          ],
+          highlight: [2, 9, 10, 13, 14, 15, 17, 21, 22, 25],
         },
-        focus: 'rollback',
-        pods: ['v1','v1','v1','v1'],
+      },
+      {
+        title: 'Step 5. 완료 — v2 Pod 5개 (v1 ReplicaSet은 보관)',
+        desc: 'desired=5, up-to-date=5, available=5 → 배포 성공. v1 ReplicaSet은 replicas=0으로 유지(롤백용). v2 ReplicaSet이 활성. 사용자는 처음부터 끝까지 무중단.',
+        pods: [
+          { v: 'v2' }, { v: 'v2' }, { v: 'v2' }, { v: 'v2' }, { v: 'v2' },
+        ],
+        counter: { desired: 5, current: 5, upToDate: 5, available: 5 },
+        rsRows: [
+          { name: 'web-v1-5b6c8e', desired: 0, current: 0, ready: 0, image: 'myapp:v1', active: false },
+          { name: 'web-v2-7d9f8c', desired: 5, current: 5, ready: 5, image: 'myapp:v2', active: true },
+        ],
+        eventBox: { kind: 'success', text: '✅ deployment "web" successfully rolled out', detail: 'v2 5/5 · v1 ReplicaSet은 replicas=0으로 보관 (롤백용)' },
+        code: {
+          lang: 'bash',
+          filename: 'rollout-done.sh',
+          lines: [
+            '# 배포 완료 확인',
+            'kubectl rollout status deployment/web',
+            '# deployment "web" successfully rolled out',
+            '',
+            'kubectl get deploy web',
+            '# NAME   READY   UP-TO-DATE   AVAILABLE   AGE',
+            '# web    5/5     5            5           30d',
+            '',
+            '# ReplicaSet 분포 — v1은 replicas=0 (히스토리 보관)',
+            'kubectl get rs -l app=web',
+            '# NAME              DESIRED   CURRENT   READY   IMAGE',
+            '# web-v1-5b6c8e     0         0         0       myapp:v1   ← 롤백 대비',
+            '# web-v2-7d9f8c     5         5         5       myapp:v2   ← 활성',
+            '',
+            '# 롤아웃 히스토리 (revisionHistoryLimit 기본 10)',
+            'kubectl rollout history deployment/web',
+            '# REVISION  CHANGE-CAUSE',
+            '# 1         initial v1 deploy',
+            '# 2         release v2 (feat: search)',
+            '',
+            '# 특정 revision 상세 보기',
+            'kubectl rollout history deployment/web --revision=2',
+            '# Pod Template:',
+            '#   Containers:',
+            '#     app:',
+            '#       Image: myapp:v2',
+            '',
+            '# Pod — 모두 v2',
+            'kubectl get pods -l app=web -o jsonpath="{.items[*].spec.containers[*].image}"',
+            '# myapp:v2 myapp:v2 myapp:v2 myapp:v2 myapp:v2',
+            '',
+            '# 사후 검증 체크리스트',
+            '#  ✓ kubectl get deploy web — READY 5/5',
+            '#  ✓ kubectl top pods -l app=web — 메모리/CPU 정상',
+            '#  ✓ Prometheus 5xx rate < 0.1%',
+            '#  ✓ p99 latency 평소 수준',
+          ],
+          highlight: [2, 3, 12, 13, 19, 20, 24, 25, 26, 27, 30, 31, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 6. 롤백 — v2 에러 감지 → kubectl rollout undo',
+        desc: 'v2 배포 후 5xx 급증 / readiness fail. 한 줄 명령으로 v1 복귀 — v1 ReplicaSet replicas를 5로 다시 늘리고 v2를 0으로. 사용자 무중단으로 안전한 버전 복귀.',
+        pods: [
+          { v: 'v1' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' }, { v: 'v1' },
+        ],
+        counter: { desired: 5, current: 5, upToDate: 5, available: 5 },
+        rsRows: [
+          { name: 'web-v1-5b6c8e', desired: 5, current: 5, ready: 5, image: 'myapp:v1', active: true },
+          { name: 'web-v2-7d9f8c', desired: 0, current: 0, ready: 0, image: 'myapp:v2', active: false },
+        ],
+        eventBox: { kind: 'crit', text: '🚨 v2 5xx 급증 → rollout undo 실행', detail: 'v1 ReplicaSet 복귀 · v2 ReplicaSet replicas=0 · revision 3 기록' },
+        code: {
+          lang: 'bash',
+          filename: 'rollout-undo.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# v2 운영 중 — 갑자기 에러 폭증 (5xx HighErrorRate alert)',
+            '',
+            '# 0) 증상 파악 — 진짜 v2가 문제인지 빠르게 확인',
+            'kubectl logs -l app=web,version=v2 --tail=20',
+            '# [ERROR] TypeError: undefined is not a function at search()',
+            '# [ERROR] readiness probe failed: HTTP 500',
+            '# Prometheus alert: HighErrorRate (5xx > 1% for 3m)',
+            '',
+            '# 1) 직전 revision 확인',
+            'kubectl rollout history deployment/web',
+            '# REVISION  CHANGE-CAUSE',
+            '# 1         initial v1 deploy',
+            '# 2         release v2 (feat: search)   ← 현재',
+            '',
+            '# 2) ★ 즉시 롤백 — 직전 revision (v1)으로 복귀',
+            'kubectl rollout undo deployment/web',
+            '# deployment.apps/web rolled back',
+            '',
+            '# 3) 진행 모니터링 — 30초 내 완료가 일반적',
+            'kubectl rollout status deployment/web',
+            '# Waiting for deployment "web" rollout to finish:',
+            '#   3 of 5 updated replicas are available...',
+            '# deployment "web" successfully rolled out',
+            '',
+            '# 4) 복귀 검증 — v1 image 5개 확인',
+            'kubectl get pods -l app=web -o wide',
+            '# NAME             READY   STATUS    IMAGE       NODE',
+            '# web-v1-cc1       1/1     Running   myapp:v1    node-1   ← 복귀!',
+            '# web-v1-cc2       1/1     Running   myapp:v1    node-2',
+            '# web-v1-cc3       1/1     Running   myapp:v1    node-3',
+            '# web-v1-cc4       1/1     Running   myapp:v1    node-1',
+            '# web-v1-cc5       1/1     Running   myapp:v1    node-2',
+            '',
+            '# 5) ReplicaSet 분포 — v2는 0으로, v1은 5로 복귀',
+            'kubectl get rs -l app=web',
+            '# NAME              DESIRED   CURRENT   READY   IMAGE',
+            '# web-v1-5b6c8e     5         5         5       myapp:v1   ← 활성',
+            '# web-v2-7d9f8c     0         0         0       myapp:v2   ← 보관',
+            '',
+            '# 6) 특정 revision으로 핀포인트 복귀 (필요 시)',
+            '# kubectl rollout undo deployment/web --to-revision=1',
+            '',
+            '# 7) 새 revision 기록 — undo도 history에 남는다',
+            'kubectl rollout history deployment/web',
+            '# REVISION  CHANGE-CAUSE',
+            '# 2         release v2 (feat: search)',
+            '# 3         <none>   ← undo로 생성된 새 revision',
+            '',
+            '# 핵심 정리',
+            '#  - ReplicaSet을 보관하기 때문에 복귀가 즉시 (= 새로 빌드 X)',
+            '#  - revisionHistoryLimit 만큼만 보관 (기본 10)',
+            '#  - rollout pause / rollout resume — 단계별 검증 가능',
+            '#  - 사용자는 무중단 — Service Endpoints 자동 업데이트',
+          ],
+          highlight: [5, 6, 7, 8, 17, 18, 22, 30, 39, 40, 41, 51, 52],
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      shell: { label: 'Bash', textColor: '#86efac' },
-      yaml:  { label: 'YAML', textColor: '#fde68a' },
+    // ─────────────────────────────────────────────────────
+    // Pod 상태별 SVG 스타일 (cyan = v1, violet = v2)
+    // ─────────────────────────────────────────────────────
+    const POD_STYLE = {
+      'v1':      { fill: '#cffafe', stroke: '#06b6d4', text: '#0e7490', label: 'v1',     dim: false, term: false },
+      'v2':      { fill: '#ede9fe', stroke: '#8b5cf6', text: '#5b21b6', label: 'v2',     dim: false, term: false },
+      'v1-term': { fill: '#fef3c7', stroke: '#f59e0b', text: '#92400e', label: 'v1 ✕',  dim: true,  term: true  },
+      'v2-fail': { fill: '#fee2e2', stroke: '#ef4444', text: '#991b1b', label: 'v2 !',   dim: false, term: false },
     };
 
-    // Pod 색상 정적 매핑 (Tailwind CDN 안전성)
-    const VERSION_STYLE = {
-      v1: { bg: 'bg-emerald-100', border: 'border-emerald-400', text: 'text-emerald-800', label: 'v1' },
-      v2: { bg: 'bg-blue-100',    border: 'border-blue-400',    text: 'text-blue-800',    label: 'v2' },
+    // 이벤트 박스 스타일
+    const EVENT_STYLE = {
+      info:    { box: 'bg-sky-50 border-sky-300',         text: 'text-sky-800',     detail: 'text-sky-700' },
+      warn:    { box: 'bg-amber-50 border-amber-300',     text: 'text-amber-800',   detail: 'text-amber-700' },
+      success: { box: 'bg-emerald-50 border-emerald-300', text: 'text-emerald-800', detail: 'text-emerald-700' },
+      crit:    { box: 'bg-red-50 border-red-400',         text: 'text-red-800',     detail: 'text-red-700' },
     };
 
-    function PodLine({ pods, focus }) {
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — SVG Pod 박스 + 카운터 + ReplicaSet 표
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ pods, counter, rsRows, eventBox }) {
+      // SVG 레이아웃 — Pod 박스 한 줄 정렬
+      const SVG_W = 540;
+      const SVG_H = 130;
+      const podW = 64;
+      const podH = 76;
+      const gap = 10;
+      const totalW = pods.length * podW + (pods.length - 1) * gap;
+      const startX = (SVG_W - totalW) / 2;
+      const podY = 28;
+
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">👷 교대 근무 — 한 명씩 교체</div>
-          <div className="flex items-center justify-center gap-3">
-            {pods.map((v, i) => {
-              const s = VERSION_STYLE[v];
-              return (
-                <div key={i} className={`${s.bg} border-2 ${s.border} rounded-lg px-3 py-2 text-center min-w-[80px]`}>
-                  <div className="text-xl">📦</div>
-                  <div className={`text-xs font-bold ${s.text} mt-1`}>Pod {i + 1}</div>
-                  <div className={`text-[10px] font-mono ${s.text}`}>{s.label}</div>
-                </div>
-              );
-            })}
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          {/* 카운터 — desired / current / up-to-date / available */}
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-xs font-bold text-slate-700">📦 Deployment · web</div>
+            <span className="text-[10px] text-slate-400 font-mono">live state</span>
           </div>
-          <p className="text-center text-[11px] text-slate-500 mt-3">
-            {focus === 'stable' && 'v1 4개 안정 운영 중'}
-            {focus === 'rolling' && 'v1 → v2 점진 교체 중 (maxSurge=1)'}
-            {focus === 'done' && 'v2 4개 교체 완료 (v1 ReplicaSet은 replicas=0으로 보관)'}
-            {focus === 'rollback' && 'kubectl rollout undo → v1 즉시 복귀 ✅'}
-          </p>
+
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            <CounterCell label="desired"     value={counter.desired}    color="slate" />
+            <CounterCell label="current"     value={counter.current}    color={counter.current > counter.desired ? 'cyan' : 'slate'} />
+            <CounterCell label="up-to-date"  value={counter.upToDate}   color="violet" />
+            <CounterCell label="available"   value={counter.available}  color="emerald" />
+          </div>
+
+          {/* SVG Pod 박스 */}
+          <div className="rounded-lg bg-slate-50 border border-slate-200 px-2 py-1 mb-3">
+            <svg viewBox={`0 0 ${SVG_W} ${SVG_H}`} className="w-full h-auto" aria-label="Pod 상태 시각화">
+              {/* 상단 라벨 */}
+              <text x={SVG_W / 2} y="16" textAnchor="middle" fontSize="10" fontFamily="ui-monospace, monospace" fill="#64748b">
+                kubectl get pods -l app=web · 총 {pods.length}개
+              </text>
+
+              {/* Pod 박스들 */}
+              {pods.map((p, i) => {
+                const s = POD_STYLE[p.v];
+                const x = startX + i * (podW + gap);
+                return (
+                  <g key={i} style={{ transition: 'all 0.6s ease' }}>
+                    {/* 종료 중인 Pod에 X 마크 */}
+                    {s.term && (
+                      <rect
+                        x={x - 2} y={podY - 2}
+                        width={podW + 4} height={podH + 4}
+                        rx="10"
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth="1.5"
+                        strokeDasharray="4 3"
+                        opacity="0.7"
+                      />
+                    )}
+                    <rect
+                      x={x} y={podY}
+                      width={podW} height={podH}
+                      rx="8"
+                      fill={s.fill}
+                      stroke={s.stroke}
+                      strokeWidth="2"
+                      opacity={s.dim ? 0.55 : 1}
+                    />
+                    {/* Pod 아이콘 (📦 대신 SVG 박스) */}
+                    <g transform={`translate(${x + podW / 2}, ${podY + 22})`}>
+                      <rect x="-12" y="-9" width="24" height="18" rx="2" fill={s.stroke} opacity="0.85" />
+                      <line x1="-12" y1="-9" x2="12" y2="-9" stroke="white" strokeWidth="1" opacity="0.6" />
+                      <line x1="0" y1="-9" x2="0" y2="9" stroke="white" strokeWidth="1" opacity="0.6" />
+                    </g>
+                    {/* Pod 번호 */}
+                    <text
+                      x={x + podW / 2} y={podY + 50}
+                      textAnchor="middle"
+                      fontSize="10"
+                      fontWeight="700"
+                      fill={s.text}
+                      fontFamily="ui-monospace, monospace"
+                    >
+                      Pod {i + 1}
+                    </text>
+                    {/* 버전 라벨 */}
+                    <text
+                      x={x + podW / 2} y={podY + 65}
+                      textAnchor="middle"
+                      fontSize="11"
+                      fontWeight="800"
+                      fill={s.text}
+                      fontFamily="ui-monospace, monospace"
+                    >
+                      {s.label}
+                    </text>
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+
+          {/* ReplicaSet 표 */}
+          <div className="text-[11px] font-bold text-slate-700 mb-1.5">🧬 ReplicaSet</div>
+          <div className="rounded-lg border border-slate-200 overflow-hidden mb-3">
+            <table className="w-full text-[11px] font-mono">
+              <thead className="bg-slate-100 text-slate-600">
+                <tr>
+                  <th className="text-left px-2 py-1 font-medium">name</th>
+                  <th className="text-right px-2 py-1 font-medium">desired</th>
+                  <th className="text-right px-2 py-1 font-medium">ready</th>
+                  <th className="text-left px-2 py-1 font-medium">image</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rsRows.map((rs) => {
+                  const isV2 = rs.image.includes('v2');
+                  const accent = isV2 ? 'text-violet-700' : 'text-cyan-700';
+                  const dim = !rs.active ? 'opacity-50' : '';
+                  return (
+                    <tr key={rs.name} className={`border-t border-slate-100 ${dim}`}>
+                      <td className={`px-2 py-1 font-bold ${accent}`}>{rs.name}</td>
+                      <td className="px-2 py-1 text-right text-slate-700">{rs.desired}</td>
+                      <td className="px-2 py-1 text-right text-slate-700">{rs.ready}</td>
+                      <td className={`px-2 py-1 ${accent}`}>{rs.image}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* 이벤트 박스 */}
+          {eventBox && (
+            <div className={`p-2.5 rounded-lg border-2 ${EVENT_STYLE[eventBox.kind].box} ${eventBox.kind === 'crit' ? 'animate-pulse' : ''}`}>
+              <div className={`text-xs font-bold ${EVENT_STYLE[eventBox.kind].text}`}>
+                {eventBox.text}
+              </div>
+              <div className={`text-[10px] mt-0.5 font-mono ${EVENT_STYLE[eventBox.kind].detail}`}>
+                {eventBox.detail}
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm border-2 border-cyan-500 bg-cyan-100"></span>v1 (cyan)
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm border-2 border-violet-500 bg-violet-100"></span>v2 (violet)
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm border-2 border-amber-500 bg-amber-100" style={{ borderStyle: 'dashed' }}></span>Terminating
+            </span>
+          </div>
         </div>
       );
     }
 
+    // ─────────────────────────────────────────────────────
+    // CounterCell — 단일 메트릭 박스
+    // ─────────────────────────────────────────────────────
+    const COUNTER_COLOR = {
+      slate:   { box: 'bg-slate-50 border-slate-200',     value: 'text-slate-800',  label: 'text-slate-500'  },
+      cyan:    { box: 'bg-cyan-50 border-cyan-300',       value: 'text-cyan-800',   label: 'text-cyan-700'   },
+      violet:  { box: 'bg-violet-50 border-violet-300',   value: 'text-violet-800', label: 'text-violet-700' },
+      emerald: { box: 'bg-emerald-50 border-emerald-300', value: 'text-emerald-800',label: 'text-emerald-700'},
+    };
+
+    function CounterCell({ label, value, color }) {
+      const c = COUNTER_COLOR[color] || COUNTER_COLOR.slate;
+      return (
+        <div className={`rounded-lg border-2 px-2 py-1.5 text-center transition-all duration-500 ${c.box}`}>
+          <div className={`text-[9px] font-mono uppercase tracking-wider ${c.label}`}>{label}</div>
+          <div className={`text-xl font-extrabold tabular-nums ${c.value}`}>{value}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-cyan-500/15 border-l-2 border-cyan-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">롤링 업데이트와 롤백</h1>
-                <p className="text-sm text-slate-500 mt-1">교대 근무 — v1 → v2 한 명씩 교체, 문제 시 즉시 복귀</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-cyan-700 hover:text-cyan-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-1-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-cyan-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. Workload &gt; Chapter 1. Deployment</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">롤링 업데이트와 롤백</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">교대 근무 — v1 → v2 점진 교체 (maxSurge / maxUnavailable), 문제 시 즉시 복귀</p>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane
+                pods={step.pods}
+                counter={step.counter}
+                rsRows={step.rsRows}
+                eventBox={step.eventBox}
+              />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <PodLine pods={step.pods} focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
-              </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
-            </div>
-
-            {step.focus === 'rollback' && (
-              <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-3 mb-6 text-xs text-emerald-900">
-                💡 다음(II-2-1)에서는 Deployment와 다르게 고유 ID + 영속 볼륨이 필요한 StatefulSet을 본다 — 지정석 비유
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-cyan-50 border-2 border-cyan-300 rounded-xl p-3 text-sm text-cyan-900">
+                💡 다음(II-2-1)에서는 <strong>StatefulSet</strong> — Deployment와 다르게 고유 ID + 영속 볼륨이 필요한 워크로드 (지정석 비유)
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-cyan-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-cyan-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-cyan-600 text-white hover:bg-cyan-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-1-1.html" className="text-slate-500 hover:text-slate-700">&larr; II-1-1 Deployment</a>
+              <a href="./II-2-1.html" className="text-cyan-700 hover:text-cyan-900 font-medium">II-2-1 StatefulSet &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

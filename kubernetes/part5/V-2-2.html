@@ -3,262 +3,703 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kubernetes 학습 — 트러블슈팅 체크리스트</title>
+  <title>Kubernetes 학습 — V-2-2. 트러블슈팅 체크리스트 (Pod 응급실)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    V-2-2. 트러블슈팅 체크리스트
-    학습 목표: Pod가 안 뜰 때 단계별 진단 흐름.
-    핵심 비유: "응급실 진단 흐름도" — 증상별 4가지 갈래 (Pending/ImagePullBackOff/CrashLoopBackOff/OOMKilled)
-    구조: 4단계 (Pending / ImagePullBackOff / CrashLoopBackOff / OOMKilled)
+    V-2-2. Kubernetes 트러블슈팅 체크리스트 — Pod 응급실 진단표
+    학습 목표: Pod 상태별 5 시나리오(Pending/ImagePullBackOff/CrashLoopBackOff/OOMKilled/NotReady)를 단계별로 진단하며 누적 진행률을 확인한다.
+    핵심 비유: Pod 응급실 — 5 시나리오 카드를 손가락으로 짚으며 증상/원인/명령어/해결 4 칸 ✓
+    패턴: fastapi v1 패턴 — 좌(LiveDataPane 5 시나리오 누적) / 우(VSCode CodeViewer bash/yaml)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 5 시나리오 메타 + 각 시나리오별 4 칸(증상/원인/명령어/해결)
+    // ─────────────────────────────────────────────────────
+    const SCENARIOS = [
+      {
+        key: 'pending',
+        emoji: '⏳',
+        name: 'Pending',
+        sub: '스케줄링 실패',
+        items: [
+          { label: '증상',     text: 'Pod READY 0/1 · STATUS Pending 5분 이상 정체' },
+          { label: '원인',     text: '노드 자원 부족 / nodeSelector 매칭 실패 / PVC 미바인딩' },
+          { label: '명령어', text: 'kubectl describe pod → Events: 0/3 nodes available' },
+          { label: '해결',     text: 'replicas↓ · requests↓ · 노드 추가 · nodeSelector 수정' },
+        ],
+      },
+      {
+        key: 'imagepull',
+        emoji: '📥',
+        name: 'ImagePullBackOff',
+        sub: '이미지 못 가져옴',
+        items: [
+          { label: '증상',     text: 'STATUS ErrImagePull → ImagePullBackOff 백오프' },
+          { label: '원인',     text: '이미지 경로 오타 / 비공개 레지스트리 인증 secret 누락' },
+          { label: '명령어', text: 'kubectl describe → Failed to pull image: manifest unknown' },
+          { label: '해결',     text: 'imagePullSecrets 추가 · 태그 검증 · regcred 갱신' },
+        ],
+      },
+      {
+        key: 'crashloop',
+        emoji: '🔁',
+        name: 'CrashLoopBackOff',
+        sub: '시작 즉시 죽음',
+        items: [
+          { label: '증상',     text: 'RESTARTS 5+ · STATUS CrashLoopBackOff · 백오프 증가' },
+          { label: '원인',     text: '환경변수 누락 / DB 연결 실패 / probe 설정 오류' },
+          { label: '명령어', text: 'kubectl logs --previous · describe Last State Exit Code' },
+          { label: '해결',     text: 'ConfigMap/Secret 매핑 · probe path 수정 · stack trace fix' },
+        ],
+      },
+      {
+        key: 'oomkilled',
+        emoji: '💥',
+        name: 'OOMKilled',
+        sub: '메모리 limits 초과',
+        items: [
+          { label: '증상',     text: 'Last State Terminated · Reason OOMKilled · Exit 137' },
+          { label: '원인',     text: 'limits 부족 / 메모리 누수 / JVM Xmx와 cgroup 불일치' },
+          { label: '명령어', text: 'kubectl describe → Last State + container_memory_working_set_bytes' },
+          { label: '해결',     text: 'resources.limits.memory 상향 · 누수 fix · JVM 튜닝' },
+        ],
+      },
+      {
+        key: 'notready',
+        emoji: '🚦',
+        name: 'Running but Not Ready',
+        sub: 'readinessProbe 실패',
+        items: [
+          { label: '증상',     text: 'STATUS Running · READY 0/1 → Service endpoint 제외' },
+          { label: '원인',     text: 'readinessProbe path/port 오류 · DB 워밍업 미완료' },
+          { label: '명령어', text: 'kubectl describe → Readiness probe failed: HTTP 503' },
+          { label: '해결',     text: 'probe path /healthz → /readyz · initialDelaySeconds 상향' },
+        ],
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // STEP 정의 — 단계별 어떤 시나리오를 진단 완료(done) 처리할지
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. Pending — "스케줄링 안 됨"',
-        desc: 'Pod가 어떤 노드에도 안 떠지는 상태. 원인은 대부분 자원 부족, NodeSelector 불일치, PVC 미바인딩. describe Events에 "0/3 nodes are available" 메시지가 핵심 단서.',
-        block: {
-          kind: 'shell',
-          code: `# 진단 흐름
-$ kubectl get pods
-NAME      READY   STATUS    RESTARTS   AGE
-web-aa1   0/1     Pending   0          5m
-
-$ kubectl describe pod web-aa1
-Events:
-  Warning  FailedScheduling  default-scheduler
-    0/3 nodes are available: 3 Insufficient memory.
-
-# 흔한 원인
-1. 노드 자원 부족 — kubectl top nodes (메모리/CPU 확인)
-2. NodeSelector 불일치 — spec.nodeSelector 확인
-3. PVC 미바인딩 — kubectl get pvc (Pending인지)
-4. taint/toleration 불일치
-
-# 해결 예시
-- replicas 줄이기, 노드 추가, requests 줄이기
-- 다른 노드로 이동시키기 (spec.nodeSelector 수정)`,
-        },
+        title: 'Step 1. Pending — "스케줄링 안 됨" (1/5 = 20%)',
+        desc: '첫 번째 환자. Pod가 어떤 노드에도 배치되지 않은 상태. describe Events에 "0/3 nodes are available: 3 Insufficient memory" 메시지가 핵심 단서. 노드 자원 부족, nodeSelector 불일치, PVC 미바인딩, taint/toleration 중 하나가 원인.',
+        scenarioStates: { pending: 'done', imagepull: 'todo', crashloop: 'todo', oomkilled: 'todo', notready: 'todo' },
+        progress: { done: 1, total: 5, pct: 20 },
         focus: 'pending',
+        code: {
+          lang: 'bash',
+          filename: 'kubectl-describe.sh',
+          lines: [
+            '#!/bin/bash',
+            '# ───────────────────────────────────────',
+            '# Pod 응급실 — Step 1. Pending 진단',
+            '# ───────────────────────────────────────',
+            '',
+            '# 1) 현재 상태 확인',
+            'kubectl get pods',
+            '# NAME      READY   STATUS    RESTARTS   AGE',
+            '# web-aa1   0/1     Pending   0          5m',
+            '',
+            '# 2) Events 확인 — 핵심 단서',
+            'kubectl describe pod web-aa1',
+            '# Events:',
+            '#   Warning  FailedScheduling  default-scheduler',
+            '#     0/3 nodes are available: 3 Insufficient memory.',
+            '',
+            '# 3) 노드 자원 추세',
+            'kubectl top nodes',
+            '# NAME       CPU(cores)   MEMORY(bytes)',
+            '# node-1     1800m/2000m  7.2Gi/8Gi      ← 거의 풀',
+            '',
+            '# 4) 흔한 원인 4가지',
+            '#    - 노드 자원 부족',
+            '#    - nodeSelector 불일치 (spec.nodeSelector)',
+            '#    - PVC 미바인딩 (kubectl get pvc)',
+            '#    - taint/toleration 불일치',
+            '',
+            '# 5) 해결',
+            'kubectl scale deploy web --replicas=2     # replicas 줄이기',
+            'kubectl edit deploy web                    # requests 낮추기',
+            '',
+            'echo "Pending 진단 완료 → 누적 1/5 (20%)"',
+          ],
+          highlight: [7, 12, 14, 15, 18, 28],
+        },
       },
       {
-        title: 'Step 2. ImagePullBackOff — "이미지 못 가져옴"',
-        desc: '컨테이너 이미지를 레지스트리에서 못 가져옴. 오타, 비공개 이미지인데 imagePullSecrets 누락, 레지스트리 다운, 네트워크 문제 중 하나.',
-        block: {
-          kind: 'shell',
-          code: `$ kubectl describe pod web-aa1
-Events:
-  Warning  Failed  Failed to pull image "myapp:v1.5":
-           rpc error: code = NotFound desc = manifest unknown
-
-# 흔한 원인
-1. 태그 오타 — "myapp:v1.5" vs "myapp:1.5"
-2. 비공개 레지스트리 + imagePullSecrets 미설정
-3. 사설 레지스트리 인증 만료
-4. 네트워크 정책으로 외부 차단
-
-# 해결 흐름
-$ docker pull myapp:v1.5      # 외부에서 직접 시도해보기 (가능한가?)
-$ kubectl get secrets         # imagePullSecrets 존재?
-$ kubectl edit pod web-aa1    # spec.imagePullSecrets 추가
-
-# 비공개 레지스트리
-imagePullSecrets:
-  - name: regcred`,
-        },
+        title: 'Step 2. ImagePullBackOff — "이미지 못 가져옴" (2/5 = 40%)',
+        desc: '두 번째 환자. 컨테이너 이미지를 레지스트리에서 못 가져옴. 태그 오타, 비공개 레지스트리 + imagePullSecrets 미설정, 인증 만료, 네트워크 차단이 주 원인. describe Failed 이벤트 메시지가 결정적 단서.',
+        scenarioStates: { pending: 'done', imagepull: 'done', crashloop: 'todo', oomkilled: 'todo', notready: 'todo' },
+        progress: { done: 2, total: 5, pct: 40 },
         focus: 'imagepull',
+        code: {
+          lang: 'bash',
+          filename: 'kubectl-logs.sh',
+          lines: [
+            '#!/bin/bash',
+            '# ───────────────────────────────────────',
+            '# Pod 응급실 — Step 2. ImagePullBackOff 진단',
+            '# ───────────────────────────────────────',
+            '',
+            '# 1) 상태 확인',
+            'kubectl get pods',
+            '# web-aa1   0/1   ImagePullBackOff   0   2m',
+            '',
+            '# 2) describe로 정확한 에러 메시지',
+            'kubectl describe pod web-aa1',
+            '# Events:',
+            '#   Warning  Failed  Failed to pull image "myapp:v1.5":',
+            '#            rpc error: code = NotFound',
+            '#            desc = manifest unknown',
+            '',
+            '# 3) 외부에서 직접 이미지 pull 시도',
+            'docker pull myapp:v1.5    # ❌ not found',
+            'docker pull myapp:1.5     # ✓ 태그 오타였음',
+            '',
+            '# 4) 비공개 레지스트리 secret 확인',
+            'kubectl get secrets',
+            '# regcred   kubernetes.io/dockerconfigjson   1   30d',
+            '',
+            'kubectl create secret docker-registry regcred \\',
+            '  --docker-server=registry.company.com \\',
+            '  --docker-username=$USER --docker-password=$PASS',
+            '',
+            '# 5) Pod spec에 imagePullSecrets 추가 → 재배포',
+            'kubectl apply -f pod-fixed.yaml',
+            '',
+            'echo "ImagePullBackOff 진단 완료 → 누적 2/5 (40%)"',
+          ],
+          highlight: [7, 11, 13, 14, 15, 25],
+        },
       },
       {
-        title: 'Step 3. CrashLoopBackOff — "시작은 됐는데 즉시 죽음"',
-        desc: '컨테이너가 시작 → 즉시 종료를 반복. 앱 자체 에러, 헬스체크 실패, 환경 변수 누락이 흔한 원인. logs --previous로 죽기 직전 출력 보는 게 핵심.',
-        block: {
-          kind: 'shell',
-          code: `$ kubectl get pods
-NAME      READY   STATUS             RESTARTS   AGE
-web-aa1   0/1     CrashLoopBackOff   5          3m
-
-# 1차: 죽기 직전 로그
-$ kubectl logs --previous web-aa1
-Error: DB_URL environment variable not set
-  at config.py:14
-  exit code: 1
-
-# 2차: describe로 종료 코드 확인
-$ kubectl describe pod web-aa1
-Last State:    Terminated
-  Reason:      Error
-  Exit Code:   1            ← 0이 아니면 비정상 종료
-
-# 흔한 원인
-1. 환경변수 누락 — ConfigMap/Secret 매핑 확인
-2. DB 연결 실패 — Service DNS / NetworkPolicy 확인
-3. readinessProbe/livenessProbe 실패
-4. 앱 자체 에러 — logs로 stack trace 확인`,
-        },
+        title: 'Step 3. CrashLoopBackOff — "시작 즉시 죽음" (3/5 = 60%)',
+        desc: '세 번째 환자. 컨테이너가 시작 → 즉시 종료를 반복. RESTARTS 카운트가 빠르게 누적된다. logs --previous로 죽기 직전 출력을 확인하고, describe Last State Exit Code로 종료 사유를 파악. 환경변수 누락이 가장 흔한 원인.',
+        scenarioStates: { pending: 'done', imagepull: 'done', crashloop: 'done', oomkilled: 'todo', notready: 'todo' },
+        progress: { done: 3, total: 5, pct: 60 },
         focus: 'crashloop',
+        code: {
+          lang: 'bash',
+          filename: 'pod-events.txt',
+          lines: [
+            '# ───────────────────────────────────────',
+            '# Pod 응급실 — Step 3. CrashLoopBackOff 진단',
+            '# ───────────────────────────────────────',
+            '',
+            '# 1) RESTARTS 카운트 확인',
+            '$ kubectl get pods',
+            '# NAME      READY   STATUS             RESTARTS   AGE',
+            '# web-aa1   0/1     CrashLoopBackOff   5          3m',
+            '',
+            '# 2) 죽기 직전 로그 — --previous 가 핵심',
+            '$ kubectl logs --previous web-aa1',
+            'Traceback (most recent call last):',
+            '  File "/app/config.py", line 14, in <module>',
+            '    DB_URL = os.environ["DB_URL"]',
+            'KeyError: \'DB_URL\'',
+            'Error: environment variable not set, exit code 1',
+            '',
+            '# 3) describe로 종료 사유 + restart count',
+            '$ kubectl describe pod web-aa1',
+            'Last State:    Terminated',
+            '  Reason:      Error',
+            '  Exit Code:   1            ← 0이 아니면 비정상 종료',
+            '  Started:     Tue, 07 May 2026 09:12:34',
+            '  Finished:    Tue, 07 May 2026 09:12:35',
+            'Restart Count: 5',
+            '',
+            '# 4) 흔한 원인 4가지',
+            '#    - 환경변수 누락 (ConfigMap/Secret 매핑 빠짐)',
+            '#    - DB 연결 실패 (Service DNS / NetworkPolicy)',
+            '#    - readiness/liveness probe path 오류',
+            '#    - 앱 자체 에러 (logs stack trace 확인)',
+            '',
+            '# 5) 해결: ConfigMap/Secret 추가 후 rollout',
+            '$ kubectl create configmap app-cfg --from-literal=DB_URL=...',
+            '$ kubectl rollout restart deploy/web',
+            '',
+            'echo "CrashLoopBackOff 진단 완료 → 누적 3/5 (60%)"',
+          ],
+          highlight: [11, 14, 15, 16, 22, 26],
+        },
       },
       {
-        title: 'Step 4. OOMKilled — "메모리 초과로 죽음"',
-        desc: '메모리 limits 초과 시 K8s가 즉시 컨테이너 강제 종료(SIGKILL). limits 부족 / 메모리 누수 / GC 부적절이 원인. last state Reason: OOMKilled가 신호.',
-        block: {
-          kind: 'shell',
-          code: `$ kubectl describe pod web-aa1
-Last State:    Terminated
-  Reason:      OOMKilled         ← 핵심
-  Exit Code:   137               ← SIGKILL (128+9)
-
-# 메모리 추세 확인 (Prometheus가 있다면)
-container_memory_working_set_bytes{pod="web-aa1"}
-# → 시간에 따라 우상향 = 메모리 누수 의심
-
-# 해결 옵션
-1. limits 늘리기 — 임시 응급조치
-   resources.limits.memory: 512Mi → 1Gi
-2. requests 조정 — 스케줄링 안정화
-3. 앱 메모리 누수 수정 — 진짜 해결
-4. JVM 앱이면 -Xmx와 cgroup limit 조율 필수
-
-# 종합 트러블슈팅 흐름
-get → 상태 확인 (Pending/Pull/Crash/OOM 어디?)
-describe → Events + Last State 분기
-logs --previous → 앱 자체 에러
-fix → 원인별 대응`,
-        },
+        title: 'Step 4. OOMKilled — "메모리 초과로 죽음" (4/5 = 80%)',
+        desc: '네 번째 환자. 메모리 limits 초과 시 K8s가 SIGKILL로 즉시 강제 종료(Exit 137 = 128+9). describe Last State Reason: OOMKilled가 결정적 신호. limits 부족, 메모리 누수, JVM Xmx와 cgroup limit 불일치가 주 원인. resources.limits.memory 조정 후 누수 fix.',
+        scenarioStates: { pending: 'done', imagepull: 'done', crashloop: 'done', oomkilled: 'done', notready: 'todo' },
+        progress: { done: 4, total: 5, pct: 80 },
         focus: 'oomkilled',
+        code: {
+          lang: 'yaml',
+          filename: 'fix-resources.yaml',
+          lines: [
+            '# ───────────────────────────────────────',
+            '# Pod 응급실 — Step 4. OOMKilled 해결',
+            '# ───────────────────────────────────────',
+            '#',
+            '# describe 결과 (BEFORE):',
+            '#   Last State:    Terminated',
+            '#     Reason:      OOMKilled         ← 핵심',
+            '#     Exit Code:   137               ← SIGKILL (128 + 9)',
+            '#   Restart Count: 8',
+            '#',
+            '# Prometheus 메트릭으로 추세 확인:',
+            '#   container_memory_working_set_bytes{pod="web-aa1"}',
+            '#   → 시간에 따라 우상향 = 메모리 누수 의심',
+            '',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: web',
+            'spec:',
+            '  replicas: 3',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: web',
+            '          image: myapp:1.5',
+            '          resources:',
+            '            requests:',
+            '              memory: "256Mi"   # 스케줄링 안정화',
+            '              cpu: "200m"',
+            '            limits:',
+            '              memory: "1Gi"     # ← 512Mi → 1Gi 상향 (응급)',
+            '              cpu: "1000m"',
+            '          env:',
+            '            # JVM 앱이면 -Xmx와 cgroup limit 조율 필수',
+            '            - name: JAVA_OPTS',
+            '              value: "-Xmx768m -XX:+UseG1GC"',
+            '',
+            '# ───────────────────────────────────────',
+            '# 진짜 해결: 메모리 누수 fix (heap profiler)',
+            '# kubectl exec -it web-aa1 -- jcmd 1 GC.heap_dump /tmp/h.hprof',
+            '# kubectl cp web-aa1:/tmp/h.hprof ./h.hprof',
+            '# ───────────────────────────────────────',
+            '',
+            '# echo "OOMKilled 진단 완료 → 누적 4/5 (80%)"',
+          ],
+          highlight: [7, 8, 27, 31, 36],
+        },
+      },
+      {
+        title: 'Step 5. Running but Not Ready — readinessProbe 실패 (5/5 = 100%) 🎉',
+        desc: '마지막 환자. STATUS Running인데 READY 0/1 → Service endpoint에서 자동 제외되어 트래픽 안 받음. describe Events에 "Readiness probe failed: HTTP 503" 메시지. probe path/port 오류, DB 워밍업 미완료가 원인. 5/5 모두 진단 완료 → kubernetes 100% fastapi 패턴 통일 완료.',
+        scenarioStates: { pending: 'done', imagepull: 'done', crashloop: 'done', oomkilled: 'done', notready: 'done' },
+        progress: { done: 5, total: 5, pct: 100 },
+        focus: 'notready',
+        code: {
+          lang: 'yaml',
+          filename: 'fix-probe.yaml',
+          lines: [
+            '# ───────────────────────────────────────',
+            '# Pod 응급실 — Step 5. NotReady 해결',
+            '# ───────────────────────────────────────',
+            '#',
+            '# 증상 (BEFORE):',
+            '#   $ kubectl get pods',
+            '#   NAME      READY   STATUS    RESTARTS   AGE',
+            '#   web-aa1   0/1     Running   0          2m   ← READY 0/1',
+            '#',
+            '#   $ kubectl describe pod web-aa1',
+            '#   Events:',
+            '#     Warning  Unhealthy  Readiness probe failed:',
+            '#              HTTP probe failed with statuscode: 503',
+            '#',
+            '# Service endpoint 확인:',
+            '#   $ kubectl get endpoints web   ← Pod IP 빠짐',
+            '',
+            'apiVersion: v1',
+            'kind: Pod',
+            'metadata:',
+            '  name: web',
+            'spec:',
+            '  containers:',
+            '    - name: web',
+            '      image: myapp:1.5',
+            '      ports:',
+            '        - containerPort: 8080',
+            '      readinessProbe:',
+            '        httpGet:',
+            '          path: /readyz       # /healthz → /readyz 분리',
+            '          port: 8080',
+            '        initialDelaySeconds: 30   # ← 5 → 30 (DB 워밍업)',
+            '        periodSeconds: 10',
+            '        timeoutSeconds: 3',
+            '        failureThreshold: 3',
+            '      livenessProbe:',
+            '        httpGet:',
+            '          path: /healthz      # liveness는 가벼운 것',
+            '          port: 8080',
+            '        initialDelaySeconds: 60',
+            '        periodSeconds: 30',
+            '',
+            '# ═══════════════════════════════════════════',
+            '# 5/5 시나리오 진단 완료 → 100% 🎉',
+            '# kubernetes 20/20 모두 fastapi 패턴 통일 완료',
+            '# Part I (개론) → V (운영) 한 사이클 마무리',
+            '# 다음 단계: 실제 클러스터에 직접 배포해보기',
+            '# ═══════════════════════════════════════════',
+          ],
+          highlight: [12, 13, 28, 30, 32, 38],
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      shell: { label: 'Bash', textColor: '#86efac' },
-      yaml:  { label: 'YAML', textColor: '#fde68a' },
+    // ─────────────────────────────────────────────────────
+    // 시나리오 카드 상태별 스타일 (Tailwind static class — purge 안전)
+    // ─────────────────────────────────────────────────────
+    const SCENARIO_STYLE = {
+      todo: {
+        card: 'bg-slate-50 border-slate-300',
+        title: 'text-slate-500',
+        sub: 'text-slate-400',
+        bar: 'bg-slate-300',
+        badge: 'bg-slate-200 text-slate-500',
+        badgeText: '대기',
+        item: 'text-slate-400',
+        check: 'text-slate-300',
+      },
+      done: {
+        card: 'bg-cyan-50 border-cyan-400',
+        title: 'text-cyan-800',
+        sub: 'text-cyan-600',
+        bar: 'bg-cyan-500',
+        badge: 'bg-cyan-100 text-cyan-700',
+        badgeText: '진단 ✓',
+        item: 'text-cyan-700',
+        check: 'text-cyan-600',
+      },
     };
 
-    // 4가지 증상 정적 매핑
-    const SYMPTOMS = [
-      { key: 'pending',    emoji: '⏳', name: 'Pending',           cause: '스케줄링 실패 (자원/NodeSelector)' },
-      { key: 'imagepull',  emoji: '📥', name: 'ImagePullBackOff', cause: '이미지 못 가져옴 (오타/Secret)' },
-      { key: 'crashloop',  emoji: '🔁', name: 'CrashLoopBackOff', cause: '시작 즉시 죽음 (env/probe)' },
-      { key: 'oomkilled',  emoji: '💥', name: 'OOMKilled',         cause: '메모리 limits 초과' },
-    ];
-
-    function ERDiagram({ focus }) {
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 5 시나리오 카드 + 누적 진단 진행률
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ scenarioStates, progress, focus }) {
+      const allDone = progress.pct === 100;
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">🚑 응급실 — 4가지 증상별 진단</div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-            {SYMPTOMS.map((s) => {
-              const isActive = focus === s.key;
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">🚑 Pod 응급실 진단표</h2>
+            <span className="text-[10px] text-slate-400 font-mono">5 시나리오 · 증상/원인/명령어/해결</span>
+          </div>
+
+          {/* 누적 진단 진행률 */}
+          <div className={`rounded-lg border-2 p-3 mb-4 transition-all duration-500 ${allDone ? 'bg-cyan-100 border-cyan-500 animate-pulse' : 'bg-slate-50 border-slate-300'}`}>
+            <div className="flex items-baseline justify-between mb-1.5">
+              <span className="text-xs font-bold text-slate-700">진단 진행률</span>
+              <span className={`text-2xl font-extrabold tabular-nums ${allDone ? 'text-cyan-700' : 'text-slate-700'}`}>
+                {progress.done}<span className="text-sm text-slate-500"> / {progress.total}</span>
+                <span className="ml-2 text-base">({progress.pct}%)</span>
+                {allDone && <span className="ml-2">🎉</span>}
+              </span>
+            </div>
+            <div className="relative h-3 bg-slate-200 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-cyan-500 transition-all duration-1000"
+                style={{ width: `${progress.pct}%` }}
+              />
+            </div>
+            {allDone && (
+              <div className="mt-2 text-xs font-bold text-cyan-800">
+                kubernetes 100% fastapi 패턴 통일 완료 🎉
+              </div>
+            )}
+          </div>
+
+          {/* 5 시나리오 카드 (반응형 1~2열) */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {SCENARIOS.map((sc) => {
+              const state = scenarioStates[sc.key];
+              const style = SCENARIO_STYLE[state];
+              const isFocus = focus === sc.key;
               return (
                 <div
-                  key={s.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-amber-100 border-2 border-amber-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                  key={sc.key}
+                  className={`rounded-lg border-2 p-3 transition-all duration-500 ${style.card} ${isFocus ? 'ring-2 ring-cyan-300 ring-offset-1 scale-[1.02]' : ''}`}
                 >
-                  <div className="text-2xl">{s.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{s.cause}</div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-base" aria-hidden="true">{sc.emoji}</span>
+                      <span className={`text-xs font-bold ${style.title}`}>{sc.name}</span>
+                    </div>
+                    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${style.badge}`}>
+                      {style.badgeText}
+                    </span>
+                  </div>
+                  <div className={`text-[10px] mb-2 ${style.sub}`}>{sc.sub}</div>
+
+                  {/* 4 칸 도트 바 */}
+                  <div className="flex gap-1 mb-2">
+                    {sc.items.map((_, i) => (
+                      <span
+                        key={i}
+                        className={`h-1.5 flex-1 rounded-sm transition-colors duration-500 ${style.bar}`}
+                        aria-hidden="true"
+                      />
+                    ))}
+                  </div>
+
+                  {/* 4 칸 텍스트 (증상/원인/명령어/해결) */}
+                  <ul className="space-y-1">
+                    {sc.items.map((it, i) => (
+                      <li key={i} className={`text-[10px] flex items-start gap-1.5 ${style.item}`}>
+                        <span className={`${style.check} font-mono`}>{state === 'done' ? '✓' : '○'}</span>
+                        <span className="flex-1">
+                          <span className="font-bold mr-1">{it.label}:</span>
+                          <span>{it.text}</span>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               );
             })}
+          </div>
+
+          {/* 5번째 시나리오는 단독 한 칸일 수 있어 한 번 더 동일 그리드 끝 — 위에서 5개 모두 자동 처리 */}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-4 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-slate-300"></span>대기</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-cyan-500"></span>진단 완료</span>
+            <span className="ml-auto font-mono">4 칸 × 5 시나리오 = 20</span>
           </div>
         </div>
       );
     }
 
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js (bash/yaml)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      useEffect(() => {
+        if (!codeRef.current || !window.hljs) return;
+        const html = codeRef.current.innerHTML;
+        setRenderedLines(html.split('\n'));
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일명 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화 hidden */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 결정적 라인 highlight */}
+          <div className="overflow-auto max-h-[30rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${highlighted ? 'bg-cyan-500/10 border-l-2 border-cyan-400' : ''}`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">트러블슈팅 체크리스트</h1>
-                <p className="text-sm text-slate-500 mt-1">응급실 — 4가지 증상별 진단 흐름</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-cyan-700 hover:text-cyan-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-cyan-600 text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 운영 &amp; 마무리 &gt; Chapter 2. 트러블슈팅 체크리스트</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Pod 응급실 — 5 시나리오 진단표</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">Pending / ImagePullBackOff / CrashLoopBackOff / OOMKilled / NotReady · 4 칸 × 5 시나리오</p>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane
+                scenarioStates={step.scenarioStates}
+                progress={step.progress}
+                focus={step.focus}
+              />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <ERDiagram focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
-              </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
-            </div>
-
-            {step.focus === 'oomkilled' && (
-              <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-3 mb-6 text-xs text-emerald-900">
-                🎉 Kubernetes 학습 20/20 100% 완성! Part I 개론 → V 운영까지 한 사이클 완료. 이제 실제 클러스터에서 직접 한 번 배포해보는 것이 다음 단계
+            {/* 마지막 단계 축하 배지 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-cyan-50 border-2 border-cyan-300 rounded-xl p-4 text-sm text-cyan-900 shadow-sm">
+                <div className="font-bold mb-1">🎉 kubernetes 100% fastapi 패턴 통일 완료</div>
+                <div className="text-xs leading-relaxed text-cyan-800">
+                  Part I (개론) → V (운영) 한 사이클 완성. 5 시나리오(Pending/ImagePullBackOff/CrashLoopBackOff/OOMKilled/NotReady) 진단 흐름 모두 체화.
+                  다음 단계는 실제 클러스터에 직접 배포해보면서 응급실 진단 체험.
+                </div>
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-cyan-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-cyan-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-cyan-600 text-white hover:bg-cyan-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./V-2-1.html" className="text-slate-500 hover:text-slate-700">&larr; V-2-1</a>
+              <a href="../index.html" className="text-cyan-700 hover:text-cyan-900 font-medium">허브로 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
