@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — PromQL 쿼리</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-1-2. PromQL 쿼리
+    학습 목표: 시간 시리즈를 selector → range → rate → aggregation 순으로 조립한다.
+    핵심 비유: "시간 시리즈 SQL" — SQL이 행/열을 다룬다면 PromQL은 시간 시리즈를 다룬다.
+    구조: 4단계 (Selector / Range Vector / Rate / Aggregation)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Selector — 메트릭 + 라벨 필터로 시계열 고르기',
+        desc: '메트릭 이름 뒤에 { } 로 라벨을 좁힌다. 결과는 instant vector — 각 시계열의 "지금 한 시점" 값. SQL의 WHERE에 해당. status="500" 만 남기고, job="api" 인스턴스만 본다.',
+        block: {
+          kind: 'yaml',
+          code: `# 메트릭 이름만 — 모든 시계열의 현재 값
+http_requests_total
+
+# 라벨 필터로 좁히기 (instant vector)
+http_requests_total{job="api", status="500"}
+
+# 정규식 매칭 (=~)도 가능
+http_requests_total{job="api", status=~"5.."}    # 5xx 전체
+http_requests_total{job="api", status!="200"}    # 200 제외
+
+# 결과 형태 (instant vector — 시점 1개의 값)
+# {job="api", instance="api-1", status="500"}  3
+# {job="api", instance="api-2", status="500"}  7
+# {job="api", instance="api-3", status="500"}  2
+#
+# → SQL: SELECT * FROM http_requests_total
+#         WHERE job='api' AND status='500'`,
+        },
+        focus: 'selector',
+      },
+      {
+        title: 'Step 2. Range Vector — [5m] 으로 시간 범위 잘라내기',
+        desc: '[5m] 을 붙이면 instant vector → range vector. "최근 5분의 모든 샘플"을 들고 온다. 그래프나 rate/increase 같은 함수의 입력으로 쓰인다. 단독으로는 그래프에 못 그림 (값이 시점 1개가 아니라 배열).',
+        block: {
+          kind: 'yaml',
+          code: `# instant vector — 한 시점
+http_requests_total{job="api", status="500"}
+
+# range vector — 최근 5분의 샘플 묶음
+http_requests_total{job="api", status="500"}[5m]
+
+# 결과 형태 (range vector)
+# {job="api", instance="api-1", status="500"}
+#   1230 @ t-280s
+#   1232 @ t-265s
+#   1235 @ t-250s
+#   ...                      # 5분치 샘플 ~20개
+#   1287 @ t-15s
+#
+# 시간 단위
+# [30s]  [1m]  [5m]  [1h]  [1d]
+#
+# 주의: range vector 는 그래프에 직접 못 그린다
+# → 반드시 rate(), increase(), avg_over_time() 같은
+#    함수로 감싸서 instant vector 로 변환해야 함`,
+        },
+        focus: 'range',
+      },
+      {
+        title: 'Step 3. Rate — Counter 의 초당 변화율 추출',
+        desc: 'Counter 는 monotonic 증가만 한다 (재시작 시 0으로 리셋). 절대값은 의미 없고, "초당 얼마나 늘었나" 가 핵심. rate() 는 range vector 를 받아 초당 평균 증가율을 돌려준다. p99 latency 는 histogram bucket 에 같은 패턴을 적용한다.',
+        block: {
+          kind: 'yaml',
+          code: `# Counter 절대값 — 의미 없음 (시작 이후 누적)
+http_requests_total{job="api"}
+# = 1,234,567   (재시작하면 0으로 리셋)
+
+# rate() — 초당 평균 증가율 (req/sec)
+rate(http_requests_total{job="api"}[5m])
+# = 12.4         (지난 5분간 초당 12.4 요청)
+
+# increase() — 같은 구간의 절대 증가량 (= rate * 구간초)
+increase(http_requests_total{job="api"}[5m])
+# = 3,720        (5분 동안 3720건)
+
+# irate() — 마지막 두 샘플만 (순간 변화율, 노이즈 큼)
+irate(http_requests_total{job="api"}[5m])
+
+# Histogram bucket 도 같은 패턴 — p99 latency 의 입력
+rate(http_request_duration_seconds_bucket{job="api"}[5m])
+# → 각 bucket(le="0.1", "0.5", "1", ...) 의 초당 증가율
+# → 다음 step 의 histogram_quantile() 입력으로 사용
+
+# 규칙: Counter 는 항상 rate() 로 감싸기`,
+        },
+        focus: 'rate',
+      },
+      {
+        title: 'Step 4. Aggregation — sum by / histogram_quantile 로 집계',
+        desc: 'sum by(label) 로 라벨별 합계 (SQL GROUP BY). histogram_quantile(0.99, ...) 는 bucket 의 rate 를 받아 p99 latency 를 계산. 두 패턴을 조합하면 "지난 5분 5xx 비율" SLO 식이 된다.',
+        block: {
+          kind: 'yaml',
+          code: `# 1) status 별 초당 요청 수 — 라벨별 집계
+sum by(status) (
+  rate(http_requests_total{job="api"}[5m])
+)
+# {status="200"} 124.5
+# {status="404"}   3.2
+# {status="500"}   1.8
+
+# 2) p99 latency — histogram bucket → 분위수
+histogram_quantile(0.99,
+  sum by(le) (
+    rate(http_request_duration_seconds_bucket{job="api"}[5m])
+  )
+)
+# = 0.412   (지난 5분 99% 요청이 412ms 이내)
+
+# 3) 5분 SLO — 5xx 에러율
+sum(rate(http_requests_total{job="api", status=~"5.."}[5m]))
+  /
+sum(rate(http_requests_total{job="api"}[5m]))
+# = 0.014   (1.4% — SLO 1% 초과 → 알림)
+
+# SQL 비유
+#   PromQL: sum by(status) (rate(metric[5m]))
+#   SQL   : SELECT status, SUM(req)/300 AS rps
+#           FROM metric
+#           WHERE ts > now() - INTERVAL '5 min'
+#           GROUP BY status`,
+        },
+        focus: 'agg',
+      },
+    ];
+
+    // KIND_STYLE 3종 — yaml/python/shell
+    const KIND_STYLE = {
+      yaml:   { label: 'PromQL', textColor: '#fde68a' },  // amber — 쿼리 강조
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+    };
+
+    const PROMQL = [
+      { key: 'selector', emoji: '🎯', name: 'Selector',     note: '메트릭 + 라벨' },
+      { key: 'range',    emoji: '📊', name: 'Range Vector', note: '[5m] 시간 범위' },
+      { key: 'rate',     emoji: '🔢', name: 'Rate',         note: '초당 변화율' },
+      { key: 'agg',      emoji: '📈', name: 'Aggregation',  note: 'sum by / quantile' },
+    ];
+
+    function PromQLCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🔍 시간 시리즈 쿼리 (PromQL)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {PROMQL.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">PromQL 쿼리</h1>
+                <p className="text-sm text-slate-500 mt-1">시간 시리즈 SQL — selector → range → rate → aggregation</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <PromQLCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'agg' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(II-2-1)에서는 Grafana — PromQL 결과를 대시보드로 시각화
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

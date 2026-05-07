@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — Prometheus 개론 (pull 모델)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-1-1. Prometheus 개론 (pull 모델)
+    학습 목표: push와 pull 차이를 이해하고 Prometheus가 왜 pull을 채택했는지 안다.
+    핵심 비유: "우유 배달 vs 우편" — push(앱이 보냄) vs pull(Prometheus가 가져감)
+    구조: 4단계 (push 한계 / pull scrape / Service Discovery / TSDB)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Push 모델 — "앱이 매번 보냄" (StatsD/Graphite)',
+        desc: 'StatsD나 Graphite처럼 push 방식은 애플리케이션이 메트릭 수집기 주소를 알고 매번 직접 보낸다. 트래픽이 폭증하면 메트릭 트래픽도 같이 폭증하고, 앱이 죽으면 "왜 안 오지?"인지 "원래 안 보내는지" 구분이 어렵다. 우체국이 우편을 받기만 기다리는 셈.',
+        block: {
+          kind: 'shell',
+          code: `# push 모델 도식 (StatsD 예시)
+
+  [App #1] --(UDP statsd)--> ┐
+  [App #2] --(UDP statsd)--> ├──> [StatsD/Graphite]
+  [App #3] --(UDP statsd)--> ┘
+       ↑ 앱이 수집기 주소를 알아야 함
+       ↑ 매 요청마다 send() — 트래픽 폭증 위험
+
+# 앱 코드 (Python statsd 클라이언트)
+$ pip install statsd
+$ python -c "
+import statsd
+c = statsd.StatsClient('graphite.local', 8125)
+c.incr('login.success')          # 매번 네트워크 호출
+c.timing('db.query', 42)
+"
+
+# 한계
+# - 앱이 메트릭 시스템 주소/프로토콜을 알아야 함
+# - 트래픽 폭증 시 메트릭도 폭증 → 수집기 다운
+# - 앱이 죽었는지 / 안 보내는지 구분 불가`,
+        },
+        focus: 'push',
+      },
+      {
+        title: 'Step 2. Pull 모델 — "Prometheus가 가지러 옴" (scrape)',
+        desc: 'Prometheus는 정해진 간격(scrape_interval=15s)으로 각 타깃의 /metrics 엔드포인트를 HTTP GET 한다. 앱은 단순히 expose 포맷(텍스트)으로 노출만 하면 끝. JSON도 아니고 라인 기반이라 가볍다. 우유 배달부가 정해진 시간에 우유통을 가지러 오는 구조.',
+        block: {
+          kind: 'yaml',
+          code: `# prometheus.yml — scrape 설정
+global:
+  scrape_interval: 15s        # 15초마다 가지러 감
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'my-app'
+    static_configs:
+      - targets:
+          - 'app1.local:9090'
+          - 'app2.local:9090'
+    # → Prometheus가 GET http://app1.local:9090/metrics 호출
+
+---
+# 앱이 노출하는 /metrics 출력 예시 (expose 포맷)
+# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{method="GET",status="200"} 1027
+http_requests_total{method="POST",status="500"} 3
+
+# HELP process_cpu_seconds_total CPU time
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 4.21
+
+# 장점
+# - 앱은 expose만 하면 됨 (수집기 주소 모름)
+# - Prometheus가 죽음 감지 (scrape 실패 = up 0)
+# - 트래픽과 무관하게 메트릭 트래픽 일정`,
+        },
+        focus: 'pull',
+      },
+      {
+        title: 'Step 3. Service Discovery — "타깃을 자동으로 찾는다"',
+        desc: 'K8s 환경에서 Pod이 매번 IP가 바뀌는데 static_configs로 다 적을 수 없다. kubernetes_sd_configs를 쓰면 Pod label을 보고 자동으로 타깃 등록. ServiceMonitor CRD(Prometheus Operator)를 쓰면 더 선언적으로 관리. EC2/Consul/DNS 등 다양한 SD 지원.',
+        block: {
+          kind: 'yaml',
+          code: `# prometheus.yml — Kubernetes Service Discovery
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod                           # Pod 단위로 발견
+    relabel_configs:
+      # annotation prometheus.io/scrape=true 인 Pod만
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      # annotation prometheus.io/port 로 포트 지정
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\\d+)?;(\\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+---
+# Prometheus Operator 방식 — ServiceMonitor CRD
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-app
+spec:
+  selector:
+    matchLabels:
+      app: my-app                # 이 label 가진 Service 자동 scrape
+  endpoints:
+    - port: metrics
+      interval: 15s
+
+# → 새 Pod 뜨면 자동 등록, 죽으면 자동 제거
+# → 정적 IP 리스트 관리 끝`,
+        },
+        focus: 'discovery',
+      },
+      {
+        title: 'Step 4. TSDB — "시계열 DB에 저장" (retention 15일)',
+        desc: 'Prometheus는 자체 TSDB(Time Series Database)를 갖는다. 시간 + 메트릭 이름 + label 조합을 시계열로 저장. 기본 retention은 15일이고 로컬 디스크에 저장. 장기 보관/멀티 클러스터 통합은 Thanos/Mimir/Cortex로 확장한다.',
+        block: {
+          kind: 'shell',
+          code: `# Prometheus 데이터 디렉터리 구조
+$ ls /prometheus/data/
+01HXAB...  # 2시간 단위 block
+01HXCD...
+01HXEF...
+chunks_head/   # 메모리에서 디스크로 flush 중
+wal/           # Write-Ahead Log (장애 복구용)
+
+$ ls /prometheus/data/01HXAB.../
+chunks/        # 실제 시계열 청크 (압축됨)
+index          # label → 시계열 인덱스
+meta.json      # block 메타데이터
+tombstones     # 삭제 마커
+
+# retention 설정 (CLI flag)
+$ prometheus \\
+    --storage.tsdb.path=/prometheus/data \\
+    --storage.tsdb.retention.time=15d \\
+    --storage.tsdb.retention.size=50GB \\
+    --config.file=/etc/prometheus/prometheus.yml
+
+# 장기 보관이 필요하면?
+# → Thanos / Mimir / Cortex 같은 원격 스토리지로 remote_write
+# remote_write:
+#   - url: "http://thanos-receive:19291/api/v1/receive"
+
+# Prometheus 자체는 "최근 15일 빠른 조회" 담당
+# 장기 / 멀티 클러스터 / 다운샘플링은 Thanos에 위임`,
+        },
+        focus: 'tsdb',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const PROMETHEUS = [
+      { key: 'push',      emoji: '📤', name: 'Push',              note: 'StatsD — 앱이 보냄' },
+      { key: 'pull',      emoji: '📥', name: 'Pull',              note: 'scrape /metrics' },
+      { key: 'discovery', emoji: '🎯', name: 'Service Discovery', note: 'K8s/EC2 자동 등록' },
+      { key: 'tsdb',      emoji: '💾', name: 'TSDB',              note: '시계열 저장 (15d)' },
+    ];
+
+    function PrometheusCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🥛 우유 배달 (Prometheus Pull 모델)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {PROMETHEUS.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Prometheus 개론 (pull 모델)</h1>
+                <p className="text-sm text-slate-500 mt-1">우유 배달 vs 우편 — 누가 가지러 가느냐의 차이</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <PrometheusCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'tsdb' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(II-1-2)에서는 PromQL — 시계열 쿼리 언어 (rate, histogram_quantile 등)
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

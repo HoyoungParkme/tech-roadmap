@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — 구조화 로그 (JSON)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📔</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-1-1. 구조화 로그 (JSON)
+    학습 목표: 자유 텍스트 로그를 JSON 구조로 바꿔 검색·집계·추적이 가능하게 만든다.
+    핵심 비유: "일기장 vs 데이터베이스" — 자유 텍스트는 읽기만, JSON은 쿼리 가능
+    구조: 4단계 (plain / json / context / levels)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Plain — "error: failed to fetch user 123 — timeout 5s"',
+        desc: '자유 텍스트 로그는 사람이 읽기는 편하지만 grep으로 키워드 매칭만 가능하다. "에러 몇 번 났지?", "user_id별 실패율은?" 같은 집계 질의는 정규식 지옥. 일기장처럼 페이지를 한 장씩 넘겨야 한다.',
+        block: {
+          kind: 'shell',
+          code: `# 평범한 print 로그 — 일기장
+$ python app.py
+error: failed to fetch user 123 — timeout 5s
+info: request finished in 1.2s
+warning: cache miss for key=session:abc
+error: failed to fetch user 456 — timeout 5s
+
+# 분석은 grep으로 노가다
+$ grep "failed to fetch" app.log | wc -l
+2
+$ grep "user 123" app.log
+# user_id만 뽑고 싶다 → 정규식 작성 필요
+$ grep -oP 'user \\d+' app.log | sort | uniq -c
+# timeout 평균? → awk + 추가 파싱...
+# ✗ 매번 ad-hoc 파싱, 실수투성이`,
+        },
+        focus: 'plain',
+      },
+      {
+        title: 'Step 2. JSON — key-value 구조',
+        desc: '같은 정보를 JSON으로 찍으면 jq, ELK, Loki 어디서든 필드 단위 쿼리·집계가 된다. user_id, timeout_s 같은 필드가 명시적이라 분석 도구가 자동으로 인식. 일기장이 데이터베이스로 바뀐 순간이다.',
+        block: {
+          kind: 'python',
+          code: `# structlog 또는 logging + JSONFormatter
+import logging, json, sys
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        # 표준 필드 + extra를 한 dict로 직렬화
+        payload = {
+            "level": record.levelname.lower(),
+            "msg": record.getMessage(),
+            "logger": record.name,
+        }
+        # logger.info("...", extra={"user_id": 123}) 지원
+        for k, v in record.__dict__.items():
+            if k not in ("args", "msg", "levelname", "name") and not k.startswith("_"):
+                payload.setdefault(k, v)
+        return json.dumps(payload, ensure_ascii=False)
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JSONFormatter())
+log = logging.getLogger("app")
+log.addHandler(handler)
+log.setLevel(logging.INFO)
+
+log.error("fetch_user_failed", extra={"user_id": 123, "timeout_s": 5})
+# → {"level":"error","msg":"fetch_user_failed","user_id":123,"timeout_s":5}
+
+# 분석은 jq로 한 줄
+# $ cat app.log | jq 'select(.level=="error") | .user_id' | sort -u
+# $ cat app.log | jq 'select(.msg=="fetch_user_failed") | .timeout_s' | jq -s 'add/length'`,
+        },
+        focus: 'json',
+      },
+      {
+        title: 'Step 3. Context — request_id / trace_id 자동 주입',
+        desc: 'HTTP 요청 한 건이 만든 모든 로그에 같은 request_id가 찍히면, 한 요청의 흐름 전체를 한 번에 모을 수 있다. contextvars(또는 자바 MDC)에 한 번만 넣으면 그 요청 안에서 호출되는 모든 함수의 로그에 자동 포함된다.',
+        block: {
+          kind: 'python',
+          code: `# contextvars로 요청별 컨텍스트 전파
+import contextvars, logging, uuid
+
+request_id_var = contextvars.ContextVar("request_id", default=None)
+user_id_var = contextvars.ContextVar("user_id", default=None)
+
+class ContextFilter(logging.Filter):
+    # 모든 LogRecord에 현재 컨텍스트 값 자동 주입
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        record.user_id = user_id_var.get()
+        return True
+
+log = logging.getLogger("app")
+log.addFilter(ContextFilter())
+
+# FastAPI 미들웨어 예시
+async def trace_middleware(request, call_next):
+    # 요청 진입점에서 한 번만 set
+    request_id_var.set(request.headers.get("x-request-id") or str(uuid.uuid4()))
+    user_id_var.set(request.state.user_id)
+    return await call_next(request)
+
+# 이후 어디서 찍어도 request_id가 붙는다
+log.info("fetch_user_start")
+# → {"msg":"fetch_user_start","request_id":"a1b2...","user_id":42}
+log.error("fetch_user_failed", extra={"timeout_s": 5})
+# → {"msg":"fetch_user_failed","request_id":"a1b2...","user_id":42,"timeout_s":5}
+# → 같은 request_id로 grep 한 번에 요청 전체 흐름 복원`,
+        },
+        focus: 'context',
+      },
+      {
+        title: 'Step 4. Levels — DEBUG / INFO / WARN / ERROR',
+        desc: '레벨은 "이걸 누가 봐야 하나"의 신호다. DEBUG(개발자 본인), INFO(정상 흐름 기록), WARN(주의 — 곧 문제될 수도), ERROR(즉시 대응). 운영은 보통 INFO 이상만, 디버깅 필요할 때 동적으로 DEBUG로 낮춘다.',
+        block: {
+          kind: 'python',
+          code: `# logging 레벨 — 운영/개발 분리
+import logging, os
+
+log = logging.getLogger("app")
+
+# 환경변수로 운영=INFO, 개발=DEBUG
+log.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+log.debug("cache_lookup", extra={"key": "session:abc"})  # 개발자만 본다
+log.info("request_completed", extra={"latency_ms": 124})  # 정상 흐름
+log.warning("cache_miss_high", extra={"miss_rate": 0.42}) # 곧 문제될 수도
+log.error("db_connection_lost", extra={"retries": 3})     # 즉시 대응
+
+# 운영 중 갑자기 DEBUG가 필요하면 — 재배포 없이 동적 변경
+# 1) admin endpoint
+@app.post("/admin/log-level")
+def set_level(level: str):
+    logging.getLogger("app").setLevel(level.upper())
+    return {"level": level}
+
+# 2) SIGUSR1 시그널로 토글
+import signal
+def toggle_debug(signum, frame):
+    cur = log.getEffectiveLevel()
+    log.setLevel(logging.DEBUG if cur != logging.DEBUG else logging.INFO)
+signal.signal(signal.SIGUSR1, toggle_debug)
+
+# production 기본은 INFO — 노이즈 줄이고 비용 절약
+# 장애 디버깅 30분만 DEBUG로 낮췄다 다시 INFO로`,
+        },
+        focus: 'levels',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const LOG = [
+      { key: 'plain',   emoji: '📝', name: 'Plain',    note: '자유 텍스트' },
+      { key: 'json',    emoji: '📋', name: 'JSON',     note: 'key-value 구조' },
+      { key: 'context', emoji: '🆔', name: 'Context',  note: 'request_id 주입' },
+      { key: 'levels',  emoji: '🎚️', name: 'Levels',   note: 'DEBUG~ERROR' },
+    ];
+
+    function LogCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">📔 일기장 vs DB (구조화 로그)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {LOG.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">구조화 로그 (JSON)</h1>
+                <p className="text-sm text-slate-500 mt-1">일기장 vs 데이터베이스 — 텍스트 로그를 쿼리 가능한 데이터로</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <LogCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'levels' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(III-1-2)에서는 ELK vs Loki — 두 로그 백엔드 비교
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

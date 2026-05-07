@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — ELK vs Loki 비교</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-1-2. ELK vs Loki 비교
+    학습 목표: 로그 저장소 두 진영 — 전수 색인 vs 라벨 색인의 트레이드오프 이해
+    핵심 비유: "도서관 vs 공책" — ELK는 모든 단어 인덱싱(도서관 전수 조사), Loki는 라벨만 인덱싱+압축
+    구조: 4단계 (ELK / Loki / 비용 / 선택)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. ELK — "도서관 전수 조사" (Elasticsearch + Logstash + Kibana)',
+        desc: '모든 필드를 inverted index로 색인. "error" 단어 한 줄을 뽑는 데 밀리초. 풀텍스트 검색·집계·대시보드 모두 강력. 단점: 인덱스가 원본보다 크고 디스크/메모리 비싸고 운영 무거움.',
+        block: {
+          kind: 'yaml',
+          code: `# Elasticsearch index template — 모든 필드 색인
+PUT _index_template/logs-app
+{
+  "index_patterns": ["logs-app-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "5s"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "level":      { "type": "keyword" },
+        "service":    { "type": "keyword" },
+        "trace_id":   { "type": "keyword" },
+        "message":    { "type": "text" },     # 본문 풀텍스트 색인
+        "user_id":    { "type": "keyword" },
+        "latency_ms": { "type": "long" }
+      }
+    }
+  }
+}
+
+# 강점
+# - 어떤 필드든 빠른 검색/집계 (Kibana 대시보드)
+# - "user_id=42 AND error" 같은 임의 쿼리 즉시
+# - 보안/감사/사용자 행동 분석에 최적
+
+# 약점
+# - 인덱스 크기 = 원본의 2~3배
+# - 메모리(JVM heap) 부담 큼
+# - Hot/Warm/Cold 티어 운영 필수`,
+        },
+        focus: 'elk',
+      },
+      {
+        title: 'Step 2. Loki — "공책 메모" (라벨만 인덱싱)',
+        desc: 'Grafana Labs가 만든 로그 저장소. Prometheus 식으로 라벨(service, level 등)만 색인하고 본문은 gzip 압축 chunk로 저장. 저렴하고 가볍지만 본문 검색은 grep식(LogQL) — 라벨로 좁힌 뒤 스캔.',
+        block: {
+          kind: 'yaml',
+          code: `# loki-config.yaml — 라벨 색인 + chunk 저장
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb              # 라벨 인덱스 (작음)
+      object_store: s3         # 본문 chunk는 S3에
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  aws:
+    s3: s3://us-east-1/loki-chunks
+  tsdb_shipper:
+    active_index_directory: /loki/index
+
+# Promtail/Alloy가 보내는 라벨만 색인됨
+# {service="api", level="error"} |= "timeout"
+#  └─ 라벨로 chunk 좁힘     └─ 본문은 grep(스캔)
+
+# 강점
+# - 디스크 비용 1/10 수준 (gzip chunk)
+# - Prometheus와 라벨 모델 동일 (Grafana 통합)
+# - 운영 단순 (JVM 없음, Go 단일 바이너리)
+
+# 약점
+# - 본문 풀텍스트 검색은 느림 (스캔)
+# - 라벨 카디널리티 폭발 주의 (user_id 라벨 금지)`,
+        },
+        focus: 'loki',
+      },
+      {
+        title: 'Step 3. 비용 비교 — "같은 1TB 로그, 디스크는 10배 차이"',
+        desc: '원본 1TB를 ELK는 인덱스 포함 약 3TB(원본+inverted index+replica), Loki는 gzip 압축으로 약 0.3TB. S3 저장과 합치면 운영 비용 차이는 더 벌어짐. 본문 검색 빈도가 낮다면 Loki가 압도적.',
+        block: {
+          kind: 'shell',
+          code: `# 같은 1TB 원본 로그, 30일 보관 가정
+# ─────────────────────────────────────────────────────────
+# 항목                    ELK              Loki
+# ─────────────────────────────────────────────────────────
+# 원본 로그              1.0 TB           1.0 TB
+# 색인/저장 후           ~3.0 TB          ~0.3 TB
+#   └─ inverted index    ~1.0 TB          0 (라벨만 색인)
+#   └─ replica x1        ~1.0 TB          S3 다중 AZ 기본
+#   └─ 압축              없음/약함        gzip ~10:1
+#
+# 스토리지 (월)          ~$300 (EBS gp3)  ~$7  (S3 Standard)
+# 컴퓨트                 JVM heap 64GB+   Go 4~8GB
+# 운영 인력              튜닝/샤딩 필요   거의 무인
+# ─────────────────────────────────────────────────────────
+# 월 운영비 체감          $$$              $
+# 검색 속도(풀텍스트)     ms 단위          초~분 단위
+# 검색 속도(라벨 필터)    ms 단위          ms 단위
+
+# 핵심 트레이드오프
+# - ELK : "비싸지만 무엇이든 빨리 찾는다"
+# - Loki: "싸지만 라벨로 먼저 좁혀야 빠르다"
+
+# 한 줄 요약
+# 검색 빈도가 높고 풀텍스트가 핵심 → ELK
+# 로그 양은 많고 가끔 grep 수준이면 됨 → Loki`,
+        },
+        focus: 'cost',
+      },
+      {
+        title: 'Step 4. 어느 걸 고를까 — "용도가 다르면 같이 써도 된다"',
+        desc: '사용자 행동 분석/감사/SIEM처럼 임의 쿼리·집계가 잦으면 ELK. 운영 디버깅·SRE 트러블슈팅 위주면 Loki. Grafana 통합도 강점. 큰 조직은 ELK(보안) + Loki(운영) 둘 다 두는 경우가 흔하다.',
+        block: {
+          kind: 'shell',
+          code: `# 의사결정 매트릭스
+# ─────────────────────────────────────────────────────────
+# 상황                                    → 답
+# ─────────────────────────────────────────────────────────
+# "user_id로 임의 검색/집계"              → ELK
+# "보안/감사/SIEM, 컴플라이언스"          → ELK
+# "Kibana 대시보드, 풀텍스트 분석"        → ELK
+# "trace_id 따라가는 운영 디버깅"         → Loki
+# "Prometheus + Grafana 이미 사용 중"     → Loki
+# "로그량 폭발, 비용 압박 큼"             → Loki
+# "둘 다 필요 (보안 + 운영)"              → ELK + Loki 병행
+
+# 실무 패턴
+# 1) 스타트업/SRE 중심팀
+#    → Loki 단독 (저렴 + Grafana 단일 화면)
+# 2) 보안/감사 의무가 큰 기업
+#    → ELK 단독 또는 ELK 중심
+# 3) 대규모 플랫폼
+#    → Loki(운영 로그) + ELK(보안/분석)
+#       수집은 Fluent Bit/Vector로 fan-out
+
+# 한 줄 요약
+# ELK : "도서관 — 무엇이든 빨리 찾지만 비싸다"
+# Loki: "공책 — 라벨로 묶고 압축, 본문은 필요할 때 읽는다"`,
+        },
+        focus: 'choose',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const LOGSTACK = [
+      { key: 'elk',    emoji: '📚', name: 'ELK',  note: '전문 검색' },
+      { key: 'loki',   emoji: '📓', name: 'Loki', note: '라벨만 색인' },
+      { key: 'cost',   emoji: '💰', name: '비용', note: '디스크 비교' },
+      { key: 'choose', emoji: '🎯', name: '선택', note: '어느 걸?' },
+    ];
+
+    function LogStackCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">📚 도서관 vs 공책 (ELK vs Loki)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {LOGSTACK.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">ELK vs Loki 비교</h1>
+                <p className="text-sm text-slate-500 mt-1">도서관 vs 공책 — 전수 색인의 강력함 vs 라벨 색인의 가벼움</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <LogStackCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'choose' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 다음(III-2-1)에서는 로그 수집 파이프라인 — Fluent Bit / Vector
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

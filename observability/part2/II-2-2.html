@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Observability 학습 — Alertmanager 알람 라우팅</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-2-2. Alertmanager — 알람 라우팅
+    학습 목표: AlertRule 정의 → severity/team별 라우팅 → Silence → Receiver 채널 분기
+    핵심 비유: "119 분류" — severity별로 다른 곳으로 (critical=PagerDuty, warning=Slack, info=Email)
+    구조: 4단계 (Rule / Routing / Silence / Receiver)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Rule — "임계 조건 정의 (신고 접수 기준)"',
+        desc: 'Prometheus가 PromQL로 "위험 상태"를 판단해 alert를 발생시킨다. expr(조건) + for(지속시간) + labels(severity/team)이 핵심. for를 두는 이유: 일시적 spike로 매번 호출되면 운영팀이 미쳐버림. 5분 지속돼야 진짜 문제.',
+        block: {
+          kind: 'yaml',
+          code: `# Prometheus AlertRule (alert.yml)
+# expr: 조건 (PromQL) / for: 지속시간 / labels: 라우팅 키
+groups:
+- name: api-server
+  rules:
+
+  - alert: HighErrorRate
+    expr: rate(http_requests_total{status=~"5.."}[5m])
+        / rate(http_requests_total[5m]) > 0.05
+    for: 5m                          # 5분간 지속돼야 발화
+    labels:
+      severity: critical             # 라우팅 핵심 키
+      team: ops
+    annotations:
+      summary: "5xx 에러율 5% 초과"
+      runbook: "https://wiki/runbook#HighErrorRate"
+
+  - alert: ModelAccuracyDrop
+    expr: ml_accuracy_daily < 0.75
+    for: 1h
+    labels:
+      severity: warning
+      team: ml                       # 팀별 분기용
+    annotations:
+      summary: "모델 정확도 75% 미만"
+
+# 핵심 원칙
+# - severity 3단계: critical / warning / info
+# - team label로 누구한테 갈지 결정
+# - for를 0으로 두지 마라 (false alarm 폭탄)`,
+        },
+        focus: 'rule',
+      },
+      {
+        title: 'Step 2. Routing — "119 분류 트리 (어디로 보낼까)"',
+        desc: 'Alertmanager가 alert를 받으면 route 트리를 따라 내려간다. 부모-자식 매칭 구조 — match가 일치하면 그 receiver로, 안 맞으면 default로. group_by로 같은 알람 묶고, group_wait로 burst 합쳐서 발송.',
+        block: {
+          kind: 'yaml',
+          code: `# alertmanager.yml — 라우팅 트리
+route:
+  receiver: default-email            # 매칭 안 되면 여기로
+  group_by: [alertname, cluster]     # 같은 알람 묶기
+  group_wait: 30s                    # burst 합쳐서 한 번에
+  group_interval: 5m
+  repeat_interval: 4h                # 미해결 4h마다 재발송
+
+  routes:
+  # 1순위 — critical은 무조건 PagerDuty (새벽이라도 호출)
+  - match:
+      severity: critical
+    receiver: pagerduty-oncall
+    continue: false                  # 매칭 끝, 다음 route 안 봄
+
+  # 2순위 — ML팀 warning은 ML 슬랙 채널
+  - match:
+      severity: warning
+      team: ml
+    receiver: slack-ml
+
+  # 3순위 — ops팀 warning은 ops 슬랙
+  - match:
+      severity: warning
+      team: ops
+    receiver: slack-ops
+
+  # info는 default(이메일)로 떨어짐 — route 추가 X
+
+# amtool로 route 시뮬레이션 (어디로 갈지 미리 확인)
+# $ amtool config routes test severity=critical team=ops
+# → pagerduty-oncall`,
+        },
+        focus: 'routing',
+      },
+      {
+        title: 'Step 3. Silence — "점검/배포 중 알람 차단"',
+        desc: 'DB 점검·정기 배포 중에는 알람이 시끄러워진다. Silence는 특정 label 매칭 alert를 일정 시간 차단. 만료 시간 필수(영구 silence는 사고 원인 1순위). amtool CLI 또는 웹 UI에서 만든다.',
+        block: {
+          kind: 'shell',
+          code: `# amtool silence — CLI로 알람 일시 차단
+# 시나리오: 새벽 2~4시 DB 정기 점검, DB 관련 알람 차단
+
+# 1) silence 추가 (matcher + 만료 시간 필수)
+$ amtool silence add \\
+    alertname="HighErrorRate" \\
+    service="db-primary" \\
+    --duration=2h \\
+    --comment="DB 정기 점검 - JIRA OPS-1234" \\
+    --author="hong@team.com"
+# silence_id: a1b2c3d4-...
+
+# 2) 현재 활성 silence 목록
+$ amtool silence query
+ID         Matchers                              Ends At              Created By
+a1b2c3d4   alertname=HighErrorRate, service=db   2026-05-07 04:00 KST hong@team.com
+
+# 3) 점검 일찍 끝나면 즉시 만료
+$ amtool silence expire a1b2c3d4
+
+# 절대 규칙
+# - duration 없는 silence 금지 (영구 차단 = 사고)
+# - comment에 JIRA/배포 티켓 번호 필수
+# - silence 만들고 끝나면 본인이 expire 시킴 (자동 만료 믿지 마라)
+# - critical 알람을 silence하면 슬랙에 announce`,
+        },
+        focus: 'silence',
+      },
+      {
+        title: 'Step 4. Receiver — "Slack / PagerDuty / Webhook (수신처)"',
+        desc: '실제 알람이 도착하는 채널. PagerDuty(전화/SMS, oncall), Slack(팀 채널, 즉시 확인), Webhook(자동화 트리거)로 분기. template으로 메시지 포맷 통일하고 runbook URL 반드시 포함 — 새벽에 깬 사람이 뭘 해야 할지 바로 알 수 있게.',
+        block: {
+          kind: 'yaml',
+          code: `# alertmanager.yml — receivers + Slack template
+receivers:
+
+# 1) PagerDuty — critical only (전화로 깨움)
+- name: pagerduty-oncall
+  pagerduty_configs:
+  - service_key: <PAGERDUTY_INTEGRATION_KEY>
+    description: "{{ .CommonAnnotations.summary }}"
+    severity: "{{ .CommonLabels.severity }}"
+
+# 2) Slack ML팀 — warning + 풍부한 컨텍스트
+- name: slack-ml
+  slack_configs:
+  - api_url: <SLACK_WEBHOOK_URL>
+    channel: "#ml-alerts"
+    title: "🚨 [{{ .CommonLabels.severity | toUpper }}] {{ .CommonLabels.alertname }}"
+    text: |
+      *Summary:* {{ .CommonAnnotations.summary }}
+      *Service:* {{ .CommonLabels.service }}
+      *Started:* {{ (index .Alerts 0).StartsAt }}
+      *Runbook:* {{ .CommonAnnotations.runbook }}
+      *Silence:* https://alertmanager/#/silences/new
+
+# 3) Slack ops팀
+- name: slack-ops
+  slack_configs:
+  - channel: "#ops-alerts"
+    title: "{{ .CommonAnnotations.summary }}"
+
+# 4) Webhook — 자동화 (예: auto-rollback 트리거)
+- name: default-email
+  email_configs:
+  - to: "team-default@company.com"
+
+# Slack 메시지 결과 예시
+# 🚨 [WARNING] ModelAccuracyDrop
+# Summary: 모델 정확도 75% 미만
+# Service: fraud-detector
+# Runbook: https://wiki/runbook#ModelAccuracyDrop  ← 클릭 → 조치 단계`,
+        },
+        focus: 'receiver',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:  { label: 'YAML',  textColor: '#fde68a' },
+      shell: { label: 'Bash',  textColor: '#a5f3fc' },
+      python:{ label: 'Python',textColor: '#86efac' },
+    };
+
+    const ALERT = [
+      { key: 'rule',     emoji: '🚨', name: 'Rule',     note: '임계 조건 + for' },
+      { key: 'routing',  emoji: '🚦', name: 'Routing',  note: 'severity/team 분기' },
+      { key: 'silence',  emoji: '🤐', name: 'Silence',  note: '점검 중 차단' },
+      { key: 'receiver', emoji: '📞', name: 'Receiver', note: 'Slack/PD/Webhook' },
+    ];
+
+    function AlertCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🚒 119 분류 (Alertmanager)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {ALERT.map((a) => {
+              const isActive = focus === a.key;
+              return (
+                <div
+                  key={a.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{a.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{a.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{a.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Alertmanager — 알람 라우팅</h1>
+                <p className="text-sm text-slate-500 mt-1">119 분류 — Rule / Routing / Silence / Receiver</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <AlertCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'receiver' && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
+                💡 Part II 완성. 다음(Part III)에서는 로그 — 구조화 / ELK·Loki / 수집 / 검색
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
