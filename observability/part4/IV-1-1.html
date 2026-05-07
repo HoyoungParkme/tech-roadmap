@@ -3,288 +3,475 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Observability 학습 — Trace / Span 개론</title>
+  <title>Observability 학습 — IV-1-1. Trace / Span 개론</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🚇</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     IV-1-1. Trace / Span 개론
     학습 목표: 분산 시스템에서 한 요청의 전체 여정(Trace)과 단위 작업(Span)을 추적하는 모델 이해
     핵심 비유: "지하철 환승 기록" — 출발지~목적지 전체 여정(Trace) + 각 환승역(Span)
-    구조: 4단계 (trace / span / propagation / tree)
+    패턴: fastapi 표준 — 좌(Span 트리 워터폴) / 우(VSCode 코드)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // 시간축 0~500ms 기준
+    const TIME_MAX = 500;
+
+    // 4 STEPS — 각 단계마다 좌측 LiveDataPane이 보여줄 span 트리
+    // span: { id, name, start, dur, depth, color, traceId }
     const STEPS = [
       {
-        title: 'Step 1. Trace — 한 요청의 전체 여정',
-        desc: '사용자가 "/checkout" 한 번 누르면 API → DB → Cache → 외부 결제까지 여러 정거장을 거친다. 이 모든 단계를 하나의 trace_id로 묶으면 "이 요청 한 건"의 전 여정이 한 줄로 복원된다. 지하철에서 출발역~목적지까지 같은 카드 한 장으로 환승하는 것과 같다.',
-        block: {
-          kind: 'shell',
-          code: `# 한 요청의 trace 전경 — trace_id 하나로 묶인 5개 정거장
-trace_id = 4bf92f3577b34da6a3ce929d0e0e4736
-
-[ 사용자 ] ──HTTP POST /checkout──▶ [ API Gateway ]
-                                          │
-                                          ├─▶ [ Order Service ]
-                                          │         │
-                                          │         ├─▶ [ Postgres ]   (DB call)
-                                          │         └─▶ [ Redis ]      (cache get)
-                                          │
-                                          └─▶ [ Payment Service ] ──▶ [ Stripe API ]
-
-# trace_id 하나만 알면 → 위 5개 호출이 한 화면에 떠오른다
-$ curl jaeger:16686/api/traces/4bf92f3577b34da6a3ce929d0e0e4736
-{
-  "traceID": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "spans": [ {...}, {...}, {...}, {...}, {...} ],   # ← 5개의 정거장
-  "duration": 842ms
-}
-# ✓ 환승 카드 한 장 = trace_id 하나`,
+        title: 'Step 1. 단일 서비스 — Trace 없음',
+        desc: '서비스가 하나뿐일 때는 그냥 이 함수가 250ms 걸렸다는 로그 한 줄이면 충분하다. 따로 trace_id를 만들 이유가 없다. 지하철로 치면 한 정거장만 타는 셈이라 환승 카드를 굳이 안 봐도 된다.',
+        title2: '한 박스 — log 한 줄로 충분',
+        spans: [
+          { id: 's1', name: 'POST /checkout', start: 0, dur: 250, depth: 0, color: 'red', traceId: '—' },
+        ],
+        legend: 'trace_id 없음 — 단일 서비스라 호출 계층이 없다',
+        code: {
+          lang: 'python',
+          filename: 'app.py — 단일 서비스 (FastAPI)',
+          lines: [
+            '# 단일 서비스 — trace 개념 자체가 없다',
+            'from fastapi import FastAPI',
+            'import logging, time',
+            '',
+            'app = FastAPI()',
+            'log = logging.getLogger(__name__)',
+            '',
+            '@app.post("/checkout")',
+            'def checkout(payload: dict):',
+            '    t0 = time.perf_counter()',
+            '    result = process(payload)',
+            '    elapsed = (time.perf_counter() - t0) * 1000',
+            '    log.info("checkout done elapsed=%.1fms", elapsed)',
+            '    return result',
+            '',
+            '# 로그: "checkout done elapsed=250.3ms"',
+            '# 끝. trace_id도, span도 없다.',
+          ],
+          highlight: [12, 13],
         },
-        focus: 'trace',
       },
       {
-        title: 'Step 2. Span — 한 단위 작업 (DB call, HTTP call …)',
-        desc: '각 정거장이 하나의 span. start/end 시각, 속성(http.method, db.statement, status), 도중 일어난 이벤트, 에러까지 담는다. parent_span_id로 호출 계층을 그린다. 환승역마다 "몇 시 도착, 몇 시 출발, 몇 호선 환승"을 적어두는 것과 같다.',
-        block: {
-          kind: 'python',
-          code: `# opentelemetry SDK — span 직접 생성
-from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
-
-tracer = trace.get_tracer(__name__)
-
-def fetch_user(user_id: int):
-    # start_as_current_span: 시작/종료 시각 자동 측정 + context 등록
-    with tracer.start_as_current_span("db.fetch_user") as span:
-        # 속성 — 검색/필터에 쓰인다
-        span.set_attribute("db.system", "postgresql")
-        span.set_attribute("db.statement", "SELECT * FROM users WHERE id=%s")
-        span.set_attribute("user.id", user_id)
-
-        # 이벤트 — 타임라인 위 점으로 기록
-        span.add_event("query.start")
-        try:
-            row = db.execute("SELECT * FROM users WHERE id=%s", user_id)
-            span.add_event("query.end", {"rows": 1})
-            return row
-        except Exception as e:
-            # 에러는 status + record_exception 둘 다
-            span.set_status(Status(StatusCode.ERROR, str(e)))
-            span.record_exception(e)
-            raise
-
-# 한 span = { trace_id, span_id, parent_span_id,
-#             name, start_time, end_time,
-#             attributes, events, status }
-# parent_span_id가 호출 계층(부모-자식)을 만든다`,
+        title: 'Step 2. 분산 시작 — Trace ID 필요',
+        desc: '서비스를 셋으로 쪼개니 문제가 생긴다. api → cart → product 호출이 각자 따로 로그를 남긴다. "이 250ms 응답이 어디서 200ms를 쓴 건지" 묶을 키가 없다. 환승할 때마다 카드를 새로 사는 꼴이라 출발~도착 여정을 복원할 수 없다.',
+        title2: '3개 서비스 — 시간축 따로, 묶을 키 없음',
+        spans: [
+          { id: 's1', name: 'api: POST /checkout',   start: 0,   dur: 250, depth: 0, color: 'red',   traceId: 'A' },
+          { id: 's2', name: 'cart: GET /cart/123',   start: 30,  dur: 180, depth: 0, color: 'amber', traceId: 'B' },
+          { id: 's3', name: 'product: GET /p/9',    start: 80,  dur: 120, depth: 0, color: 'amber', traceId: 'C' },
+        ],
+        legend: '각 서비스 trace_id가 다르다 (A/B/C) — 한 요청이라는 증거가 없다',
+        code: {
+          lang: 'python',
+          filename: 'manual_trace.py — 수동 시도 (한계)',
+          lines: [
+            '# 수동으로 trace_id를 만들어 헤더에 넣어보지만…',
+            'import uuid, requests',
+            'from fastapi import FastAPI, Request',
+            '',
+            'app = FastAPI()',
+            '',
+            '@app.post("/checkout")',
+            'def checkout(req: Request):',
+            '    # 발신측: trace_id 직접 생성',
+            '    trace_id = req.headers.get("x-trace-id") or uuid.uuid4().hex',
+            '    headers = {"x-trace-id": trace_id}',
+            '',
+            '    # 모든 호출에 헤더 직접 전달 — 빠뜨리면 끊긴다',
+            '    cart    = requests.get("http://cart/items",    headers=headers)',
+            '    product = requests.get("http://product/p/9",   headers=headers)',
+            '    pay     = requests.post("http://pay/charge",   headers=headers)',
+            '',
+            '    # 문제 1: span 시작/끝 시각 누가 기록?',
+            '    # 문제 2: 부모-자식 관계는 어떻게?',
+            '    # 문제 3: DB/Redis/외부 라이브러리 호출은?',
+            '    # → 결국 표준이 필요해진다 (W3C Trace Context)',
+            '    return {"ok": True}',
+          ],
+          highlight: [10, 13, 14, 15],
         },
-        focus: 'span',
       },
       {
-        title: 'Step 3. Context Propagation — 서비스 간 trace_id 전달',
-        desc: '서비스 A가 만든 trace_id를 서비스 B가 이어받아야 한 trace로 묶인다. HTTP 헤더 `traceparent`(W3C Trace Context 표준)에 trace_id/span_id를 실어 전달하고, Python에서는 contextvars로 같은 프로세스 내 비동기 호출 사이에도 자동 전파된다. 환승할 때 같은 카드를 다시 찍는 것과 같다.',
-        block: {
-          kind: 'python',
-          code: `# W3C Trace Context — traceparent 헤더로 서비스 간 전파
-# 형식: traceparent: 00-{trace_id}-{parent_span_id}-{flags}
-#   예: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-
-from opentelemetry import trace, context
-from opentelemetry.propagate import inject, extract
-import requests
-
-# [발신측] 서비스 A — 나가는 요청에 현재 context를 주입
-def call_payment(amount):
-    headers = {}
-    inject(headers)   # ← traceparent 자동 추가
-    # headers == {"traceparent": "00-4bf9...-00f0...-01"}
-    return requests.post("http://payment/charge",
-                         json={"amount": amount}, headers=headers)
-
-# [수신측] 서비스 B — 들어온 요청 헤더에서 context 복원
-@app.post("/charge")
-def charge(request, payload):
-    ctx = extract(request.headers)   # ← traceparent 파싱
-    token = context.attach(ctx)      # 현재 컨텍스트로 활성화
-    try:
-        with tracer.start_as_current_span("payment.charge"):
-            # 이 span의 parent = A에서 보낸 span_id
-            # 이 span의 trace_id = A와 동일 → 한 trace로 묶인다
-            stripe.charge(payload)
-    finally:
-        context.detach(token)
-
-# FastAPI/requests instrumentation을 켜면 inject/extract 자동
-# contextvars 기반이라 asyncio 안에서도 task 간 전파됨`,
+        title: 'Step 3. Span 트리 등장 — 같은 trace_id로 묶임',
+        desc: 'OpenTelemetry SDK를 켜고 tracer.start_as_current_span을 쓰면 각 호출이 자동으로 span이 된다. 같은 trace_id를 공유하면서 parent_span_id로 부모-자식이 이어진다. 시간축 위에 폭포수(워터폴) 트리가 그려진다.',
+        title2: '같은 trace_id로 묶인 부모-자식 트리',
+        spans: [
+          { id: 's1', name: 'api: POST /checkout',   start: 0,   dur: 250, depth: 0, color: 'red',  traceId: 'X' },
+          { id: 's2', name: 'cart: GET /cart/123',   start: 30,  dur: 80,  depth: 1, color: 'blue', traceId: 'X' },
+          { id: 's3', name: 'product: GET /p/9',    start: 130, dur: 60,  depth: 1, color: 'blue', traceId: 'X' },
+        ],
+        legend: 'trace_id=X 공유 + parent_span_id로 트리 — 한 요청 한 줄로 복원',
+        code: {
+          lang: 'python',
+          filename: 'otel_init.py — OpenTelemetry SDK',
+          lines: [
+            '# OpenTelemetry SDK — 자동으로 trace_id/span_id 부여',
+            'from opentelemetry import trace',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.export import (',
+            '    BatchSpanProcessor, ConsoleSpanExporter,',
+            ')',
+            '',
+            'trace.set_tracer_provider(TracerProvider())',
+            'trace.get_tracer_provider().add_span_processor(',
+            '    BatchSpanProcessor(ConsoleSpanExporter())',
+            ')',
+            'tracer = trace.get_tracer(__name__)',
+            '',
+            '@app.post("/checkout")',
+            'def checkout(payload: dict):',
+            '    # ① 부모 span — 시작/종료 시각 자동 측정',
+            '    with tracer.start_as_current_span("POST /checkout") as root:',
+            '        root.set_attribute("user.id", payload["user_id"])',
+            '',
+            '        # ② 자식 span — parent_span_id가 자동으로 root.span_id',
+            '        with tracer.start_as_current_span("cart.get"):',
+            '            cart = fetch_cart(payload["user_id"])',
+            '',
+            '        with tracer.start_as_current_span("product.get"):',
+            '            product = fetch_product(cart["item_id"])',
+            '',
+            '        return {"ok": True}',
+            '',
+            '# 출력 span 한 건 = { trace_id, span_id, parent_span_id,',
+            '#                     name, start_ns, end_ns, attributes }',
+          ],
+          highlight: [17, 21, 24],
         },
-        focus: 'propagation',
       },
       {
-        title: 'Step 4. Trace Tree — 부모-자식 관계와 Critical Path',
-        desc: 'span들을 parent_span_id로 이으면 트리(폭포수)가 된다. 가장 긴 span이 병목이고, 루트~잎까지 시간을 가장 많이 잡아먹는 경로가 Critical Path. "어디서 갈아타느라 늦었나?"를 한눈에 본다. p99 지연의 범인을 1분 안에 지목하는 도구.',
-        block: {
-          kind: 'shell',
-          code: `# Jaeger/Tempo의 trace tree (폭포수) — ASCII 시각화
-trace_id: 4bf9...4736                       total: 842ms
-─────────────────────────────────────────────────────────────────────
-[POST /checkout                                              ] 842ms ◀ root
-├─[validate_cart                ]                              60ms
-├─[order.create                            ]                  120ms
-│  ├─[db.insert_order      ]                                   45ms
-│  └─[redis.lock           ]                                   15ms
-├─[payment.charge                                          ]  640ms ◀◀ 병목
-│  ├─[traceparent inject ]                                      2ms
-│  └─[http POST stripe                                   ]    620ms ◀ 진짜 범인
-│        └─[stripe.api.process                          ]     580ms
-└─[notify.send             ]                                   20ms
-─────────────────────────────────────────────────────────────────────
-Critical Path: /checkout → payment.charge → http POST stripe
-              → stripe.api.process   (842 중 580ms = 69%)
-
-# 읽는 법
-# - 가로 길이 = 그 span이 잡아먹은 시간
-# - 들여쓰기 = parent → child 관계
-# - 가장 긴 leaf span 위쪽 경로 = Critical Path → 최적화 1순위
-
-# 액션
-# → Stripe 호출을 비동기/배치로 → 사용자 응답에서 분리
-# → 또는 결제 사이드카로 캐시/멱등 처리`,
+        title: 'Step 4. Context Propagation — 5단계 깊이 트리',
+        desc: 'requests/httpx instrumentation을 켜면 traceparent 헤더가 자동으로 주입/추출된다. DB·Redis instrumentation까지 켜면 트리는 5단계 깊이로 자란다. 가장 긴 leaf span이 병목이고 그 위로 올라가는 경로가 Critical Path. p99 지연의 범인을 30초 안에 지목한다.',
+        title2: '5 levels deep — Critical Path가 보인다',
+        spans: [
+          { id: 's1', name: 'api: POST /checkout',          start: 0,   dur: 480, depth: 0, color: 'red',  traceId: 'X' },
+          { id: 's2', name: 'auth.verify_jwt',              start: 10,  dur: 30,  depth: 1, color: 'blue', traceId: 'X' },
+          { id: 's3', name: 'cart: GET /cart/123',          start: 50,  dur: 380, depth: 1, color: 'blue', traceId: 'X' },
+          { id: 's4', name: 'redis.GET cart:123',           start: 60,  dur: 15,  depth: 2, color: 'sky',  traceId: 'X' },
+          { id: 's5', name: 'product: GET /p/9',            start: 90,  dur: 320, depth: 2, color: 'sky',  traceId: 'X' },
+          { id: 's6', name: 'postgres.SELECT product',      start: 110, dur: 280, depth: 3, color: 'cyan', traceId: 'X', critical: true },
+          { id: 's7', name: 'postgres.SELECT stock',        start: 200, dur: 150, depth: 4, color: 'teal', traceId: 'X', critical: true },
+        ],
+        legend: 'Critical Path: api → cart → product → postgres.SELECT (가장 긴 leaf)',
+        code: {
+          lang: 'python',
+          filename: 'auto_instrument.py — context propagation',
+          lines: [
+            '# 자동 계측 — traceparent 헤더 자동 주입/추출 + DB span 자동',
+            'from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor',
+            'from opentelemetry.instrumentation.requests import RequestsInstrumentor',
+            'from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor',
+            'from opentelemetry.instrumentation.redis import RedisInstrumentor',
+            '',
+            '# ① 한 줄로 자동 계측 — 코드 수정 거의 없음',
+            'FastAPIInstrumentor.instrument_app(app)   # 들어오는 요청 → root span',
+            'RequestsInstrumentor().instrument()       # 나가는 HTTP → 자식 span',
+            'Psycopg2Instrumentor().instrument()       # DB 쿼리 → 자식 span',
+            'RedisInstrumentor().instrument()          # Redis → 자식 span',
+            '',
+            '# ② 발신측 — 헤더 주입 자동 (traceparent: 00-{tid}-{sid}-01)',
+            '@app.post("/checkout")',
+            'def checkout(payload: dict):',
+            '    # requests가 자동으로 traceparent 헤더 추가',
+            '    cart    = requests.get(f"http://cart/items/{payload[\'user_id\']}")',
+            '    product = requests.get(f"http://product/p/{cart.json()[\'pid\']}")',
+            '    return {"ok": True}',
+            '',
+            '# ③ 수신측 — 헤더 추출 자동',
+            '#    cart 서비스 FastAPI도 instrument_app 켜두면',
+            '#    들어오는 traceparent로 parent_span_id 복원',
+            '#    → cart의 span이 api의 span의 자식이 된다',
+            '',
+            '# 결과 — 5단계 깊이 트리:',
+            '# api ─┬─ auth                      30ms',
+            '#      └─ cart ─── redis            15ms',
+            '#                └─ product ─ pg ─── pg.stock  150ms ◀ Critical',
+          ],
+          highlight: [8, 9, 10, 11],
         },
-        focus: 'tree',
       },
     ];
 
-    const KIND_STYLE = {
-      python: { label: 'Python', textColor: '#86efac' },
-      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
-      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    // ── span 색상 매핑
+    const COLOR = {
+      red:   { bar: 'bg-red-500',   border: 'border-red-600',   text: 'text-red-50',   shadow: 'shadow-red-500/40' },
+      amber: { bar: 'bg-amber-500', border: 'border-amber-600', text: 'text-amber-50', shadow: 'shadow-amber-500/40' },
+      blue:  { bar: 'bg-blue-500',  border: 'border-blue-600',  text: 'text-blue-50',  shadow: 'shadow-blue-500/40' },
+      sky:   { bar: 'bg-sky-500',   border: 'border-sky-600',   text: 'text-sky-50',   shadow: 'shadow-sky-500/40' },
+      cyan:  { bar: 'bg-cyan-500',  border: 'border-cyan-600',  text: 'text-cyan-50',  shadow: 'shadow-cyan-500/40' },
+      teal:  { bar: 'bg-teal-500',  border: 'border-teal-600',  text: 'text-teal-50',  shadow: 'shadow-teal-500/40' },
     };
 
-    const TRACE = [
-      { key: 'trace',       emoji: '🚇', name: 'Trace',       note: '한 요청의 전체 여정' },
-      { key: 'span',        emoji: '🚉', name: 'Span',        note: '한 단위 작업' },
-      { key: 'propagation', emoji: '🆔', name: 'Propagation', note: 'trace_id/span_id 전달' },
-      { key: 'tree',        emoji: '🌳', name: 'Trace Tree',  note: '부모-자식 관계' },
-    ];
+    // ── 좌측: Span 트리 워터폴
+    function SpanWaterfall({ step, stepIdx }) {
+      // 시간 눈금 — 0, 100, 200, 300, 400, 500ms
+      const ticks = [0, 100, 200, 300, 400, 500];
+      // 단계가 바뀔 때마다 span이 새로 등장하는 효과를 위한 key
+      const animKey = `step-${stepIdx}`;
 
-    function TraceCards({ focus }) {
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">🚇 지하철 환승 기록 (Trace/Span)</div>
-          <div className="grid grid-cols-4 gap-2">
-            {TRACE.map((t) => {
-              const isActive = focus === t.key;
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🚇</span>
+              <span className="text-xs font-bold text-slate-700">Span 트리 워터폴</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">trace_id={step.spans[0].traceId === '—' ? '—' : `${step.spans[0].traceId}…4736`}</span>
+          </div>
+
+          {/* 시간축 눈금 */}
+          <div className="px-3 pt-3">
+            <div className="ml-[180px] relative h-5 border-b border-slate-200">
+              {ticks.map((t) => (
+                <div key={t} className="absolute top-0 -translate-x-1/2 text-[10px] text-slate-400 font-mono"
+                     style={{ left: `${(t / TIME_MAX) * 100}%` }}>
+                  {t}ms
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* span 행들 */}
+          <div className="p-3 space-y-1.5 min-h-[280px]" key={animKey}>
+            {step.spans.map((s, idx) => {
+              const c = COLOR[s.color];
+              const leftPct = (s.start / TIME_MAX) * 100;
+              const widthPct = (s.dur / TIME_MAX) * 100;
+              const indent = s.depth * 14;
+              const animDelay = `${idx * 220}ms`;
+
               return (
-                <div
-                  key={t.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
-                >
-                  <div className="text-2xl">{t.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{t.note}</div>
+                <div key={s.id} className="flex items-center gap-2 fade-in" style={{ animationDelay: animDelay }}>
+                  {/* 라벨 */}
+                  <div className="w-[180px] shrink-0 text-[11px] font-mono text-slate-700 truncate"
+                       style={{ paddingLeft: `${indent}px` }}>
+                    {s.depth > 0 && <span className="text-slate-300 mr-1">└─</span>}
+                    <span className={s.critical ? 'text-red-700 font-bold' : ''}>{s.name}</span>
+                  </div>
+                  {/* 시간축 위 막대 */}
+                  <div className="flex-1 relative h-5">
+                    {/* 배경 격자 */}
+                    {ticks.map((t) => (
+                      <div key={t} className="absolute top-0 bottom-0 border-l border-slate-100"
+                           style={{ left: `${(t / TIME_MAX) * 100}%` }} />
+                    ))}
+                    {/* 막대 — 단계 진입 시 width 0 → 실제 폭으로 */}
+                    <div
+                      className={`absolute top-0 h-full rounded ${c.bar} ${c.border} border ${c.shadow} shadow grow-bar`}
+                      style={{
+                        left: `${leftPct}%`,
+                        '--target-width': `${widthPct}%`,
+                        animationDelay: `calc(${animDelay} + 120ms)`,
+                      }}
+                    >
+                      <span className={`absolute inset-0 px-1.5 flex items-center text-[9px] font-bold ${c.text}`}>
+                        {s.dur}ms
+                      </span>
+                    </div>
+                  </div>
                 </div>
               );
             })}
+          </div>
+
+          {/* 범례/제목 */}
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title2}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          // re-highlight (innerHTML이 바뀌었을 수 있음)
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일명 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          {/* 코드 + 라인 번호 */}
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
           </div>
         </div>
       );
     }
 
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
 
-      const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
-      };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
       handleNextRef.current = handleNext;
       handlePrevRef.current = handlePrev;
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
         setIsPlaying((p) => !p);
       };
 
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
+      const step = STEPS[stepIdx];
 
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">Trace / Span 개론</h1>
-                <p className="text-sm text-slate-500 mt-1">지하철 환승 기록 — 출발지부터 목적지까지 어디서 갈아탔는지 추적</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar {
+              width: 0;
+              animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-red-600 hover:text-red-800 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-red-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. Observability &gt; Chapter 1. Tracing</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Trace / Span 개론</h1>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                지하철 환승 기록 — <strong>분산 추적의 기본</strong>. 한 요청의 출발지~목적지 여정(<code className="bg-slate-100 px-1 rounded text-xs">Trace</code>)과
+                각 환승역(<code className="bg-slate-100 px-1 rounded text-xs">Span</code>)을 추적하는 모델.
+              </p>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <SpanWaterfall step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <TraceCards focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+            {/* 설명 */}
+            <div className="p-4 rounded-xl bg-red-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-red-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-red-200">키보드 &larr;/&rarr;</span>
               </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            {step.focus === 'tree' && (
-              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
-                💡 다음(IV-1-2)에서는 OpenTelemetry — 표준 SDK + 자동 계측
+            {/* 마지막 단계: 다음 안내 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-red-50 border-2 border-red-300 text-red-900 text-sm">
+                💡 다음(IV-1-2)에서는 <strong>OpenTelemetry — 표준 SDK + Collector</strong>
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
               </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-red-600 text-white hover:bg-red-700 transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./IV-1-2.html" className="text-red-600 hover:text-red-800 font-medium">IV-1-2 OpenTelemetry &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
