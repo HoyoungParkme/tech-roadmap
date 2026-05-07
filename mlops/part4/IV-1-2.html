@@ -3,288 +3,618 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MLOps 학습 — 데이터 드리프트 감지</title>
+  <title>MLOps 학습 — IV-1-2. 데이터 드리프트 감지</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     IV-1-2. 데이터 드리프트 감지
-    학습 목표: 라벨이 늦게 들어와 정확도가 보이기 전에 입력 분포 변화로 모델 위험을 조기 감지
-    핵심 비유: "기상 캐스터" — 어제와 오늘의 기온/습도 분포 비교, 이상하면 경보
-    구조: 4단계 (드리프트 정의 / PSI 계산 / 시각화 / 알람 자동화)
+    학습 목표: 라벨 들어오기 전에 입력 분포 변화로 모델 위험을 조기 감지한다.
+    핵심 비유: "기상 캐스터" — 학습 시점 분포(reference)와 production 분포(current)를 비교해 경보
+    패턴: fastapi v1 패턴 — 좌(LiveDataPane: 분포 히스토그램 + PSI) / 우(VSCode CodeViewer)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 분포 히스토그램용 bin 값 (10 bins)
+    // reference: 학습 데이터 (파란색)
+    // current  : production 입력 (단계마다 변해감)
+    // ─────────────────────────────────────────────────────
+    const REF_BINS  = [4, 10, 22, 34, 46, 52, 44, 30, 18, 8];          // 학습 분포 (정규분포 모양)
+
+    // 단계별 일별 PSI 추세 (Step 2~4에서 노출)
+    const PSI_TREND_STEP2 = [0.05, 0.07, 0.09, 0.12, 0.15, 0.17, 0.18];
+    const PSI_TREND_STEP3 = [0.07, 0.10, 0.15, 0.21, 0.28, 0.31, 0.34];
+    const PSI_TREND_STEP4 = [0.09, 0.13, 0.18, 0.25, 0.32, 0.36, 0.41];
+
+    // Evidently 리포트 row (Step 3, 4)
+    const EVIDENTLY_ROWS = [
+      { name: 'amount',       type: 'num', score: 0.34, metric: 'PSI',   drift: true  },
+      { name: 'time_of_day',  type: 'cat', score: 0.41, metric: 'Chi²',  drift: true  },
+      { name: 'region',       type: 'cat', score: 0.28, metric: 'Chi²',  drift: true  },
+      { name: 'device',       type: 'cat', score: 0.05, metric: 'Chi²',  drift: false },
+      { name: 'user_age',     type: 'num', score: 0.07, metric: 'PSI',   drift: false },
+      { name: 'merchant_cat', type: 'cat', score: 0.04, metric: 'Chi²',  drift: false },
+      { name: 'session_dur',  type: 'num', score: 0.06, metric: 'PSI',   drift: false },
+      { name: 'os',           type: 'cat', score: 0.02, metric: 'Chi²',  drift: false },
+      { name: 'channel',      type: 'cat', score: 0.03, metric: 'Chi²',  drift: false },
+      { name: 'ip_country',   type: 'cat', score: 0.06, metric: 'Chi²',  drift: false },
+      { name: 'tx_count_1d',  type: 'num', score: 0.08, metric: 'PSI',   drift: false },
+      { name: 'avg_amount',   type: 'num', score: 0.09, metric: 'PSI',   drift: false },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의 (드리프트 시뮬레이션)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. 드리프트란? — "입력 환경이 변했다"',
-        desc: '학습 시점 데이터 분포(reference)와 production 입력 분포(current)가 달라지는 현상. 코로나로 결제 패턴이 바뀌면 사기 탐지가 못 따라감. 정확도 하락보다 먼저 보임 → 조기 신호.',
-        block: {
-          kind: 'shell',
-          code: `# 학습 데이터 (2025년 봄, reference)
-거래 금액 분포: 평균 $50, p99 $300
-시간대 분포: 평일 낮 80%, 새벽 5%
-지역 분포: 서울 50%, 경기 25%, 기타 25%
-
-# Production 입력 (2026년 5월, current)
-거래 금액 분포: 평균 $80 ↑, p99 $600 ↑
-시간대 분포: 평일 낮 60% ↓, 새벽 20% ↑   ← 변화!
-지역 분포: 서울 30%, 경기 25%, 기타 45% ↑
-
-# 결과
-- 모델은 "새벽 거래는 사기" 패턴을 학습 안 함
-- 정상 새벽 거래 → 사기로 잘못 분류
-- 정확도 떨어짐 (라벨 들어오면 발견)
-- 그러나 입력 분포만 보면 즉시 감지 가능
-→ "드리프트 = 라벨 없이도 위험 알림"`,
-        },
+        title: 'Step 1. 드리프트란? — "어제와 오늘의 날씨가 다르다"',
+        desc: '학습 시점 데이터(reference)와 production 입력(current)이 거의 일치 — 평소엔 분포가 닮아있다. PSI 0.05 (정상). 라벨 없이도 입력 분포만으로 모델 환경을 감시하는 첫걸음.',
         focus: 'concept',
+        // 거의 동일한 분포 (살짝 흔들기)
+        curBins: [5, 11, 21, 33, 47, 51, 43, 31, 19, 9],
+        psi: 0.05,
+        psiState: 'good',
+        psiTrend: null,
+        showEvidently: false,
+        showAlert: false,
+        showRetrainArrow: false,
+        code: {
+          lang: 'python',
+          filename: 'concept_drift.py',
+          lines: [
+            '# 데이터 드리프트 = 입력 환경이 변하는 현상',
+            '#   학습 데이터 (reference) ≠ production 입력 (current)',
+            '#',
+            '# 일반 SW 버그와 다른 점',
+            '#   - 코드는 그대로인데 정확도만 떨어진다',
+            '#   - 라벨이 들어오기 전엔 정확도 하락이 안 보인다',
+            '#   - 그러나 입력 분포는 즉시 관측 가능 → 조기 신호',
+            '',
+            '# 실제 사례 (사기 탐지)',
+            'reference = load("training_2025_spring.parquet")',
+            'current   = load_production(today)',
+            '',
+            '# 거래 금액 분포',
+            'reference["amount"].describe()',
+            '#   mean=50, p99=300  ← 학습 시점',
+            '',
+            'current["amount"].describe()',
+            '#   mean=52, p99=310  ← 거의 동일 (정상)',
+            '',
+            '# → 평소엔 두 분포가 닮아있다',
+            '# → 분포가 갈라지기 시작하면 위험 신호',
+          ],
+          highlight: [1, 6, 19, 20],
+        },
       },
       {
         title: 'Step 2. PSI 계산 — "분포 차이를 숫자로"',
-        desc: 'Population Stability Index. reference와 current를 같은 bin으로 나눠 비율 차이를 계산. PSI < 0.1 = 정상, 0.1~0.25 = 주의, > 0.25 = 위험. KS test, Wasserstein 거리도 흔히 사용.',
-        block: {
-          kind: 'python',
-          code: `import numpy as np
-
-def calculate_psi(reference, current, bins=10):
-    """
-    PSI = sum( (current% - reference%) * ln(current% / reference%) )
-    """
-    # 1. reference 분포로 bin 경계 잡기
-    breakpoints = np.percentile(reference, np.arange(0, 101, 100/bins))
-
-    # 2. 양쪽을 같은 bin으로 분할
-    ref_pct, _ = np.histogram(reference, breakpoints)
-    cur_pct, _ = np.histogram(current, breakpoints)
-    ref_pct = ref_pct / sum(ref_pct) + 1e-6
-    cur_pct = cur_pct / sum(cur_pct) + 1e-6
-
-    # 3. PSI 계산
-    psi = np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct))
-    return psi
-
-# 일별 PSI 추적
-ref = load("training_2025_spring.parquet")["amount"]
-for date in last_7_days:
-    cur = load_production(date)["amount"]
-    psi = calculate_psi(ref, cur)
-    print(f"{date}  amount PSI = {psi:.3f}")
-
-# 출력
-2026-05-01  amount PSI = 0.05  (정상)
-2026-05-02  amount PSI = 0.08
-2026-05-03  amount PSI = 0.18  ← 주의
-2026-05-04  amount PSI = 0.31  ← 위험!
-2026-05-05  amount PSI = 0.34  ← 지속`,
-        },
+        desc: 'Population Stability Index. 같은 bin으로 reference/current 비율을 비교해 한 숫자로 압축. PSI 0.18 — 분포가 살짝 어긋나기 시작 (주의/노랑). 일별 추세로 드리프트 진행 속도 추적.',
         focus: 'psi',
+        // 평균이 오른쪽으로 밀린 분포
+        curBins: [2, 6, 14, 24, 36, 50, 50, 40, 28, 18],
+        psi: 0.18,
+        psiState: 'warn',
+        psiTrend: PSI_TREND_STEP2,
+        showEvidently: false,
+        showAlert: false,
+        showRetrainArrow: false,
+        code: {
+          lang: 'python',
+          filename: 'psi.py',
+          lines: [
+            'import numpy as np',
+            '',
+            'def calculate_psi(reference, current, bins=10):',
+            '    """PSI = sum( (cur% - ref%) * ln(cur% / ref%) )"""',
+            '    # 1) reference 분포로 bin 경계 잡기',
+            '    edges = np.percentile(reference, np.arange(0, 101, 100/bins))',
+            '',
+            '    # 2) 양쪽을 같은 bin에 넣고 비율 계산',
+            '    ref_pct, _ = np.histogram(reference, edges)',
+            '    cur_pct, _ = np.histogram(current,   edges)',
+            '    ref_pct = ref_pct / ref_pct.sum() + 1e-6',
+            '    cur_pct = cur_pct / cur_pct.sum() + 1e-6',
+            '',
+            '    # 3) PSI 합산',
+            '    return np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct))',
+            '',
+            '# 임계 가이드',
+            '#   PSI < 0.10  → 정상 (녹색)',
+            '#   0.10 ~ 0.25 → 주의 (노랑)',
+            '#   PSI > 0.25  → 위험 (빨강)',
+            '',
+            '# 일별 추세 추적',
+            'for date in last_7_days:',
+            '    cur = load_production(date)["amount"]',
+            '    psi = calculate_psi(ref, cur)',
+            '    print(f"{date}  PSI={psi:.2f}")',
+          ],
+          highlight: [3, 14, 15, 18, 19, 20],
+        },
       },
       {
-        title: 'Step 3. EvidentlyAI 대시보드 — "드리프트 시각화"',
-        desc: 'EvidentlyAI/WhyLabs/Arize 같은 ML 전용 모니터링 도구. PSI/KS/MMD 등 자동 계산 + HTML 리포트로 분포 비교 시각화. feature별 드리프트 점수 표시 → 어떤 입력이 변했는지 한눈에.',
-        block: {
-          kind: 'python',
-          code: `# evidently로 한 줄 리포트
-from evidently.report import Report
-from evidently.metric_preset import DataDriftPreset
-
-report = Report(metrics=[DataDriftPreset()])
-report.run(reference_data=ref_df, current_data=cur_df)
-report.save_html("drift_report.html")
-
-# 리포트 결과 (HTML)
-─────────────────────────────────
-Data Drift Summary
-─────────────────────────────────
-Drift detected: 3 / 12 features
-
-Feature           Type    Drift Score   Drifted?
-─────────────────────────────────────────────────
-amount            num     0.34 (PSI)    ✅ Yes
-time_of_day       cat     0.41 (Chi²)   ✅ Yes
-region            cat     0.28 (Chi²)   ✅ Yes
-device            cat     0.05          —
-user_age          num     0.07          —
-...
-
-# Airflow DAG로 매일 자동 실행 → S3에 리포트 저장
-@task
-def daily_drift_check():
-    report = Report(metrics=[DataDriftPreset()])
-    report.run(reference_data=ref, current_data=load_yesterday())
-    report.save_html(f"s3://drift-reports/{today}.html")
-    return report.as_dict()`,
-        },
+        title: 'Step 3. EvidentlyAI 리포트 — "어떤 feature가 변했나"',
+        desc: 'PSI는 한 컬럼만. 실제 모델은 12+ feature. EvidentlyAI가 자동으로 feature별 드리프트 점수를 계산 + HTML 리포트로 비교 시각화. 12개 중 3개(amount/time_of_day/region) 빨간색 drift 감지.',
         focus: 'tool',
+        // 분포가 더 이동
+        curBins: [1, 3, 9, 16, 28, 42, 52, 48, 36, 25],
+        psi: 0.34,
+        psiState: 'crit',
+        psiTrend: PSI_TREND_STEP3,
+        showEvidently: true,
+        showAlert: false,
+        showRetrainArrow: false,
+        code: {
+          lang: 'python',
+          filename: 'evidently_report.py',
+          lines: [
+            '# EvidentlyAI — feature별 드리프트 자동 리포트',
+            'from evidently.report import Report',
+            'from evidently.metric_preset import DataDriftPreset',
+            '',
+            'report = Report(metrics=[DataDriftPreset()])',
+            'report.run(reference_data=ref_df, current_data=cur_df)',
+            'report.save_html("drift_report.html")',
+            '',
+            '# 결과 요약 (HTML 리포트 발췌)',
+            '#   Drift detected: 3 / 12 features',
+            '#',
+            '#   feature        type   score  metric   drifted',
+            '#   ─────────────────────────────────────────────',
+            '#   amount         num    0.34   PSI       YES 🔴',
+            '#   time_of_day    cat    0.41   Chi²      YES 🔴',
+            '#   region         cat    0.28   Chi²      YES 🔴',
+            '#   device         cat    0.05   Chi²       —',
+            '#   user_age       num    0.07   PSI        —',
+            '#   ...',
+            '',
+            '# Airflow DAG로 매일 자동 실행 + S3에 리포트 보관',
+            '@task',
+            'def daily_drift_check():',
+            '    rep = Report(metrics=[DataDriftPreset()])',
+            '    rep.run(reference_data=ref, current_data=load_yesterday())',
+            '    rep.save_html(f"s3://drift-reports/{today}.html")',
+            '    return rep.as_dict()',
+          ],
+          highlight: [5, 6, 7, 13, 14, 15],
+        },
       },
       {
         title: 'Step 4. 알람 + 자동 재학습 트리거 — "비 오면 우산"',
-        desc: 'PSI > 0.25 지속 N일 → Slack 알람 + Airflow retraining DAG 자동 발동. 사람이 매일 리포트 보지 않아도 됨. 임계치 튜닝 (너무 민감하면 false alarm, 너무 둔하면 늦음).',
-        block: {
-          kind: 'python',
-          code: `# Airflow에서 드리프트 감지 → 자동 알람 + 트리거
-from airflow.decorators import task
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-
-@task
-def check_drift_and_alert():
-    psi = calculate_psi(ref, load_yesterday())
-
-    if psi > 0.25:
-        # 1. Slack 알람
-        slack.post(
-            "#ml-alerts",
-            f"🚨 fraud-detector PSI={psi:.2f} > 0.25 (3일 연속)"
-        )
-        # 2. 재학습 DAG 자동 트리거
-        return "trigger_retrain"
-    return "ok"
-
-# 임계치 튜닝
-- PSI > 0.10 (주의)  → 슬랙 채널 알림만 (사람이 봄)
-- PSI > 0.25 (위험)  → 재학습 DAG 자동 트리거
-- 3일 연속 위험      → 모델 자동 staging 강등 + on-call 호출
-
-# 트레이드오프
-# - 너무 민감(0.10) → false alarm 빈번, 알람 피로
-# - 너무 둔감(0.40) → 모델 망가진 후에 알람
-
-# 다음(IV-2-1)에서는 Retraining 트리거 — 어떤 신호로 재학습할까`,
-        },
+        desc: 'PSI > 0.25 임계 초과 → Slack 알람 발화 + Airflow retraining DAG 자동 트리거. 사람이 매일 리포트 보지 않아도 됨. PSI 0.41 — 빨간색 위험, retraining 화살표 발동.',
         focus: 'auto',
+        curBins: [0, 2, 6, 12, 22, 36, 50, 54, 44, 32],
+        psi: 0.41,
+        psiState: 'crit',
+        psiTrend: PSI_TREND_STEP4,
+        showEvidently: true,
+        showAlert: true,
+        showRetrainArrow: true,
+        code: {
+          lang: 'python',
+          filename: 'drift_alert_dag.py',
+          lines: [
+            '# Airflow DAG — 드리프트 감지 → 알람 → 재학습 자동 트리거',
+            'from airflow.decorators import task',
+            'from airflow.operators.trigger_dagrun import TriggerDagRunOperator',
+            '',
+            '@task',
+            'def check_drift_and_alert():',
+            '    psi = calculate_psi(ref, load_yesterday()["amount"])',
+            '',
+            '    if psi > 0.25:',
+            '        # 1) Slack 알람',
+            '        slack.post(',
+            '            "#ml-alerts",',
+            '            f"🚨 fraud-detector PSI={psi:.2f} > 0.25"',
+            '        )',
+            '        # 2) 재학습 DAG 자동 트리거',
+            '        return "trigger_retrain"',
+            '    return "ok"',
+            '',
+            'trigger = TriggerDagRunOperator(',
+            '    task_id="trigger_retrain",',
+            '    trigger_dag_id="fraud_model_retrain",',
+            ')',
+            '',
+            '# 임계치 튜닝 트레이드오프',
+            '#   PSI > 0.10  → 슬랙 알림만 (사람이 봄)',
+            '#   PSI > 0.25  → 재학습 자동 트리거',
+            '#   3일 연속 위험 → on-call 호출 + staging 강등',
+            '#',
+            '#   너무 민감(0.10) → false alarm, 알람 피로',
+            '#   너무 둔감(0.40) → 모델 망가진 후에 알람',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14, 15, 16],
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      python: { label: 'Python', textColor: '#86efac' },
-      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
-      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    // ─────────────────────────────────────────────────────
+    // PSI 임계 색상
+    // ─────────────────────────────────────────────────────
+    const PSI_STYLE = {
+      good: { box: 'bg-emerald-50 border-emerald-300', text: 'text-emerald-700', bar: 'bg-emerald-400', label: '정상' },
+      warn: { box: 'bg-yellow-50 border-yellow-400',   text: 'text-yellow-700',  bar: 'bg-yellow-400',  label: '주의' },
+      crit: { box: 'bg-red-50 border-red-500',         text: 'text-red-700',     bar: 'bg-red-500',     label: '위험' },
     };
 
-    const PHASES = [
-      { key: 'concept', emoji: '🌦️', name: '드리프트',  note: '입력 환경 변화' },
-      { key: 'psi',     emoji: '🧮', name: 'PSI 계산',   note: '분포 차이 수치화' },
-      { key: 'tool',    emoji: '📈', name: 'Evidently',   note: '자동 리포트' },
-      { key: 'auto',    emoji: '🔔', name: '알람+트리거', note: '재학습 자동' },
-    ];
+    const psiBarColor = (v) => v < 0.10 ? 'bg-emerald-400' : v < 0.25 ? 'bg-yellow-400' : 'bg-red-500';
 
-    function PhaseCards({ focus }) {
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 히스토그램 + PSI + Evidently + Retraining 화살표
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const { curBins, psi, psiState, psiTrend, showEvidently, showAlert, showRetrainArrow } = step;
+      const psiStyle = PSI_STYLE[psiState];
+
+      // 히스토그램 막대 최대값 (스케일 통일)
+      const maxBin = Math.max(...REF_BINS, ...curBins);
+
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">🌦️ 기상 캐스터 (드리프트 감지)</div>
-          <div className="grid grid-cols-4 gap-2">
-            {PHASES.map((p) => {
-              const isActive = focus === p.key;
-              return (
-                <div
-                  key={p.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-purple-100 border-2 border-purple-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
-                >
-                  <div className="text-2xl">{p.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{p.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1">{p.note}</div>
-                </div>
-              );
-            })}
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-bold text-slate-700">🌦️ 기상 캐스터 (입력 분포 감시)</h2>
+            <span className="text-[10px] text-slate-400 font-mono">amount feature · live</span>
+          </div>
+
+          {/* 히스토그램 — reference vs current 겹쳐 비교 */}
+          <div className="bg-slate-50 rounded-lg p-3 border border-slate-200 mb-4">
+            <div className="flex items-center justify-between mb-2 text-[11px]">
+              <span className="font-bold text-slate-600">분포 비교 (10 bins)</span>
+              <span className="flex items-center gap-3">
+                <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-blue-500"></span><span className="text-slate-600">reference (학습)</span></span>
+                <span className="flex items-center gap-1"><span className={`w-2.5 h-2.5 rounded-sm ${psiState === 'good' ? 'bg-emerald-500' : psiState === 'warn' ? 'bg-yellow-500' : 'bg-fuchsia-500'}`}></span><span className="text-slate-600">current (운영)</span></span>
+              </span>
+            </div>
+            <div className="flex items-end gap-1 h-32">
+              {REF_BINS.map((refV, i) => {
+                const curV = curBins[i];
+                const refH = (refV / maxBin) * 100;
+                const curH = (curV / maxBin) * 100;
+                const curColor = psiState === 'good' ? 'bg-emerald-500' : psiState === 'warn' ? 'bg-yellow-500' : 'bg-fuchsia-500';
+                return (
+                  <div key={i} className="flex-1 flex items-end gap-0.5 h-full">
+                    <div
+                      className="flex-1 bg-blue-500 rounded-t transition-all duration-700"
+                      style={{ height: `${refH}%` }}
+                      aria-label={`reference bin ${i + 1}: ${refV}`}
+                    />
+                    <div
+                      className={`flex-1 ${curColor} rounded-t transition-all duration-700 opacity-80`}
+                      style={{ height: `${curH}%` }}
+                      aria-label={`current bin ${i + 1}: ${curV}`}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex justify-between text-[9px] text-slate-400 mt-1 font-mono">
+              <span>$0</span><span>$50</span><span>$150</span><span>$300</span><span>$600+</span>
+            </div>
+          </div>
+
+          {/* PSI 점수 카드 */}
+          <div className={`rounded-lg border-2 p-3 mb-3 transition-all duration-500 ${psiStyle.box} ${psiState === 'crit' ? 'animate-pulse' : ''}`}>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-bold text-slate-700">🧮 PSI (Population Stability Index)</span>
+              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded bg-white ${psiStyle.text}`}>
+                {psiState === 'crit' ? '🚨 ' : ''}{psiStyle.label}
+              </span>
+            </div>
+            <div className="flex items-baseline gap-2 mb-2">
+              <span className={`text-3xl font-extrabold tabular-nums ${psiStyle.text}`}>{psi.toFixed(2)}</span>
+              <span className="text-[11px] text-slate-500">임계 0.25</span>
+            </div>
+            {/* PSI 위치 게이지 (0 ~ 0.5) */}
+            <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div
+                className={`h-full transition-all duration-700 ${psiStyle.bar}`}
+                style={{ width: `${Math.min(100, (psi / 0.5) * 100)}%` }}
+              />
+              {/* 임계 0.25 라인 (50% 위치) */}
+              <div className="absolute top-0 bottom-0 w-0.5 bg-red-600" style={{ left: '50%' }} aria-hidden="true" />
+            </div>
+            <div className="flex justify-between text-[9px] text-slate-400 mt-1 font-mono">
+              <span>0.00</span><span className="text-red-600">0.25 ⚠</span><span>0.50</span>
+            </div>
+          </div>
+
+          {/* 일별 PSI 막대 차트 (Step 2~4) */}
+          {psiTrend && (
+            <div className="bg-slate-50 rounded-lg p-3 border border-slate-200 mb-3">
+              <div className="text-[11px] font-bold text-slate-600 mb-2">📊 일별 PSI 추세 (최근 7일)</div>
+              <div className="flex items-end gap-1.5 h-20">
+                {psiTrend.map((v, i) => {
+                  const h = Math.min(100, (v / 0.5) * 100);
+                  return (
+                    <div key={i} className="flex-1 flex flex-col items-center gap-1">
+                      <div className="w-full flex-1 flex items-end">
+                        <div
+                          className={`w-full rounded-t transition-all duration-700 ${psiBarColor(v)}`}
+                          style={{ height: `${h}%` }}
+                          title={`Day ${i + 1}: PSI ${v.toFixed(2)}`}
+                        />
+                      </div>
+                      <span className="text-[9px] text-slate-500 font-mono">{v.toFixed(2)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="flex justify-between text-[9px] text-slate-400 mt-1 font-mono">
+                <span>D-6</span><span>D-5</span><span>D-4</span><span>D-3</span><span>D-2</span><span>D-1</span><span>오늘</span>
+              </div>
+            </div>
+          )}
+
+          {/* Evidently 리포트 (Step 3, 4) */}
+          {showEvidently && (
+            <div className="bg-slate-50 rounded-lg p-3 border border-slate-200 mb-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[11px] font-bold text-slate-600">📈 EvidentlyAI 리포트 (12 features)</span>
+                <span className="text-[10px] text-red-600 font-bold">3 drifted</span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 max-h-44 overflow-auto">
+                {EVIDENTLY_ROWS.map((r) => (
+                  <div
+                    key={r.name}
+                    className={`flex items-center justify-between px-2 py-1 rounded border text-[10px] font-mono ${r.drift ? 'bg-red-50 border-red-300 text-red-700' : 'bg-white border-slate-200 text-slate-500'}`}
+                  >
+                    <span className="truncate">
+                      {r.drift ? '🔴 ' : '⚪ '}
+                      {r.name}
+                    </span>
+                    <span className="font-bold tabular-nums">{r.score.toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Step 4 — 알람 + Retraining 트리거 화살표 */}
+          {showAlert && (
+            <div className="mt-3 p-3 rounded-lg bg-red-50 border-2 border-red-400 animate-pulse">
+              <div className="flex items-center gap-2 text-red-800 font-bold text-sm">
+                <span className="text-lg">🚨</span>
+                <span>ALERT: PSI {step.psi.toFixed(2)} &gt; 0.25 임계 초과</span>
+              </div>
+              <div className="text-[11px] text-red-700 mt-1 font-mono">
+                #ml-alerts · severity=critical · 3일 연속 위험
+              </div>
+            </div>
+          )}
+
+          {showRetrainArrow && (
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <div className="flex-1 px-3 py-2 rounded-lg bg-red-100 border border-red-300 text-center">
+                <div className="text-[10px] text-red-600 font-bold uppercase">Drift 감지</div>
+                <div className="text-xs font-bold text-red-800">PSI 0.41</div>
+              </div>
+              <div className="text-2xl text-fuchsia-600 font-bold animate-pulse" aria-hidden="true">→</div>
+              <div className="flex-1 px-3 py-2 rounded-lg bg-fuchsia-100 border-2 border-fuchsia-400 text-center">
+                <div className="text-[10px] text-fuchsia-700 font-bold uppercase">Airflow 트리거</div>
+                <div className="text-xs font-bold text-fuchsia-900">retrain DAG ▶</div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${highlighted ? 'bg-fuchsia-500/10 border-l-2 border-fuchsia-400' : ''}`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
           </div>
         </div>
       );
     }
 
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">데이터 드리프트 감지</h1>
-                <p className="text-sm text-slate-500 mt-1">기상 캐스터 — 입력 분포 변화 조기 신호</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-fuchsia-700 hover:text-fuchsia-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-fuchsia-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. 모니터링 &amp; 운영 &gt; Chapter 1. 모델 헬스체크</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">데이터 드리프트 감지</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">기상 캐스터 — 입력 분포 변화 (reference vs current) 조기 신호</p>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <PhaseCards focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
-              </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
-            </div>
-
-            {step.focus === 'auto' && (
-              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 mb-6 text-xs text-purple-900">
-                💡 다음(IV-2-1)에서는 Retraining 트리거 — 스케줄/임계치/이벤트 3종 비교
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-fuchsia-50 border-2 border-fuchsia-300 rounded-xl p-3 text-sm text-fuchsia-900">
+                💡 다음(IV-2-1)에서는 <strong>Retraining 트리거</strong> — 자동차 정기 점검
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-fuchsia-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-fuchsia-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-fuchsia-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-fuchsia-600 text-white hover:bg-fuchsia-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./IV-1-1.html" className="text-slate-500 hover:text-slate-700">&larr; IV-1-1 모델 성능 모니터링</a>
+              <a href="./IV-2-1.html" className="text-fuchsia-700 hover:text-fuchsia-900 font-medium">IV-2-1 Retraining 트리거 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
