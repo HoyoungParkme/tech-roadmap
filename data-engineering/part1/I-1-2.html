@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — OLTP vs OLAP</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    I-1-2. OLTP vs OLAP — 트랜잭션 vs 분석
+    학습 목표: 거래용 DB와 분석용 DB가 왜 분리되는지, row vs column 저장 방식의 차이.
+    핵심 비유: "편의점 vs 도서관"
+      - 편의점(OLTP): 짧고 잦은 거래. 결제 1건을 ms 단위로 처리.
+      - 도서관(OLAP): 많은 데이터를 한 번에 분석. 분기 매출 같은 대량 집계.
+    구조: 4단계 (OLTP / OLAP / Contrast / Hybrid HTAP)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. OLTP — "편의점" (짧고 잦은 거래)',
+        desc: '결제 1건, 회원가입 1건 같은 짧은 트랜잭션을 ms 단위로 처리. row 기반 저장 + 인덱스 + ACID 보장. 동시 사용자 수천 명이 각자 자기 행만 읽고 쓰는 워크로드. PostgreSQL, MySQL, Oracle 같은 전통 RDBMS가 여기에 해당.',
+        block: {
+          kind: 'shell',
+          code: `# OLTP — 편의점 계산대 한 건의 결제
+
+BEGIN;
+  -- 1. 재고 차감 (특정 행 1개)
+  UPDATE inventory
+     SET qty = qty - 1
+   WHERE product_id = 1234;        -- 인덱스로 1개 행 즉시 찾기
+
+  -- 2. 주문 1건 INSERT
+  INSERT INTO orders (user_id, product_id, amount)
+       VALUES (42, 1234, 3500);
+
+  -- 3. 결제 1건 INSERT
+  INSERT INTO payments (order_id, status)
+       VALUES (lastval(), 'paid');
+COMMIT;
+-- 응답 시간: ~5ms
+
+# 특징
+- row 기반 저장 (한 행 전체를 한 블록에)
+- B-tree 인덱스로 특정 행 즉시 찾기
+- ACID — Atomicity / Consistency / Isolation / Durability
+- 동시 트랜잭션 수천 TPS
+
+# 대표 엔진
+PostgreSQL, MySQL, Oracle, SQL Server, Aurora`,
+        },
+        focus: 'oltp',
+      },
+      {
+        title: 'Step 2. OLAP — "도서관" (대량 분석)',
+        desc: '"지난 분기 카테고리별 매출 합계"처럼 수억 행을 한 번에 스캔/집계. column 기반 저장으로 필요한 컬럼만 읽고, 압축률이 높고, 분산 처리에 최적화. 응답은 초~분 단위지만 한 번에 거대한 질문에 답한다. BigQuery, Snowflake, Redshift, ClickHouse 등이 대표.',
+        block: {
+          kind: 'yaml',
+          code: `# OLAP — 도서관에서 분기 매출을 한 번에 집계
+
+query: |
+  SELECT category,
+         SUM(amount)        AS revenue,
+         COUNT(DISTINCT user_id) AS buyers
+    FROM warehouse.orders                  # 1억 행 fact 테이블
+   WHERE order_date BETWEEN '2026-01-01'
+                        AND '2026-03-31'
+   GROUP BY category
+   ORDER BY revenue DESC;
+
+execution:
+  scanned_rows: 100_000_000
+  scanned_bytes: 1.2GB        # column 압축 덕에 작음
+  duration: 3.4s              # 초 단위 OK
+  workers: 32                 # 분산 스캔
+
+storage:
+  layout: columnar            # category, amount, user_id 컬럼별로 저장
+  compression: zstd / dict / RLE
+  partition: order_date 기준 일자별
+  cluster_by: [category]
+
+design_principles:
+  - row 단위 갱신 X — append / batch load 위주
+  - 인덱스 대신 partition + clustering
+  - latency보다 throughput 우선
+  - 한 쿼리가 수많은 row를 읽고 적은 row를 반환
+
+# 대표 엔진
+engines: [BigQuery, Snowflake, Redshift, ClickHouse, Databricks]`,
+        },
+        focus: 'olap',
+      },
+      {
+        title: 'Step 3. Contrast — 워크로드 비교',
+        desc: '같은 SQL이 돌아가도 내부 저장/실행 모델이 완전히 다르다. row vs column, latency vs throughput, 인덱스 vs 파티션. OLTP에 분석 쿼리를 돌리면 락 경합이 나고, OLAP에 1건 update를 자주 하면 비효율 — 그래서 두 시스템을 분리하고 ETL/ELT로 데이터를 옮긴다.',
+        block: {
+          kind: 'shell',
+          code: `# OLTP vs OLAP 비교 표
+
+항목                  OLTP (편의점)             OLAP (도서관)
+─────────────────────────────────────────────────────────────
+저장 방식             row 기반                   column 기반
+주 작업               INSERT/UPDATE/DELETE       SELECT (집계)
+한 쿼리가 읽는 행     1 ~ 수십                   수백만 ~ 수십억
+한 쿼리가 반환하는 행 1 ~ 수십                   1 ~ 수천 (집계 결과)
+응답 시간             ms 단위                    초 ~ 분 단위
+동시성                수천 TPS                   동시 쿼리 수십
+인덱스 전략           B-tree / hash 인덱스       partition + clustering
+정합성                ACID 강함                  eventual / batch OK
+스키마                정규화 (3NF)               denormalized (star schema)
+데이터 양             수GB ~ 수TB                수TB ~ 수PB
+
+# 대표 시스템
+OLTP:  PostgreSQL, MySQL, Oracle, SQL Server, Aurora, DynamoDB
+OLAP:  BigQuery, Snowflake, Redshift, ClickHouse, Databricks
+
+# 왜 분리하나?
+1. 같은 DB에서 분석 쿼리 = 거대한 스캔 → 트랜잭션 락 경합
+2. row 저장은 컬럼 집계에 비효율, column 저장은 1건 update에 비효율
+3. 비용 모델이 다름 — OLTP는 IOPS, OLAP는 스캔 byte 단위
+
+→ ETL/ELT로 OLTP → OLAP로 주기적으로 데이터를 흘려보낸다`,
+        },
+        focus: 'contrast',
+      },
+      {
+        title: 'Step 4. Hybrid (HTAP) — 한 시스템에서 둘 다',
+        desc: 'Hybrid Transactional/Analytical Processing. 분리에 따른 운영 복잡도(데이터 동기화 지연, 두 벌의 스키마)를 줄이려는 시도. row 저장 + column 저장(MV/replica)을 한 엔진에서 같이 운영. CockroachDB, TiDB, SingleStore, SAP HANA 등. 만능은 아니고 초대형 분석은 여전히 전용 DW가 우세.',
+        block: {
+          kind: 'python',
+          code: `# HTAP 예시 — TiDB (TiKV: row store + TiFlash: column store)
+
+# 한 SQL을 옵티마이저가 자동으로 적절한 엔진에 보낸다
+
+# 1) 트랜잭션 — TiKV(row)로 라우팅
+def place_order(user_id: int, product_id: int, amount: int) -> None:
+    """결제 1건 — ms 단위, 강한 일관성."""
+    with tidb.transaction() as tx:
+        tx.execute("UPDATE inventory SET qty = qty - 1 WHERE product_id = %s",
+                   (product_id,))
+        tx.execute("INSERT INTO orders (user_id, product_id, amount) "
+                   "VALUES (%s, %s, %s)",
+                   (user_id, product_id, amount))
+    # → TiKV에서 처리, 일반 OLTP처럼 동작
+
+# 2) 분석 — TiFlash(column)로 자동 라우팅
+def quarterly_revenue() -> list[dict]:
+    """분기 매출 집계 — 옵티마이저가 TiFlash 선택."""
+    return tidb.query("""
+        SELECT category, SUM(amount) AS rev
+          FROM orders
+         WHERE order_date BETWEEN '2026-01-01' AND '2026-03-31'
+         GROUP BY category
+    """)
+    # → TiFlash(column replica)에서 스캔, 별도 ETL 없음
+
+# 트레이드오프
+# - 장점: 데이터 동기화 지연 없음 (replica가 준실시간)
+# - 단점: 운영 복잡, 초대형 PB급 분석은 전용 DW(BigQuery/Snowflake)가 더 강함
+# - 적합: 수TB 규모, 실시간 대시보드가 중요한 워크로드
+
+# 다른 HTAP 엔진
+# CockroachDB, SingleStore (구 MemSQL), SAP HANA, YugabyteDB`,
+        },
+        focus: 'hybrid',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const CONTRAST = [
+      { key: 'oltp',     emoji: '🏪', name: 'OLTP',     note: '편의점: 짧은 거래' },
+      { key: 'olap',     emoji: '📚', name: 'OLAP',     note: '도서관: 대량 분석' },
+      { key: 'contrast', emoji: '⚖️', name: 'Contrast', note: '워크로드 비교' },
+      { key: 'hybrid',   emoji: '🔁', name: 'Hybrid',   note: 'HTAP — 둘 다' },
+    ];
+
+    function ContrastCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🏪 편의점 vs 도서관 (OLTP vs OLAP)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {CONTRAST.map((c) => {
+              const isActive = focus === c.key;
+              return (
+                <div
+                  key={c.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{c.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{c.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{c.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">OLTP vs OLAP — 트랜잭션 vs 분석</h1>
+                <p className="text-sm text-slate-500 mt-1">편의점 vs 도서관 — 짧고 잦은 거래 vs 대량 분석</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <ContrastCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'hybrid' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(I-2-1)에서는 ETL vs ELT — 데이터 이동 방식
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — Terraform 실전</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    I-2-2. Terraform 실전 (state / module / workspace / CI/CD)
+    학습 목표: Terraform을 팀 단위로 안전하게 운영하는 4가지 축
+    핵심 비유: "🛠️ Terraform 실전" — state는 인프라 사진, module은 부품, workspace는 환경, CI/CD는 자동화
+    구조: 4단계 (State / Module / Workspace / CI/CD)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. State — "현재 인프라의 사진"',
+        desc: 'terraform.tfstate가 현재 인프라의 모든 리소스 상태를 기록한다. 절대 손으로 수정하면 안 된다(drift 발생). 팀 협업을 위해 S3 backend + DynamoDB lock을 권장한다 — 동시 apply를 잠가서 충돌을 방지한다.',
+        block: {
+          kind: 'yaml',
+          code: `# backend.tf — S3 backend + DynamoDB lock (팀 표준)
+terraform {
+  backend "s3" {
+    bucket         = "myorg-tfstate-prod"
+    key            = "platform/network/terraform.tfstate"
+    region         = "ap-northeast-2"
+    encrypt        = true
+    dynamodb_table = "tfstate-lock"   # 동시 apply 차단
+    kms_key_id     = "alias/tfstate"  # 암호화 키
+  }
+}
+
+# 처음 1회 — 백엔드 리소스 자체는 부트스트랩 모듈로 미리 만든다
+# aws_s3_bucket.tfstate     (versioning ON, public OFF)
+# aws_dynamodb_table.lock   (hash_key = "LockID")
+
+# 일상 운영
+$ terraform init -backend-config=backend.hcl
+$ terraform plan
+$ terraform apply           # 다른 사람이 apply 중이면 lock 대기
+
+# 절대 금지
+# - terraform.tfstate 를 git 에 커밋
+# - 콘솔에서 직접 리소스 삭제 (state 와 어긋남 = drift)
+# - state 파일 손편집
+
+# state 검사/조작은 전용 명령어만 사용
+$ terraform state list
+$ terraform state show aws_vpc.main
+$ terraform state mv aws_instance.old aws_instance.new
+$ terraform import aws_s3_bucket.legacy my-existing-bucket`,
+        },
+        focus: 'state',
+      },
+      {
+        title: 'Step 2. Module — "재사용 가능한 부품"',
+        desc: 'VPC / EKS / RDS 같은 반복 패턴을 module로 추상화한다. variables.tf 로 입력, outputs.tf 로 출력을 정의하면 여러 환경/팀이 동일한 부품을 호출만 해서 사용 가능하다. 표준화 + 보안 베이스라인을 한 곳에 강제한다.',
+        block: {
+          kind: 'yaml',
+          code: `# modules/vpc/variables.tf — 입력 명세
+variable "name"        { type = string }
+variable "cidr"        { type = string }
+variable "azs"         { type = list(string) }
+variable "enable_nat"  { type = bool, default = true }
+
+# modules/vpc/main.tf — 본체
+resource "aws_vpc" "this" {
+  cidr_block           = var.cidr
+  enable_dns_hostnames = true
+  tags                 = { Name = var.name }
+}
+
+resource "aws_subnet" "private" {
+  count             = length(var.azs)
+  vpc_id            = aws_vpc.this.id
+  availability_zone = var.azs[count.index]
+  cidr_block        = cidrsubnet(var.cidr, 4, count.index)
+}
+
+# modules/vpc/outputs.tf — 출력 명세 (다른 module이 받아서 씀)
+output "vpc_id"             { value = aws_vpc.this.id }
+output "private_subnet_ids" { value = aws_subnet.private[*].id }
+
+# ---- 호출부 (envs/prod/main.tf) ----
+module "vpc" {
+  source     = "../../modules/vpc"     # local path or git/registry
+  name       = "prod-vpc"
+  cidr       = "10.10.0.0/16"
+  azs        = ["ap-northeast-2a", "ap-northeast-2c"]
+  enable_nat = true
+}
+
+module "eks" {
+  source     = "../../modules/eks"
+  vpc_id     = module.vpc.vpc_id        # 출력 → 입력 연결
+  subnet_ids = module.vpc.private_subnet_ids
+}
+
+# 강점 - VPC 만드는 표준이 한 곳에 (보안/태깅/네이밍)
+# 강점 - 버전 핀 가능 (source = "git::...?ref=v1.4.0")`,
+        },
+        focus: 'module',
+      },
+      {
+        title: 'Step 3. Workspace — "같은 코드, 다른 환경"',
+        desc: 'terraform workspace로 dev / stage / prod 를 분리한다. 같은 .tf 코드가 workspace별로 다른 state 파일을 갖는다. 작은 환경 분리에 적합하지만, 환경 차이가 크면 폴더 분리(envs/prod, envs/dev)를 권장한다.',
+        block: {
+          kind: 'shell',
+          code: `# Workspace 만들기 — 환경마다 별도 state
+$ terraform workspace new dev
+$ terraform workspace new stage
+$ terraform workspace new prod
+
+$ terraform workspace list
+  default
+  dev
+* stage
+  prod
+
+# 현재 workspace 에 따라 분기
+# main.tf
+locals {
+  env = terraform.workspace
+  cfg = {
+    dev   = { instance_type = "t3.small",  count = 1 }
+    stage = { instance_type = "t3.medium", count = 2 }
+    prod  = { instance_type = "m6i.large", count = 4 }
+  }
+  c = local.cfg[local.env]
+}
+
+resource "aws_instance" "app" {
+  count         = local.c.count
+  instance_type = local.c.instance_type
+  tags          = { Env = local.env }
+}
+
+# 운영
+$ terraform workspace select dev
+$ terraform apply        # → state: env:/dev/...
+
+$ terraform workspace select prod
+$ terraform apply        # → state: env:/prod/... (완전히 분리)
+
+# 한계 (실무에서 주의)
+# - 같은 backend 안에 prefix만 다른 state → 권한 분리 어려움
+# - 큰 차이 (다른 region/account) 는 envs/ 폴더 분리가 안전
+# - 보통 "soft 분리" 용도, 진짜 프로덕션은 폴더+CI 분리`,
+        },
+        focus: 'workspace',
+      },
+      {
+        title: 'Step 4. CI/CD — "PR에서 plan, merge에서 apply"',
+        desc: 'Atlantis / Spacelift / Terraform Cloud 가 PR에 terraform plan을 자동 코멘트로 붙인다. 리뷰어가 변경 영향을 보고 approve → merge → apply. Sentinel/OPA 정책으로 "퍼블릭 S3 금지" 같은 가드레일을 자동 검사한다.',
+        block: {
+          kind: 'yaml',
+          code: `# atlantis.yaml — Atlantis 워크플로우
+version: 3
+projects:
+  - name: prod-network
+    dir: envs/prod/network
+    workspace: prod
+    autoplan:
+      when_modified: ["*.tf", "../../modules/vpc/**/*.tf"]
+      enabled: true
+    apply_requirements: [approved, mergeable]
+    workflow: prod-guarded
+
+workflows:
+  prod-guarded:
+    plan:
+      steps:
+        - init
+        - plan
+        - run: conftest test --policy ../../policies $PLANFILE   # OPA 검사
+    apply:
+      steps:
+        - apply
+
+# ---- 흐름 ----
+# 1) 개발자가 PR 올림 (modules/vpc/main.tf 수정)
+# 2) Atlantis 가 자동으로 plan 실행 → PR 에 코멘트
+#
+#    Plan: 2 to add, 1 to change, 0 to destroy.
+#      + aws_subnet.private[2]      (new AZ)
+#      ~ aws_vpc.this               (tag update)
+#
+# 3) OPA 정책 검사 — "퍼블릭 S3 금지", "태그 필수" 자동 검증
+# 4) 리뷰어 approve → 작성자가 PR 코멘트
+#       atlantis apply
+# 5) Atlantis 가 apply 후 결과 코멘트
+# 6) merge → main 브랜치는 항상 실제 인프라와 일치
+
+# 강점 - 콘솔 클릭 0회, 모든 변경이 git 히스토리
+# 강점 - 정책 검사 자동화 (compliance 증빙)
+# 강점 - state lock + apply 큐잉 자동 처리
+
+# Part I 완성 — 다음(Part II)부터 Compute/Storage/Network/Managed`,
+        },
+        focus: 'cicd',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const TERRAFORM = [
+      { key: 'state',     emoji: '💾', name: 'State',     note: 'terraform.tfstate' },
+      { key: 'module',    emoji: '📦', name: 'Module',    note: '재사용 단위' },
+      { key: 'workspace', emoji: '🔀', name: 'Workspace', note: 'env 분리' },
+      { key: 'cicd',      emoji: '🔄', name: 'CI/CD',     note: 'Atlantis/Spacelift' },
+    ];
+
+    function TerraformCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🛠️ Terraform 실전 (state · module · workspace · CI/CD)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {TERRAFORM.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Terraform 실전</h1>
+                <p className="text-sm text-slate-500 mt-1">팀 운영의 4축 — State / Module / Workspace / CI/CD</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <TerraformCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'cicd' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 Part I 완성. 다음(Part II)에서는 Compute / Storage / Network / Managed
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

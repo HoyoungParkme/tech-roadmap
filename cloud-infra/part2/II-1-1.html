@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — Compute (VM / Container / Serverless)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-1-1. Compute — VM / Container / Serverless
+    학습 목표: 워크로드 특성에 맞는 컴퓨트 자원 선택 기준을 이해한다.
+    핵심 비유: "일꾼 3종" — VM(정직원, 항상 출근) / Container(계약직, 필요할 때) / Serverless(단발 알바)
+    구조: 4단계 (VM EC2 / Container EKS / Serverless Lambda / 선택 기준)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. VM — "정직원, 항상 출근" (EC2 / GCE)',
+        desc: 'EC2 t3.medium 같은 가상 머신을 띄우면 OS, 패치, 모니터링, 보안 설정까지 전부 내가 책임진다. 자유도는 최고지만 항상 가동 비용이 든다 (꺼도 디스크/EIP 비용). 레거시 앱 이전, GPU 학습, 특수 OS 필요할 때 적합. Terraform으로 코드화해 관리.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — AWS EC2 인스턴스
+resource "aws_instance" "web" {
+  ami           = "ami-0c9c942bd7bf113a2"   # Amazon Linux 2023
+  instance_type = "t3.medium"               # 2 vCPU, 4 GiB
+  key_name      = "my-keypair"
+
+  vpc_security_group_ids = [aws_security_group.web.id]
+  subnet_id              = aws_subnet.public.id
+
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    yum install -y nginx
+    systemctl enable --now nginx
+  EOF
+
+  tags = {
+    Name = "web-server"
+    Env  = "prod"
+  }
+}
+
+# 책임 범위 (내가 직접 해야 할 것)
+# - OS 패치 (yum update / apt upgrade)
+# - 보안 그룹, IAM Role, SSH key 관리
+# - CloudWatch Agent 설치 (모니터링)
+# - 디스크 백업 (EBS snapshot)
+# - 항상 가동 → 24h × $0.0416 ≈ $30/월 (t3.medium)`,
+        },
+        focus: 'vm',
+      },
+      {
+        title: 'Step 2. Container — "계약직, 필요할 때" (EKS / GKE / AKS)',
+        desc: 'Kubernetes(EKS/GKE/AKS) 위에서 Pod 단위로 배포. 이미지 한 번 빌드하면 어디서든 실행 가능하고, HPA로 트래픽 따라 빠르게 스케일. OS 관리는 클라우드가 (관리형 노드 그룹) 해주니 운영 부담 ↓. 마이크로서비스 + 자주 배포하는 워크로드에 표준.',
+        block: {
+          kind: 'yaml',
+          code: `# Kubernetes — Deployment + Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3                       # Pod 3개로 스케일
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/myorg/api:1.4.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  type: ClusterIP
+  selector: { app: api }
+  ports:
+    - port: 80
+      targetPort: 8080
+
+# 장점
+# - 빠른 스케일 (HPA — CPU 70% 넘으면 Pod 추가)
+# - 이미지 = 불변 배포 단위 (어디서나 동일)
+# - 롤링 업데이트, 롤백 1초 컷
+# - 노드는 클라우드가 관리 (Managed Node Group)`,
+        },
+        focus: 'container',
+      },
+      {
+        title: 'Step 3. Serverless — "단발 알바" (Lambda / Functions)',
+        desc: 'Lambda 같은 함수 단위 실행. 호출 안 되면 0원, 호출당 ms 단위 과금. 인프라 0 관리. 단점은 cold start (첫 호출 100ms~수초 지연), 최대 15분 실행 제한, 동시 실행 수 quota. 이벤트 기반/간헐 트래픽에 최강 (S3 업로드 트리거, API Gateway 백엔드).',
+        block: {
+          kind: 'python',
+          code: `# AWS Lambda 핸들러 (Python 3.12)
+import json
+import boto3
+
+s3 = boto3.client("s3")
+
+def lambda_handler(event, context):
+    """S3에 업로드된 파일을 받아 메타데이터를 DynamoDB에 저장.
+
+    Args:
+        event: S3 트리거 이벤트 (Records 배열)
+        context: Lambda 런타임 정보 (request_id, 남은 ms 등)
+
+    Returns:
+        dict: HTTP 응답 (statusCode, body)
+    """
+    record = event["Records"][0]
+    bucket = record["s3"]["bucket"]["name"]
+    key    = record["s3"]["object"]["key"]
+
+    # 파일 메타 조회
+    head = s3.head_object(Bucket=bucket, Key=key)
+    size = head["ContentLength"]
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"key": key, "size": size}),
+    }
+
+# 특징
+# - 호출당 과금 (예: 128MB × 100ms ≈ $0.0000002)
+# - 호출 0이면 비용 0 (정직원 vs 알바 차이)
+# - 인프라 관리 0 (OS / 런타임 / 패치 → AWS)
+#
+# 한계
+# - cold start: 첫 호출 100ms~수초 (VPC 붙으면 더)
+# - 최대 실행 15분 (긴 배치 X)
+# - 메모리 최대 10GB, 임시 디스크 /tmp 10GB
+# - 동시 실행 quota (기본 1000) — 폭증 시 throttle`,
+        },
+        focus: 'serverless',
+      },
+      {
+        title: 'Step 4. 어떤 컴퓨트를 고를까? — 의사결정 매트릭스',
+        desc: '"항상 가동 + OS/네트워크 자유도 필요?" → VM. "마이크로서비스 + 자주 배포 + 빠른 스케일?" → Container. "이벤트 처리 + 간헐 트래픽 + 운영 0?" → Serverless. 한 시스템 안에서 섞어 쓰기도 한다 (API는 EKS, S3 트리거는 Lambda, GPU 학습은 EC2).',
+        block: {
+          kind: 'shell',
+          code: `# 의사결정 표
+질문                                       → 답
+──────────────────────────────────────────────────────
+"항상 켜둬야 하나? + 특수 OS/GPU?"         → VM
+"마이크로서비스 + 자주 배포?"              → Container
+"이벤트 트리거 + 호출 0이면 비용 0?"       → Serverless
+"15분 넘게 도는 배치?"                     → VM 또는 Container
+"트래픽 0 → 스파이크 100x?"                → Serverless 또는 Container(HPA)
+"OS 패치/모니터링 직접 하기 싫다"          → Serverless > Container > VM
+
+# 가격 비교 (월 기준, 대략치 — us-east-1 2026)
+유형          예시              비용 모델            월 비용 예시
+VM            EC2 t3.medium     시간당 $0.0416       ~ $30  (24h 가동)
+Container     EKS Fargate Pod   vCPU/메모리 시간당   ~ $25  (0.25vCPU 24h)
+Serverless    Lambda 1M 호출    호출당 + GB-초       ~ $0.2 (128MB×100ms)
+
+# 운영 부담 (낮을수록 편함)
+Serverless < Container(Fargate) < Container(EC2 노드) < VM
+
+# 실무 패턴 — 섞어쓰기
+- API 서버           → EKS/ECS  (자주 배포, 스케일)
+- S3 업로드 후처리   → Lambda   (이벤트, 간헐)
+- ML 학습 (GPU)      → EC2 p4d  (특수 인스턴스, 자유도)
+- 야간 배치 6시간    → ECS Task (15분 제한 회피)
+
+# 다음(II-1-2)에서는 Storage 3종 — Object/Block/File`,
+        },
+        focus: 'choose',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+    };
+
+    const COMPUTE = [
+      { key: 'vm',         emoji: '💻', name: 'VM',         note: 'EC2 / GCE' },
+      { key: 'container',  emoji: '📦', name: 'Container',  note: 'EKS / GKE / AKS' },
+      { key: 'serverless', emoji: '⚡', name: 'Serverless', note: 'Lambda / Functions' },
+      { key: 'choose',     emoji: '🎯', name: '선택',        note: '어느 걸' },
+    ];
+
+    function ComputeCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">👷 일꾼 3종 (Compute)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {COMPUTE.map((c) => {
+              const isActive = focus === c.key;
+              return (
+                <div
+                  key={c.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{c.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{c.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{c.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Compute (VM / Container / Serverless)</h1>
+                <p className="text-sm text-slate-500 mt-1">일꾼 3종 — 정직원 / 계약직 / 단발 알바</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <ComputeCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'choose' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(II-1-2)에서는 Storage 3종 — Object/Block/File
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

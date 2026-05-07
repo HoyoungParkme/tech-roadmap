@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — Auth / KMS / Logs</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛡️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-1-2. Auth / KMS / Logs
+    학습 목표: IAM(누가 무엇을) / KMS·Secret(비밀 안전 보관) / Logs(감시 기록)
+    핵심 비유: "출입증 + 금고 + CCTV"
+    구조: 4단계 (IAM / KMS·Secret / Logs·Audit / Least Privilege)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. IAM — 출입증 (User / Group / Role + Policy)',
+        desc: 'IAM은 "누가(User/Role) 어떤 자원에(Resource) 어떤 행위(Action)를 할 수 있는지" 정의한다. Policy는 JSON 문서. 사람은 User/Group, 서비스는 Role(STS Assume Role)로 임시 권한 발급. 액세스 키 박는 대신 Role로 위임하는 게 표준.',
+        block: {
+          kind: 'yaml',
+          code: `# IAM Policy JSON — S3 읽기 전용 + 특정 버킷 한정
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyMyBucket",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::my-app-data",
+        "arn:aws:s3:::my-app-data/*"
+      ],
+      "Condition": {
+        "IpAddress": { "aws:SourceIp": "10.0.0.0/16" }
+      }
+    }
+  ]
+}
+
+# Trust Policy — EC2가 이 Role을 Assume 가능하게
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ec2.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+
+# 흐름
+EC2 인스턴스 -> Role 부여 -> STS 임시 자격증명 발급
+-> SDK가 자동으로 사용 (액세스 키 코드에 박지 않음)`,
+        },
+        focus: 'iam',
+      },
+      {
+        title: 'Step 2. KMS / Secret Manager — 금고',
+        desc: 'KMS = 암호화 키 관리(자동 회전, HSM 보관). Secret Manager = DB 비밀번호/API 키를 안전하게 저장 + 자동 회전. 코드에 비밀번호 하드코딩 금지. 런타임에 boto3로 fetch해서 메모리에서만 사용.',
+        block: {
+          kind: 'python',
+          code: `# boto3 secretsmanager get_secret_value
+import json
+import boto3
+from functools import lru_cache
+
+# -- KMS로 암호화된 Secret을 안전하게 가져온다
+@lru_cache(maxsize=1)  # 매 요청마다 fetch 금지 (비용/속도)
+def get_db_credentials() -> dict:
+    """RDS 비밀번호 조회 (KMS 복호화 자동)."""
+    client = boto3.client("secretsmanager", region_name="ap-northeast-2")
+    resp = client.get_secret_value(SecretId="prod/rds/password")
+    # -- SecretString은 KMS로 복호화된 평문 JSON
+    return json.loads(resp["SecretString"])
+
+# 사용
+creds = get_db_credentials()
+conn = psycopg2.connect(
+    host=creds["host"],
+    user=creds["username"],
+    password=creds["password"],  # -- 코드/Git에 평문 절대 금지
+    dbname=creds["dbname"],
+)
+
+# 자동 회전 (Secrets Manager Rotation)
+# - 30일마다 RDS 비밀번호 자동 변경
+# - 앱은 fetch만 하면 됨 (재배포 불필요)
+# - KMS 키 자동 회전: 1년마다`,
+        },
+        focus: 'kms_secret',
+      },
+      {
+        title: 'Step 3. Logs / Audit — CCTV (CloudTrail + CloudWatch)',
+        desc: 'CloudTrail = 모든 AWS API call 기록(누가 언제 무엇을 변경). 변경 추적/감사/포렌식의 핵심. CloudWatch Logs = 앱 로그 수집. S3로 장기 보관 후 Athena SQL로 분석. 보안 사고 시 "누가 했어요?"의 답.',
+        block: {
+          kind: 'yaml',
+          code: `# CloudTrail Trail — 모든 API call을 S3로 저장
+Resources:
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: org-audit-trail
+      S3BucketName: !Ref AuditBucket
+      IsLogging: true
+      IsMultiRegionTrail: true       # 모든 리전 통합
+      EnableLogFileValidation: true  # 변조 감지 (해시 체인)
+      IncludeGlobalServiceEvents: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values: ["arn:aws:s3:::my-app-data/"]
+
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: org-audit-logs-2026
+      VersioningConfiguration: { Status: Enabled }
+      ObjectLockEnabled: true        # WORM (변경 불가)
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90  # 90일 후 저비용 보관
+
+# 분석 흐름
+CloudTrail -> S3 (JSON.gz) -> Athena (SQL) -> 대시보드
+예) "지난 24시간에 IAM Policy 변경한 사람?"
+SELECT userIdentity.userName, eventName, eventTime
+FROM cloudtrail_logs
+WHERE eventName LIKE '%Policy%' AND eventTime > now() - interval '1' day;`,
+        },
+        focus: 'logs_audit',
+      },
+      {
+        title: 'Step 4. Least Privilege — 최소 권한 원칙',
+        desc: '필요한 권한만, 필요한 자원에만, 필요한 만큼만. wildcard `*`는 사고의 근원. Resource ARN을 명시하고, Action도 좁힌다. IAM Access Analyzer로 미사용 권한 자동 감지 + 정책 자동 생성. 정기 audit.',
+        block: {
+          kind: 'shell',
+          code: `# -- 나쁜 정책 (절대 금지) -----------------------------
+{
+  "Effect": "Allow",
+  "Action": "*",          # 모든 행위
+  "Resource": "*"         # 모든 자원 -> root 권한 수준
+}
+# 사고 시: 키 1개 유출 -> 회사 전체 자원 노출
+
+# -- 그래도 나쁨 (서비스만 한정) ------------------------
+{
+  "Effect": "Allow",
+  "Action": "s3:*",       # S3 모든 행위 (삭제 포함)
+  "Resource": "*"         # 모든 버킷
+}
+
+# -- 좋은 정책 (Action + Resource 모두 좁힘) ------------
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject",
+    "s3:ListBucket"
+  ],
+  "Resource": [
+    "arn:aws:s3:::my-app-data",
+    "arn:aws:s3:::my-app-data/uploads/*"
+  ],
+  "Condition": {
+    "StringEquals": { "aws:PrincipalTag/team": "data" }
+  }
+}
+
+# IAM Access Analyzer — 미사용 권한 감지
+$ aws accessanalyzer list-findings \\
+    --analyzer-arn arn:aws:access-analyzer:ap-northeast-2:...:analyzer/org
+
+# 자동 생성 (CloudTrail 90일 이력 기반)
+$ aws accessanalyzer start-policy-generation \\
+    --policy-generation-details principalArn=arn:aws:iam::...:role/AppRole
+
+# 정기 audit 체크리스트
+[ ] wildcard Action 없는지
+[ ] wildcard Resource 없는지
+[ ] 90일 이상 미사용 Role 비활성화
+[ ] MFA 적용 (콘솔 로그인)
+[ ] Root 계정은 봉인 + 알람`,
+        },
+        focus: 'least_privilege',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const SECURITY = [
+      { key: 'iam',             emoji: '🪪', name: 'IAM',           note: 'Role / Policy' },
+      { key: 'kms_secret',      emoji: '🔑', name: 'KMS / Secret',  note: '암호화 + 비밀' },
+      { key: 'logs_audit',      emoji: '📜', name: 'Logs / Audit',  note: 'CloudTrail' },
+      { key: 'least_privilege', emoji: '🔒', name: 'Least Priv',    note: '최소 권한' },
+    ];
+
+    function SecurityCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🛡️ 출입증 + 금고 + CCTV (Auth/KMS/Logs)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {SECURITY.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Auth / KMS / Logs</h1>
+                <p className="text-sm text-slate-500 mt-1">출입증 + 금고 + CCTV — IAM / Secret Manager / CloudWatch</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <SecurityCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'least_privilege' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 Phase B 완성 — Cloud Infrastructure 10/20. Part IV (모니터링/비용 최적화) + Part V (실전) 후속 sprint
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

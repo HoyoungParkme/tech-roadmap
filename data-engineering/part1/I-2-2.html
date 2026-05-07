@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — CDC (Change Data Capture)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔄</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    I-2-2. CDC (Change Data Capture)
+    학습 목표: 운영 DB의 변경분(INSERT/UPDATE/DELETE)을 실시간으로 다른 시스템에 전파하는 패턴을 이해한다.
+    핵심 비유: "실시간 복사기" — 전체 dump가 아니라 변경분만 즉시 복사해서 전달
+    구조: 4단계 (Snapshot / Log-based / Debezium / Use Cases)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Snapshot — "매일 한 번 전체 복사"',
+        desc: '가장 단순한 방식. 매일 자정에 운영 DB 전체를 SELECT * 으로 dump 떠서 다른 곳으로 보냄. 구현은 쉽지만 테이블이 커지면 부하가 커지고, 어제 데이터까지만 보임 (시간 지연). 실시간 분석/캐시 동기화에는 부적합.',
+        block: {
+          kind: 'python',
+          code: `# 매일 새벽 2시 cron으로 전체 dump
+import psycopg2, pandas as pd
+
+# 1. 운영 DB 전체 SELECT
+conn = psycopg2.connect("postgresql://prod-db/orders")
+df = pd.read_sql("SELECT * FROM orders", conn)   # 1억 row?
+df.to_parquet(f"s3://dw/orders/dt={today}/")     # DW로 적재
+
+# 2. 한계
+# - 테이블 1억 row → SELECT 1시간, 운영 DB 부하 ↑
+# - dump 떠는 사이 들어온 변경은 다음날까지 안 보임 (24h 지연)
+# - DELETE 된 row는 어떻게? → 비교 로직 직접 짜야 함
+# - 1% 변경 / 99% 그대로인데 100% 다 복사 → 낭비
+
+# → "snapshot only" 방식의 한계
+# → 변경분만 가져오는 더 똑똑한 방법이 필요
+# → 다음 단계: DB 트랜잭션 로그를 직접 읽자`,
+        },
+        focus: 'snapshot',
+      },
+      {
+        title: 'Step 2. Log-based CDC — "DB 트랜잭션 로그를 읽는다"',
+        desc: 'PostgreSQL의 WAL(Write-Ahead Log), MySQL의 binlog는 모든 변경을 row 단위로 기록한다. 이 로그를 외부에서 읽으면 INSERT/UPDATE/DELETE를 실시간으로 추적 가능. 운영 DB에 SELECT 부하 없이 "변경분만" 흘려보낸다. PostgreSQL은 logical replication slot을 만들어 사용.',
+        block: {
+          kind: 'yaml',
+          code: `# PostgreSQL — logical replication 활성화
+# postgresql.conf
+wal_level = logical            # WAL을 row 변경 단위로 기록
+max_replication_slots = 10     # 동시 구독자 최대 N개
+max_wal_senders = 10
+
+# pg_hba.conf — replication 사용자 허용
+host  replication  cdc_user  10.0.0.0/8  md5
+
+---
+# DB에서 publication + replication slot 생성
+CREATE PUBLICATION orders_pub FOR TABLE orders, payments;
+
+SELECT pg_create_logical_replication_slot(
+  'debezium_slot',
+  'pgoutput'                   -- PG 내장 logical decoding plugin
+);
+
+# 외부 consumer가 slot에서 변경 stream 구독
+# → INSERT/UPDATE/DELETE 한 건씩 row로 흘러나옴
+# → 운영 DB SELECT 부하 0
+# → 슬롯이 안 비워지면 WAL 쌓여 디스크 위험 (모니터링 필수)
+
+# MySQL은 같은 개념을 binlog (ROW format) 으로 제공
+# binlog_format = ROW, binlog_row_image = FULL`,
+        },
+        focus: 'log_based',
+      },
+      {
+        title: 'Step 3. Debezium — "표준 도구로 Kafka에 흘려보낸다"',
+        desc: 'Debezium은 Kafka Connect 위에서 도는 오픈소스 CDC 커넥터. PG/MySQL/MongoDB/Oracle binlog를 읽어 Kafka topic에 push. 한 번 설정하면 모든 변경이 `dbserver1.public.orders` 같은 topic에 자동 발행 → 다른 서비스들이 구독만 하면 됨. 표준 envelope (before/after/op) 으로 정규화해줌.',
+        block: {
+          kind: 'yaml',
+          code: `# debezium-connector.yaml — Kafka Connect 등록
+name: orders-pg-connector
+config:
+  connector.class: io.debezium.connector.postgresql.PostgresConnector
+  database.hostname: prod-db.internal
+  database.port: 5432
+  database.user: cdc_user
+  database.dbname: shop
+  database.server.name: dbserver1
+  plugin.name: pgoutput
+  slot.name: debezium_slot
+  publication.name: orders_pub
+  table.include.list: public.orders,public.payments
+  topic.prefix: shop                      # → topic: shop.public.orders
+  snapshot.mode: initial                  # 최초 1회 스냅샷 + 이후 stream
+
+---
+# Kafka topic에 흘러나오는 메시지 형태 (envelope)
+{
+  "op": "u",                              # c=create, u=update, d=delete
+  "ts_ms": 1714972800123,
+  "before": { "id": 42, "status": "paid",     "amount": 100 },
+  "after":  { "id": 42, "status": "shipped",  "amount": 100 },
+  "source": { "db": "shop", "table": "orders", "lsn": "0/1A2B3C" }
+}
+
+# 구독자들 (각자 필요한 topic만)
+# - DW 적재 sink → S3/BigQuery
+# - Redis 캐시 무효화 consumer
+# - 검색 인덱스 (Elasticsearch) 동기화 consumer`,
+        },
+        focus: 'debezium',
+      },
+      {
+        title: 'Step 4. Use Cases — "어디에 쓰나?" (DW / 캐시 / 마이크로서비스 / 감사)',
+        desc: 'CDC는 "운영 DB 변경"을 이벤트로 만들어 fan-out 한다. DW 실시간 동기화, 캐시 무효화, 마이크로서비스 간 데이터 일관성, 감사 로그(audit trail) 구축이 대표적. 단 exactly-once 보장은 어렵고, 보통 at-least-once → consumer 쪽에서 idempotent 처리가 필수.',
+        block: {
+          kind: 'shell',
+          code: `# CDC 활용 시나리오 표
+─────────────────────────────────────────────────────────────
+시나리오            | 토픽 흐름                       | 효과
+─────────────────────────────────────────────────────────────
+DW 실시간 동기화    | shop.orders → S3/BigQuery       | T+1 → 분 단위
+캐시 무효화         | shop.products → Redis DEL key   | stale 캐시 0
+검색 인덱스 동기화  | shop.products → ES bulk upsert  | 즉시 검색 반영
+마이크로서비스 통합 | shop.users → notification svc   | 강결합 API 제거
+감사 로그           | shop.* → S3 (immutable)         | 누가/언제/뭐 변경
+event sourcing      | shop.* → event store            | 시점 복원 가능
+─────────────────────────────────────────────────────────────
+
+# 주의사항
+- 전달 보장: at-least-once (중복 가능)
+  → consumer는 반드시 idempotent (같은 메시지 두 번 받아도 안전)
+  → e.g. UPSERT BY primary_key, dedupe by (table, pk, lsn)
+- 스키마 변경: ALTER TABLE 시 schema registry 연동 필요
+- 초기 스냅샷: 큰 테이블은 incremental snapshot 옵션 사용
+- 슬롯 미소비: consumer 죽으면 WAL 쌓임 → lag 알람 필수`,
+        },
+        focus: 'use_cases',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const CDC_PHASES = [
+      { key: 'snapshot',  emoji: '📸', name: 'Snapshot',  note: '주기적 전체 dump' },
+      { key: 'log_based', emoji: '📜', name: 'Log-based', note: 'WAL / binlog 읽기' },
+      { key: 'debezium',  emoji: '🐝', name: 'Debezium',  note: '표준 CDC 도구' },
+      { key: 'use_cases', emoji: '💼', name: 'Use Cases', note: 'DW / 캐시 / MSA' },
+    ];
+
+    function CDCCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🔄 실시간 복사기 (Change Data Capture)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {CDC_PHASES.map((p) => {
+              const isActive = focus === p.key;
+              return (
+                <div
+                  key={p.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{p.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{p.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{p.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">CDC (Change Data Capture)</h1>
+                <p className="text-sm text-slate-500 mt-1">실시간 복사기 — 운영 DB 변경분만 즉시 다른 시스템으로 전파</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <CDCCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'use_cases' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(II-1-1)에서는 Data Warehouse 본격 개론
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

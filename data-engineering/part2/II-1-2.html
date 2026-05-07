@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Star Schema 차원 모델링</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-1-2. Star Schema 차원 모델링
+    학습 목표: Fact + Dimension 으로 분석용 DW 스키마를 설계한다.
+    핵심 비유: "별 모양" — 중앙 Fact + 주변 Dimension. 가장 단순하고 분석 쿼리 빠름.
+    구조: 4단계 (Fact / Dimension / Star / Snowflake)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Fact — 측정값 (매출 1건 = 1 row)',
+        desc: 'Fact 테이블은 비즈니스 이벤트의 측정값을 저장한다. 핵심은 measure (amount, quantity 같은 숫자) + foreign keys (date_id, product_id, customer_id). 한 거래 = 한 행. 아주 길고 좁은 테이블 (수천만~수십억 rows).',
+        block: {
+          kind: 'yaml',
+          code: `# fact_sales — 매출 Fact 테이블
+table: fact_sales
+grain: "1 row = 1 거래 라인 아이템"
+
+columns:
+  # --- Foreign Keys (Dimension 연결) ---
+  date_id:       INT      # → dim_date.date_id
+  product_id:    INT      # → dim_product.product_id
+  customer_id:   INT      # → dim_customer.customer_id
+  store_id:      INT      # → dim_store.store_id
+
+  # --- Measures (분석 대상 숫자값) ---
+  quantity:      INT      # 판매 수량
+  unit_price:    DECIMAL  # 단가
+  amount:        DECIMAL  # 총 금액 (= quantity * unit_price)
+  discount:      DECIMAL  # 할인액
+  net_amount:    DECIMAL  # 순매출
+
+  # --- Degenerate Dimension (영수증 번호 등) ---
+  order_id:      VARCHAR
+
+# 특징
+# - row 가 매우 많음 (수천만~수십억)
+# - column 은 적음 (FK + measure)
+# - INSERT 만, UPDATE 거의 없음 (이벤트 누적)`,
+        },
+        focus: 'fact',
+      },
+      {
+        title: 'Step 2. Dimension — 분석 축 (date / product / customer)',
+        desc: 'Dimension 테이블은 "어떤 관점으로 자를까"를 담는다. 자주 쓰는 속성을 펼쳐 둔다 (정규화 X). Surrogate key (자체 PK)로 자연키와 분리 — 자연키 변경에 안전. row 적고 (수천~수십만) column 많음.',
+        block: {
+          kind: 'yaml',
+          code: `# dim_product — 상품 Dimension
+table: dim_product
+grain: "1 row = 1 상품 버전"
+
+columns:
+  # --- Surrogate Key (자체 PK, 의미 없음) ---
+  product_id:        INT PRIMARY KEY    # 1, 2, 3, ...
+
+  # --- Natural Key (원본 시스템 ID) ---
+  product_sku:       VARCHAR            # "SKU-A1234"
+
+  # --- 펼친 속성 (정규화 X — JOIN 줄이기) ---
+  product_name:      VARCHAR
+  category:          VARCHAR    # "전자제품"
+  subcategory:       VARCHAR    # "스마트폰"
+  brand:             VARCHAR    # "Samsung"
+  department:        VARCHAR    # "모바일"
+  color:             VARCHAR
+  size:              VARCHAR
+
+  # --- SCD Type 2 (이력 관리) ---
+  valid_from:        DATE
+  valid_to:          DATE
+  is_current:        BOOLEAN
+
+# 왜 Surrogate Key 인가?
+# - 자연키(SKU) 가 바뀌어도 Fact 가 안 깨짐
+# - SCD Type 2 (상품명 변경 이력) 가능
+# - INT 가 VARCHAR 보다 JOIN 빠름`,
+        },
+        focus: 'dimension',
+      },
+      {
+        title: 'Step 3. Star Schema — Fact 1개 + Dim 3~5개',
+        desc: 'Fact 가 중앙, Dimension 이 주변에 배치된 별 모양. JOIN 이 많아 보여도 단방향이라 단순하고 옵티마이저 친화적. 분석 쿼리는 SELECT measure FROM fact JOIN dim 형태 — 분석가도 쉽게 작성 가능.',
+        block: {
+          kind: 'yaml',
+          code: `# Star Schema — fact_sales 중심
+#
+#         dim_date
+#             |
+#  dim_store -- fact_sales -- dim_product
+#             |
+#         dim_customer
+#
+# 분석 쿼리 예시 — "2026년 카테고리별 매출 Top 5"
+SELECT
+  d.year,
+  p.category,
+  SUM(f.amount)        AS total_sales,
+  SUM(f.quantity)      AS total_qty,
+  COUNT(DISTINCT f.customer_id) AS unique_customers
+FROM fact_sales f
+JOIN dim_date     d ON f.date_id     = d.date_id
+JOIN dim_product  p ON f.product_id  = p.product_id
+JOIN dim_customer c ON f.customer_id = c.customer_id
+WHERE d.year = 2026
+  AND c.country = 'KR'
+GROUP BY d.year, p.category
+ORDER BY total_sales DESC
+LIMIT 5;
+
+# 장점
+# - 직관적: "별" 모양이라 BI 툴이 자동 인식
+# - 빠름: 단방향 JOIN, dim 작아서 broadcast join 가능
+# - 분석가 친화: 한 fact + 몇 개 dim 만 알면 됨`,
+        },
+        focus: 'star_schema',
+      },
+      {
+        title: 'Step 4. Snowflake Schema — Dim 도 정규화',
+        desc: 'Dimension 을 정규화로 더 쪼갠 형태 (product → category → department). 저장공간은 줄어들지만 JOIN 이 늘어나 쿼리가 느려지고 복잡해진다. 분석 DW 에서는 일반적으로 Star 가 우세 — 디스크보다 분석 속도가 비싸기 때문.',
+        block: {
+          kind: 'shell',
+          code: `# Star vs Snowflake — 비교
+#
+# Star Schema (펼친 dim)
+# ────────────────────────────────────────
+#   fact_sales ─ dim_product
+#                  ├ category    "전자제품"
+#                  ├ subcategory "스마트폰"
+#                  └ department  "모바일"
+#
+#   JOIN 1개. 컬럼이 dim_product 안에 다 있음
+#
+#
+# Snowflake Schema (정규화한 dim)
+# ────────────────────────────────────────
+#   fact_sales ─ dim_product ─ dim_category ─ dim_department
+#
+#   JOIN 3개. category 만 보려고 해도 chain JOIN
+#
+#
+# 비교표
+# ┌────────────────┬──────────────┬─────────────────┐
+# │ 항목           │ Star         │ Snowflake       │
+# ├────────────────┼──────────────┼─────────────────┤
+# │ 정규화         │ 낮음 (펼침)  │ 높음 (쪼갬)     │
+# │ JOIN 개수      │ 적음         │ 많음            │
+# │ 쿼리 속도      │ 빠름  ⚡     │ 느림            │
+# │ 저장 공간      │ 큼           │ 작음            │
+# │ BI 툴 호환     │ 자동 인식 ⭐ │ 수동 설정 필요  │
+# │ 분석가 친화도  │ 높음         │ 낮음            │
+# └────────────────┴──────────────┴─────────────────┘
+#
+# 결론: 디스크는 싸고 분석 시간은 비싸다 → Star 가 표준`,
+        },
+        focus: 'snowflake_schema',
+      },
+    ];
+
+    // KIND_STYLE 3종 — yaml/python/shell
+    const KIND_STYLE = {
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+    };
+
+    const SCHEMA = [
+      { key: 'fact',             emoji: '📊', name: 'Fact',      note: '측정값' },
+      { key: 'dimension',        emoji: '📐', name: 'Dimension', note: '분석 축' },
+      { key: 'star_schema',      emoji: '⭐', name: 'Star',      note: '정규화 ↓' },
+      { key: 'snowflake_schema', emoji: '❄️', name: 'Snowflake', note: 'Dim 도 정규화' },
+    ];
+
+    function SchemaCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">⭐ 별 모양 (Star Schema 차원 모델링)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {SCHEMA.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Star Schema 차원 모델링</h1>
+                <p className="text-sm text-slate-500 mt-1">별 모양 — Fact 1개 + Dimension 여러 개</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <SchemaCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'snowflake_schema' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(II-2-1)에서는 3대 DW — Snowflake/BigQuery/Redshift 비교
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

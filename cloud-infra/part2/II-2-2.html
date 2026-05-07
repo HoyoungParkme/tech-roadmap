@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — DNS / CDN / LB / Ingress</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-2-2. DNS / CDN / LB / Ingress
+    학습 목표: 트래픽 라우팅 4 layer (주소 해석 → 캐시 → 분산 → 클러스터 라우팅)
+    핵심 비유: "안내데스크 + 우편 라우팅" — DNS(주소록) / CDN(배달 캐시) / LB(접수처) / Ingress(층별 안내)
+    구조: 4단계 (dns / cdn / lb_l4_l7 / ingress)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. DNS — "도메인을 IP로 해석하는 주소록"',
+        desc: 'Route53(AWS) / Cloud DNS(GCP)는 example.com 같은 도메인을 IP로 변환. A record(IPv4 직접), CNAME(다른 도메인 alias), Alias(AWS 전용 — ALB/CloudFront 무료 alias). TTL로 클라이언트 캐싱 시간 제어. health check + failover로 장애 시 자동으로 백업 IP로 전환.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — Route53 record + alias to ALB
+# 도메인: api.example.com → ALB로 라우팅
+
+resource "aws_route53_zone" "main" {
+  name = "example.com"
+}
+
+# Alias record — ALB로 무료 alias (AWS 전용)
+resource "aws_route53_record" "api" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "api.example.com"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.main.dns_name
+    zone_id                = aws_lb.main.zone_id
+    evaluate_target_health = true   # health check 결과로 failover
+  }
+}
+
+# 일반 A record — TTL 60초 (캐시 짧게 → 빠른 전환)
+resource "aws_route53_record" "www" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "www.example.com"
+  type    = "A"
+  ttl     = 60
+  records = ["203.0.113.10"]
+}
+
+# Health check + failover
+resource "aws_route53_health_check" "api" {
+  fqdn              = "api.example.com"
+  port              = 443
+  type              = "HTTPS"
+  resource_path     = "/health"
+  failure_threshold = 3
+  request_interval  = 30
+}
+
+# 라우팅 정책
+# - Simple    : 단일 endpoint
+# - Failover  : primary 죽으면 secondary 로
+# - Weighted  : 80/20 트래픽 분배 (canary 배포)
+# - Latency   : 가장 가까운 region 으로
+# - Geo       : 국가별 분기 (KR → ap-northeast-2)`,
+        },
+        focus: 'dns',
+      },
+      {
+        title: 'Step 2. CDN — "엣지 노드에 캐시해서 origin 부하 ↓"',
+        desc: 'CloudFront(AWS) / Cloud CDN(GCP)는 전 세계 edge node에 정적 자산(이미지, JS, CSS, 비디오)을 캐시. 사용자는 가장 가까운 edge에서 받음 → latency ↓, origin 부하 ↓, 비용 ↓. TLS 종료(edge에서 HTTPS 처리), HTTP/2/3 자동 지원. WAF/Shield와 결합해 DDoS 방어.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — CloudFront distribution + cache policy
+resource "aws_cloudfront_distribution" "cdn" {
+  enabled             = true
+  is_ipv6_enabled     = true
+  default_root_object = "index.html"
+  aliases             = ["cdn.example.com"]
+  http_version        = "http2and3"      # HTTP/3 지원
+
+  # origin — S3 또는 ALB
+  origin {
+    domain_name = aws_s3_bucket.assets.bucket_regional_domain_name
+    origin_id   = "s3-assets"
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.oai.cloudfront_access_identity_path
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "s3-assets"
+    viewer_protocol_policy = "redirect-to-https"   # TLS 강제
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    cache_policy_id        = aws_cloudfront_cache_policy.long.id
+    compress               = true                  # gzip/brotli
+  }
+
+  viewer_certificate {
+    acm_certificate_arn = aws_acm_certificate.cdn.arn
+    ssl_support_method  = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+
+  price_class = "PriceClass_200"   # 북미/유럽/아시아 edge
+}
+
+# Cache policy — 정적 자산은 1년 캐시
+resource "aws_cloudfront_cache_policy" "long" {
+  name        = "static-1year"
+  default_ttl = 31536000   # 1년
+  max_ttl     = 31536000
+  min_ttl     = 0
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config       { cookie_behavior = "none" }
+    headers_config       { header_behavior = "none" }
+    query_strings_config { query_string_behavior = "none" }
+  }
+}
+
+# 효과
+# - latency: origin(서울) → 미국 사용자 200ms → edge 캐시 20ms
+# - origin 부하: 95%+ 캐시 hit → origin RPS 1/20 로 ↓
+# - 비용: edge 전송 단가가 origin 직접보다 저렴`,
+        },
+        focus: 'cdn',
+      },
+      {
+        title: 'Step 3. LB (L4/L7) — "접수처 — 어느 서버로 보낼지"',
+        desc: 'L4 LB(NLB)는 TCP/UDP 단위로 분배 — 빠르고 단순, 게임 서버/gRPC에 적합. L7 LB(ALB)는 HTTP 단위로 path/host/header 기반 라우팅 + sticky session + TLS 종료 가능. target group으로 백엔드 묶고 health check로 죽은 인스턴스 자동 제외. GCP는 GCLB가 L4/L7 통합.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — ALB (L7) + target group
+resource "aws_lb" "main" {
+  name               = "api-alb"
+  internal           = false
+  load_balancer_type = "application"        # L7 (HTTP/HTTPS)
+  subnets            = aws_subnet.public[*].id
+  security_groups    = [aws_security_group.alb.id]
+}
+
+resource "aws_lb_target_group" "api" {
+  name     = "api-tg"
+  port     = 8080
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
+
+  health_check {
+    path                = "/health"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    matcher             = "200"
+  }
+
+  stickiness {
+    type            = "lb_cookie"
+    cookie_duration = 3600        # 같은 사용자 → 같은 인스턴스 1시간
+    enabled         = true
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 443
+  protocol          = "HTTPS"
+  certificate_arn   = aws_acm_certificate.api.arn   # TLS 종료
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+}
+
+# host/path 기반 라우팅 rule
+resource "aws_lb_listener_rule" "admin" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 100
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.admin.arn
+  }
+  condition {
+    path_pattern { values = ["/admin/*"] }
+  }
+}
+
+# L4 (NLB) — TCP 그대로 패스스루
+# resource "aws_lb" "tcp" {
+#   load_balancer_type = "network"
+#   # gRPC, 게임 서버, 정적 IP 필요할 때
+# }`,
+        },
+        focus: 'lb_l4_l7',
+      },
+      {
+        title: 'Step 4. Ingress — "K8s 안 층별 안내판"',
+        desc: 'K8s Ingress는 클러스터 내부 L7 LB. 외부 트래픽 → Ingress Controller(nginx/traefik/AWS LB Controller) → Service → Pod. host(api.example.com)와 path(/v1/*)로 라우팅, TLS 종료, cert-manager 연동으로 인증서 자동 갱신. AWS Load Balancer Controller는 Ingress를 ALB로 자동 생성.',
+        block: {
+          kind: 'yaml',
+          code: `# K8s Ingress — host/path 라우팅 + TLS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  annotations:
+    # AWS Load Balancer Controller — 자동 ALB 생성
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    # cert-manager — Let's Encrypt 자동 발급/갱신
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts: [api.example.com]
+      secretName: api-tls          # cert-manager 가 자동 채움
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: api-v1-svc
+                port: { number: 80 }
+          - path: /v2
+            pathType: Prefix
+            backend:
+              service:
+                name: api-v2-svc
+                port: { number: 80 }
+    - host: admin.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-svc
+                port: { number: 80 }
+
+# 트래픽 흐름 (전체 4 layer)
+# 1) DNS  : api.example.com → ALB IP
+# 2) CDN  : (정적 자산만) edge → S3
+# 3) LB   : ALB → Ingress Controller pod (target group)
+# 4) Ingress : host/path 매칭 → api-v1-svc → Pod
+#
+# 주요 Ingress Controller 비교
+# - nginx-ingress  : 가장 대중적, 성숙, 거의 모든 기능
+# - traefik        : 자동 서비스 디스커버리, 대시보드 UI
+# - AWS LB Ctrl    : Ingress → ALB 자동 (AWS 네이티브)
+# - istio gateway  : 서비스 메시 통합 (mTLS/트래픽 분할)`,
+        },
+        focus: 'ingress',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const TRAFFIC = [
+      { key: 'dns',       emoji: '🌐', name: 'DNS',       note: 'Route53 / Cloud DNS' },
+      { key: 'cdn',       emoji: '🚀', name: 'CDN',       note: 'CloudFront / Cloud CDN' },
+      { key: 'lb_l4_l7',  emoji: '⚖️', name: 'LB (L4/L7)', note: 'ALB / NLB / GCLB' },
+      { key: 'ingress',   emoji: '🔀', name: 'Ingress',   note: 'K8s Ingress' },
+    ];
+
+    function TrafficCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🚪 안내데스크 + 우편 라우팅 (DNS/CDN/LB/Ingress)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {TRAFFIC.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">DNS / CDN / LB / Ingress</h1>
+                <p className="text-sm text-slate-500 mt-1">안내데스크 + 우편 라우팅 — DNS / CDN / LB / Ingress</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <TrafficCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'ingress' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(III-1-1)에서는 Managed DB — RDS/Cloud SQL/Spanner/DynamoDB
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — Storage (Object/Block/File)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-1-2. Storage — Object / Block / File
+    학습 목표: 클라우드 스토리지 3종(+Hybrid)의 차이와 쓰임새를 익힌다.
+    핵심 비유: "창고 3종" — Object(서랍, 키-값) / Block(상자, 디스크) / File(캐비닛, 공유 폴더)
+    구조: 4단계 (Object / Block / File / Hybrid)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Object Storage — "서랍에 키 붙여 넣기"',
+        desc: 'S3 / GCS / Azure Blob. HTTP API 로 PUT/GET. 파일 시스템이 아니라 키(bucket/path) 기반의 평면 키-값 저장소. 무한 확장에 가깝고 단가가 가장 싸다. 정적 자산, 백업, Data Lake 의 핵심.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — S3 bucket + lifecycle
+resource "aws_s3_bucket" "lake" {
+  bucket = "company-data-lake"
+}
+
+resource "aws_s3_bucket_versioning" "lake" {
+  bucket = aws_s3_bucket.lake.id
+  versioning_configuration { status = "Enabled" }
+}
+
+# 라이프사이클 — 30일 후 IA, 90일 후 Glacier, 365일 후 삭제
+resource "aws_s3_bucket_lifecycle_configuration" "lake" {
+  bucket = aws_s3_bucket.lake.id
+  rule {
+    id     = "tiering"
+    status = "Enabled"
+    transition { days = 30  storage_class = "STANDARD_IA" }
+    transition { days = 90  storage_class = "GLACIER" }
+    expiration { days = 365 }
+  }
+}
+
+# 사용 — 키 기반 PUT/GET (HTTP API)
+# aws s3 cp ./report.pdf s3://company-data-lake/2026/05/report.pdf
+# → 키: 2026/05/report.pdf  (디렉터리 X, 평면 네임스페이스)
+#
+# 특징
+# - 무한 확장 / 11x9 내구성 / 단가 최저
+# - 단점: 부분 수정 X (전체 재업로드), latency 큼 (수십 ms)`,
+        },
+        focus: 'object',
+      },
+      {
+        title: 'Step 2. Block Storage — "상자(디스크)를 VM에 끼우기"',
+        desc: 'EBS / GCP Persistent Disk. VM 1대에 attach 해서 OS 가 "디스크"로 인식. 블록(섹터) 단위 R/W 가 빠르고 latency 낮다. DB 데이터 파일, OS 루트 디스크에 쓴다. 보통 1 VM에 1 attach (멀티-attach 는 제한적).',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — EBS volume + EC2 attach
+resource "aws_ebs_volume" "db_data" {
+  availability_zone = "ap-northeast-2a"
+  size              = 100              # GiB
+  type              = "gp3"            # SSD
+  iops              = 6000
+  throughput        = 250              # MiB/s
+  encrypted         = true
+}
+
+resource "aws_volume_attachment" "db_attach" {
+  device_name = "/dev/xvdf"
+  volume_id   = aws_ebs_volume.db_data.id
+  instance_id = aws_instance.db.id
+}
+
+# VM 안에서 — OS가 디스크로 인식, 포맷 후 마운트
+# $ lsblk
+#   xvda   8G   /          (루트)
+#   xvdf   100G            (방금 attach)
+# $ sudo mkfs.ext4 /dev/xvdf
+# $ sudo mount /dev/xvdf /var/lib/postgresql/data
+#
+# 특징
+# - 블록 단위 R/W → DB / OS 디스크에 적합 (낮은 latency)
+# - VM 1대 전속 (같은 AZ 안에서만 attach)
+# - 단가는 Object 보다 비쌈, 용량 무한 확장 X`,
+        },
+        focus: 'block',
+      },
+      {
+        title: 'Step 3. File Storage — "캐비닛을 여러 명이 공유"',
+        desc: 'EFS / GCP Filestore. NFS 프로토콜로 여러 VM 이 같은 파일 시스템을 마운트. POSIX 호환이라 디렉터리/권한/심볼릭 링크 모두 지원. 공유 업로드 폴더, CMS 미디어, 레거시 NFS 워크로드에 쓴다.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — EFS file system + mount target (AZ별)
+resource "aws_efs_file_system" "shared" {
+  creation_token   = "shared-fs"
+  performance_mode = "generalPurpose"
+  encrypted        = true
+}
+
+resource "aws_efs_mount_target" "az_a" {
+  file_system_id  = aws_efs_file_system.shared.id
+  subnet_id       = aws_subnet.private_a.id
+  security_groups = [aws_security_group.efs.id]
+}
+
+resource "aws_efs_mount_target" "az_b" {
+  file_system_id  = aws_efs_file_system.shared.id
+  subnet_id       = aws_subnet.private_b.id
+  security_groups = [aws_security_group.efs.id]
+}
+
+# 여러 VM 에서 동시에 mount (NFSv4)
+# $ sudo mount -t nfs4 fs-12345.efs.ap-northeast-2.amazonaws.com:/ /mnt/shared
+# $ ls /mnt/shared
+#   uploads/  cms-media/  legacy-data/
+#
+# 특징
+# - 다중 VM 동시 R/W (NFS) — Block 과의 가장 큰 차이
+# - POSIX 호환 → 기존 NFS 앱 그대로 이식
+# - 단가는 Block 과 Object 사이, latency 도 중간`,
+        },
+        focus: 'file',
+      },
+      {
+        title: 'Step 4. Hybrid — "Object + DB 통합으로 비용 절감"',
+        desc: '실제 파일 본체는 Object (S3) 에, 메타데이터(파일명/소유자/권한)만 DB row 에 저장하고 S3 URL 로 indirect 참조. 다운로드는 presigned URL 로 클라이언트가 S3 에서 직접. DB 비용·트래픽이 폭증을 막는 베스트 프랙티스.',
+        block: {
+          kind: 'python',
+          code: `# 파일 본체는 S3, 메타만 DB row — presigned URL 로 직접 다운로드
+import boto3
+from datetime import datetime
+from sqlalchemy.orm import Session
+
+s3 = boto3.client("s3")
+BUCKET = "company-uploads"
+
+def upload_file(db: Session, user_id: int, file_bytes: bytes, filename: str) -> int:
+    # 1) S3 키 생성 (DB id 와 분리, 충돌 방지용 prefix)
+    key = f"users/{user_id}/{datetime.utcnow():%Y/%m/%d}/{filename}"
+
+    # 2) 본체는 S3 로
+    s3.put_object(Bucket=BUCKET, Key=key, Body=file_bytes)
+
+    # 3) DB 에는 메타만 — S3 URL 을 indirect 참조
+    row = FileRow(
+        user_id=user_id,
+        filename=filename,
+        s3_bucket=BUCKET,
+        s3_key=key,
+        size=len(file_bytes),
+    )
+    db.add(row)
+    db.commit()
+    return row.id
+
+def get_download_url(db: Session, file_id: int) -> str:
+    # 4) 다운로드는 presigned URL — 1시간만 유효, S3 가 직접 응답
+    row = db.get(FileRow, file_id)
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": row.s3_bucket, "Key": row.s3_key},
+        ExpiresIn=3600,
+    )
+
+# 효과
+# - DB 는 작은 row 만 보관 → 백업/조회 빠름
+# - 다운로드 트래픽이 API 서버를 거치지 않음 → 비용 절감
+# - 권한은 DB 에서 검사 후 presigned URL 발급으로 위임`,
+        },
+        focus: 'hybrid',
+      },
+    ];
+
+    // KIND_STYLE 3종 — yaml/python/shell
+    const KIND_STYLE = {
+      yaml:   { label: 'Terraform', textColor: '#fde68a' },
+      python: { label: 'Python',    textColor: '#86efac' },
+      shell:  { label: 'Bash',      textColor: '#a5f3fc' },
+    };
+
+    const STORAGE = [
+      { key: 'object', emoji: '🪣', name: 'Object', note: 'S3 / GCS / Blob' },
+      { key: 'block',  emoji: '🧱', name: 'Block',  note: 'EBS / Persistent Disk' },
+      { key: 'file',   emoji: '📁', name: 'File',   note: 'EFS / Filestore' },
+      { key: 'hybrid', emoji: '🤝', name: 'Hybrid', note: 'Object + DB 통합' },
+    ];
+
+    function StorageCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🗄️ 창고 3종 (Storage)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {STORAGE.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Storage — Object / Block / File</h1>
+                <p className="text-sm text-slate-500 mt-1">창고 3종 — 키-값 서랍 / 디스크 상자 / 공유 캐비닛</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <StorageCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'hybrid' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(II-2-1)에서는 VPC + Subnet + 보안 그룹
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

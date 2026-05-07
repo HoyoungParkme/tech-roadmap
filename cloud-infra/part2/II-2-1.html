@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — VPC + Subnet + Security Group + NAT/Peering</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🏘️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    II-2-1. VPC + Subnet + Security Group + NAT/Peering
+    학습 목표: 클라우드 네트워크 격리의 4대 요소 — VPC / Subnet / SG / NAT·Peering
+    핵심 비유: "사설 동네" — VPC(동네) / Subnet(구역) / Security Group(집 출입 규칙) / NAT(우체국)
+    구조: 4단계 (vpc_concept / subnet / security_group / nat_peering)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. VPC — "사설 동네 하나 만들기"',
+        desc: 'AWS account에 VPC 1개 생성 (예: 10.0.0.0/16). region 단위로 격리된 가상 네트워크 — 다른 VPC, 다른 account와 기본 차단. CIDR 블록은 사설 IP 범위(10.x / 172.16-31.x / 192.168.x)에서 선택. VPC 안에서만 라우팅이 자유롭다.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — VPC 정의 (사설 동네 = 10.0.0.0/16)
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"   # 65,536개 IP
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "prod-vpc"
+    Env  = "production"
+  }
+}
+
+# CIDR 선택 가이드 (사설 IP 대역)
+# 10.0.0.0/8         → 대규모 (1,600만 IP)
+# 172.16.0.0/12      → 중규모 (100만 IP)
+# 192.168.0.0/16     → 소규모 (65k IP)
+
+# region 단위 — 다른 region VPC와 기본 격리
+# account 간 격리 — 다른 AWS 계정 VPC와도 격리
+# VPC 안 → 자유 통신 / 밖 → 명시 라우팅 필요`,
+        },
+        focus: 'vpc_concept',
+      },
+      {
+        title: 'Step 2. Subnet — "공용 구역 / 사설 구역 분리"',
+        desc: 'VPC를 더 작은 CIDR로 쪼갠 게 Subnet. 공용 subnet은 인터넷 게이트웨이로 라우팅 → ALB, Bastion 배치. 사설 subnet은 외부에서 직접 접근 불가 → RDS, 내부 서비스 배치. AZ별로 분산해서 가용성 확보.',
+        block: {
+          kind: 'yaml',
+          code: `# 공용 subnet 2개 (AZ-a, AZ-c) — ALB, Bastion 배치
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-northeast-2a"
+  map_public_ip_on_launch = true
+  tags = { Name = "public-a", Tier = "public" }
+}
+
+resource "aws_subnet" "public_c" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "ap-northeast-2c"
+  tags = { Name = "public-c", Tier = "public" }
+}
+
+# 사설 subnet 2개 — RDS, 내부 ECS/EKS 배치
+resource "aws_subnet" "private_a" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.11.0/24"
+  availability_zone = "ap-northeast-2a"
+  tags = { Name = "private-a", Tier = "private" }
+}
+
+# 라우팅 테이블 (공용)
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id   # 인터넷 게이트웨이
+  }
+}
+
+# 배치 원칙
+# - ALB / NAT GW / Bastion → public subnet
+# - App / DB / Cache       → private subnet
+# - 같은 tier는 AZ별 분산   → 1개 AZ 장애 시 가용성 유지`,
+        },
+        focus: 'subnet',
+      },
+      {
+        title: 'Step 3. Security Group — "집 출입 규칙"',
+        desc: '인스턴스(EC2/RDS/ELB) 단위 가상 방화벽. inbound/outbound 규칙으로 접근 제어. stateful — 들어온 응답은 자동 허용. NACL은 subnet 단위 + stateless로 다르다. 실무는 SG 위주, NACL은 광범위 차단용.',
+        block: {
+          kind: 'yaml',
+          code: `# ALB SG — 인터넷 → 80/443 허용
+resource "aws_security_group" "alb" {
+  name   = "alb-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]   # 인터넷 전체
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# App SG — ALB SG에서만 8080 허용 (SG 참조)
+resource "aws_security_group" "app" {
+  name   = "app-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]   # SG 체인
+  }
+}
+
+# RDS SG — App SG에서만 5432 허용
+resource "aws_security_group" "rds" {
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+}
+
+# SG vs NACL
+# SG    : 인스턴스 단위 / stateful  / allow only
+# NACL  : subnet 단위    / stateless / allow + deny
+# 실무: SG가 주력, NACL은 IP 차단용 보조`,
+        },
+        focus: 'security_group',
+      },
+      {
+        title: 'Step 4. NAT Gateway + VPC Peering — "외부 / 다른 VPC 연결"',
+        desc: '사설 subnet의 인스턴스가 외부 인터넷(패키지 다운로드 등)에 나가야 할 때 NAT Gateway 통과 — 외부에서 들어오는 건 차단. 다른 VPC와 통신은 VPC Peering(1:1) 또는 Transit Gateway(허브). VPN/Direct Connect는 온프레미스 연결용.',
+        block: {
+          kind: 'yaml',
+          code: `# NAT Gateway — 사설 → 인터넷 단방향
+resource "aws_eip" "nat" { domain = "vpc" }
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public_a.id   # 공용 subnet에 위치
+  tags = { Name = "prod-nat" }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id   # 사설 → NAT → IGW
+  }
+}
+
+# VPC Peering — 다른 VPC와 1:1 연결
+resource "aws_vpc_peering_connection" "to_data" {
+  vpc_id      = aws_vpc.main.id
+  peer_vpc_id = aws_vpc.data_lake.id
+  auto_accept = true
+}
+
+resource "aws_route" "to_data_vpc" {
+  route_table_id            = aws_route_table.private.id
+  destination_cidr_block    = "10.20.0.0/16"            # data VPC CIDR
+  vpc_peering_connection_id = aws_vpc_peering_connection.to_data.id
+}
+
+# 연결 옵션 비교
+# NAT Gateway       : 사설 → 인터넷 (단방향, 시간당 과금)
+# Internet Gateway  : 공용 ↔ 인터넷 (양방향)
+# VPC Peering       : VPC ↔ VPC (1:1, transitive 불가)
+# Transit Gateway   : 다수 VPC 허브 (mesh, 비싸지만 깔끔)
+# VPN / DX          : 온프레미스 ↔ VPC
+
+# 다음(II-2-2)에서는 LB / Ingress / CDN / DNS`,
+        },
+        focus: 'nat_peering',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const NETWORK = [
+      { key: 'vpc_concept',     emoji: '🏘️', name: 'VPC',            note: '사설 동네' },
+      { key: 'subnet',          emoji: '📐', name: 'Subnet',         note: '공용/사설 구역' },
+      { key: 'security_group',  emoji: '🔐', name: 'Security Group', note: '출입 규칙' },
+      { key: 'nat_peering',     emoji: '🌉', name: 'NAT + Peering',  note: '외부/다른 VPC' },
+    ];
+
+    function NetworkCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🏘️ 사설 동네 (VPC + Subnet)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {NETWORK.map((n) => {
+              const isActive = focus === n.key;
+              return (
+                <div
+                  key={n.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{n.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{n.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{n.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">VPC + Subnet + Security Group + NAT/Peering</h1>
+                <p className="text-sm text-slate-500 mt-1">사설 동네 — VPC / Subnet / Security Group / NAT·Peering</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <NetworkCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'nat_peering' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(II-2-2)에서는 LB / Ingress / CDN / DNS
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

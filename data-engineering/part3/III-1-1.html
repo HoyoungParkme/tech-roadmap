@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Data Lake</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>💧</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-1-1. Data Lake
+    학습 목표: 원본 그대로 보관하는 거대 저장소 — 정형/반정형/비정형 다 담고 schema-on-read.
+    핵심 비유: "물 저장소(거대 창고)" — 모든 형태 데이터를 일단 그대로 담는다.
+    구조: 4단계 (definition / parquet / partition / catalog)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Definition — 원본 그대로, schema-on-read',
+        desc: 'Data Lake는 S3 / GCS / ADLS 같은 오브젝트 스토리지에 파일을 그대로 쌓는다. JSON, CSV, Parquet, Avro, 이미지, 로그까지 형식 가리지 않는다. DW와 달리 적재 시점에 스키마를 강제하지 않고(schema-on-read), 읽을 때 해석한다. 미래 어떤 분석이 필요할지 모를 때 일단 다 담아두는 "거대 창고" 전략.',
+        block: {
+          kind: 'shell',
+          code: `# S3 버킷 디렉터리 — 형식 가리지 않고 다 담는다
+$ aws s3 ls s3://company-lake/ --recursive
+raw/events/2026/05/06/events-00.json.gz       # 반정형 (이벤트 로그)
+raw/orders/2026/05/06/orders.csv              # 정형 (CSV 덤프)
+raw/images/products/sku-1234.jpg              # 비정형 (이미지)
+raw/logs/nginx/2026-05-06/access.log          # 비정형 (텍스트)
+curated/sales/year=2026/month=05/part-0.parquet  # 가공 후 컬럼 형식
+
+# schema-on-write (DW)  vs  schema-on-read (Lake)
+# DW   : 적재 전에 테이블 정의 → 안 맞으면 거부
+# Lake : 일단 저장 → 읽을 때 (Spark/Athena) 스키마 적용
+# → 비정형/탐색적 분석/ML 학습 데이터에 강함`,
+        },
+        focus: 'definition',
+      },
+      {
+        title: 'Step 2. Parquet — 컬럼 형식 + Snappy 압축',
+        desc: '같은 데이터를 CSV 대신 Parquet로 저장하면 컬럼 단위로 묶고 Snappy로 압축해서 보통 5배 작아진다. Spark/Presto/Athena가 필요한 컬럼만 읽기 때문에 스캔량이 10배 가까이 줄어든다. Lake 위에서 분석 비용을 줄이는 사실상 표준 포맷.',
+        block: {
+          kind: 'python',
+          code: `# pandas + pyarrow로 CSV → Parquet 변환
+import pandas as pd
+
+# 원본 CSV (raw zone)
+df = pd.read_csv("s3://company-lake/raw/orders/2026/05/06/orders.csv")
+# 1.2 GB, 컬럼 20개
+
+# Parquet로 다시 쓰기 (curated zone)
+df.to_parquet(
+    "s3://company-lake/curated/orders/year=2026/month=05/day=06/part-0.parquet",
+    engine="pyarrow",
+    compression="snappy",   # 빠르고 합리적
+    index=False,
+)
+# → 약 240 MB (5x 작아짐)
+
+# 분석은 컬럼만 골라 읽음 — 스캔량 10x ↓
+import pyarrow.parquet as pq
+tbl = pq.read_table(
+    "s3://company-lake/curated/orders/year=2026/month=05/day=06/part-0.parquet",
+    columns=["order_id", "amount"],   # 필요한 2개만
+)
+# CSV였다면 전체 라인 파싱 필수, Parquet은 해당 컬럼 chunk만 읽음`,
+        },
+        focus: 'parquet',
+      },
+      {
+        title: 'Step 3. Partition — 디렉터리가 곧 파티션 컬럼 (Hive)',
+        desc: '`year=2026/month=05/day=07/` 형태로 폴더를 나누면 Spark/Athena가 디렉터리 이름을 그대로 파티션 컬럼으로 인식한다. `WHERE year=2026 AND month=05`만 줘도 해당 폴더만 스캔해서 비용·시간이 크게 줄어든다. Hive 표준 레이아웃이라 거의 모든 쿼리 엔진이 그대로 알아본다.',
+        block: {
+          kind: 'shell',
+          code: `# Hive 스타일 파티션 레이아웃
+$ aws s3 ls s3://company-lake/curated/sales/ --recursive
+curated/sales/year=2024/month=12/day=31/part-0.parquet
+curated/sales/year=2025/month=01/day=01/part-0.parquet
+...
+curated/sales/year=2026/month=05/day=06/part-0.parquet
+curated/sales/year=2026/month=05/day=07/part-0.parquet
+
+# 파티션 컬럼은 "디렉터리 이름"이고 파일 안에는 없다 (중복 제거)
+# year, month, day는 폴더명에서 자동 인식
+
+# Athena 쿼리 — 파티션으로 스캔량 ↓
+SELECT product_id, SUM(amount)
+FROM   sales
+WHERE  year = 2026 AND month = 5 AND day = 7   -- ← partition pruning
+GROUP  BY product_id;
+# 전체 2년치 중 2026-05-07 폴더만 읽음 → 비용 1/700
+
+# 주의: 파티션 너무 잘게 쪼개면 small-file 문제
+# 보통 day 단위, 트래픽 적으면 month 단위까지가 무난`,
+        },
+        focus: 'partition',
+      },
+      {
+        title: 'Step 4. Catalog — Glue / Hive Metastore',
+        desc: 'Lake 자체는 그냥 파일 더미라, "어떤 폴더가 어떤 테이블이고 스키마는 뭔지" 알려주는 메타 저장소가 필요하다. AWS Glue Data Catalog 또는 Hive Metastore가 그 역할. 한번 등록해두면 Athena, Spark, Presto, Trino가 모두 같은 테이블 정의로 표준 SQL을 쏠 수 있다.',
+        block: {
+          kind: 'yaml',
+          code: `# AWS Glue 테이블 정의 (CloudFormation 스니펫)
+Resources:
+  SalesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: analytics
+      TableInput:
+        Name: sales
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          # 파티션 컬럼 자동 인식
+          projection.enabled: "true"
+        StorageDescriptor:
+          Location: s3://company-lake/curated/sales/
+          InputFormat:  org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - { Name: order_id,   Type: bigint }
+            - { Name: product_id, Type: string }
+            - { Name: amount,     Type: double }
+        # 디렉터리에서 받아오는 파티션 키
+        PartitionKeys:
+          - { Name: year,  Type: int }
+          - { Name: month, Type: int }
+          - { Name: day,   Type: int }
+
+# 등록 후 Athena/Spark/Trino 어디서나
+#   SELECT * FROM analytics.sales WHERE year=2026 AND month=5;
+# 동일 메타로 동작 → 엔진 갈아끼워도 쿼리 그대로`,
+        },
+        focus: 'catalog',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const LAKE = [
+      { key: 'definition', emoji: '💧', name: '정의',      note: 'schema-on-read' },
+      { key: 'parquet',    emoji: '📁', name: 'Parquet',   note: '컬럼 형식 + Snappy' },
+      { key: 'partition',  emoji: '🪟', name: 'Partition', note: 'Hive partition' },
+      { key: 'catalog',    emoji: '📋', name: 'Catalog',   note: 'Glue / Hive Metastore' },
+    ];
+
+    function LakeCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">💧 물 저장소 (Data Lake)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {LAKE.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Data Lake</h1>
+                <p className="text-sm text-slate-500 mt-1">물 저장소 — 정형/반정형/비정형을 원본 그대로 담는 거대 창고</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <LakeCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'catalog' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(III-1-2)에서는 Lakehouse — DW + Lake 통합
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
