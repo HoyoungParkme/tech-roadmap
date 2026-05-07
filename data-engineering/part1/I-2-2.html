@@ -3,273 +3,687 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Data Engineering 학습 — CDC (Change Data Capture)</title>
+  <title>Data Engineering 학습 — I-2-2. CDC (Change Data Capture)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔄</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     I-2-2. CDC (Change Data Capture)
-    학습 목표: 운영 DB의 변경분(INSERT/UPDATE/DELETE)을 실시간으로 다른 시스템에 전파하는 패턴을 이해한다.
-    핵심 비유: "실시간 복사기" — 전체 dump가 아니라 변경분만 즉시 복사해서 전달
+    학습 목표: 운영 DB 변경분(INSERT/UPDATE/DELETE)을 실시간으로 다른 시스템에 전파하는 패턴 이해.
+    핵심 비유: 실시간 복사기 — 전체 dump가 아니라 "변경분만" 즉시 복제 전달
+    패턴: fastapi v1 패턴 — 좌(LiveDataPane: CDC 흐름) / 우(VSCode CodeViewer: yaml debezium config)
     구조: 4단계 (Snapshot / Log-based / Debezium / Use Cases)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의 (CDC 흐름 시뮬레이션)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Step 1. Snapshot — "매일 한 번 전체 복사"',
-        desc: '가장 단순한 방식. 매일 자정에 운영 DB 전체를 SELECT * 으로 dump 떠서 다른 곳으로 보냄. 구현은 쉽지만 테이블이 커지면 부하가 커지고, 어제 데이터까지만 보임 (시간 지연). 실시간 분석/캐시 동기화에는 부적합.',
-        block: {
-          kind: 'python',
-          code: `# 매일 새벽 2시 cron으로 전체 dump
-import psycopg2, pandas as pd
-
-# 1. 운영 DB 전체 SELECT
-conn = psycopg2.connect("postgresql://prod-db/orders")
-df = pd.read_sql("SELECT * FROM orders", conn)   # 1억 row?
-df.to_parquet(f"s3://dw/orders/dt={today}/")     # DW로 적재
-
-# 2. 한계
-# - 테이블 1억 row → SELECT 1시간, 운영 DB 부하 ↑
-# - dump 떠는 사이 들어온 변경은 다음날까지 안 보임 (24h 지연)
-# - DELETE 된 row는 어떻게? → 비교 로직 직접 짜야 함
-# - 1% 변경 / 99% 그대로인데 100% 다 복사 → 낭비
-
-# → "snapshot only" 방식의 한계
-# → 변경분만 가져오는 더 똑똑한 방법이 필요
-# → 다음 단계: DB 트랜잭션 로그를 직접 읽자`,
-        },
+        title: 'Step 1. Snapshot — "매일 한 번 전체 dump"',
+        desc: '가장 단순한 방식. 매일 자정 cron으로 SELECT * → 테이블 전체를 통째로 복사. 1억 row면 1시간씩 걸리고, 운영 DB에 부하가 크고, 24시간 지연이 발생한다. "변경 1%인데 100% 다 복사"하는 낭비.',
         focus: 'snapshot',
+        // 좌측 시각화 상태
+        snapshotRows: [
+          { id: 1, status: 'paid',    amount: 100, copied: true },
+          { id: 2, status: 'paid',    amount: 250, copied: true },
+          { id: 3, status: 'shipped', amount:  80, copied: true },
+          { id: 4, status: 'paid',    amount: 420, copied: true },
+          { id: 5, status: 'pending', amount: 150, copied: true },
+        ],
+        events: [],
+        topicMessages: [],
+        useCasesActive: false,
+        code: {
+          lang: 'yaml',
+          filename: 'snapshot-cron.yml',
+          lines: [
+            '# 매일 새벽 2시 cron — 전체 dump',
+            'apiVersion: batch/v1',
+            'kind: CronJob',
+            'metadata:',
+            '  name: orders-snapshot',
+            'spec:',
+            '  schedule: "0 2 * * *"           # 매일 02:00',
+            '  jobTemplate:',
+            '    spec:',
+            '      template:',
+            '        spec:',
+            '          containers:',
+            '          - name: dump',
+            '            image: postgres:16',
+            '            command: ["sh", "-c"]',
+            '            args:',
+            '            - |',
+            '              pg_dump -h prod-db -t orders \\',
+            '                | aws s3 cp - s3://dw/orders/$(date +%F).sql',
+            '',
+            '# 한계',
+            '# - 1억 row → SELECT 1시간, 운영 DB 부하 ↑',
+            '# - 24h 지연 (어제 데이터까지만)',
+            '# - DELETE된 row 추적 어려움',
+            '# - 변경 1% / 그대로 99% 인데 100% 다 복사',
+            '#',
+            '# → "변경분만" 가져올 수 없을까?',
+          ],
+          highlight: [7, 18, 19, 28],
+        },
       },
       {
-        title: 'Step 2. Log-based CDC — "DB 트랜잭션 로그를 읽는다"',
-        desc: 'PostgreSQL의 WAL(Write-Ahead Log), MySQL의 binlog는 모든 변경을 row 단위로 기록한다. 이 로그를 외부에서 읽으면 INSERT/UPDATE/DELETE를 실시간으로 추적 가능. 운영 DB에 SELECT 부하 없이 "변경분만" 흘려보낸다. PostgreSQL은 logical replication slot을 만들어 사용.',
-        block: {
-          kind: 'yaml',
-          code: `# PostgreSQL — logical replication 활성화
-# postgresql.conf
-wal_level = logical            # WAL을 row 변경 단위로 기록
-max_replication_slots = 10     # 동시 구독자 최대 N개
-max_wal_senders = 10
-
-# pg_hba.conf — replication 사용자 허용
-host  replication  cdc_user  10.0.0.0/8  md5
-
----
-# DB에서 publication + replication slot 생성
-CREATE PUBLICATION orders_pub FOR TABLE orders, payments;
-
-SELECT pg_create_logical_replication_slot(
-  'debezium_slot',
-  'pgoutput'                   -- PG 내장 logical decoding plugin
-);
-
-# 외부 consumer가 slot에서 변경 stream 구독
-# → INSERT/UPDATE/DELETE 한 건씩 row로 흘러나옴
-# → 운영 DB SELECT 부하 0
-# → 슬롯이 안 비워지면 WAL 쌓여 디스크 위험 (모니터링 필수)
-
-# MySQL은 같은 개념을 binlog (ROW format) 으로 제공
-# binlog_format = ROW, binlog_row_image = FULL`,
-        },
+        title: 'Step 2. Log-based CDC — "WAL/binlog를 직접 읽는다"',
+        desc: 'PostgreSQL WAL, MySQL binlog는 모든 변경을 row 단위로 기록한다. 외부에서 이 로그를 구독하면 INSERT/UPDATE/DELETE를 실시간으로 추적 가능. 운영 DB SELECT 부하 0. PostgreSQL은 logical replication slot을 만들어 사용한다.',
         focus: 'log_based',
+        snapshotRows: [
+          { id: 1, status: 'paid',    amount: 100, copied: true },
+          { id: 2, status: 'paid',    amount: 250, copied: true },
+          { id: 3, status: 'shipped', amount:  80, copied: true },
+          { id: 4, status: 'paid',    amount: 420, copied: true },
+          { id: 5, status: 'pending', amount: 150, copied: true },
+        ],
+        events: [
+          { lsn: '0/1A2B3C', op: 'INSERT', table: 'orders',   pk: 6,  detail: 'amount=320' },
+          { lsn: '0/1A2B40', op: 'UPDATE', table: 'orders',   pk: 2,  detail: 'paid → shipped' },
+          { lsn: '0/1A2B47', op: 'DELETE', table: 'payments', pk: 11, detail: 'refund' },
+          { lsn: '0/1A2B4E', op: 'UPDATE', table: 'orders',   pk: 5,  detail: 'pending → paid' },
+        ],
+        topicMessages: [],
+        useCasesActive: false,
+        code: {
+          lang: 'yaml',
+          filename: 'postgresql.conf',
+          lines: [
+            '# PostgreSQL — logical replication 활성화',
+            '# postgresql.conf',
+            'wal_level = logical              # WAL을 row 변경 단위로 기록',
+            'max_replication_slots = 10       # 동시 구독자 N개',
+            'max_wal_senders = 10',
+            '',
+            '# pg_hba.conf — replication 사용자 허용',
+            '# host  replication  cdc_user  10.0.0.0/8  md5',
+            '',
+            '---',
+            '# DB에서 publication + replication slot 생성',
+            'CREATE PUBLICATION orders_pub',
+            '  FOR TABLE orders, payments;',
+            '',
+            'SELECT pg_create_logical_replication_slot(',
+            "  'debezium_slot',",
+            "  'pgoutput'                    -- PG 내장 plugin",
+            ');',
+            '',
+            '# → INSERT/UPDATE/DELETE가 row로 흘러나옴',
+            '# → 운영 DB SELECT 부하 0',
+            '# → 슬롯 미소비 시 WAL 쌓임 (모니터링 필수)',
+            '#',
+            '# MySQL은 binlog (ROW format) 으로 동일 개념 제공',
+            '# binlog_format = ROW, binlog_row_image = FULL',
+          ],
+          highlight: [3, 12, 15, 16, 17],
+        },
       },
       {
-        title: 'Step 3. Debezium — "표준 도구로 Kafka에 흘려보낸다"',
-        desc: 'Debezium은 Kafka Connect 위에서 도는 오픈소스 CDC 커넥터. PG/MySQL/MongoDB/Oracle binlog를 읽어 Kafka topic에 push. 한 번 설정하면 모든 변경이 `dbserver1.public.orders` 같은 topic에 자동 발행 → 다른 서비스들이 구독만 하면 됨. 표준 envelope (before/after/op) 으로 정규화해줌.',
-        block: {
-          kind: 'yaml',
-          code: `# debezium-connector.yaml — Kafka Connect 등록
-name: orders-pg-connector
-config:
-  connector.class: io.debezium.connector.postgresql.PostgresConnector
-  database.hostname: prod-db.internal
-  database.port: 5432
-  database.user: cdc_user
-  database.dbname: shop
-  database.server.name: dbserver1
-  plugin.name: pgoutput
-  slot.name: debezium_slot
-  publication.name: orders_pub
-  table.include.list: public.orders,public.payments
-  topic.prefix: shop                      # → topic: shop.public.orders
-  snapshot.mode: initial                  # 최초 1회 스냅샷 + 이후 stream
-
----
-# Kafka topic에 흘러나오는 메시지 형태 (envelope)
-{
-  "op": "u",                              # c=create, u=update, d=delete
-  "ts_ms": 1714972800123,
-  "before": { "id": 42, "status": "paid",     "amount": 100 },
-  "after":  { "id": 42, "status": "shipped",  "amount": 100 },
-  "source": { "db": "shop", "table": "orders", "lsn": "0/1A2B3C" }
-}
-
-# 구독자들 (각자 필요한 topic만)
-# - DW 적재 sink → S3/BigQuery
-# - Redis 캐시 무효화 consumer
-# - 검색 인덱스 (Elasticsearch) 동기화 consumer`,
-        },
+        title: 'Step 3. Debezium — "표준 도구로 Kafka topic에 흘려보낸다"',
+        desc: 'Debezium은 Kafka Connect 위에서 도는 오픈소스 CDC 커넥터. PG/MySQL/MongoDB binlog를 읽어 Kafka topic에 push. 한 번 설정하면 모든 변경이 dbserver1.public.orders 같은 topic에 자동 발행. before/after/op 표준 envelope으로 정규화.',
         focus: 'debezium',
+        snapshotRows: [
+          { id: 1, status: 'paid',    amount: 100, copied: true },
+          { id: 2, status: 'shipped', amount: 250, copied: true },
+          { id: 6, status: 'paid',    amount: 320, copied: true },
+        ],
+        events: [
+          { lsn: '0/1A2B40', op: 'UPDATE', table: 'orders', pk: 2, detail: 'paid → shipped' },
+          { lsn: '0/1A2B6A', op: 'INSERT', table: 'orders', pk: 7, detail: 'amount=180' },
+        ],
+        topicMessages: [
+          { topic: 'shop.public.orders',   op: 'u', pk: 2, ts: '14:02:11.123' },
+          { topic: 'shop.public.orders',   op: 'c', pk: 7, ts: '14:02:18.450' },
+          { topic: 'shop.public.payments', op: 'd', pk: 11, ts: '14:02:22.012' },
+        ],
+        useCasesActive: false,
+        code: {
+          lang: 'yaml',
+          filename: 'debezium-connector.yml',
+          lines: [
+            '# Kafka Connect — Debezium PG connector',
+            'name: orders-pg-connector',
+            'config:',
+            '  connector.class: io.debezium.connector.postgresql.PostgresConnector',
+            '  database.hostname: prod-db.internal',
+            '  database.port: 5432',
+            '  database.user: cdc_user',
+            '  database.dbname: shop',
+            '  database.server.name: dbserver1',
+            '  plugin.name: pgoutput',
+            '  slot.name: debezium_slot',
+            '  publication.name: orders_pub',
+            '  table.include.list: public.orders,public.payments',
+            '  topic.prefix: shop                # → topic: shop.public.orders',
+            '  snapshot.mode: initial            # 최초 스냅샷 + 이후 stream',
+            '',
+            '---',
+            '# Kafka topic envelope (표준 메시지 형태)',
+            '# {',
+            '#   "op": "u",                    # c=create, u=update, d=delete',
+            '#   "ts_ms": 1714972800123,',
+            '#   "before": { "id": 2, "status": "paid",    "amount": 250 },',
+            '#   "after":  { "id": 2, "status": "shipped", "amount": 250 },',
+            '#   "source": { "db": "shop", "table": "orders", "lsn": "0/1A2B40" }',
+            '# }',
+          ],
+          highlight: [4, 13, 14, 15, 20],
+        },
       },
       {
-        title: 'Step 4. Use Cases — "어디에 쓰나?" (DW / 캐시 / 마이크로서비스 / 감사)',
-        desc: 'CDC는 "운영 DB 변경"을 이벤트로 만들어 fan-out 한다. DW 실시간 동기화, 캐시 무효화, 마이크로서비스 간 데이터 일관성, 감사 로그(audit trail) 구축이 대표적. 단 exactly-once 보장은 어렵고, 보통 at-least-once → consumer 쪽에서 idempotent 처리가 필수.',
-        block: {
-          kind: 'shell',
-          code: `# CDC 활용 시나리오 표
-─────────────────────────────────────────────────────────────
-시나리오            | 토픽 흐름                       | 효과
-─────────────────────────────────────────────────────────────
-DW 실시간 동기화    | shop.orders → S3/BigQuery       | T+1 → 분 단위
-캐시 무효화         | shop.products → Redis DEL key   | stale 캐시 0
-검색 인덱스 동기화  | shop.products → ES bulk upsert  | 즉시 검색 반영
-마이크로서비스 통합 | shop.users → notification svc   | 강결합 API 제거
-감사 로그           | shop.* → S3 (immutable)         | 누가/언제/뭐 변경
-event sourcing      | shop.* → event store            | 시점 복원 가능
-─────────────────────────────────────────────────────────────
-
-# 주의사항
-- 전달 보장: at-least-once (중복 가능)
-  → consumer는 반드시 idempotent (같은 메시지 두 번 받아도 안전)
-  → e.g. UPSERT BY primary_key, dedupe by (table, pk, lsn)
-- 스키마 변경: ALTER TABLE 시 schema registry 연동 필요
-- 초기 스냅샷: 큰 테이블은 incremental snapshot 옵션 사용
-- 슬롯 미소비: consumer 죽으면 WAL 쌓임 → lag 알람 필수`,
-        },
+        title: 'Step 4. Use Cases — "어디에 쓰나?"',
+        desc: 'CDC는 "운영 DB 변경"을 이벤트로 만들어 fan-out한다. 캐시 무효화, DW 동기화, 검색 인덱스, 감사 로그 등 다양한 consumer가 같은 topic을 구독한다. 단 at-least-once 보장이라 consumer 쪽에서 idempotent (UPSERT BY pk) 처리가 필수.',
         focus: 'use_cases',
+        snapshotRows: [
+          { id: 1, status: 'paid',    amount: 100, copied: true },
+          { id: 2, status: 'shipped', amount: 250, copied: true },
+        ],
+        events: [
+          { lsn: '0/1A2B40', op: 'UPDATE', table: 'orders', pk: 2, detail: 'paid → shipped' },
+        ],
+        topicMessages: [
+          { topic: 'shop.public.orders', op: 'u', pk: 2, ts: '14:02:11.123' },
+        ],
+        useCasesActive: true,
+        code: {
+          lang: 'yaml',
+          filename: 'consumers.yml',
+          lines: [
+            '# 같은 Kafka topic을 구독하는 여러 consumer',
+            'consumers:',
+            '  - name: cache-invalidator',
+            '    topic: shop.public.products',
+            '    action: redis DEL product:{pk}',
+            '    sla: stale 캐시 0',
+            '',
+            '  - name: dw-sink',
+            '    topic: shop.public.orders',
+            '    action: S3 / BigQuery upsert',
+            '    sla: T+1 → 분 단위',
+            '',
+            '  - name: search-indexer',
+            '    topic: shop.public.products',
+            '    action: Elasticsearch bulk upsert',
+            '    sla: 즉시 검색 반영',
+            '',
+            '  - name: audit-logger',
+            '    topic: shop.*',
+            '    action: S3 immutable append',
+            '    sla: 누가/언제/뭐 변경 추적',
+            '',
+            '# 주의사항',
+            '# - 전달 보장: at-least-once (중복 가능)',
+            '#   → consumer는 반드시 idempotent',
+            '#   → e.g. UPSERT BY pk, dedupe (table, pk, lsn)',
+            '# - 스키마 변경: schema registry 연동',
+            '# - 큰 테이블: incremental snapshot 옵션 사용',
+            '# - slot 미소비: WAL 쌓임 → lag 알람 필수',
+          ],
+          highlight: [3, 8, 13, 18, 24, 25],
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
-      python: { label: 'Python', textColor: '#86efac' },
-      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    // ─────────────────────────────────────────────────────
+    // CDC 파이프라인 4 stage
+    // ─────────────────────────────────────────────────────
+    const PIPELINE_STAGES = [
+      { key: 'oltp',     emoji: '🗄️', name: 'OLTP DB',  sub: 'PostgreSQL / MySQL' },
+      { key: 'debezium', emoji: '🐝', name: 'Debezium', sub: 'CDC connector' },
+      { key: 'kafka',    emoji: '📨', name: 'Kafka',    sub: 'topic stream' },
+      { key: 'sink',     emoji: '🎯', name: 'Sink',     sub: 'DW / 캐시 / ES' },
+    ];
+
+    // 단계별로 활성 stage 매핑
+    const FOCUS_TO_ACTIVE_STAGES = {
+      snapshot:  ['oltp'],
+      log_based: ['oltp'],
+      debezium:  ['oltp', 'debezium', 'kafka'],
+      use_cases: ['oltp', 'debezium', 'kafka', 'sink'],
     };
 
-    const CDC_PHASES = [
-      { key: 'snapshot',  emoji: '📸', name: 'Snapshot',  note: '주기적 전체 dump' },
-      { key: 'log_based', emoji: '📜', name: 'Log-based', note: 'WAL / binlog 읽기' },
-      { key: 'debezium',  emoji: '🐝', name: 'Debezium',  note: '표준 CDC 도구' },
-      { key: 'use_cases', emoji: '💼', name: 'Use Cases', note: 'DW / 캐시 / MSA' },
+    const OP_STYLE = {
+      INSERT: { color: 'text-emerald-700', bg: 'bg-emerald-50',  border: 'border-emerald-300', short: '+' },
+      UPDATE: { color: 'text-amber-700',   bg: 'bg-amber-50',    border: 'border-amber-300',   short: '~' },
+      DELETE: { color: 'text-rose-700',    bg: 'bg-rose-50',     border: 'border-rose-300',    short: '−' },
+    };
+
+    const TOPIC_OP_STYLE = {
+      c: { label: 'create', color: 'text-emerald-700', bg: 'bg-emerald-50',  border: 'border-emerald-300' },
+      u: { label: 'update', color: 'text-amber-700',   bg: 'bg-amber-50',    border: 'border-amber-300'   },
+      d: { label: 'delete', color: 'text-rose-700',    bg: 'bg-rose-50',     border: 'border-rose-300'    },
+    };
+
+    const USE_CASES = [
+      { emoji: '⚡', name: 'Cache invalidation', detail: 'Redis DEL key',         color: 'rose'    },
+      { emoji: '📊', name: 'DW sync',            detail: 'S3 / BigQuery upsert',  color: 'sky'     },
+      { emoji: '🔍', name: 'Search index',       detail: 'Elasticsearch bulk',    color: 'violet'  },
+      { emoji: '📜', name: 'Audit log',          detail: 'S3 immutable append',   color: 'amber'   },
     ];
 
-    function CDCCards({ focus }) {
+    const USE_CASE_STYLE = {
+      rose:   'bg-rose-50 border-rose-300 text-rose-800',
+      sky:    'bg-sky-50 border-sky-300 text-sky-800',
+      violet: 'bg-violet-50 border-violet-300 text-violet-800',
+      amber:  'bg-amber-50 border-amber-300 text-amber-800',
+    };
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — CDC 흐름 시각화
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const activeStages = FOCUS_TO_ACTIVE_STAGES[step.focus] || [];
+
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">🔄 실시간 복사기 (Change Data Capture)</div>
-          <div className="grid grid-cols-4 gap-2">
-            {CDC_PHASES.map((p) => {
-              const isActive = focus === p.key;
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-bold text-slate-700">🔄 실시간 복사기 (Change Data Capture)</h2>
+            <span className="text-[10px] text-slate-400 font-mono">CDC pipeline · live</span>
+          </div>
+
+          {/* 파이프라인 4 stage */}
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            {PIPELINE_STAGES.map((s, i) => {
+              const isActive = activeStages.includes(s.key);
               return (
-                <div
-                  key={p.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
-                >
-                  <div className="text-2xl">{p.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{p.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1">{p.note}</div>
-                </div>
+                <React.Fragment key={s.key}>
+                  <div
+                    className={`rounded-lg p-2 text-center border-2 transition-all duration-500 ${
+                      isActive
+                        ? 'bg-teal-50 border-teal-400 scale-105 shadow-sm'
+                        : 'bg-slate-50 border-slate-200 opacity-50'
+                    }`}
+                  >
+                    <div className="text-xl">{s.emoji}</div>
+                    <div className="text-[11px] font-bold text-slate-700 mt-0.5">{s.name}</div>
+                    <div className="text-[9px] text-slate-500">{s.sub}</div>
+                  </div>
+                </React.Fragment>
               );
             })}
+          </div>
+
+          {/* Step 1: Snapshot — 전체 row dump 표 */}
+          {step.focus === 'snapshot' && (
+            <div className="border-2 border-teal-300 rounded-lg p-3 bg-teal-50/40">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs font-bold text-slate-700">📸 SELECT * FROM orders — 전체 dump</div>
+                <span className="text-[10px] text-slate-500 font-mono">5 / 5 row 복사 (100%)</span>
+              </div>
+              <table className="w-full text-xs font-mono">
+                <thead>
+                  <tr className="text-slate-500 border-b border-slate-200">
+                    <th className="text-left py-1 pl-1">id</th>
+                    <th className="text-left py-1">status</th>
+                    <th className="text-right py-1 pr-1">amount</th>
+                    <th className="text-right py-1 pr-1">copied</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {step.snapshotRows.map((r) => (
+                    <tr key={r.id} className="border-b border-slate-100 hover:bg-white/60">
+                      <td className="py-1 pl-1 text-slate-700">{r.id}</td>
+                      <td className="py-1 text-slate-700">{r.status}</td>
+                      <td className="py-1 pr-1 text-right text-slate-700 tabular-nums">{r.amount}</td>
+                      <td className="py-1 pr-1 text-right text-emerald-600">✓</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="text-[10px] text-rose-600 mt-2 font-mono">
+                ⚠ 변경 1% 인데 100% 복사 · 1억 row면 1시간 · 24h 지연
+              </div>
+            </div>
+          )}
+
+          {/* Step 2: Log-based — WAL 이벤트 라인 */}
+          {step.focus === 'log_based' && (
+            <div className="border-2 border-teal-300 rounded-lg p-3 bg-slate-900">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs font-bold text-teal-300">📜 WAL stream (logical decoding)</div>
+                <span className="text-[10px] text-slate-400 font-mono">slot: debezium_slot</span>
+              </div>
+              <div className="space-y-1 font-mono text-[11px]">
+                {step.events.map((e, i) => {
+                  const s = OP_STYLE[e.op];
+                  return (
+                    <div
+                      key={i}
+                      className={`px-2 py-1 rounded border ${s.bg} ${s.border} flex items-center gap-2`}
+                    >
+                      <span className="text-slate-500 text-[10px] w-20">LSN {e.lsn}</span>
+                      <span className={`${s.color} font-bold w-14`}>{e.op}</span>
+                      <span className="text-slate-700">{e.table}</span>
+                      <span className="text-slate-500">pk={e.pk}</span>
+                      <span className="text-slate-600 ml-auto">{e.detail}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="text-[10px] text-emerald-300 mt-2 font-mono">
+                ✓ row 단위 stream · SELECT 부하 0 · 실시간
+              </div>
+            </div>
+          )}
+
+          {/* Step 3: Debezium — connector + Kafka topic 흐름 */}
+          {step.focus === 'debezium' && (
+            <div className="space-y-2">
+              {/* WAL → Debezium */}
+              <div className="border-2 border-teal-300 rounded-lg p-3 bg-slate-900">
+                <div className="text-xs font-bold text-teal-300 mb-1.5">📜 WAL events</div>
+                <div className="space-y-1 font-mono text-[11px]">
+                  {step.events.map((e, i) => {
+                    const s = OP_STYLE[e.op];
+                    return (
+                      <div key={i} className={`px-2 py-0.5 rounded border ${s.bg} ${s.border} flex items-center gap-2`}>
+                        <span className={`${s.color} font-bold w-14`}>{e.op}</span>
+                        <span className="text-slate-700">{e.table}#{e.pk}</span>
+                        <span className="text-slate-500 ml-auto">{e.detail}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* 화살표 */}
+              <div className="text-center text-teal-500 text-lg leading-none">↓ Debezium connector ↓</div>
+
+              {/* Kafka topic */}
+              <div className="border-2 border-teal-400 rounded-lg p-3 bg-teal-50/60">
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="text-xs font-bold text-teal-700">📨 Kafka topic 발행</div>
+                  <span className="text-[10px] text-slate-500 font-mono">topic.prefix: shop</span>
+                </div>
+                <div className="space-y-1 font-mono text-[11px]">
+                  {step.topicMessages.map((m, i) => {
+                    const s = TOPIC_OP_STYLE[m.op];
+                    return (
+                      <div key={i} className={`px-2 py-1 rounded border bg-white ${s.border} flex items-center gap-2`}>
+                        <span className="text-slate-400 text-[10px] w-16">{m.ts}</span>
+                        <span className={`${s.color} font-bold text-[10px] uppercase w-12`}>{s.label}</span>
+                        <span className="text-slate-700 truncate">{m.topic}</span>
+                        <span className="text-slate-500 ml-auto">pk={m.pk}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="text-[10px] text-teal-700 mt-2 font-mono">
+                  ✓ before / after / op envelope 으로 정규화
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Step 4: Use Cases — 4 use case 표 */}
+          {step.focus === 'use_cases' && (
+            <div className="space-y-3">
+              {/* 압축된 파이프라인 표시 */}
+              <div className="border border-teal-300 rounded-lg p-2 bg-teal-50/40 text-center text-[11px] font-mono text-teal-800">
+                shop.public.orders · pk=2 · update (paid → shipped)
+              </div>
+
+              {/* fan-out 표시 */}
+              <div className="text-center text-teal-500 text-lg leading-none">↓ fan-out ↓</div>
+
+              {/* 4 use case 카드 */}
+              <div className="grid grid-cols-2 gap-2">
+                {USE_CASES.map((u) => (
+                  <div
+                    key={u.name}
+                    className={`rounded-lg border-2 p-2.5 ${USE_CASE_STYLE[u.color]}`}
+                  >
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <span aria-hidden="true">{u.emoji}</span>
+                      <span className="text-xs font-bold">{u.name}</span>
+                    </div>
+                    <div className="text-[10px] font-mono opacity-80">{u.detail}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md p-2 font-mono">
+                ⚠ at-least-once 전달 → consumer는 <strong className="text-rose-700">idempotent</strong> 처리 필수
+                (UPSERT BY pk, dedupe by lsn)
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-4 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-teal-400"></span>활성 stage</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-emerald-400"></span>INSERT (c)</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-amber-400"></span>UPDATE (u)</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-rose-400"></span>DELETE (d)</span>
           </div>
         </div>
       );
     }
 
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      useEffect(() => {
+        if (!codeRef.current || !window.hljs) return;
+        const html = codeRef.current.innerHTML;
+        setRenderedLines(html.split('\n'));
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[28rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${highlighted ? 'bg-teal-500/10 border-l-2 border-teal-400' : ''}`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
 
       const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
       };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
-        setIsPlaying((p) => !p);
-      };
-
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
-
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">CDC (Change Data Capture)</h1>
-                <p className="text-sm text-slate-500 mt-1">실시간 복사기 — 운영 DB 변경분만 즉시 다른 시스템으로 전파</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-teal-700 hover:text-teal-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum I-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-teal-600 text-white flex items-center justify-center rounded-full font-bold text-sm">I</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part I. 데이터 파이프라인 기초 &gt; Chapter 2. 적재 패턴</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">CDC (Change Data Capture)</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">실시간 복사기 — 운영 DB 변경분만 즉시 다른 시스템으로 전파</p>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <CDCCards focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
-              </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
-            </div>
-
-            {step.focus === 'use_cases' && (
-              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
-                💡 다음(II-1-1)에서는 Data Warehouse 본격 개론
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 text-sm text-teal-900">
+                💡 Part I 완성. 다음(II-1-1)에서는 <strong>Data Warehouse</strong>
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
-              </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-teal-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-teal-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-teal-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-teal-600 text-white hover:bg-teal-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./I-2-1.html" className="text-slate-500 hover:text-slate-700">&larr; I-2-1 ETL vs ELT</a>
+              <a href="../part2/II-1-1.html" className="text-teal-700 hover:text-teal-900 font-medium">II-1-1 Data Warehouse &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
