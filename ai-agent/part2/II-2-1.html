@@ -9,146 +9,693 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    II-2-1. 프롬프트의 구조 — System / User / Assistant 메시지
+    학습 목표: messages 배열이 어떻게 누적되는지 5단계로 이해한다.
+              단일 메시지 → System 페르소나 → 대화 이력 → Few-shot → 모범 프롬프트.
+    핵심 비유: 연극 대본 — System(무대 설정) + User(관객 질문) + Assistant(배우 대사)
+    패턴: fastapi v1 — 좌(LiveDataPane: 메시지 스택 시각화) / 우(VSCode CodeViewer)
+    색상: ai-agent amber
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    const CODE_LINES = [
-      'messages = [',
-      '  {',
-      '    "role": "system",',
-      '    "content": "너는 친절한 요리사야."',
-      '  },',
-      '  {',
-      '    "role": "user",',
-      '    "content": "파스타 만드는 법"',
-      '  },',
-      '  {',
-      '    "role": "assistant",',
-      '    "content": "먼저 물을 끓이고..."',
-      '  },',
-      '  {',
-      '    "role": "user",',
-      '    "content": "소스는 어떻게?"',
-      '  }',
-      ']',
-    ];
-
-    const STEPS = [
-      { desc: "[연극 대본] 프롬프트는 연극 대본과 같습니다. System = 무대 설정, User = 관객의 질문, Assistant = 배우의 대사. 이 세 가지가 messages 배열로 API에 전달됩니다.", highlightLines: [], activeRole: null },
-      { desc: "[System 메시지] 무대 설정입니다. \"너는 친절한 요리사야\" — 관객(유저)은 안 보지만, 배우(LLM)의 연기 방향을 정합니다. 페르소나, 규칙, 제약조건을 여기에 넣습니다.", highlightLines: [1, 2, 3, 4], activeRole: 'system' },
-      { desc: "[User 메시지] 관객의 질문입니다. \"파스타 만드는 법\" — 사용자가 LLM에게 보내는 메시지입니다.", highlightLines: [5, 6, 7, 8], activeRole: 'user' },
-      { desc: "[Assistant 메시지] 배우의 대사입니다. \"먼저 물을 끓이고...\" — LLM이 생성한 응답입니다. 대화가 이어지면 User/Assistant가 번갈아 쌓입니다.", highlightLines: [9, 10, 11, 12], activeRole: 'assistant' },
-      { desc: "[전체 구조] 대화가 이어지면 messages 배열에 User→Assistant→User→... 가 계속 추가됩니다. 이 전체 배열이 매 호출마다 LLM에 전달됩니다.", highlightLines: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], activeRole: 'all' },
-    ];
-
-    const ROLES = {
-      system:    { icon: '🎭', label: 'System', color: 'violet', desc: '무대 설정 (페르소나, 규칙)' },
-      user:      { icon: '👤', label: 'User', color: 'sky', desc: '관객의 질문 (사용자 입력)' },
-      assistant: { icon: '🤖', label: 'Assistant', color: 'emerald', desc: '배우의 대사 (LLM 응답)' },
+    // ─────────────────────────────────────────────────────
+    // role별 색상/아이콘/라벨 — 모든 시각화에서 재사용
+    // ─────────────────────────────────────────────────────
+    const ROLE_META = {
+      system: {
+        icon: '🎭',
+        label: 'system',
+        bg: 'bg-violet-50',
+        border: 'border-violet-300',
+        ring: 'ring-violet-400',
+        text: 'text-violet-900',
+        badge: 'bg-violet-600',
+        badgeText: 'text-violet-100',
+        desc: '무대 설정 (페르소나·규칙·제약)',
+      },
+      user: {
+        icon: '👤',
+        label: 'user',
+        bg: 'bg-sky-50',
+        border: 'border-sky-300',
+        ring: 'ring-sky-400',
+        text: 'text-sky-900',
+        badge: 'bg-sky-600',
+        badgeText: 'text-sky-100',
+        desc: '관객의 질문 (사용자 입력)',
+      },
+      assistant: {
+        icon: '🤖',
+        label: 'assistant',
+        bg: 'bg-emerald-50',
+        border: 'border-emerald-300',
+        ring: 'ring-emerald-400',
+        text: 'text-emerald-900',
+        badge: 'bg-emerald-600',
+        badgeText: 'text-emerald-100',
+        desc: '배우의 대사 (LLM 응답)',
+      },
     };
 
-    const KEYWORDS_SET = new Set(['messages', '"role"', '"content"', '"system"', '"user"', '"assistant"']);
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   messages : 현재까지 누적된 messages 배열
+    //              [{ role, content, isNew, tag }]
+    //   tag      : 메시지 위에 붙는 보조 라벨 (Few-shot 표시용)
+    //   note     : LiveDataPane 우상단 메모 (옵션)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 단일 메시지 — 가장 단순한 호출',
+        desc: '제일 기본은 user 한 줄. messages 배열에 {role: "user", content: "..."} 객체 하나만 넣으면 LLM은 그 메시지에 대한 응답을 만든다. 페르소나도 이력도 없는 "맨몸" 호출.',
+        messages: [
+          { role: 'user', content: '파스타 만드는 법 알려줘', isNew: true },
+        ],
+        note: '메시지 1개 — 이력 없음',
+        code: {
+          lang: 'python',
+          filename: 'single-msg.py',
+          lines: [
+            '# Step 1. 가장 단순한 호출 — user 메시지 1개',
+            '# (모든 LLM 호출의 출발점. 여기서부터 점점 쌓아간다.)',
+            'from openai import OpenAI',
+            '',
+            'client = OpenAI()  # OPENAI_API_KEY 환경변수 자동 로드',
+            '',
+            '# messages 배열에 user 1개만 넣음',
+            '# role은 system / user / assistant 셋 중 하나',
+            'response = client.chat.completions.create(',
+            '    model="gpt-4o-mini",',
+            '    messages=[',
+            '        {"role": "user", "content": "파스타 만드는 법 알려줘"},',
+            '    ],',
+            ')',
+            '',
+            '# 응답 객체에서 텍스트만 꺼내기',
+            'answer = response.choices[0].message.content',
+            'print(answer)',
+            '# → "파스타를 만들려면 먼저 물을 끓이고..."',
+            '',
+            '# 한계 (다음 step에서 하나씩 해결):',
+            '#   1) 응답 톤이 매번 다르다  → Step 2: system 메시지',
+            '#   2) 이전 대화 기억 못 함   → Step 3: 이력 누적',
+            '#   3) 출력 형식이 제멋대로  → Step 4: few-shot',
+            '#   4) 모호한 지시            → Step 5: 4 원칙',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14],
+        },
+      },
+      {
+        title: 'Step 2. System 메시지 추가 — Agent 페르소나 부여',
+        desc: 'messages 맨 앞에 system 메시지를 넣어 LLM의 역할/규칙/말투를 지정한다. user는 system을 못 보지만 LLM의 모든 응답이 그 설정을 따른다. Agent 설계의 출발점.',
+        messages: [
+          { role: 'system', content: '너는 20년 경력의 이탈리안 셰프다. 항상 친절하게 단계별로 설명한다.', isNew: true },
+          { role: 'user', content: '파스타 만드는 법 알려줘', isNew: false },
+        ],
+        note: 'system 추가 — 페르소나 1개',
+        code: {
+          lang: 'python',
+          filename: 'system-msg.py',
+          lines: [
+            '# Step 2. system 메시지로 페르소나 / 규칙 부여',
+            '# (Agent 설계의 출발점 — system이 곧 Agent의 정체성)',
+            'from openai import OpenAI',
+            '',
+            'client = OpenAI()',
+            '',
+            '# system이 맨 앞 — 무대 설정',
+            '# user는 system 내용을 보지 못한다 (오직 LLM에게만 보임)',
+            'response = client.chat.completions.create(',
+            '    model="gpt-4o-mini",',
+            '    messages=[',
+            '        {',
+            '            "role": "system",',
+            '            "content": (',
+            '                "너는 20년 경력의 이탈리안 셰프다. "',
+            '                "항상 친절하게 단계별로 설명한다."',
+            '            ),',
+            '        },',
+            '        {"role": "user", "content": "파스타 만드는 법 알려줘"},',
+            '    ],',
+            ')',
+            '',
+            '# 결과 톤이 달라진다:',
+            '# → "Buongiorno! 파스타는 이탈리아의 영혼입니다.',
+            '#    먼저 큰 냄비에 물을 넉넉히 받고..."',
+            '',
+            '# system에 들어가는 것 (3 카테고리):',
+            '#   1) 페르소나 — 직업, 말투, 전문 분야',
+            '#      예: "너는 시니어 데이터 사이언티스트다"',
+            '#   2) 규칙   — 해야 할 일 / 하지 말아야 할 일',
+            '#      예: "코드는 반드시 Python 3.11 + 타입힌트"',
+            '#      예: "외부 라이브러리 추천 금지"',
+            '#   3) 포맷   — 출력 구조',
+            '#      예: "JSON으로 {answer, confidence} 반환"',
+            '',
+            '# 주의사항:',
+            '#   - system은 강제력이 100%는 아니다 (LLM이 무시할 수도)',
+            '#   - 너무 길면 토큰 비용 ↑ → 핵심만 간결하게',
+            '#   - 모델별 system 처리 방식이 다름 (Claude vs GPT)',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 17, 18, 19],
+        },
+      },
+      {
+        title: 'Step 3. 대화 이력 — Assistant 응답을 다시 누적',
+        desc: 'LLM은 stateless다. 매 호출마다 messages 배열 전체를 다시 보낸다. 직전 assistant 응답을 배열에 추가한 뒤 새 user 질문을 붙이면 LLM이 "이전 대화"를 기억한 것처럼 답한다. 이게 멀티턴(multi-turn) 채팅의 본질.',
+        messages: [
+          { role: 'system', content: '너는 20년 경력의 이탈리안 셰프다. 항상 친절하게 단계별로 설명한다.', isNew: false },
+          { role: 'user', content: '파스타 만드는 법 알려줘', isNew: false },
+          { role: 'assistant', content: '먼저 큰 냄비에 물을 받고 소금을 넣어 끓입니다. 면을 넣고 8분간 삶아주세요.', isNew: true },
+          { role: 'user', content: '소스는 어떻게 만들어?', isNew: true },
+        ],
+        note: '4 메시지 — 멀티턴',
+        code: {
+          lang: 'python',
+          filename: 'multi-turn.py',
+          lines: [
+            '# Step 3. 대화 이력을 messages에 계속 누적',
+            'from openai import OpenAI',
+            '',
+            'client = OpenAI()',
+            '',
+            '# 직전 응답까지 모두 배열에 다시 넣어 보낸다',
+            'messages = [',
+            '    {"role": "system", "content": "너는 20년 경력의 이탈리안 셰프다."},',
+            '    {"role": "user",   "content": "파스타 만드는 법 알려줘"},',
+            '    {"role": "assistant",',
+            '     "content": "먼저 큰 냄비에 물을 받고 소금을 넣어 끓입니다..."},',
+            '    {"role": "user",   "content": "소스는 어떻게 만들어?"},',
+            ']',
+            '',
+            'response = client.chat.completions.create(',
+            '    model="gpt-4o-mini",',
+            '    messages=messages,',
+            ')',
+            '',
+            '# LLM은 "소스" 질문이 파스타 맥락이라는 걸 이력으로 안다',
+            '# → "방금 삶은 면에는 토마토 소스가 잘 어울립니다..."',
+            '',
+            '# 핵심:',
+            '#   - LLM 자체에는 메모리 없음 (stateless)',
+            '#   - 컨텍스트 윈도우 = "기억"의 전부',
+            '#   - 이력이 길어지면 토큰 비용 ↑ → 요약/잘라내기 필요',
+            '',
+            '# 다음 turn 때는 이번 응답도 messages.append() 해서 보낸다',
+            'messages.append({"role": "assistant", "content": response.choices[0].message.content})',
+            '',
+            '# 실무 패턴 — 이력 관리 전략:',
+            '#   1) 슬라이딩 윈도우: 최근 N턴만 유지',
+            '#      messages = messages[-10:]  # 최근 10개만',
+            '#   2) 요약 압축: 오래된 대화는 LLM으로 1줄 요약',
+            '#   3) RAG: 이력을 벡터 DB에 넣고 관련 부분만 회수',
+            '',
+            '# system은 항상 맨 앞에 유지',
+            '# (system을 잘라내면 페르소나가 사라짐)',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 13, 28, 29],
+        },
+      },
+      {
+        title: 'Step 4. Few-shot — 예시를 미리 제공해 답 형식 학습',
+        desc: 'system + user/assistant 짝(예시)을 미리 messages에 넣어두면 LLM이 그 패턴을 따라 답한다. "이런 질문엔 이런 형식으로 답해줘"를 코드 한 줄 없이 가르치는 In-context Learning. JSON 출력, 분류 라벨, 말투 통일에 강하다.',
+        messages: [
+          { role: 'system', content: '사용자 리뷰의 감정을 positive / negative / neutral 한 단어로 분류해라.', isNew: false },
+          { role: 'user', content: '배송도 빠르고 품질 좋아요!', isNew: false, tag: '예시 1' },
+          { role: 'assistant', content: 'positive', isNew: false, tag: '예시 1' },
+          { role: 'user', content: '한 시간을 기다렸는데 식어서 왔습니다.', isNew: false, tag: '예시 2' },
+          { role: 'assistant', content: 'negative', isNew: false, tag: '예시 2' },
+          { role: 'user', content: '평범했어요. 다음에 또 살지는 모르겠네요.', isNew: true, tag: '실제 질문' },
+        ],
+        note: '예시 2쌍 + 실제 1개',
+        code: {
+          lang: 'python',
+          filename: 'few-shot.py',
+          lines: [
+            '# Step 4. Few-shot — user/assistant 쌍을 예시로 미리 넣음',
+            'from openai import OpenAI',
+            '',
+            'client = OpenAI()',
+            '',
+            'response = client.chat.completions.create(',
+            '    model="gpt-4o-mini",',
+            '    messages=[',
+            '        # 1) system: 작업 정의',
+            '        {',
+            '            "role": "system",',
+            '            "content": (',
+            '                "사용자 리뷰의 감정을 "',
+            '                "positive / negative / neutral 한 단어로 분류해라."',
+            '            ),',
+            '        },',
+            '        # 2) 예시 1 — user/assistant 쌍',
+            '        {"role": "user",      "content": "배송도 빠르고 품질 좋아요!"},',
+            '        {"role": "assistant", "content": "positive"},',
+            '',
+            '        # 3) 예시 2 — user/assistant 쌍',
+            '        {"role": "user",      "content": "한 시간을 기다렸는데 식어서 왔습니다."},',
+            '        {"role": "assistant", "content": "negative"},',
+            '',
+            '        # 4) 실제 질문',
+            '        {"role": "user",      "content": "평범했어요. 다음에 또 살지는 모르겠네요."},',
+            '    ],',
+            ')',
+            '',
+            'print(response.choices[0].message.content)',
+            '# → "neutral"   (정확히 한 단어, 예시 형식 그대로)',
+            '',
+            '# Few-shot의 강점:',
+            '#   - 학습/파인튜닝 없이 출력 형식 강제',
+            '#   - 2~5개 예시면 충분 (많을수록 토큰 ↑)',
+            '#   - JSON 출력, 분류, 변환, 말투 통일에 효과적',
+            '',
+            '# 약점:',
+            '#   - 예시가 편향되면 실수가 그대로 학습됨',
+            '#   - 예시 개수만큼 매 호출 토큰 추가',
+            '',
+            '# 예시 선정 팁:',
+            '#   1) 다양성 — 비슷한 예시만 모으면 일반화 실패',
+            '#   2) edge case 1개 — neutral 같은 애매한 케이스 포함',
+            '#   3) 순서 — 마지막 예시의 영향력이 가장 크다',
+            '#      (recency bias)',
+            '',
+            '# Zero-shot vs Few-shot:',
+            '#   - Zero-shot = 예시 없음, 지시만',
+            '#   - One-shot  = 예시 1개',
+            '#   - Few-shot  = 예시 2~5개',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 16, 18, 19, 22, 23, 26, 27, 32],
+        },
+      },
+      {
+        title: 'Step 5. 모범 프롬프트 — 명시성 · 제약 · 예시 · 포맷',
+        desc: '실무 프롬프트는 4 원칙을 모두 담는다. (1) 페르소나/역할 명시 (2) 하지 말 것 / 해야 할 것 제약 (3) Few-shot 예시 1~3개 (4) 출력 포맷(JSON/마크다운). 길지만 결과 품질이 압도적으로 좋아진다. 이게 Agent 설계의 토대.',
+        messages: [
+          { role: 'system', content: '[페르소나] 너는 시니어 백엔드 개발자다.\n[규칙] 코드는 반드시 Python 3.11 + 타입힌트.\n[금지] 외부 라이브러리 추천 금지 (표준 라이브러리만).\n[포맷] JSON으로 {explanation, code} 반환.', isNew: true },
+          { role: 'user', content: '리스트에서 중복 제거하고 순서 유지', isNew: false, tag: '예시' },
+          { role: 'assistant', content: '{"explanation": "dict.fromkeys 활용", "code": "list(dict.fromkeys(items))"}', isNew: false, tag: '예시' },
+          { role: 'user', content: '두 dict를 깊은 병합', isNew: true, tag: '실제' },
+        ],
+        note: '4 원칙 모두 적용',
+        code: {
+          lang: 'markdown',
+          filename: 'best-practice.md',
+          lines: [
+            '# 모범 프롬프트 4 원칙 — Agent 설계의 토대',
+            '',
+            '## 1. 명시성 (Specificity)',
+            '- ❌ "코드 잘 짜줘"',
+            '- ✅ "Python 3.11, 타입힌트 필수, 표준 라이브러리만 사용"',
+            '- 페르소나·언어·버전·환경을 모두 명시',
+            '',
+            '## 2. 제약 (Constraints)',
+            '- 해야 할 것 / 하지 말아야 할 것을 명확히 분리',
+            '- "외부 라이브러리 추천 금지" 같은 negative constraint',
+            '- 길이 제한, 안전 가드(개인정보 마스킹 등)',
+            '',
+            '## 3. 예시 (Few-shot)',
+            '- user/assistant 쌍 1~3개로 출력 포맷 시연',
+            '- 분류·변환·JSON 출력에 가장 효과 큼',
+            '- 예시는 짧고 다양하게 (edge case 1개 포함)',
+            '',
+            '## 4. 포맷 (Format)',
+            '- 출력 구조를 명시: JSON / 마크다운 / 표 / Plain text',
+            '- JSON이면 키 이름까지 system에 적기',
+            '- "코드만 출력, 설명 금지" 같은 형식 강제도 포맷',
+            '',
+            '---',
+            '',
+            '## 종합 템플릿',
+            '',
+            '```',
+            'system = """',
+            '[페르소나] 너는 ...',
+            '[규칙]    반드시 ...',
+            '[금지]    절대 ...',
+            '[포맷]    JSON {key1, key2}',
+            '"""',
+            '',
+            'messages = [',
+            '    {"role": "system",    "content": system},',
+            '    # few-shot 1~3쌍',
+            '    {"role": "user",      "content": example_q1},',
+            '    {"role": "assistant", "content": example_a1},',
+            '    # 실제 질문',
+            '    {"role": "user",      "content": real_question},',
+            ']',
+            '```',
+            '',
+            '## 자주 하는 실수',
+            '- ❌ system에 모든 걸 다 욱여넣기 → 토큰 낭비, 우선순위 모호',
+            '- ❌ 예시를 5개 이상 → 비용은 늘고 효과는 정체',
+            '- ❌ JSON 포맷만 말로 시키고 예시 없음 → 깨진 JSON 자주 옴',
+            '- ❌ "최선을 다해줘" 같은 추상 지시 → 측정 불가',
+            '',
+            '## 다음 단계',
+            '- II-2-2 API 호출 기본: temperature, max_tokens 등 호출 파라미터',
+            '- III-x Tool Calling: 프롬프트로 LLM이 함수를 호출하게 만들기',
+            '- IV-x Agent 패턴: ReAct, Plan-and-Execute, Reflexion',
+          ],
+          highlight: [3, 4, 5, 8, 9, 10, 13, 14, 15, 18, 19, 20, 28, 29, 30, 31],
+        },
+      },
+    ];
 
-    function App() {
-      const [currentStepIdx, setCurrentStepIdx] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playIntervalRef = useRef(null);
-      const stepData = STEPS[currentStepIdx];
-      const isEnd = currentStepIdx === STEPS.length - 1;
-
-      const handleNext = () => { setCurrentStepIdx(prev => { if (prev < STEPS.length - 1) return prev + 1; setIsPlaying(false); return prev; }); };
-      const handleNextRef = useRef(handleNext); handleNextRef.current = handleNext;
-      const handlePrev = () => { if (currentStepIdx > 0) { setCurrentStepIdx(prev => prev - 1); setIsPlaying(false); } };
-      const handlePrevRef = useRef(handlePrev); handlePrevRef.current = handlePrev;
-      const togglePlay = () => { if (isEnd) setCurrentStepIdx(0); setIsPlaying(prev => !prev); };
-
-      useEffect(() => { if (isPlaying) { playIntervalRef.current = setInterval(() => handleNextRef.current(), 3000); } else { clearInterval(playIntervalRef.current); } return () => clearInterval(playIntervalRef.current); }, [isPlaying]);
-      useEffect(() => { const onKey = (e) => { if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); } if (e.key === 'ArrowLeft') { e.preventDefault(); handlePrevRef.current(); } }; window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []);
+    // ─────────────────────────────────────────────────────
+    // 메시지 카드 — 좌측 LiveDataPane이 사용
+    // ─────────────────────────────────────────────────────
+    function MessageCard({ msg, idx }) {
+      const meta = ROLE_META[msg.role];
+      const isNew = msg.isNew;
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm"><a href="../index.html" className="inline-flex items-center gap-1 text-sky-700 hover:text-sky-900 font-medium"><span>&larr;</span> 허브로 돌아가기</a></nav>
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part II. LLM 기초 &gt; Chapter 2. 프롬프트 엔지니어링</div>
-                  <h1 className="text-2xl font-bold text-slate-800">II-2-1. 프롬프트의 구조</h1>
-                </div>
-              </div>
-              <p className="text-slate-600"><b>연극 대본</b>처럼 System(무대 설정) + User(관객 질문) + Assistant(배우 대사)로 구성됩니다.</p>
-            </header>
-
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-sky-700 border-sky-800 text-white">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">System / User / Assistant</h3>
-                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;로 단계 이동</span>
-              </div>
-              <p className="text-lg font-medium leading-relaxed">{stepData.desc}</p>
-            </div>
-
-            {/* 좌우 분할: 역할 카드 + 코드 */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* 왼쪽: 역할 카드 */}
-              <div className="space-y-3">
-                {Object.entries(ROLES).map(([key, role]) => {
-                  const isActive = stepData.activeRole === key || stepData.activeRole === 'all';
-                  const colorMap = { violet: { bg: 'bg-violet-50', border: 'border-violet-300', text: 'text-violet-700' }, sky: { bg: 'bg-sky-50', border: 'border-sky-300', text: 'text-sky-700' }, emerald: { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-700' } };
-                  const c = colorMap[role.color];
-                  return (
-                    <div key={key} className={`p-4 rounded-xl border-2 transition-all duration-500 ${isActive ? `${c.bg} ${c.border} scale-105 shadow-md` : 'border-slate-100 bg-white opacity-40'}`}>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-2xl">{role.icon}</span>
-                        <span className={`font-bold ${isActive ? c.text : 'text-slate-400'}`}>{role.label}</span>
-                      </div>
-                      <p className="text-sm text-slate-600">{role.desc}</p>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* 오른쪽: 코드 */}
-              <div className="bg-slate-900 rounded-xl p-4 overflow-x-auto">
-                <div className="text-xs text-slate-500 mb-2 font-mono">messages 배열 (JSON)</div>
-                {CODE_LINES.map((line, i) => {
-                  const isHighlighted = stepData.highlightLines.includes(i);
-                  return (
-                    <div key={i} className={`font-mono text-sm px-2 py-0.5 rounded transition-all duration-300 ${isHighlighted ? 'bg-sky-900 bg-opacity-50' : ''}`}>
-                      <span className="text-slate-600 mr-3 select-none w-5 inline-block text-right">{i + 1}</span>
-                      <span className={isHighlighted ? 'text-sky-300' : 'text-slate-400'}>{line}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {['System message', 'User message', 'Assistant message', 'messages 배열'].map(kw => (
-                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-sm font-medium border border-sky-200">{kw}</span>
-              ))}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={handlePrev} disabled={currentStepIdx === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg></button>
-                <button onClick={togglePlay} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-sky-600 hover:bg-sky-700">{isPlaying ? <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</> : <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>}</button>
-                <button onClick={handleNext} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {currentStepIdx + 1} / {STEPS.length}</div>
-            </div>
-
-            <div className="text-sm text-slate-500 flex justify-between">
-              <a href="./II-1-2.html" className="text-sky-600 hover:text-sky-800 font-medium">← II-1-2. 토큰과 컨텍스트 윈도우</a>
-              <a href="./II-2-2.html" className="text-sky-600 hover:text-sky-800 font-medium">II-2-2. API 호출 기본 →</a>
-            </div>
+        <div
+          className={[
+            'rounded-lg border-2 p-3 transition-all duration-700',
+            meta.bg,
+            meta.border,
+            isNew ? `ring-2 ${meta.ring} ring-offset-2 shadow-md scale-[1.02]` : 'opacity-95',
+          ].join(' ')}
+        >
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-base leading-none">{meta.icon}</span>
+            <span className={`text-[10px] font-mono font-bold uppercase tracking-wider px-2 py-0.5 rounded ${meta.badge} ${meta.badgeText}`}>
+              {meta.label}
+            </span>
+            {msg.tag && (
+              <span className="text-[10px] font-mono text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">
+                {msg.tag}
+              </span>
+            )}
+            {isNew && (
+              <span className="ml-auto text-[10px] font-mono font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-300 animate-pulse">
+                NEW
+              </span>
+            )}
+            {!isNew && (
+              <span className="ml-auto text-[10px] font-mono text-slate-400">#{idx}</span>
+            )}
+          </div>
+          <div className={`text-xs leading-relaxed font-medium whitespace-pre-line ${meta.text}`}>
+            {msg.content}
           </div>
         </div>
       );
     }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — messages 배열 시각화 (스택)
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step, stepIdx }) {
+      const counts = step.messages.reduce(
+        (acc, m) => {
+          acc[m.role] = (acc[m.role] || 0) + 1;
+          return acc;
+        },
+        { system: 0, user: 0, assistant: 0 }
+      );
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700 flex items-center gap-1.5">
+              <span>🎬</span>
+              <span>messages 배열 — 연극 대본 누적</span>
+            </h2>
+            <span className="text-[10px] text-slate-400 font-mono">{step.note}</span>
+          </div>
+
+          {/* 역할별 카운트 — 상단 */}
+          <div className="flex items-center gap-2 mb-3 text-[10px] font-mono">
+            {Object.entries(ROLE_META).map(([role, meta]) => (
+              <span
+                key={role}
+                className={[
+                  'flex items-center gap-1 px-2 py-0.5 rounded border',
+                  counts[role] > 0 ? `${meta.badge} ${meta.badgeText} border-transparent` : 'bg-slate-50 text-slate-400 border-slate-200',
+                ].join(' ')}
+              >
+                <span>{meta.icon}</span>
+                <span>{meta.label}</span>
+                <span className="font-bold">{counts[role]}</span>
+              </span>
+            ))}
+            <span className="ml-auto text-slate-500">
+              total {step.messages.length}
+            </span>
+          </div>
+
+          {/* 메시지 스택 */}
+          <div className="space-y-2 max-h-[28rem] overflow-y-auto pr-1">
+            {step.messages.map((msg, i) => (
+              <MessageCard key={`${stepIdx}-${i}`} msg={msg} idx={i} />
+            ))}
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-3 pt-3 border-t border-slate-100 text-slate-500">
+            {Object.entries(ROLE_META).map(([role, meta]) => (
+              <span key={role} className="flex items-center gap-1">
+                <span className={`w-2.5 h-2.5 rounded-full ${meta.badge}`}></span>
+                <span>{meta.icon} {meta.label} — {meta.desc}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-amber-500/15 border-l-2 border-amber-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-amber-700 hover:text-amber-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-2-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-amber-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. LLM 기초 &gt; Chapter 2. 프롬프트 엔지니어링</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">II-2-1. 프롬프트의 구조</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">연극 대본 — System(무대) + User(질문) + Assistant(응답)</p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-3 text-sm text-amber-900">
+                💡 다음(II-2-2)에서는 <strong>API 호출 파라미터</strong>(temperature, max_tokens, top_p 등)로 응답을 더 정교하게 제어하는 법을 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-amber-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-amber-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-amber-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-amber-600 text-white hover:bg-amber-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 칩 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['system message', 'user message', 'assistant message', 'multi-turn', 'few-shot', '4 원칙'].map((kw) => (
+                <span key={kw} className="bg-amber-50 text-amber-800 px-3 py-1 rounded-full text-xs font-medium border border-amber-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-1-2.html" className="text-slate-500 hover:text-slate-700">&larr; II-1-2 토큰과 컨텍스트 윈도우</a>
+              <a href="./II-2-2.html" className="text-amber-700 hover:text-amber-900 font-medium">II-2-2 API 호출 기본 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>

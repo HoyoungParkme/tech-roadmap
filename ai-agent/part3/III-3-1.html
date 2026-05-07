@@ -3,133 +3,837 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AI Agent 학습 — III-3-1. Tool Use란</title>
+  <title>AI Agent 학습 — III-3-1. Tool Use란 (Function Calling)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    III-3-1. Tool Use란 (외부 함수/API 호출 — Function Calling)
+    학습 목표: LLM이 직접 함수를 실행하지 못한다는 사실 → JSON tool_call로 "이 함수를
+              이 인자로 호출해줘"라고 요청하면 우리 코드가 실행하고 결과를 다시
+              LLM에게 돌려주는 5단계 흐름을 이해한다.
+    핵심 비유: 사무실 직원 — 머리(LLM)는 결정만, 손(코드)이 실제 도구 실행
+    패턴: fastapi v1 — 좌(LiveDataPane: LLM ↔ Registry ↔ 함수 흐름) / 우(VSCode CodeViewer)
+    색상: ai-agent amber
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    const TOOLS = [
-      { id: 'search', icon: '🔍', name: '검색', desc: '웹에서 정보를 찾는다' },
-      { id: 'calc', icon: '🧮', name: '계산기', desc: '수학 계산을 한다' },
-      { id: 'email', icon: '📧', name: '이메일', desc: '이메일을 보낸다' },
-      { id: 'calendar', icon: '📅', name: '캘린더', desc: '일정을 추가한다' },
+    // ─────────────────────────────────────────────────────
+    // Tool Registry — 등록된 도구 목록
+    //   id, icon, name, desc, params(파라미터 schema 요약)
+    // ─────────────────────────────────────────────────────
+    const TOOL_REGISTRY = [
+      { id: 'calculator', icon: '🧮', name: 'calculator', desc: '사칙연산 계산', params: ['expression: string'] },
+      { id: 'web_search', icon: '🔍', name: 'web_search', desc: '웹 검색',       params: ['query: string', 'top_k: int'] },
+      { id: 'db_query',   icon: '🗄️', name: 'db_query',   desc: 'DB 조회',       params: ['sql: string'] },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   phase           : 'define' | 'pass' | 'call' | 'return' | 'multi'
+    //   userQuery       : 사용자 질문
+    //   activeTools     : Registry에서 활성화된 도구 id 목록
+    //   selectedToolId  : LLM이 호출하기로 선택한 도구
+    //   toolCallJson    : LLM이 응답한 tool_call JSON (파라미터 포함)
+    //   toolResult      : 함수 실행 결과
+    //   finalAnswer     : 최종 LLM 답
+    //   flowActive      : 흐름 화살표 활성 단계 [llm→registry, registry→exec, exec→llm]
+    //   llmState        : 'idle' | 'thinking' | 'calling' | 'answering'
+    //   multiCalls      : Step 5 — 여러 도구 동시 호출 [{tool, args, result}]
+    // ─────────────────────────────────────────────────────
     const STEPS = [
-      { desc: "[사무실 직원] 사무실 직원이 계산기, 검색엔진, 이메일, 캘린더를 사용하듯이 — LLM도 도구를 골라서 사용합니다. 이것이 Tool Use (= Function Calling)입니다.", phase: 'intro', selectedTool: null, flowStep: -1 },
-      { desc: "[1. 도구 목록 확인] LLM은 사용 가능한 도구 목록을 받습니다. 각 도구의 이름, 설명, 필요한 파라미터가 적혀 있습니다. 사용 설명서와 같습니다.", phase: 'list', selectedTool: null, flowStep: 0 },
-      { desc: "[2. 도구 선택] \"매출 합계를 구해야 하니까 계산기를 쓰자\" — LLM이 상황에 맞는 도구를 골라서, 올바른 파라미터와 함께 호출을 요청합니다.", phase: 'select', selectedTool: 'calc', flowStep: 1 },
-      { desc: "[3. 도구 실행] 개발자 코드가 실제로 도구를 실행합니다. LLM이 직접 실행하는 게 아니라, LLM이 \"이 도구를 이렇게 호출해줘\"라고 요청하면 코드가 실행합니다.", phase: 'execute', selectedTool: 'calc', flowStep: 2 },
-      { desc: "[4. 결과 수신] 도구 실행 결과를 LLM에게 돌려줍니다. LLM은 이 결과를 바탕으로 사용자에게 답변하거나, 다른 도구를 추가로 호출합니다.", phase: 'result', selectedTool: 'calc', flowStep: 3 },
+      {
+        title: 'Step 1. Tool 정의 — JSON Schema로 도구 명세 작성',
+        desc: 'LLM이 도구를 쓰려면 먼저 도구가 무엇인지 알려줘야 한다. name(이름), description(언제 쓸지), parameters(JSON Schema로 인자 타입)를 정의한다. 이 schema를 보고 LLM이 "아, 이 함수는 이런 일을 하고 이런 인자가 필요하구나"를 이해한다.',
+        phase: 'define',
+        userQuery: null,
+        activeTools: ['calculator'],
+        selectedToolId: null,
+        toolCallJson: null,
+        toolResult: null,
+        finalAnswer: null,
+        flowActive: [],
+        llmState: 'idle',
+        multiCalls: null,
+        code: {
+          lang: 'json',
+          filename: 'tool-schema.json',
+          lines: [
+            '{',
+            '  "type": "function",',
+            '  "function": {',
+            '    "name": "calculator",',
+            '    "description": "사칙연산이 필요할 때 호출. 수식 문자열을 받아 결과를 반환한다.",',
+            '    "parameters": {',
+            '      "type": "object",',
+            '      "properties": {',
+            '        "expression": {',
+            '          "type": "string",',
+            '          "description": "평가할 수식. 예: \'120 * 3 + 50\'"',
+            '        }',
+            '      },',
+            '      "required": ["expression"]',
+            '    }',
+            '  }',
+            '}',
+            '',
+            '// 핵심 3요소',
+            '//   1) name        — LLM이 부르는 함수명 (영문, snake_case)',
+            '//   2) description — "언제 이 도구를 쓰면 되는지" 명확히',
+            '//   3) parameters  — JSON Schema (type / properties / required)',
+            '//',
+            '// LLM은 이 schema만 보고 호출 여부와 인자를 결정한다.',
+            '// → 실제 함수 본문(code)은 LLM에게 보여주지 않는다.',
+          ],
+          highlight: [4, 5, 6, 9, 10, 11, 14],
+        },
+      },
+      {
+        title: 'Step 2. LLM에 tools 전달 → 모델이 적절한 tool 선택',
+        desc: '사용자 질문 "사과 120원짜리 3개와 50원 봉지값은?"을 받은 LLM에게, 시스템 메시지로 tools 배열을 함께 전달한다. LLM은 질문을 읽고 schema의 description을 보면서 "이건 계산이 필요해 → calculator를 써야지"라고 추론한다.',
+        phase: 'pass',
+        userQuery: '사과 120원짜리 3개와 50원 봉지값은?',
+        activeTools: ['calculator'],
+        selectedToolId: 'calculator',
+        toolCallJson: null,
+        toolResult: null,
+        finalAnswer: null,
+        flowActive: ['user-llm', 'llm-registry'],
+        llmState: 'thinking',
+        multiCalls: null,
+        code: {
+          lang: 'python',
+          filename: 'register.py',
+          lines: [
+            '# LLM에 tools 배열을 함께 넘긴다 (OpenAI / Anthropic 동일 패턴)',
+            'from openai import OpenAI',
+            'import json',
+            '',
+            'client = OpenAI()',
+            '',
+            '# 1) tool schema 로드',
+            'with open("tool-schema.json") as f:',
+            '    calculator_tool = json.load(f)',
+            '',
+            'tools = [calculator_tool]',
+            '',
+            '# 2) 사용자 메시지 + tools 함께 전달',
+            'messages = [',
+            '    {"role": "user", "content": "사과 120원짜리 3개와 50원 봉지값은?"}',
+            ']',
+            '',
+            'response = client.chat.completions.create(',
+            '    model="gpt-4o",',
+            '    messages=messages,',
+            '    tools=tools,            # ← schema 배열 전달',
+            '    tool_choice="auto",     # auto: 모델이 알아서 결정',
+            ')',
+            '',
+            '# 3) 모델이 도구 호출이 필요하다고 판단하면',
+            '#    response.choices[0].message.tool_calls 에 호출 요청이 들어옴',
+            '#    (도구가 필요 없으면 그냥 텍스트 답변)',
+            '',
+            '# 핵심: LLM이 "직접 실행"하는 게 아니라',
+            '#       "이 함수를 이 인자로 호출해줘"라는 JSON을 돌려준다',
+          ],
+          highlight: [11, 14, 15, 18, 19, 20, 21, 22, 23, 26, 27],
+        },
+      },
+      {
+        title: 'Step 3. tool_call 응답 → 실제 함수 실행 → 결과 반환',
+        desc: 'LLM이 tool_call JSON을 응답한다. {"name": "calculator", "arguments": {"expression": "120*3+50"}}. 이 JSON을 우리 코드가 파싱해서 실제 calculator 함수를 호출한다. 결과 410을 얻는다. LLM은 절대 자기가 직접 실행하지 않는다 — 우리 코드가 실행한다.',
+        phase: 'call',
+        userQuery: '사과 120원짜리 3개와 50원 봉지값은?',
+        activeTools: ['calculator'],
+        selectedToolId: 'calculator',
+        toolCallJson: { name: 'calculator', arguments: { expression: '120 * 3 + 50' } },
+        toolResult: { ok: true, value: 410 },
+        finalAnswer: null,
+        flowActive: ['llm-registry', 'registry-exec'],
+        llmState: 'calling',
+        multiCalls: null,
+        code: {
+          lang: 'python',
+          filename: 'execute.py',
+          lines: [
+            '# LLM 응답 파싱 → 실제 함수 dispatch',
+            '',
+            '# 실제 도구 함수 (Python 코드 — 우리가 작성)',
+            'def calculator(expression: str) -> float:',
+            '    """수식을 평가해 결과를 반환한다."""',
+            '    return eval(expression, {"__builtins__": {}}, {})',
+            '',
+            '# 함수명 → 실제 함수 매핑',
+            'TOOL_FUNCTIONS = {',
+            '    "calculator": calculator,',
+            '}',
+            '',
+            '# 1) LLM 응답에서 tool_calls 꺼내기',
+            'tool_calls = response.choices[0].message.tool_calls',
+            '',
+            'for call in tool_calls:',
+            '    name = call.function.name',
+            '    args = json.loads(call.function.arguments)',
+            '    # args = {"expression": "120 * 3 + 50"}',
+            '',
+            '    # 2) 매핑 테이블에서 실제 함수 찾아 실행',
+            '    func = TOOL_FUNCTIONS[name]',
+            '    result = func(**args)',
+            '    # result = 410',
+            '',
+            '    print(f"[{name}] {args} → {result}")',
+            '',
+            '# 핵심: LLM은 "호출 의도"만 표현. 실행은 우리 코드.',
+            '# → 보안/검증/로깅을 우리가 통제할 수 있다',
+            '# → 잘못된 인자 검증, rate-limit, 권한 체크 모두 여기서',
+          ],
+          highlight: [4, 5, 6, 9, 10, 11, 14, 17, 18, 22, 23],
+        },
+      },
+      {
+        title: 'Step 4. 결과를 다시 LLM에 전달 → 최종 답',
+        desc: '함수 실행 결과 410을 다시 LLM에게 보낸다. role="tool" 메시지로 "calculator의 결과는 410"이라고 알려주면, LLM이 이걸 자연어로 다듬어서 "사과 3개와 봉지값 합계는 410원입니다"라고 최종 답변을 생성한다. 이 round-trip이 Tool Use 한 사이클.',
+        phase: 'return',
+        userQuery: '사과 120원짜리 3개와 50원 봉지값은?',
+        activeTools: ['calculator'],
+        selectedToolId: 'calculator',
+        toolCallJson: { name: 'calculator', arguments: { expression: '120 * 3 + 50' } },
+        toolResult: { ok: true, value: 410 },
+        finalAnswer: '사과 3개와 봉지값을 합치면 총 410원입니다.',
+        flowActive: ['registry-exec', 'exec-llm'],
+        llmState: 'answering',
+        multiCalls: null,
+        code: {
+          lang: 'python',
+          filename: 'execute.py',
+          lines: [
+            '# 함수 결과를 LLM에게 다시 보내 최종 답 받기',
+            '',
+            '# 1) tool 결과를 messages에 append',
+            'messages.append(response.choices[0].message)  # assistant의 tool_call',
+            '',
+            'messages.append({',
+            '    "role": "tool",',
+            '    "tool_call_id": call.id,',
+            '    "name": name,',
+            '    "content": str(result),  # "410"',
+            '})',
+            '',
+            '# 2) 같은 모델에 두 번째 호출 — 이번엔 tool 결과 포함',
+            'second = client.chat.completions.create(',
+            '    model="gpt-4o",',
+            '    messages=messages,',
+            '    tools=tools,  # 추가 호출 가능성 열어둠',
+            ')',
+            '',
+            'final = second.choices[0].message.content',
+            '# final = "사과 3개와 봉지값을 합치면 총 410원입니다."',
+            '',
+            '# 흐름 정리:',
+            '#   user → LLM → tool_call → 우리 코드 실행 → tool 결과 → LLM → 최종 답',
+            '#   ↑                                                          ↓',
+            '#   질문                                                       답변',
+            '#',
+            '# 이 한 round-trip이 Tool Use 한 사이클.',
+            '# 추가 도구 호출이 필요하면 LLM이 또 tool_calls 응답 → 반복.',
+          ],
+          highlight: [4, 6, 7, 8, 9, 10, 14, 15, 16, 17, 20, 21],
+        },
+      },
+      {
+        title: 'Step 5. 다중 Tool — Calculator / Search / DB 동시 정의',
+        desc: '실전에서는 도구를 여럿 등록한다. tools 배열에 calculator + web_search + db_query를 모두 넘기면, LLM이 질문에 따라 적절한 걸 고른다. 한 번에 여러 도구를 병렬 호출하기도 한다(parallel tool use). 도구가 늘수록 LLM의 선택 능력이 핵심.',
+        phase: 'multi',
+        userQuery: '오늘 환율로 100달러는 한국 돈 얼마? 그리고 지난주 매출도 알려줘',
+        activeTools: ['calculator', 'web_search', 'db_query'],
+        selectedToolId: null,
+        toolCallJson: null,
+        toolResult: null,
+        finalAnswer: '환율 1,380원 기준 100달러는 138,000원이며, 지난주 매출은 12,450,000원입니다.',
+        flowActive: ['llm-registry', 'registry-exec', 'exec-llm'],
+        llmState: 'answering',
+        multiCalls: [
+          { tool: 'web_search', args: { query: 'USD KRW 환율', top_k: 1 }, result: '1 USD = 1,380 KRW' },
+          { tool: 'calculator', args: { expression: '100 * 1380' },         result: '138000' },
+          { tool: 'db_query',   args: { sql: 'SELECT SUM(amt) FROM sales WHERE week=-1' }, result: '12,450,000' },
+        ],
+        code: {
+          lang: 'python',
+          filename: 'multi-tools.py',
+          lines: [
+            '# 다중 도구 등록 + 병렬 호출 패턴',
+            '',
+            '# 1) 도구 schema 여러 개 정의',
+            'tools = [',
+            '    {',
+            '        "type": "function",',
+            '        "function": {',
+            '            "name": "calculator",',
+            '            "description": "사칙연산이 필요할 때",',
+            '            "parameters": { ... },',
+            '        },',
+            '    },',
+            '    {',
+            '        "type": "function",',
+            '        "function": {',
+            '            "name": "web_search",',
+            '            "description": "최신 정보(환율/뉴스 등) 검색",',
+            '            "parameters": { ... },',
+            '        },',
+            '    },',
+            '    {',
+            '        "type": "function",',
+            '        "function": {',
+            '            "name": "db_query",',
+            '            "description": "사내 DB의 매출/고객 데이터 조회",',
+            '            "parameters": { ... },',
+            '        },',
+            '    },',
+            ']',
+            '',
+            '# 2) 함수 매핑',
+            'TOOL_FUNCTIONS = {',
+            '    "calculator": calculator,',
+            '    "web_search": web_search,',
+            '    "db_query":   db_query,',
+            '}',
+            '',
+            '# 3) 한 번의 호출에서 여러 tool_call 응답 가능 (parallel tool use)',
+            'response = client.chat.completions.create(',
+            '    model="gpt-4o", messages=messages, tools=tools,',
+            ')',
+            '',
+            'for call in response.choices[0].message.tool_calls:',
+            '    func = TOOL_FUNCTIONS[call.function.name]',
+            '    args = json.loads(call.function.arguments)',
+            '    result = func(**args)  # 각각 실행',
+            '    # 결과를 모두 messages에 append',
+            '',
+            '# 핵심: description을 명확히 써야 LLM이 올바른 도구를 고른다.',
+            '# 도구가 10개를 넘으면 description quality가 정확도를 좌우한다.',
+          ],
+          highlight: [4, 13, 22, 31, 32, 33, 34, 35, 42, 43, 44, 45, 46],
+        },
+      },
     ];
 
-    const FLOW = [
-      { label: 'LLM이 도구 목록을 본다', icon: '📋' },
-      { label: 'LLM이 도구를 선택한다', icon: '👆' },
-      { label: '코드가 도구를 실행한다', icon: '⚙️' },
-      { label: '결과를 LLM에게 돌려준다', icon: '📨' },
-    ];
-
-    function App() {
-      const [currentStepIdx, setCurrentStepIdx] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playIntervalRef = useRef(null);
-      const stepData = STEPS[currentStepIdx];
-      const isEnd = currentStepIdx === STEPS.length - 1;
-
-      const handleNext = () => { setCurrentStepIdx(prev => { if (prev < STEPS.length - 1) return prev + 1; setIsPlaying(false); return prev; }); };
-      const handleNextRef = useRef(handleNext); handleNextRef.current = handleNext;
-      const handlePrev = () => { if (currentStepIdx > 0) { setCurrentStepIdx(prev => prev - 1); setIsPlaying(false); } };
-      const handlePrevRef = useRef(handlePrev); handlePrevRef.current = handlePrev;
-      const togglePlay = () => { if (isEnd) setCurrentStepIdx(0); setIsPlaying(prev => !prev); };
-
-      useEffect(() => { if (isPlaying) { playIntervalRef.current = setInterval(() => handleNextRef.current(), 3000); } else { clearInterval(playIntervalRef.current); } return () => clearInterval(playIntervalRef.current); }, [isPlaying]);
-      useEffect(() => { const onKey = (e) => { if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); } if (e.key === 'ArrowLeft') { e.preventDefault(); handlePrevRef.current(); } }; window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []);
+    // ─────────────────────────────────────────────────────
+    // LLM 박스 — 상태에 따라 표정/색이 바뀜
+    // ─────────────────────────────────────────────────────
+    function LlmBox({ state }) {
+      const cfg = {
+        idle:      { label: '대기',     emoji: '🤖', bg: 'bg-slate-100',  border: 'border-slate-300', text: 'text-slate-600' },
+        thinking:  { label: '추론 중',  emoji: '🤔', bg: 'bg-amber-50',   border: 'border-amber-400', text: 'text-amber-800' },
+        calling:   { label: '호출 요청', emoji: '📤', bg: 'bg-amber-100',  border: 'border-amber-500', text: 'text-amber-900' },
+        answering: { label: '답변 생성', emoji: '✍️', bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800' },
+      };
+      const c = cfg[state] || cfg.idle;
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm"><a href="../index.html" className="inline-flex items-center gap-1 text-amber-700 hover:text-amber-900 font-medium"><span>&larr;</span> 허브로 돌아가기</a></nav>
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-amber-600 text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part III. 핵심 패턴 &gt; Chapter 3. Tool Use</div>
-                  <h1 className="text-2xl font-bold text-slate-800">III-3-1. Tool Use란: LLM이 도구를 쓴다</h1>
-                </div>
-              </div>
-              <p className="text-slate-600"><b>사무실 직원</b>이 계산기, 검색엔진, 이메일을 사용하듯 — LLM도 도구를 골라서 쓸 수 있습니다.</p>
-            </header>
-
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-amber-600 border-amber-700 text-white">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-amber-200">Tool Use 흐름</h3>
-                <span className="text-xs text-amber-200">키보드 &larr;/&rarr;로 단계 이동</span>
-              </div>
-              <p className="text-lg font-medium leading-relaxed">{stepData.desc}</p>
+        <div className={`rounded-lg border-2 ${c.border} ${c.bg} p-3 shadow-sm transition-all duration-500 relative`}>
+          {state !== 'idle' && (
+            <span className="absolute -top-2 -right-2 w-3 h-3 bg-amber-500 rounded-full animate-ping"></span>
+          )}
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-2xl">{c.emoji}</span>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">LLM</div>
+              <div className={`text-xs font-bold ${c.text}`}>{c.label}</div>
             </div>
+          </div>
+          <div className="text-[10px] text-slate-500 font-mono">gpt-4o · claude-sonnet</div>
+        </div>
+      );
+    }
 
-            {/* 도구 목록 */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {TOOLS.map(tool => {
-                const isSelected = stepData.selectedTool === tool.id;
-                const showAll = stepData.phase === 'list' || stepData.phase === 'intro';
-                return (
-                  <div key={tool.id} className={`p-4 rounded-xl border-2 text-center transition-all duration-500 ${isSelected ? 'border-amber-400 bg-amber-50 scale-110 shadow-lg ring-2 ring-amber-200' : showAll ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50 opacity-30'}`}>
-                    <div className="text-3xl mb-2">{tool.icon}</div>
-                    <div className="font-bold text-sm text-slate-800">{tool.name}</div>
-                    <div className="text-xs text-slate-500">{tool.desc}</div>
-                    {isSelected && <div className="mt-2 text-xs bg-amber-200 text-amber-800 px-2 py-0.5 rounded-full font-bold">선택됨</div>}
+    // ─────────────────────────────────────────────────────
+    // Tool Registry 박스 — 등록된 도구 카드
+    // ─────────────────────────────────────────────────────
+    function ToolRegistry({ activeTools, selectedToolId }) {
+      return (
+        <div className="rounded-lg border-2 border-amber-300 bg-gradient-to-br from-amber-50 to-amber-100 p-3 shadow-sm">
+          <div className="flex items-center gap-1 mb-2">
+            <span className="text-base">📋</span>
+            <span className="text-[11px] font-bold text-amber-900 uppercase tracking-wider">Tool Registry</span>
+          </div>
+          <div className="space-y-1.5">
+            {TOOL_REGISTRY.map((t) => {
+              const isActive = activeTools.includes(t.id);
+              const isSelected = selectedToolId === t.id;
+              return (
+                <div
+                  key={t.id}
+                  className={`rounded-md border px-2 py-1.5 transition-all duration-500 ${
+                    isSelected
+                      ? 'bg-amber-500 border-amber-700 text-white shadow-md scale-105'
+                      : isActive
+                      ? 'bg-white border-amber-300 text-amber-900'
+                      : 'bg-slate-50 border-slate-200 text-slate-400 opacity-50'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-sm">{t.icon}</span>
+                    <span className="text-[11px] font-bold font-mono">{t.name}</span>
+                    {isSelected && (
+                      <span className="ml-auto text-[9px] bg-white text-amber-700 px-1.5 py-0.5 rounded-full font-bold">
+                        선택
+                      </span>
+                    )}
                   </div>
-                );
-              })}
-            </div>
-
-            {/* 흐름 단계 */}
-            <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-              <div className="text-xs font-bold text-slate-500 uppercase mb-3">Tool Use 4단계</div>
-              <div className="flex flex-col md:flex-row items-center gap-2">
-                {FLOW.map((item, i) => (
-                  <React.Fragment key={i}>
-                    <div className={`flex-1 p-3 rounded-lg border-2 text-center transition-all duration-500 ${i <= stepData.flowStep ? 'border-amber-300 bg-amber-50' : 'border-slate-100 bg-slate-50 opacity-30'} ${i === stepData.flowStep ? 'scale-105 shadow-md' : ''}`}>
-                      <div className="text-xl mb-1">{item.icon}</div>
-                      <div className="text-xs font-bold text-slate-700">{item.label}</div>
-                    </div>
-                    {i < FLOW.length - 1 && <div className={`text-lg ${i < stepData.flowStep ? 'text-amber-500' : 'text-slate-200'} hidden md:block`}>→</div>}
-                  </React.Fragment>
-                ))}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {['Tool Use', 'Function Calling', '도구 선택', '파라미터 추출'].map(kw => (
-                <span key={kw} className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full text-sm font-medium border border-amber-200">{kw}</span>
-              ))}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={handlePrev} disabled={currentStepIdx === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg></button>
-                <button onClick={togglePlay} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-amber-600 hover:bg-amber-700">{isPlaying ? <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</> : <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>}</button>
-                <button onClick={handleNext} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {currentStepIdx + 1} / {STEPS.length}</div>
-            </div>
-            <div className="text-sm text-slate-500 flex justify-between">
-              <a href="./III-2-2.html" className="text-amber-600 hover:text-amber-800 font-medium">← III-2-2. ReAct 실행 흐름</a>
-              <a href="./III-3-2.html" className="text-amber-600 hover:text-amber-800 font-medium">III-3-2. Function Calling 상세 →</a>
-            </div>
+                  <div className={`text-[9px] mt-0.5 ${isSelected ? 'text-amber-100' : 'text-slate-500'}`}>
+                    {t.desc}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       );
     }
+
+    // ─────────────────────────────────────────────────────
+    // 실제 함수 박스 — 코드가 dispatch
+    // ─────────────────────────────────────────────────────
+    function ExecutorBox({ active, toolResult }) {
+      return (
+        <div
+          className={`rounded-lg border-2 p-3 shadow-sm transition-all duration-500 ${
+            active
+              ? 'border-emerald-400 bg-emerald-50'
+              : 'border-slate-200 bg-slate-50 opacity-60'
+          }`}
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-2xl">⚙️</span>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">실제 함수 실행</div>
+              <div className={`text-xs font-bold ${active ? 'text-emerald-800' : 'text-slate-500'}`}>
+                {active ? '실행 중' : '대기'}
+              </div>
+            </div>
+          </div>
+          <div className="text-[10px] text-slate-600 font-mono">Python · 우리 코드</div>
+          {toolResult && (
+            <div className="mt-2 rounded bg-white border border-emerald-300 px-2 py-1">
+              <div className="text-[9px] text-emerald-700 font-bold uppercase">return</div>
+              <div className="text-xs font-mono text-emerald-900">{String(toolResult.value)}</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 흐름 화살표 (가로) — 활성 시 amber 굵은 선
+    // ─────────────────────────────────────────────────────
+    function FlowArrow({ active, label }) {
+      return (
+        <div className="flex flex-col items-center justify-center min-w-[60px]">
+          <div
+            className={`text-[9px] font-mono mb-0.5 transition-colors ${
+              active ? 'text-amber-700 font-bold' : 'text-slate-400'
+            }`}
+          >
+            {label}
+          </div>
+          <svg width="48" height="14" viewBox="0 0 48 14">
+            <line
+              x1="2" y1="7" x2="40" y2="7"
+              stroke={active ? '#d97706' : '#cbd5e1'}
+              strokeWidth={active ? 3 : 1.5}
+              strokeDasharray={active ? '0' : '3,3'}
+            />
+            <polygon
+              points="40,2 48,7 40,12"
+              fill={active ? '#d97706' : '#cbd5e1'}
+            />
+          </svg>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // tool_call JSON 시각화 카드
+    // ─────────────────────────────────────────────────────
+    function ToolCallJson({ json }) {
+      if (!json) return null;
+      return (
+        <div className="rounded-lg bg-slate-900 border-2 border-amber-400 overflow-hidden shadow-lg">
+          <div className="bg-amber-500 px-3 py-1 flex items-center justify-between">
+            <span className="text-[10px] font-bold text-white uppercase tracking-wider">📤 tool_call (LLM 응답)</span>
+            <span className="text-[9px] text-amber-100 font-mono">JSON</span>
+          </div>
+          <pre className="text-[11px] text-slate-100 p-3 font-mono leading-relaxed overflow-auto">
+{`{
+  "name": "${json.name}",
+  "arguments": ${JSON.stringify(json.arguments, null, 4).split('\n').map((l, i) => i === 0 ? l : '    ' + l).join('\n')}
+}`}
+          </pre>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 다중 호출 테이블 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function MultiCallTable({ calls }) {
+      return (
+        <div className="rounded-lg bg-white border-2 border-amber-300 overflow-hidden">
+          <div className="bg-amber-100 px-3 py-1.5 border-b border-amber-200">
+            <span className="text-[11px] font-bold text-amber-900">📦 병렬 tool_calls (3개 동시 실행)</span>
+          </div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="bg-amber-50/50 text-left">
+                <th className="px-2 py-1 font-bold text-amber-700">Tool</th>
+                <th className="px-2 py-1 font-bold text-slate-700">Arguments</th>
+                <th className="px-2 py-1 font-bold text-emerald-700">Result</th>
+              </tr>
+            </thead>
+            <tbody>
+              {calls.map((c, i) => (
+                <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-amber-50/30'}>
+                  <td className="px-2 py-1 font-mono font-bold text-amber-800">{c.tool}</td>
+                  <td className="px-2 py-1 font-mono text-slate-600 truncate max-w-[180px]">
+                    {JSON.stringify(c.args)}
+                  </td>
+                  <td className="px-2 py-1 font-mono text-emerald-700 font-semibold">{c.result}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 메인 시각화
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const { phase, userQuery, activeTools, selectedToolId, toolCallJson, toolResult, finalAnswer, flowActive, llmState, multiCalls } = step;
+
+      const isFlowActive = (k) => flowActive.includes(k);
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">🏢 사무실 직원 — LLM이 도구를 쓴다</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          {/* 사용자 질문 박스 */}
+          {userQuery && (
+            <div className="rounded-lg bg-amber-600 text-white p-2.5 mb-3 flex items-start gap-2 shadow-sm">
+              <span className="text-base leading-none">❓</span>
+              <div className="flex-1">
+                <div className="text-[9px] uppercase tracking-wider text-amber-200 font-bold">사용자 질문</div>
+                <div className="text-xs font-bold mt-0.5">{userQuery}</div>
+              </div>
+            </div>
+          )}
+
+          {/* 메인 흐름: LLM ↔ Registry ↔ Executor */}
+          <div className="grid grid-cols-[1fr_auto_1fr_auto_1fr] gap-1 items-center mb-3">
+            <LlmBox state={llmState} />
+            <FlowArrow active={isFlowActive('llm-registry')} label="tools" />
+            <ToolRegistry activeTools={activeTools} selectedToolId={selectedToolId} />
+            <FlowArrow active={isFlowActive('registry-exec')} label="dispatch" />
+            <ExecutorBox active={isFlowActive('registry-exec') || isFlowActive('exec-llm')} toolResult={toolResult} />
+          </div>
+
+          {/* 결과 → LLM 역방향 흐름 (Step 4 강조용) */}
+          {isFlowActive('exec-llm') && phase !== 'multi' && (
+            <div className="flex items-center justify-center gap-2 mb-3">
+              <span className="text-[10px] text-emerald-700 font-bold font-mono">결과를 LLM에 다시 전달 (role=tool)</span>
+              <svg width="80" height="14" viewBox="0 0 80 14">
+                <line x1="78" y1="7" x2="10" y2="7" stroke="#059669" strokeWidth="3" />
+                <polygon points="10,2 2,7 10,12" fill="#059669" />
+              </svg>
+            </div>
+          )}
+
+          {/* tool_call JSON 시각화 */}
+          {toolCallJson && phase !== 'multi' && (
+            <div className="mb-3">
+              <ToolCallJson json={toolCallJson} />
+            </div>
+          )}
+
+          {/* 다중 호출 테이블 (Step 5) */}
+          {multiCalls && (
+            <div className="mb-3">
+              <MultiCallTable calls={multiCalls} />
+            </div>
+          )}
+
+          {/* 최종 답변 박스 */}
+          {finalAnswer && (
+            <div className="rounded-lg bg-emerald-50 border-2 border-emerald-400 p-2.5 flex items-start gap-2">
+              <span className="text-base leading-none">✅</span>
+              <div className="flex-1">
+                <div className="text-[9px] uppercase tracking-wider text-emerald-700 font-bold">LLM 최종 답변</div>
+                <div className="text-xs font-medium mt-0.5 text-emerald-900">{finalAnswer}</div>
+              </div>
+            </div>
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+              활성 흐름
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+              실행 결과
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full bg-slate-300"></span>
+              비활성
+            </span>
+            <span className="ml-auto font-mono text-slate-400">
+              phase: {phase}
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[34rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-amber-500/15 border-l-2 border-amber-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-amber-700 hover:text-amber-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-3-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-amber-600 text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. 핵심 패턴 &gt; Chapter 3. Tool Use</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">III-3-1. Tool Use란 (외부 함수/API 호출 — Function Calling)</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">사무실 직원 — LLM은 결정만, 우리 코드가 도구를 실행한다</p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-3 text-sm text-amber-900">
+                💡 다음(III-3-2)에서는 <strong>Function Calling 상세</strong> — JSON Schema 작성 베스트 프랙티스, tool_choice 옵션, 에러 핸들링 패턴을 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-amber-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-amber-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-amber-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 키워드 */}
+            <div className="flex flex-wrap gap-2">
+              {['Tool Use', 'Function Calling', 'JSON Schema', 'tool_call', 'parallel tools', 'dispatch'].map((kw) => (
+                <span
+                  key={kw}
+                  className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full text-xs font-medium border border-amber-200"
+                >
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-amber-600 text-white hover:bg-amber-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./III-2-2.html" className="text-amber-700 hover:text-amber-900 font-medium">&larr; III-2-2. ReAct 실행 흐름</a>
+              <a href="./III-3-2.html" className="text-amber-700 hover:text-amber-900 font-medium">III-3-2. Function Calling 상세 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
