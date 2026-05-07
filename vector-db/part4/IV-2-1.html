@@ -3,481 +3,893 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vector DB — IV-2-1. pgvector 인덱싱 — IVFFlat vs HNSW</title>
+  <title>Vector DB — IV-2-1. pgvector 인덱싱 (IVFFlat vs HNSW)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    IV-2-1. pgvector 인덱싱 — IVFFlat vs HNSW
+    학습 목표: pgvector의 두 인덱스(IVFFlat: k-means 클러스터링, HNSW: 다층 그래프)의
+              내부 구조와 빌드/검색/메모리/정확도 트레이드오프를 5단계로 비교한다.
+    핵심 비유: 도서관 분류법 — 층/구역 분류(IVFFlat) vs 추천 네트워크(HNSW)
+    패턴: fastapi v1 — 좌(LiveDataPane: IVFFlat 클러스터 SVG + HNSW 다층 그래프 SVG + 검색시간 막대)
+                       우(VSCode CodeViewer)
+    색상: purple
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 헬퍼 1: IVFFlat 클러스터 점들 생성
+    //   probedClusters: 활성 클러스터(검색 대상) 인덱스 배열
+    //   5개 클러스터 × 7개 점 = 35점 (의사난수, 단계마다 동일 분포)
+    // ─────────────────────────────────────────────────────
+    const IVF_CLUSTERS = [
+      { cx: 90,  cy: 70,  spread: 30 },
+      { cx: 200, cy: 80,  spread: 32 },
+      { cx: 305, cy: 100, spread: 30 },
+      { cx: 110, cy: 180, spread: 30 },
+      { cx: 235, cy: 195, spread: 32 },
+    ];
+
+    function makeClusteredPoints({ probedClusters = [] } = {}) {
+      const probed = new Set(probedClusters);
+      const points = [];
+      IVF_CLUSTERS.forEach((c, ci) => {
+        const seedBase = ci * 17;
+        for (let i = 0; i < 7; i++) {
+          const angle = ((seedBase + i * 37) % 360) * Math.PI / 180;
+          const dist  = ((seedBase + i * 13) % 100) / 100 * c.spread;
+          points.push({
+            id: `p-${ci}-${i}`,
+            x: c.cx + Math.cos(angle) * dist,
+            y: c.cy + Math.sin(angle) * dist,
+            cluster: ci,
+            scanned: probed.has(ci),
+            hit: probed.has(ci) && i === 2,
+          });
+        }
+      });
+      return points;
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 헬퍼 2: HNSW 노드 레이어 생성
+    //   visited / hit: Set<string> — 해당 id를 활성화
+    // ─────────────────────────────────────────────────────
+    const HNSW_LAYER_DEFS = [
+      [['L2-a', 80, 30], ['L2-b', 200, 30], ['L2-c', 320, 30]],
+      [['L1-a', 60, 110], ['L1-b', 140, 110], ['L1-c', 220, 110], ['L1-d', 300, 110], ['L1-e', 360, 110]],
+      [['L0-a', 40, 200], ['L0-b', 90, 200], ['L0-c', 140, 200], ['L0-d', 190, 200],
+       ['L0-e', 240, 200], ['L0-f', 290, 200], ['L0-g', 340, 200], ['L0-h', 390, 200]],
+    ];
+
+    function makeHnswLayers({ visited = new Set(), hit = new Set() } = {}) {
+      return HNSW_LAYER_DEFS.map((layer) =>
+        layer.map(([id, x, y]) => ({ id, x, y, visited: visited.has(id), hit: hit.has(id) }))
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 헬퍼 3: HNSW 엣지 (빌드 = 회색, 검색 = 경로 빨강)
+    // ─────────────────────────────────────────────────────
+    const HNSW_EDGES_BUILD = [
+      // Layer 2 (sparse)
+      ['L2-a', 'L2-b', 2], ['L2-b', 'L2-c', 2],
+      // Layer 1 (medium)
+      ['L1-a', 'L1-b', 1], ['L1-b', 'L1-c', 1], ['L1-c', 'L1-d', 1], ['L1-d', 'L1-e', 1],
+      ['L1-a', 'L1-c', 1], ['L1-b', 'L1-d', 1],
+      // Layer 0 (dense)
+      ['L0-a', 'L0-b', 0], ['L0-b', 'L0-c', 0], ['L0-c', 'L0-d', 0], ['L0-d', 'L0-e', 0],
+      ['L0-e', 'L0-f', 0], ['L0-f', 'L0-g', 0], ['L0-g', 'L0-h', 0],
+      ['L0-a', 'L0-c', 0], ['L0-c', 'L0-e', 0], ['L0-d', 'L0-f', 0], ['L0-e', 'L0-g', 0], ['L0-b', 'L0-d', 0],
+      // Layer 간 수직 점프
+      ['L2-a', 'L1-a', 'cross'], ['L2-b', 'L1-c', 'cross'], ['L2-c', 'L1-d', 'cross'],
+      ['L1-a', 'L0-a', 'cross'], ['L1-b', 'L0-c', 'cross'], ['L1-c', 'L0-d', 'cross'],
+      ['L1-d', 'L0-f', 'cross'], ['L1-e', 'L0-h', 'cross'],
+    ].map(([from, to, layer]) => ({ from, to, layer, hit: false }));
+
+    const HNSW_QUERY_PATH = [
+      ['L2-a', 'L2-b'], ['L2-b', 'L1-c'], ['L1-b', 'L1-c'], ['L1-c', 'L0-d'],
+      ['L0-c', 'L0-d'], ['L0-d', 'L0-e'], ['L0-e', 'L0-f'],
+    ];
+
+    const HNSW_EDGES_QUERY = HNSW_EDGES_BUILD.map((e) => ({
+      ...e,
+      hit: HNSW_QUERY_PATH.some(([a, b]) =>
+        (e.from === a && e.to === b) || (e.from === b && e.to === a)
+      ),
+    }));
+
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   ivf       : IVFFlat 클러스터 시각화 데이터
+    //                { points: [{x,y,cluster,hit,scanned}], centers: [{x,y,cluster,probed}] }
+    //   hnsw      : HNSW 다층 그래프 시각화 데이터
+    //                { layers: [[{id,x,y,hit,visited}]], edges: [{layer,from,to,hit}] }
+    //   bench     : 검색 시간 비교 막대
+    //                [{ label, ms, color, recall }]
+    //   note      : 단계 핵심 메시지
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        desc: "pgvector에서 인덱스 없이 검색하면 Seq Scan — 모든 벡터를 하나씩 비교합니다. 10만 건이면 10만 번 거리 계산. 도서관에서 모든 책을 처음부터 끝까지 넘기는 것과 같습니다. 인덱스가 필요한 이유입니다.",
-        left: 'noindex',
-        right: 'problem',
+        title: 'Step 1. 인덱스 없음 — Sequential Scan',
+        desc: '인덱스를 만들지 않은 pgvector는 모든 행을 하나씩 읽고 거리 계산을 한다. 100만 행이면 100만 번. 도서관에서 모든 책을 처음부터 끝까지 넘기는 셈. 1초 이상 걸리고 동시 요청이 늘면 DB가 무너진다. 인덱스가 반드시 필요한 이유.',
+        ivf: {
+          points: Array.from({ length: 36 }, (_, i) => ({
+            id: `p${i}`,
+            x: 30 + (i % 9) * 35 + ((i / 9 | 0) % 2) * 10,
+            y: 30 + (i / 9 | 0) * 50,
+            cluster: -1,
+            hit: false,
+            scanned: true,
+          })),
+          centers: [],
+          query: { x: 220, y: 130 },
+        },
+        hnsw: null,
+        bench: [
+          { label: 'Seq Scan (100만 행)', ms: 1200, color: '#dc2626', recall: '100%', barW: '95%' },
+        ],
+        note: '⚠ 100만 행 × 1536차원 거리 계산 = 1초+ (타임아웃 위험)',
+        code: {
+          lang: 'sql',
+          filename: 'seq-scan.sql',
+          lines: [
+            '-- ❌ 인덱스 없는 ANN 검색 = Sequential Scan',
+            '-- 모든 행을 하나씩 읽고 거리 계산 → 100만 행이면 100만 번',
+            '',
+            'EXPLAIN ANALYZE',
+            'SELECT id, content,',
+            '       embedding <=> $1 AS distance',
+            'FROM   items',
+            'ORDER  BY embedding <=> $1',
+            'LIMIT  10;',
+            '',
+            '-- 실행 계획 (예시):',
+            '--   Limit  (cost=125000.00..125000.03 rows=10)',
+            '--     ->  Sort  (cost=125000.00..127500.00 rows=1000000)',
+            '--           Sort Method: top-N heapsort',
+            '--           ->  Seq Scan on items',
+            '--                 (rows=1000000 width=...)',
+            '--   Execution Time: 1248.317 ms   ← 1초+',
+            '',
+            '-- 문제점',
+            '--   1) 100만 행 × 1536차원 거리 계산',
+            '--   2) CPU 100% — 동시 요청 한 자리만 견뎌도 한계',
+            '--   3) 데이터 늘면 선형으로 느려짐 (O(n))',
+            '--',
+            '-- → 반드시 ANN 인덱스(IVFFlat 또는 HNSW) 필요',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 17, 25],
+        },
       },
       {
-        desc: "첫 번째 분류 체계: IVFFlat (Inverted File Flat). 벡터를 여러 '구역(list)'으로 미리 나눕니다. 도서관 층별 분류와 같습니다 — 1층은 소설, 2층은 과학. 검색 시 관련 구역만 탐색합니다.",
-        left: 'ivfflat-concept',
-        right: 'ivfflat-code',
+        title: 'Step 2. IVFFlat 생성 — k-means로 lists 개 구역 분할',
+        desc: 'IVFFlat은 데이터를 k-means 클러스터링으로 lists 개의 구역으로 미리 나눈다. 각 구역은 중심(centroid)과 그에 속한 점들로 구성. 도서관 층별 분류와 같다 — 1층 소설, 2층 과학. CREATE INDEX 시점에 train이 일어나므로 데이터가 먼저 있어야 한다.',
+        ivf: {
+          points: makeClusteredPoints(),
+          centers: [
+            { x: 90,  y: 70,  cluster: 0, probed: false },
+            { x: 200, y: 80,  cluster: 1, probed: false },
+            { x: 305, y: 100, cluster: 2, probed: false },
+            { x: 110, y: 180, cluster: 3, probed: false },
+            { x: 235, y: 195, cluster: 4, probed: false },
+          ],
+          query: null,
+        },
+        hnsw: null,
+        bench: [
+          { label: 'Seq Scan',         ms: 1200, color: '#dc2626', recall: '100%', barW: '95%' },
+          { label: 'IVFFlat 빌드 시간', ms:   80, color: '#a855f7', recall: '—',    barW: '7%'  },
+        ],
+        note: '🔧 lists=100 — 100만 행을 100개 구역으로 분할 (각 구역 ≈ 1만 행)',
+        code: {
+          lang: 'sql',
+          filename: 'create-ivfflat.sql',
+          lines: [
+            '-- ✅ IVFFlat 인덱스 생성 (k-means 클러스터링)',
+            '-- 권장 lists 값: sqrt(전체 행 수). 100만 행이면 ~1000.',
+            '-- 데이터가 먼저 INSERT되어 있어야 한다 (train 필요).',
+            '',
+            'CREATE INDEX items_embedding_ivfflat_idx',
+            '    ON items',
+            ' USING ivfflat (embedding vector_l2_ops)',
+            '  WITH (lists = 100);',
+            '',
+            '-- 거리 함수별 ops 클래스',
+            '--   vector_l2_ops      : L2 (유클리드)        <->',
+            '--   vector_ip_ops      : 내적                  <#>',
+            '--   vector_cosine_ops  : 코사인                 <=>',
+            '',
+            '-- 빌드 단계 (내부적으로 일어나는 일)',
+            '--   1) 임베딩 샘플링 → k-means 학습',
+            '--   2) lists 개 centroid 결정',
+            '--   3) 각 행을 가장 가까운 centroid의 list에 적재',
+            '--   4) Inverted File 구조 완성',
+            '--',
+            '-- 빌드 시간: 100만 행 × lists=100 ≈ 30~80초',
+            '-- 메모리:    centroid + posting list (원본의 ~1.1배)',
+            '',
+            '-- ⚠ 주의: 데이터를 더 넣어도 centroid는 갱신되지 않음',
+            '--        대량 추가 후엔 REINDEX 권장',
+            'REINDEX INDEX items_embedding_ivfflat_idx;',
+          ],
+          highlight: [5, 6, 7, 8, 17, 18, 19, 20, 27],
+        },
       },
       {
-        desc: "IVFFlat의 핵심 파라미터: lists(구역 수)와 probes(검색할 구역 수). lists가 많으면 구역이 작아져 빠르지만 recall이 떨어질 수 있고, probes를 늘리면 정확도가 올라가지만 느려집니다.",
-        left: 'ivfflat-params',
-        right: 'ivfflat-tradeoff',
+        title: 'Step 3. IVFFlat 검색 — probes 개수가 정확도/속도 결정',
+        desc: '검색 시 쿼리 벡터와 가장 가까운 probes 개의 centroid를 고르고, 그 구역들 안에서만 정밀 비교한다. probes=1이면 1만 행만 보면 되니 빠르지만 인접 구역에 답이 있으면 놓침(recall ↓). probes를 늘리면 정확도는 올라가지만 검색 시간도 비례해 증가.',
+        ivf: {
+          points: makeClusteredPoints({ probedClusters: [1, 2] }),
+          centers: [
+            { x: 90,  y: 70,  cluster: 0, probed: false },
+            { x: 200, y: 80,  cluster: 1, probed: true  },
+            { x: 305, y: 100, cluster: 2, probed: true  },
+            { x: 110, y: 180, cluster: 3, probed: false },
+            { x: 235, y: 195, cluster: 4, probed: false },
+          ],
+          query: { x: 245, y: 110 },
+        },
+        hnsw: null,
+        bench: [
+          { label: 'Seq Scan',                ms: 1200, color: '#dc2626', recall: '100%', barW: '95%' },
+          { label: 'IVFFlat probes=1',        ms:   12, color: '#c084fc', recall: '70%',  barW: '3%'  },
+          { label: 'IVFFlat probes=10',       ms:   65, color: '#a855f7', recall: '95%',  barW: '8%'  },
+          { label: 'IVFFlat probes=50',       ms:  240, color: '#7e22ce', recall: '99%',  barW: '22%' },
+        ],
+        note: '🎯 probes=10이면 100구역 중 10구역만 → 검색 행 ~1/10, recall ~95%',
+        code: {
+          lang: 'sql',
+          filename: 'probe-tune.sql',
+          lines: [
+            '-- 🔍 IVFFlat 검색 — probes 튜닝',
+            '-- probes = 검색 시 들여다볼 구역(list) 수',
+            '-- 값이 클수록 정확하고 느리다',
+            '',
+            '-- 세션 단위 설정 (기본값 1)',
+            'SET ivfflat.probes = 10;',
+            '',
+            '-- 또는 트랜잭션 단위',
+            'BEGIN;',
+            '  SET LOCAL ivfflat.probes = 10;',
+            '  SELECT id, content,',
+            '         embedding <=> $1 AS distance',
+            '    FROM items',
+            '   ORDER BY embedding <=> $1',
+            '   LIMIT 10;',
+            'COMMIT;',
+            '',
+            '-- 권장 공식',
+            '--   lists  = sqrt(N)      (100만 행 → 1000)',
+            '--   probes = sqrt(lists)  (1000 → ~32)',
+            '',
+            '-- probes 별 recall / latency (100만 행 기준)',
+            '--   probes=1   →  ~12ms   recall  70%',
+            '--   probes=10  →  ~65ms   recall  95%',
+            '--   probes=50  → ~240ms   recall  99%',
+            '--   probes=100 → ~480ms   recall  ~100% (≈ Seq Scan)',
+            '',
+            '-- ⚠ probes를 늘려도 인접 구역 경계의 데이터는 누락 가능',
+            '--   → 99%+ recall이 필요하면 HNSW를 고려',
+          ],
+          highlight: [5, 6, 9, 10, 11, 12, 13, 14, 15, 22, 23, 24, 25],
+        },
       },
       {
-        desc: "두 번째 분류 체계: HNSW (Hierarchical Navigable Small World). 벡터를 그래프로 연결합니다. '친구의 친구를 따라가면 원하는 사람을 찾는다'는 원리. 상위 레이어에서 큰 점프, 하위 레이어에서 정밀 탐색합니다.",
-        left: 'hnsw-concept',
-        right: 'hnsw-code',
+        title: 'Step 4. HNSW 생성 — 다층 그래프 (skip list + small world)',
+        desc: 'HNSW는 벡터들을 다층 그래프로 연결한다. 상위 레이어는 점이 적고 멀리 점프, 하위 레이어는 모든 점이 들어가고 정밀 탐색. 친구의 친구를 따라가면 원하는 사람을 찾는 원리. m(연결 수)과 ef_construction(빌드 탐색 범위)이 핵심 파라미터. 빈 테이블에도 생성 가능, 데이터 추가 시 자동 반영.',
+        ivf: null,
+        hnsw: {
+          layers: makeHnswLayers({}),
+          edges: HNSW_EDGES_BUILD,
+          query: null,
+        },
+        bench: [
+          { label: 'Seq Scan',          ms: 1200, color: '#dc2626', recall: '100%', barW: '95%' },
+          { label: 'IVFFlat 빌드',      ms:   80, color: '#a855f7', recall: '—',    barW: '7%'  },
+          { label: 'HNSW 빌드',         ms:  600, color: '#7e22ce', recall: '—',    barW: '50%' },
+        ],
+        note: '🕸️ m=16: 각 노드 16개 이웃 · ef_construction=64: 빌드 시 후보 큐 64',
+        code: {
+          lang: 'sql',
+          filename: 'create-hnsw.sql',
+          lines: [
+            '-- ✅ HNSW 인덱스 생성 (다층 그래프)',
+            '-- 빈 테이블에도 가능, train 불필요, 추가 시 자동 반영',
+            '',
+            'CREATE INDEX items_embedding_hnsw_idx',
+            '    ON items',
+            ' USING hnsw (embedding vector_l2_ops)',
+            '  WITH (m = 16, ef_construction = 64);',
+            '',
+            '-- 핵심 파라미터',
+            '--   m               : 각 노드의 이웃 수 (기본 16)',
+            '--                     ↑ recall ↑ 메모리 ↑ 빌드 느림',
+            '--   ef_construction : 빌드 시 후보 큐 크기 (기본 64)',
+            '--                     ↑ 그래프 품질 ↑ 빌드 느림 (검색 영향 X)',
+            '',
+            '-- 내부 구조',
+            '--   Layer 2 (sparse) : 멀리 점프 — skip list 상단',
+            '--   Layer 1 (medium) : 중간 점프',
+            '--   Layer 0 (dense)  : 모든 노드, 정밀 탐색',
+            '--',
+            '-- 검색 알고리즘 (Greedy Best-First Search)',
+            '--   1) Layer 2 진입 → 쿼리에 가장 가까운 노드 선택',
+            '--   2) Layer 1 내려가 다시 Greedy 탐색',
+            '--   3) Layer 0 도달 → ef_search 만큼 후보 큐 유지',
+            '--   4) Top-k 반환',
+            '',
+            '-- 빌드 시간: 100만 행, m=16, ef_c=64 ≈ 5~10분',
+            '--           (IVFFlat 대비 5~10배 느림)',
+            '-- 메모리:    m × 노드 수 × bytes — IVFFlat 대비 2~3배',
+          ],
+          highlight: [4, 5, 6, 7, 16, 17, 18, 21, 22, 23, 24],
+        },
       },
       {
-        desc: "HNSW의 핵심 파라미터: m(각 노드의 연결 수)과 ef_construction(빌드 시 탐색 범위). m이 크면 그래프가 촘촘해져 정확하지만 메모리를 많이 쓰고, ef_construction이 크면 빌드는 느리지만 품질이 좋습니다.",
-        left: 'hnsw-params',
-        right: 'hnsw-tradeoff',
-      },
-      {
-        desc: "IVFFlat vs HNSW 최종 비교. IVFFlat은 빌드가 빠르고 메모리가 적지만 train이 필요합니다. HNSW는 recall이 높고 train 불필요하지만 메모리를 많이 씁니다. 데이터 크기와 정확도 요구에 따라 선택하세요.",
-        left: 'compare-table',
-        right: 'recommend',
+        title: 'Step 5. 비교 — 빌드 / 메모리 / 검색 / 정확도',
+        desc: 'IVFFlat은 빌드가 빠르고 메모리가 적지만 train이 필요하고 동적 추가에 약하다. HNSW는 빌드는 느리고 메모리는 많이 쓰지만 검색이 빠르고 recall이 높으며 train 불필요 + 동적 추가 자동 반영. 최근 pgvector 0.5+에선 HNSW가 기본 추천. 메모리 제약 환경이면 IVFFlat.',
+        ivf: null,
+        hnsw: {
+          layers: makeHnswLayers({
+            visited: new Set(['L2-a', 'L2-b', 'L1-b', 'L1-c', 'L0-c', 'L0-d', 'L0-e', 'L0-f']),
+            hit:     new Set(['L2-b', 'L1-c', 'L0-d', 'L0-e']),
+          }),
+          edges: HNSW_EDGES_QUERY,
+          query: { x: 215, y: 240 },
+        },
+        bench: [
+          { label: 'Seq Scan',           ms: 1200, color: '#dc2626', recall: '100%', barW: '95%' },
+          { label: 'IVFFlat probes=10',  ms:   65, color: '#a855f7', recall: '95%',  barW: '8%'  },
+          { label: 'HNSW ef_search=40',  ms:    8, color: '#6b21a8', recall: '98%',  barW: '2%'  },
+          { label: 'HNSW ef_search=100', ms:   18, color: '#581c87', recall: '99%',  barW: '4%'  },
+        ],
+        note: '🏆 HNSW가 검색 속도/recall 모두 우위. IVFFlat은 메모리 절약이 필요할 때',
+        code: {
+          lang: 'markdown',
+          filename: 'compare.md',
+          lines: [
+            '# IVFFlat vs HNSW — 어떤 걸 언제 쓸까',
+            '',
+            '## 1. 빌드 시간',
+            '- IVFFlat : 빠름 (k-means 1회 + 적재)         · 100만 행 ~80초',
+            '- HNSW    : 느림 (한 행씩 그래프에 삽입)       · 100만 행 ~10분',
+            '',
+            '## 2. 메모리 사용량',
+            '- IVFFlat : 적음 (centroid + posting list)    · 원본 ~1.1배',
+            '- HNSW    : 많음 (m개 이웃 링크 × 노드 수)     · 원본 ~2~3배',
+            '',
+            '## 3. 검색 속도 (100만 행, recall ~95%+ 기준)',
+            '- IVFFlat : ~65ms (probes=10)',
+            '- HNSW    : ~8ms  (ef_search=40)              · 약 8배 빠름',
+            '',
+            '## 4. Recall 상한',
+            '- IVFFlat : 99%+ 가능하지만 probes 크게 → 느려짐',
+            '- HNSW    : 99%+ 자연스럽게 (ef_search 약간만 ↑)',
+            '',
+            '## 5. Train 필요성',
+            '- IVFFlat : ✓ 데이터가 먼저 있어야 함 (k-means)',
+            '- HNSW    : ✗ 빈 테이블에도 생성 가능',
+            '',
+            '## 6. 동적 데이터 추가',
+            '- IVFFlat : centroid 갱신 안 됨 → REINDEX 필요',
+            '- HNSW    : ✓ 추가 즉시 그래프에 자동 편입',
+            '',
+            '## 7. 추천 가이드',
+            '- 메모리 제약 환경    → IVFFlat',
+            '- 정적 대용량 배치     → IVFFlat (빌드 빨라서)',
+            '- 실시간 추가 / 고recall → HNSW',
+            '- pgvector 0.5+ 기본   → HNSW',
+            '',
+            '## 8. 한 줄 요약',
+            '- IVFFlat = 빠른 빌드 + 적은 메모리, 약간의 recall 양보',
+            '- HNSW    = 느린 빌드 + 많은 메모리, 빠른 검색 + 높은 recall',
+          ],
+          highlight: [4, 5, 8, 9, 12, 13, 14, 17, 18, 21, 22, 25, 26, 33, 34],
+        },
       },
     ];
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playRef = useRef(null);
-      const s = STEPS[step];
-      const isEnd = step === STEPS.length - 1;
+    // ─────────────────────────────────────────────────────
+    // IVFFlat 시각화 (k-means 클러스터 + 쿼리 + probed 영역)
+    // ─────────────────────────────────────────────────────
+    const CLUSTER_COLORS = ['#a78bfa', '#c084fc', '#d8b4fe', '#9333ea', '#7e22ce'];
 
-      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
-      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
-      const nextRef = useRef(next); nextRef.current = next;
-      const prevRef = useRef(prev); prevRef.current = prev;
-      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
+    function IVFFlatView({ ivf }) {
+      const w = 380, h = 260;
+      if (!ivf) {
+        return (
+          <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-2 flex items-center justify-center min-h-[200px]">
+            <div className="text-[10px] text-purple-400 font-mono">IVFFlat 미사용 단계</div>
+          </div>
+        );
+      }
+      const { points, centers, query } = ivf;
+
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-2">
+          <div className="text-[11px] font-bold text-purple-800 mb-1 flex items-center gap-1">
+            <span>🗂️</span>
+            <span>IVFFlat — k-means 클러스터</span>
+          </div>
+          <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+            <defs>
+              <pattern id="grid-ivf" width="30" height="30" patternUnits="userSpaceOnUse">
+                <path d="M 30 0 L 0 0 0 30" fill="none" stroke="#e9d5ff" strokeWidth="0.5" />
+              </pattern>
+            </defs>
+            <rect width={w} height={h} fill="url(#grid-ivf)" />
+
+            {/* probed 클러스터 영역 강조 */}
+            {centers.map((c) => c.probed && (
+              <circle key={`bg-${c.cluster}`} cx={c.x} cy={c.y} r={50}
+                fill="#a855f7" fillOpacity="0.12" stroke="#a855f7" strokeWidth="1.5" strokeDasharray="4,3" />
+            ))}
+
+            {/* 점 */}
+            {points.map((p) => {
+              const noCluster = p.cluster < 0;
+              const fill = noCluster
+                ? '#cbd5e1'
+                : (p.hit ? '#581c87' : (p.scanned ? CLUSTER_COLORS[p.cluster] : '#e9d5ff'));
+              const stroke = p.hit ? '#3b0764' : '#7e22ce';
+              const r = p.hit ? 6 : 4;
+              return (
+                <g key={p.id}>
+                  {p.hit && (
+                    <circle cx={p.x} cy={p.y} r={10} fill="none" stroke="#581c87" strokeWidth="1.5" opacity="0.6">
+                      <animate attributeName="r" from="6" to="14" dur="1.4s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" from="0.7" to="0" dur="1.4s" repeatCount="indefinite" />
+                    </circle>
+                  )}
+                  <circle cx={p.x} cy={p.y} r={r} fill={fill} stroke={stroke} strokeWidth="1" />
+                </g>
+              );
+            })}
+
+            {/* 클러스터 중심 (centroid) */}
+            {centers.map((c) => (
+              <g key={c.cluster}>
+                <rect x={c.x - 8} y={c.y - 8} width={16} height={16}
+                  fill={c.probed ? '#7e22ce' : '#c084fc'}
+                  stroke={c.probed ? '#3b0764' : '#7e22ce'} strokeWidth="1.5"
+                  transform={`rotate(45 ${c.x} ${c.y})`} />
+                <text x={c.x} y={c.y + 3} textAnchor="middle" fontSize="9" fontWeight="bold" fill="white" fontFamily="monospace">C{c.cluster}</text>
+              </g>
+            ))}
+
+            {/* 쿼리 벡터 */}
+            {query && (
+              <g>
+                <circle cx={query.x} cy={query.y} r={20} fill="none" stroke="#dc2626" strokeWidth="2" opacity="0.4">
+                  <animate attributeName="r" from="14" to="26" dur="1.4s" repeatCount="indefinite" />
+                  <animate attributeName="opacity" from="0.7" to="0" dur="1.4s" repeatCount="indefinite" />
+                </circle>
+                <circle cx={query.x} cy={query.y} r={7} fill="#dc2626" stroke="#7f1d1d" strokeWidth="2" />
+                <text x={query.x} y={query.y - 14} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#7f1d1d" fontFamily="monospace">
+                  쿼리
+                </text>
+              </g>
+            )}
+          </svg>
+          <div className="text-[9px] text-purple-700 mt-1 text-center font-mono">
+            ◆ centroid · ● 데이터 · 점선 = 검색 대상 구역
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // HNSW 시각화 (다층 그래프)
+    // ─────────────────────────────────────────────────────
+    function HNSWView({ hnsw }) {
+      const w = 420, h = 270;
+      if (!hnsw) {
+        return (
+          <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-2 flex items-center justify-center min-h-[200px]">
+            <div className="text-[10px] text-purple-400 font-mono">HNSW 미사용 단계</div>
+          </div>
+        );
+      }
+      const { layers, edges, query } = hnsw;
+      const allNodes = layers.flat();
+      const nodeMap = Object.fromEntries(allNodes.map((n) => [n.id, n]));
+
+      const layerLabels = ['Layer 0 (dense)', 'Layer 1 (mid)', 'Layer 2 (sparse)'];
+      const layerY = [200, 110, 30];
+
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-2">
+          <div className="text-[11px] font-bold text-purple-800 mb-1 flex items-center gap-1">
+            <span>🕸️</span>
+            <span>HNSW — 다층 그래프</span>
+          </div>
+          <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+            <defs>
+              <pattern id="grid-hnsw" width="30" height="30" patternUnits="userSpaceOnUse">
+                <path d="M 30 0 L 0 0 0 30" fill="none" stroke="#e9d5ff" strokeWidth="0.5" />
+              </pattern>
+            </defs>
+            <rect width={w} height={h} fill="url(#grid-hnsw)" />
+
+            {/* 레이어 분리선 + 라벨 */}
+            {[60, 150].map((y) => (
+              <line key={y} x1={0} y1={y} x2={w} y2={y} stroke="#c084fc" strokeWidth="0.5" strokeDasharray="3,3" opacity="0.5" />
+            ))}
+            {layerLabels.map((label, i) => (
+              <text key={label} x={5} y={layerY[i] - 15} fontSize="8" fill="#7e22ce" fontFamily="monospace" fontWeight="bold">
+                {label}
+              </text>
+            ))}
+
+            {/* 엣지 — hit 우선 */}
+            {edges.map((e, i) => {
+              const a = nodeMap[e.from];
+              const b = nodeMap[e.to];
+              if (!a || !b) return null;
+              const stroke = e.hit ? '#dc2626' : '#a78bfa';
+              const sw = e.hit ? 2.5 : 1;
+              const opacity = e.hit ? 1 : 0.45;
+              const dashed = e.layer === 'cross';
+              return (
+                <line
+                  key={`e-${i}`}
+                  x1={a.x}
+                  y1={a.y}
+                  x2={b.x}
+                  y2={b.y}
+                  stroke={stroke}
+                  strokeWidth={sw}
+                  opacity={opacity}
+                  strokeDasharray={dashed ? '3,2' : undefined}
+                />
+              );
+            })}
+
+            {/* 노드 */}
+            {allNodes.map((n) => {
+              const fill = n.hit ? '#581c87' : (n.visited ? '#a855f7' : '#ddd6fe');
+              const stroke = n.hit ? '#3b0764' : '#7e22ce';
+              const r = n.hit ? 9 : 6;
+              return (
+                <g key={n.id}>
+                  {n.hit && (
+                    <circle cx={n.x} cy={n.y} r={14} fill="none" stroke="#581c87" strokeWidth="1.5" opacity="0.6">
+                      <animate attributeName="r" from="9" to="18" dur="1.4s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" from="0.7" to="0" dur="1.4s" repeatCount="indefinite" />
+                    </circle>
+                  )}
+                  <circle cx={n.x} cy={n.y} r={r} fill={fill} stroke={stroke} strokeWidth="1.5" />
+                </g>
+              );
+            })}
+
+            {/* 쿼리 */}
+            {query && (
+              <g>
+                <circle cx={query.x} cy={query.y} r={18} fill="none" stroke="#dc2626" strokeWidth="2" opacity="0.4">
+                  <animate attributeName="r" from="12" to="22" dur="1.4s" repeatCount="indefinite" />
+                  <animate attributeName="opacity" from="0.7" to="0" dur="1.4s" repeatCount="indefinite" />
+                </circle>
+                <circle cx={query.x} cy={query.y} r={7} fill="#dc2626" stroke="#7f1d1d" strokeWidth="2" />
+                <text x={query.x} y={query.y + 20} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#7f1d1d" fontFamily="monospace">
+                  쿼리
+                </text>
+              </g>
+            )}
+          </svg>
+          <div className="text-[9px] text-purple-700 mt-1 text-center font-mono">
+            상위 = 멀리 점프 · 하위 = 정밀 탐색 · 빨간 = 탐색 경로
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 검색 시간 비교 막대
+    // ─────────────────────────────────────────────────────
+    function BenchBars({ bench, note }) {
+      return (
+        <div className="rounded-lg bg-white border-2 border-purple-200 p-3 mt-3">
+          <div className="text-[11px] font-bold text-purple-800 mb-2 flex items-center justify-between">
+            <span>⏱ 검색 시간 / 빌드 시간 비교</span>
+            <span className="text-[9px] text-purple-500 font-mono">100만 행 기준</span>
+          </div>
+          <div className="space-y-1.5">
+            {bench.map((b, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="text-[10px] font-mono text-slate-700 w-44 truncate">{b.label}</span>
+                <div className="flex-1 bg-slate-100 rounded h-4 overflow-hidden border border-slate-200">
+                  <div
+                    className="h-full rounded transition-all duration-700 flex items-center justify-end pr-1.5"
+                    style={{ width: b.barW, background: b.color }}
+                  >
+                    <span className="text-[9px] font-bold text-white font-mono">{b.ms}ms</span>
+                  </div>
+                </div>
+                <span className="text-[10px] font-mono text-slate-600 w-14 text-right">recall {b.recall}</span>
+              </div>
+            ))}
+          </div>
+          {note && (
+            <div className="mt-2 pt-2 border-t border-slate-100 text-[10px] text-purple-700 font-medium">
+              {note}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — IVFFlat(좌) + HNSW(우) + 검색시간 막대(하단)
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📚 도서관 분류법 — IVFFlat vs HNSW</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <IVFFlatView ivf={step.ivf} />
+            <HNSWView hnsw={step.hnsw} />
+          </div>
+
+          <BenchBars bench={step.bench} note={step.note} />
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-3 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#a78bfa' }}></span>
+              일반 데이터
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#7e22ce' }}></span>
+              스캔/방문
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#581c87' }}></span>
+              top-k hit
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: '#dc2626' }}></span>
+              쿼리 / 탐색 경로
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
-        else { clearInterval(playRef.current); }
-        return () => clearInterval(playRef.current);
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-purple-500/15 border-l-2 border-purple-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
           if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
-          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
-      const renderLeft = () => {
-        switch (s.left) {
-          case 'noindex':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">인덱스 없는 검색</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`-- 인덱스 없이 검색 (Seq Scan)
-SELECT id, content,
-  embedding <=> '[0.1,0.2,...]' AS dist
-FROM documents
-ORDER BY embedding <=> '[0.1,0.2,...]'
-LIMIT 5;
-
--- EXPLAIN 결과:
--- Seq Scan on documents
--- (cost=0.00..25000.00 rows=100000)`}</pre>
-                <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">100,000건 기준: 약 500ms ~ 2초 소요</div>
-              </div>
-            );
-          case 'ivfflat-concept':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">IVFFlat 개념도</div>
-                <div className="space-y-2">
-                  {[
-                    { label: '구역 1 (소설)', items: ['벡터 A', '벡터 B', '벡터 C'], color: 'bg-blue-50 border-blue-200' },
-                    { label: '구역 2 (과학)', items: ['벡터 D', '벡터 E'], color: 'bg-emerald-50 border-emerald-200' },
-                    { label: '구역 3 (역사)', items: ['벡터 F', '벡터 G', '벡터 H'], color: 'bg-amber-50 border-amber-200' },
-                    { label: '구역 4 (예술)', items: ['벡터 I', '벡터 J'], color: 'bg-purple-50 border-purple-200' },
-                  ].map((zone, i) => (
-                    <div key={i} className={`p-3 rounded-lg border ${zone.color}`}>
-                      <div className="font-bold text-xs mb-1">{zone.label}</div>
-                      <div className="flex gap-1">
-                        {zone.items.map((v, j) => (
-                          <span key={j} className="bg-white px-2 py-0.5 rounded text-xs border">{v}</span>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div className="mt-2 text-xs text-slate-500">쿼리 벡터와 가장 가까운 구역 중심을 찾고, 해당 구역만 검색</div>
-              </div>
-            );
-          case 'ivfflat-params':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">IVFFlat 파라미터</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="font-bold text-sm text-blue-800 mb-1">lists (구역 수)</div>
-                    <div className="text-xs text-blue-700 mb-2">권장: sqrt(전체 행 수). 100만 건이면 lists = 1000</div>
-                    <pre className="bg-white rounded p-2 text-xs font-mono border border-blue-100">{`CREATE INDEX ON docs USING ivfflat
-  (embedding vector_cosine_ops)
-  WITH (lists = 1000);`}</pre>
-                  </div>
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="font-bold text-sm text-blue-800 mb-1">probes (검색 구역 수)</div>
-                    <div className="text-xs text-blue-700 mb-2">기본값 1. 높이면 recall 증가, 속도 감소</div>
-                    <pre className="bg-white rounded p-2 text-xs font-mono border border-blue-100">{`SET ivfflat.probes = 10;
--- 1000개 구역 중 10개만 검색
--- recall ~95%, 속도 ~10배 향상`}</pre>
-                  </div>
-                </div>
-              </div>
-            );
-          case 'hnsw-concept':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">HNSW 개념도</div>
-                <div className="space-y-2">
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                    <div className="font-bold text-xs text-purple-800 mb-1">Layer 2 (상위 - 큰 점프)</div>
-                    <div className="flex items-center gap-2 text-xs text-purple-700">
-                      <span className="bg-purple-200 px-2 py-1 rounded">A</span>
-                      <span>---</span>
-                      <span className="bg-purple-200 px-2 py-1 rounded">F</span>
-                      <span>---</span>
-                      <span className="bg-purple-200 px-2 py-1 rounded">K</span>
-                    </div>
-                  </div>
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="font-bold text-xs text-blue-800 mb-1">Layer 1 (중간 - 중간 점프)</div>
-                    <div className="flex items-center gap-2 text-xs text-blue-700">
-                      <span className="bg-blue-200 px-2 py-1 rounded">A</span>
-                      <span>-</span>
-                      <span className="bg-blue-200 px-2 py-1 rounded">C</span>
-                      <span>-</span>
-                      <span className="bg-blue-200 px-2 py-1 rounded">F</span>
-                      <span>-</span>
-                      <span className="bg-blue-200 px-2 py-1 rounded">H</span>
-                      <span>-</span>
-                      <span className="bg-blue-200 px-2 py-1 rounded">K</span>
-                    </div>
-                  </div>
-                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
-                    <div className="font-bold text-xs text-emerald-800 mb-1">Layer 0 (하위 - 정밀 탐색)</div>
-                    <div className="flex items-center gap-1 text-xs text-emerald-700 flex-wrap">
-                      {['A','B','C','D','E','F','G','H','I','J','K'].map(n => (
-                        <span key={n} className="bg-emerald-200 px-1.5 py-0.5 rounded">{n}</span>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                <div className="mt-2 text-xs text-slate-500">상위 레이어에서 대략적 위치를 잡고, 하위로 내려가며 정밀 탐색</div>
-              </div>
-            );
-          case 'hnsw-params':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">HNSW 파라미터</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                    <div className="font-bold text-sm text-purple-800 mb-1">m (연결 수)</div>
-                    <div className="text-xs text-purple-700 mb-2">기본 16. 높이면 recall 증가, 메모리 증가</div>
-                    <pre className="bg-white rounded p-2 text-xs font-mono border border-purple-100">{`CREATE INDEX ON docs USING hnsw
-  (embedding vector_cosine_ops)
-  WITH (m = 16, ef_construction = 64);`}</pre>
-                  </div>
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                    <div className="font-bold text-sm text-purple-800 mb-1">ef_search (검색 시 탐색 범위)</div>
-                    <div className="text-xs text-purple-700 mb-2">기본 40. 높이면 recall 증가, 속도 감소</div>
-                    <pre className="bg-white rounded p-2 text-xs font-mono border border-purple-100">{`SET hnsw.ef_search = 100;
--- recall ~99%, Seq Scan 대비 50배 빠름`}</pre>
-                  </div>
-                </div>
-              </div>
-            );
-          case 'compare-table':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">IVFFlat vs HNSW 비교</div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm border-collapse">
-                    <thead>
-                      <tr className="bg-slate-100">
-                        <th className="p-2 text-left border border-slate-200">항목</th>
-                        <th className="p-2 text-center border border-slate-200 text-blue-700">IVFFlat</th>
-                        <th className="p-2 text-center border border-slate-200 text-purple-700">HNSW</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {[
-                        ['빌드 속도', '빠름', '느림'],
-                        ['검색 속도', '보통', '빠름'],
-                        ['Recall', '보통 (90~95%)', '높음 (95~99%)'],
-                        ['메모리 사용', '적음', '많음 (2~3배)'],
-                        ['Train 필요', '필요 (데이터 선행)', '불필요'],
-                        ['동적 추가', '가능 (rebuild 권장)', '바로 가능'],
-                      ].map(([item, ivf, hnsw], i) => (
-                        <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
-                          <td className="p-2 border border-slate-200 font-medium">{item}</td>
-                          <td className="p-2 border border-slate-200 text-center text-blue-700">{ivf}</td>
-                          <td className="p-2 border border-slate-200 text-center text-purple-700">{hnsw}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            );
-          default: return null;
-        }
-      };
-
-      const renderRight = () => {
-        switch (s.right) {
-          case 'problem':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">왜 인덱스가 필요한가</div>
-                <div className="space-y-3">
-                  {[
-                    { rows: '10,000', time: '~50ms', status: 'ok', label: '소규모' },
-                    { rows: '100,000', time: '~500ms', status: 'warn', label: '중규모' },
-                    { rows: '1,000,000', time: '~5초', status: 'bad', label: '대규모' },
-                    { rows: '10,000,000', time: '~50초', status: 'bad', label: '초대규모' },
-                  ].map((r, i) => (
-                    <div key={i} className={`p-3 rounded-lg border flex justify-between items-center ${
-                      r.status === 'ok' ? 'bg-emerald-50 border-emerald-200' :
-                      r.status === 'warn' ? 'bg-amber-50 border-amber-200' : 'bg-red-50 border-red-200'
-                    }`}>
-                      <div>
-                        <div className="font-bold text-sm">{r.label} ({r.rows}건)</div>
-                      </div>
-                      <div className={`font-mono text-sm font-bold ${
-                        r.status === 'ok' ? 'text-emerald-700' : r.status === 'warn' ? 'text-amber-700' : 'text-red-700'
-                      }`}>{r.time}</div>
-                    </div>
-                  ))}
-                </div>
-                <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700">
-                  pgvector는 <b>IVFFlat</b>과 <b>HNSW</b> 두 가지 인덱스를 지원합니다
-                </div>
-              </div>
-            );
-          case 'ivfflat-code':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">IVFFlat 생성 SQL</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`-- 1. 인덱스 생성 (데이터가 먼저 있어야 함)
-CREATE INDEX idx_docs_ivfflat
-  ON documents
-  USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
-
--- 2. 검색 시 probes 설정
-SET ivfflat.probes = 10;
-
--- 3. 검색 실행
-SELECT id, content,
-  1 - (embedding <=> $1) AS similarity
-FROM documents
-ORDER BY embedding <=> $1
-LIMIT 10;`}</pre>
-                <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
-                  IVFFlat은 데이터를 먼저 넣은 뒤 인덱스를 생성해야 합니다 (train 과정 포함)
-                </div>
-              </div>
-            );
-          case 'ivfflat-tradeoff':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">lists / probes 트레이드오프</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                    <div className="font-bold text-sm text-slate-700 mb-2">probes 값에 따른 변화</div>
-                    {[
-                      { probes: 1, recall: '70%', speed: '매우 빠름', bar: 'w-2/12' },
-                      { probes: 5, recall: '88%', speed: '빠름', bar: 'w-5/12' },
-                      { probes: 10, recall: '95%', speed: '보통', bar: 'w-8/12' },
-                      { probes: 50, recall: '99%', speed: '느림', bar: 'w-11/12' },
-                    ].map((p, i) => (
-                      <div key={i} className="flex items-center gap-2 mb-1">
-                        <span className="text-xs font-mono w-16 text-slate-600">probes={p.probes}</span>
-                        <div className="flex-1 bg-slate-200 rounded-full h-3">
-                          <div className={`bg-blue-500 h-3 rounded-full ${p.bar}`}></div>
-                        </div>
-                        <span className="text-xs font-medium w-10 text-right">{p.recall}</span>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700">
-                    <b>권장 공식:</b> lists = sqrt(N), probes = sqrt(lists)<br/>
-                    100만 건: lists=1000, probes=~32
-                  </div>
-                </div>
-              </div>
-            );
-          case 'hnsw-code':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">HNSW 생성 SQL</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`-- 1. 인덱스 생성 (빈 테이블에도 가능)
-CREATE INDEX idx_docs_hnsw
-  ON documents
-  USING hnsw (embedding vector_cosine_ops)
-  WITH (m = 16, ef_construction = 64);
-
--- 2. 검색 시 ef_search 설정
-SET hnsw.ef_search = 100;
-
--- 3. 검색 실행
-SELECT id, content,
-  1 - (embedding <=> $1) AS similarity
-FROM documents
-ORDER BY embedding <=> $1
-LIMIT 10;`}</pre>
-                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-700">
-                  HNSW는 train 불필요 — 데이터가 없어도 인덱스 생성 가능, 추가 시 자동 반영
-                </div>
-              </div>
-            );
-          case 'hnsw-tradeoff':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">m / ef_construction 트레이드오프</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                    <div className="font-bold text-sm text-slate-700 mb-2">m 값에 따른 변화</div>
-                    {[
-                      { m: 4, recall: '85%', mem: '적음', bar: 'w-3/12' },
-                      { m: 16, recall: '95%', mem: '보통', bar: 'w-7/12' },
-                      { m: 32, recall: '98%', mem: '많음', bar: 'w-9/12' },
-                      { m: 64, recall: '99%', mem: '매우 많음', bar: 'w-11/12' },
-                    ].map((p, i) => (
-                      <div key={i} className="flex items-center gap-2 mb-1">
-                        <span className="text-xs font-mono w-12 text-slate-600">m={p.m}</span>
-                        <div className="flex-1 bg-slate-200 rounded-full h-3">
-                          <div className={`bg-purple-500 h-3 rounded-full ${p.bar}`}></div>
-                        </div>
-                        <span className="text-xs font-medium w-10 text-right">{p.recall}</span>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg text-xs text-purple-700">
-                    <b>권장값:</b> m=16, ef_construction=64 (기본값)<br/>
-                    높은 recall 필요 시: m=32, ef_construction=128
-                  </div>
-                </div>
-              </div>
-            );
-          case 'recommend':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">상황별 추천</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="font-bold text-sm text-blue-800">IVFFlat 추천 상황</div>
-                    <ul className="text-xs text-blue-700 mt-1 space-y-1">
-                      <li>- 메모리가 제한적인 환경</li>
-                      <li>- 데이터가 대량이고 배치 빌드 가능</li>
-                      <li>- recall 90~95%면 충분한 경우</li>
-                    </ul>
-                  </div>
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                    <div className="font-bold text-sm text-purple-800">HNSW 추천 상황</div>
-                    <ul className="text-xs text-purple-700 mt-1 space-y-1">
-                      <li>- 높은 recall(99%)이 필요한 경우</li>
-                      <li>- 실시간 데이터 추가가 빈번한 경우</li>
-                      <li>- 메모리 여유가 있는 환경</li>
-                    </ul>
-                  </div>
-                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-700">
-                    <b>pgvector 0.5+ 기준:</b> HNSW가 기본 추천. IVFFlat은 메모리 절약이 필요할 때
-                  </div>
-                </div>
-              </div>
-            );
-          default: return null;
-        }
-      };
-
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm">
-              <a href="../index.html" className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 font-medium">
-                <span>&larr;</span> 허브로 돌아가기
-              </a>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-purple-700 hover:text-purple-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-1</span>
             </nav>
 
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div className="w-9 h-9 bg-purple-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
                 <div>
                   <div className="text-xs text-slate-500 font-medium">Part IV. pgvector &gt; Chapter 2. pgvector 실전</div>
-                  <h1 className="text-2xl font-bold text-slate-800">IV-2-1. pgvector 인덱싱 — IVFFlat vs HNSW</h1>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">pgvector 인덱싱 — IVFFlat vs HNSW</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">k-means 클러스터링 vs 다층 그래프 — 빌드 / 메모리 / 검색 / recall 비교</p>
                 </div>
               </div>
-              <p className="text-slate-600">도서관의 두 가지 분류 체계: <b>층별 분류</b>(IVFFlat)와 <b>추천 네트워크</b>(HNSW). 각각의 원리, 파라미터, 적합한 상황을 비교합니다.</p>
             </header>
 
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-blue-700 border-blue-800 text-white">
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 text-sm text-purple-900">
+                💡 다음(IV-2-2)에서는 <strong>pgvector 실전 운영</strong> — 인덱스 모니터링, REINDEX 전략, 벤치마크 자동화를 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-purple-700 text-white shadow-sm">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-200">IVFFlat vs HNSW</h3>
-                <span className="text-xs text-blue-200">키보드 &larr;/&rarr;로 단계 이동</span>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-purple-200">키보드 &larr;/&rarr;</span>
               </div>
-              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderLeft()}
-              </div>
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderRight()}
-              </div>
-            </div>
-
+            {/* 키워드 태그 */}
             <div className="flex flex-wrap gap-2">
-              {['ivfflat', 'hnsw', 'lists', 'probes', 'm', 'ef_construction', 'CREATE INDEX'].map(kw => (
-                <span key={kw} className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full text-sm font-medium border border-blue-200">{kw}</span>
+              {['ivfflat', 'hnsw', 'lists', 'probes', 'm', 'ef_construction', 'ef_search', 'CREATE INDEX', 'k-means', 'small world'].map((kw) => (
+                <span key={kw} className="bg-purple-50 text-purple-700 px-3 py-1 rounded-full text-xs font-medium border border-purple-200 font-mono">
+                  {kw}
+                </span>
               ))}
             </div>
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
-                </button>
-                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-blue-600 hover:bg-blue-700">
-                  {isPlaying ? (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>
-                  ) : (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>
-                  )}
-                </button>
-                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
-                </button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-purple-600 text-white hover:bg-purple-700 transition min-w-[110px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
             </div>
 
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./IV-1-2.html" className="text-blue-600 hover:text-blue-800 font-medium">&larr; IV-1-2. pgvector 데이터 모델</a>
-              <a href="./IV-2-2.html" className="text-blue-600 hover:text-blue-800 font-medium">IV-2-2. pgvector 실전 &rarr;</a>
-            </div>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./IV-1-2.html" className="text-slate-500 hover:text-slate-700">&larr; IV-1-2 pgvector 데이터 모델</a>
+              <a href="./IV-2-2.html" className="text-purple-700 hover:text-purple-900 font-medium">IV-2-2 pgvector 실전 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
     }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>

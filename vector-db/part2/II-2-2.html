@@ -3,383 +3,897 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vector DB — II-2-2. FAISS 최적화 — GPU 가속과 양자화</title>
+  <title>Vector DB — II-2-2. FAISS 최적화 (GPU 가속, Quantization)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    II-2-2. FAISS 최적화 (GPU 가속, Quantization)
+    학습 목표: CPU baseline → GPU 100x 가속 → 메모리 한계 → PQ 압축 8억 벡터 → 정확도 손실
+              5단계로 FAISS 대규모 최적화의 trade-off를 이해한다.
+    핵심 비유: 고속도로 + 압축 트럭 — 속도(GPU) vs 메모리(PQ) vs 정확도(recall)
+    패턴: fastapi v1 — 좌(LiveDataPane: 막대 그래프 + 게이지 + 압축 시각화 + tradeoff)
+                       우(VSCode CodeViewer: cpu-baseline / gpu-accel / pq-compress / recall-eval)
+    색상: vector-db purple
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   speedBars : CPU vs GPU 검색 속도 [{ label, value, max, color, highlight }]
+    //   memGauge  : VRAM 사용량 게이지 { used, total, label }
+    //   compress  : PQ 압축 시각화 { original, compressed, blocks }
+    //   tradeoff  : 정확도 vs 속도 점도표 [{ label, recall, speed, active }]
+    //   verdict   : 단계 결론 { type, text }   type: 'good'|'warn'|'fail'
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        desc: "FAISS 최적화의 두 축: GPU 가속(속도)과 양자화(메모리). 일반 도로(CPU)에서 고속도로(GPU)로 바꾸면 속도가 10~100배 빨라지고, 트럭 적재 최적화(양자화)를 하면 메모리를 10~100배 절약합니다.",
-        left: 'analogy',
-        right: 'overview',
-        analogyData: {
-          title: '고속도로 비유',
-          items: [
-            { label: '일반 도로', mapped: 'CPU 검색', detail: '안정적이지만 느림', icon: 'C' },
-            { label: '고속도로', mapped: 'GPU 검색', detail: '10~100배 빠름', icon: 'G' },
-            { label: '일반 트럭', mapped: '원본 벡터 (float32)', detail: '메모리 많이 사용', icon: 'F' },
-            { label: '압축 트럭', mapped: '양자화 벡터 (int8)', detail: '메모리 10배 절약', icon: 'Q' },
+        title: 'Step 1. CPU baseline — 100만 벡터 검색 50ms',
+        desc: 'FAISS IndexFlatL2 (brute-force L2 거리)로 100만 개의 128차원 벡터를 검색하면 CPU에서 약 50ms가 걸린다. 단일 쿼리는 견딜 만하지만 초당 20 QPS가 한계 — 검색 트래픽이 늘면 바로 병목이 된다. 메모리는 100만 × 128 × 4byte ≈ 488MB로 여유롭다.',
+        speedBars: [
+          { label: 'CPU IndexFlatL2',      value: 50,   max: 60, color: 'bg-slate-500', highlight: true },
+          { label: 'GPU IndexFlatL2',      value: null, max: 60, color: 'bg-slate-300', highlight: false },
+          { label: 'CPU IVFPQ (nprobe=10)', value: null, max: 60, color: 'bg-slate-300', highlight: false },
+          { label: 'GPU IVFPQ (nprobe=10)', value: null, max: 60, color: 'bg-slate-300', highlight: false },
+        ],
+        memGauge: { used: 0.5, total: 24, label: 'RAM 사용 (GB)', barColor: 'bg-emerald-500' },
+        compress: null,
+        tradeoff: null,
+        verdict: { type: 'warn', text: '단일 쿼리 50ms — 견딜 만하지만 초당 20 QPS 한계. 트래픽 폭증 시 병목.' },
+        code: {
+          lang: 'python',
+          filename: 'cpu-baseline.py',
+          lines: [
+            '# CPU baseline — IndexFlatL2 (정확 brute-force 검색)',
+            '# 100만 벡터 × 128차원 → 검색 ~50ms / query',
+            'import faiss',
+            'import numpy as np',
+            'import time',
+            '',
+            '# 1) 100만 합성 벡터 (128차원, float32)',
+            'd, n = 128, 1_000_000',
+            'rng = np.random.default_rng(42)',
+            'vectors = rng.standard_normal((n, d)).astype("float32")',
+            '',
+            '# 2) brute-force 인덱스 — 모든 벡터와 L2 거리',
+            'index = faiss.IndexFlatL2(d)',
+            'index.add(vectors)              # 학습 단계 없음',
+            'print(f"ntotal={index.ntotal}") # 1,000,000',
+            '',
+            '# 3) 검색 — top-10 nearest',
+            'query = rng.standard_normal((1, d)).astype("float32")',
+            't0 = time.perf_counter()',
+            'D, I = index.search(query, k=10)',
+            'print(f"latency = {(time.perf_counter()-t0)*1000:.1f} ms")',
+            '#  → latency = 50.2 ms (i9-13900K 단일 코어)',
+            '',
+            '# 메모리: 100만 × 128 × 4byte = 488 MB (RAM 여유)',
+            '# 한계: 50ms → 초당 20 QPS, 1억 벡터 키우면 5초/쿼리',
           ],
-        },
-        overviewData: {
-          title: '최적화 전략 요약',
-          items: [
-            { strategy: 'GPU 가속', effect: '속도 10~100x 향상', cost: 'GPU 하드웨어 필요' },
-            { strategy: 'PQ (Product Quantization)', effect: '메모리 10~100x 절약', cost: '정확도 약간 손실' },
-            { strategy: 'SQ (Scalar Quantization)', effect: '메모리 4x 절약', cost: '정확도 거의 유지' },
-            { strategy: 'OPQ (Optimized PQ)', effect: 'PQ보다 정확도 개선', cost: '학습 시간 증가' },
-          ],
+          highlight: [13, 14, 19, 20, 21, 22, 28, 29, 30],
         },
       },
       {
-        desc: "GPU 가속: faiss-gpu를 설치하면 CPU 인덱스를 GPU로 옮길 수 있습니다. 100만 벡터 검색 시 CPU는 ~50ms, GPU는 ~0.5ms. 멀티 GPU 환경에서는 더 큰 차이가 납니다.",
-        left: 'benchmark',
-        right: 'code',
-        benchmarkData: {
-          title: 'CPU vs GPU 성능 비교 (100만 벡터, 128차원)',
-          bars: [
-            { label: 'CPU (IndexFlatL2)', value: 50, max: 50, unit: 'ms', color: 'bg-slate-400' },
-            { label: 'GPU (GpuIndexFlatL2)', value: 0.5, max: 50, unit: 'ms', color: 'bg-green-500' },
-            { label: 'CPU (IVF, nprobe=10)', value: 5, max: 50, unit: 'ms', color: 'bg-slate-400' },
-            { label: 'GPU (IVF, nprobe=10)', value: 0.1, max: 50, unit: 'ms', color: 'bg-green-500' },
+        title: 'Step 2. GPU 가속 — 100만 벡터 검색 0.5ms (100x 가속)',
+        desc: 'faiss-gpu로 인덱스를 GPU(VRAM)에 올리면 같은 100만 벡터 검색이 0.5ms로 떨어진다. CPU 대비 100배 가속 — GPU의 수천 개 코어가 모든 벡터의 L2 거리를 동시에 계산하기 때문이다. 초당 2,000 QPS가 가능해져 프로덕션 트래픽을 감당할 수 있다.',
+        speedBars: [
+          { label: 'CPU IndexFlatL2',      value: 50,   max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'GPU IndexFlatL2',      value: 0.5,  max: 60, color: 'bg-violet-600', highlight: true },
+          { label: 'CPU IVFPQ (nprobe=10)', value: null, max: 60, color: 'bg-slate-300', highlight: false },
+          { label: 'GPU IVFPQ (nprobe=10)', value: null, max: 60, color: 'bg-slate-300', highlight: false },
+        ],
+        memGauge: { used: 0.5, total: 24, label: 'VRAM 사용 (GB)', barColor: 'bg-emerald-500' },
+        compress: null,
+        tradeoff: null,
+        verdict: { type: 'good', text: 'GPU에서 100x 가속 — 0.5ms / query → 초당 2,000 QPS 가능. 프로덕션 OK.' },
+        code: {
+          lang: 'python',
+          filename: 'gpu-accel.py',
+          lines: [
+            '# GPU 가속 — faiss-gpu로 인덱스를 VRAM으로 전송',
+            '# pip install faiss-gpu  (CUDA 환경 필수)',
+            'import faiss',
+            'import numpy as np',
+            'import time',
+            '',
+            'd, n = 128, 1_000_000',
+            'rng = np.random.default_rng(42)',
+            'vectors = rng.standard_normal((n, d)).astype("float32")',
+            '',
+            '# 1) CPU 인덱스 생성 (FAISS 표준 패턴)',
+            'cpu_index = faiss.IndexFlatL2(d)',
+            'cpu_index.add(vectors)',
+            '',
+            '# 2) GPU 리소스 핸들 — workspace 메모리 풀 관리',
+            'res = faiss.StandardGpuResources()',
+            '',
+            '# 3) CPU 인덱스 → GPU 디바이스 0번으로 복사',
+            'gpu_index = faiss.index_cpu_to_gpu(',
+            '    res,        # GPU 리소스',
+            '    0,          # device id',
+            '    cpu_index,  # 옮길 CPU 인덱스',
+            ')',
+            '',
+            '# 4) 검색 — 같은 API, 다른 속도',
+            'query = rng.standard_normal((1, d)).astype("float32")',
+            't0 = time.perf_counter()',
+            'D, I = gpu_index.search(query, k=10)',
+            'print(f"latency = {(time.perf_counter()-t0)*1000:.2f} ms")',
+            '#  → latency = 0.50 ms  (NVIDIA RTX 4090, 100x 가속)',
+            '',
+            '# 5) 멀티 GPU 샤딩',
+            '# multi_gpu = faiss.index_cpu_to_all_gpus(cpu_index)',
+            '',
+            '# 빠른 이유: 수천 코어 동시 L2 계산 + 메모리 대역폭 ~1TB/s',
           ],
-        },
-        codeData: {
-          title: 'GPU 가속 코드',
-          code: `# GPU 가속 — faiss-gpu 필요\n# pip install faiss-gpu\nimport faiss\n\n# CPU 인덱스 생성\ncpu_index = faiss.IndexFlatL2(128)\ncpu_index.add(vectors)  # 100만 벡터\n\n# GPU 리소스 설정\nres = faiss.StandardGpuResources()\n\n# CPU → GPU 전송\ngpu_index = faiss.index_cpu_to_gpu(\n    res,      # GPU 리소스\n    0,        # GPU 디바이스 번호\n    cpu_index # CPU 인덱스\n)\n\n# GPU에서 검색 (10~100x 빠름)\nD, I = gpu_index.search(query, k=5)\n\n# 멀티 GPU 사용\n# gpu_index = faiss.index_cpu_to_all_gpus(\n#     cpu_index\n# )`,
+          highlight: [16, 17, 19, 20, 21, 22, 23, 28, 29, 30, 31],
         },
       },
       {
-        desc: "양자화(Quantization): 벡터를 압축해 메모리를 절약합니다. float32(4바이트) 벡터를 int8(1바이트)이나 더 작은 코드로 변환합니다. 768차원 float32 벡터 1개 = 3KB → PQ 적용 시 ~96바이트로 줄어듭니다.",
-        left: 'memory',
-        right: 'code',
-        memoryData: {
-          title: '메모리 비교 (100만 벡터, 768차원)',
-          items: [
-            { label: 'IndexFlatL2 (원본)', size: '3.0 GB', ratio: '1x', color: 'bg-red-400', width: '100%' },
-            { label: 'SQ8 (Scalar)', size: '768 MB', ratio: '4x 절약', color: 'bg-amber-400', width: '25%' },
-            { label: 'PQ (m=96)', size: '96 MB', ratio: '32x 절약', color: 'bg-green-400', width: '3.2%' },
-            { label: 'PQ (m=48)', size: '48 MB', ratio: '64x 절약', color: 'bg-emerald-400', width: '1.6%' },
+        title: 'Step 3. 메모리 한계 — GPU VRAM 24GB로는 1억 벡터 무리',
+        desc: '데이터가 1억 벡터로 늘면 float32 × 768차원 기준 약 286GB가 필요하다. 최고급 GPU도 VRAM 24GB(RTX 4090) ~ 80GB(H100) 수준 — 원본 벡터 그대로는 GPU에 못 올린다. 일부만 올리고 나머지는 디스크에서 읽으면 PCIe 병목으로 GPU 가속 효과가 사라진다. 메모리 압축이 필수.',
+        speedBars: [
+          { label: 'CPU IndexFlatL2',      value: 50,   max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'GPU IndexFlatL2',      value: 0.5,  max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'CPU IVFPQ (nprobe=10)', value: null, max: 60, color: 'bg-slate-300', highlight: false },
+          { label: 'GPU IVFPQ (nprobe=10)', value: null, max: 60, color: 'bg-slate-300', highlight: false },
+        ],
+        memGauge: { used: 286, total: 24, label: 'VRAM 사용 (GB)', barColor: 'bg-red-500', overflow: true },
+        compress: null,
+        tradeoff: null,
+        verdict: { type: 'fail', text: '1억 벡터 × 768차원 × float32 = 286GB → VRAM 24GB로는 불가능. PCIe 스왑 시 가속 효과 소실.' },
+        code: {
+          lang: 'python',
+          filename: 'gpu-accel.py',
+          lines: [
+            '# 메모리 한계 — 데이터가 커지면 GPU VRAM에 못 올린다',
+            'import faiss',
+            'import numpy as np',
+            '',
+            '# 실전 임베딩: 768차원 (BERT base) — 차원이 6배 늘어남',
+            'd = 768',
+            'n = 100_000_000   # 1억 벡터',
+            '',
+            '# 1) 메모리 추정',
+            'bytes_per_vec = d * 4  # float32',
+            'total_gb = n * bytes_per_vec / (1024 ** 3)',
+            'print(f"raw size = {total_gb:.0f} GB")',
+            '#  → raw size = 286 GB',
+            '',
+            '# 2) GPU VRAM 한계',
+            '#   RTX 4090 24GB / A100 40~80GB / H100 80GB',
+            '#   → 단일 GPU에 안 들어감 (12배 초과)',
+            '',
+            '# 3) 멀티 GPU 샤딩? 8 × A100 80GB = 640GB 가능',
+            '#    하지만 GPU 8장 비용 월 $20,000+',
+            '',
+            '# 4) 디스크 + GPU hybrid?',
+            '#    PCIe ~32GB/s 병목 → GPU 가속 효과 소실',
+            '',
+            '# 결론: 원본 float32 그대로는 한계 → quantization 필수',
+            '',
+            '# Step 4에서 PQ로 1/32 압축 시도',
+            'try:',
+            '    cpu_index = faiss.IndexFlatL2(d)',
+            '    cpu_index.add(np.empty((n, d), dtype="float32"))',
+            'except MemoryError:',
+            '    print("RAM 부족 — float32로는 불가능")',
           ],
-        },
-        codeData: {
-          title: 'SQ (Scalar Quantization) 코드',
-          code: `# SQ8 — float32 → uint8 (4배 절약)\nimport faiss\n\nd = 768\nindex = faiss.IndexScalarQuantizer(\n    d,\n    faiss.ScalarQuantizer.QT_8bit  # 8비트\n)\nindex.train(vectors)\nindex.add(vectors)\n\n# IVF + SQ 조합\nnlist = 1024\nquantizer = faiss.IndexFlatL2(d)\nindex = faiss.IndexIVFScalarQuantizer(\n    quantizer, d, nlist,\n    faiss.ScalarQuantizer.QT_8bit\n)\nindex.train(vectors)\nindex.add(vectors)\nindex.nprobe = 10\nD, I = index.search(query, k=5)`,
+          highlight: [9, 10, 11, 12, 13, 16, 17, 18, 19, 32, 33, 34],
         },
       },
       {
-        desc: "PQ(Product Quantization)는 벡터를 m개의 서브벡터로 쪼개고, 각각을 256개 코드 중 하나로 대체합니다. 768차원을 96개 서브벡터로 나누면, 벡터 하나가 96바이트로 압축됩니다. OPQ는 PQ 전에 회전 변환을 적용해 정확도를 개선합니다.",
-        left: 'concept',
-        right: 'code',
-        conceptData: {
-          title: 'PQ 동작 원리',
-          steps: [
-            { num: '1', label: '벡터 분할', detail: '768차원 → 96개의 8차원 서브벡터' },
-            { num: '2', label: '코드북 학습', detail: '각 서브벡터 공간에서 256개 클러스터 학습' },
-            { num: '3', label: '코드 할당', detail: '각 서브벡터를 가장 가까운 클러스터 번호(0~255)로 대체' },
-            { num: '4', label: '압축 완료', detail: '96 x 1바이트 = 96바이트 (원본 3072바이트의 1/32)' },
-          ],
-          note: 'OPQ: PQ 전에 직교 변환을 적용해 서브벡터 간 독립성을 높임',
+        title: 'Step 4. PQ + GPU — 메모리 1/8~1/32 압축으로 8억 벡터 가능',
+        desc: 'Product Quantization(PQ): 768차원 벡터를 96개의 8차원 서브벡터로 쪼개고, 각 서브벡터를 256개 코드 중 가장 가까운 번호(0~255)로 대체한다. 결과: 벡터 1개 = 96바이트(원본 3,072바이트의 1/32). 1억 벡터 메모리가 286GB → 9GB로 줄어 단일 RTX 4090에도 들어간다. IVFPQ + GPU 조합으로 8억 벡터까지 단일 노드 처리 가능.',
+        speedBars: [
+          { label: 'CPU IndexFlatL2',      value: 50,   max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'GPU IndexFlatL2',      value: 0.5,  max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'CPU IVFPQ (nprobe=10)', value: 5,   max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'GPU IVFPQ (nprobe=10)', value: 0.1, max: 60, color: 'bg-violet-600', highlight: true },
+        ],
+        memGauge: { used: 9, total: 24, label: 'VRAM 사용 (GB)', barColor: 'bg-violet-500' },
+        compress: {
+          original: { label: '원본 float32 vector', size: '3,072 bytes', dim: 768, blocks: 32 },
+          compressed: { label: 'PQ code (m=96)', size: '96 bytes', dim: 96, blocks: 1 },
+          ratio: '32x',
         },
-        codeData: {
-          title: 'PQ / OPQ 코드',
-          code: `# PQ — Product Quantization\nimport faiss\n\nd = 768\nm = 96    # 서브벡터 수 (d % m == 0 필수)\nnbits = 8 # 코드북 비트 (256개 코드)\n\nindex = faiss.IndexPQ(d, m, nbits)\nindex.train(vectors)\nindex.add(vectors)\nD, I = index.search(query, k=5)\n\n# OPQ — Optimized PQ (더 정확)\nopq_matrix = faiss.OPQMatrix(d, m)\nopq_index = faiss.IndexPQ(d, m, nbits)\nindex = faiss.IndexPreTransform(\n    opq_matrix, opq_index\n)\nindex.train(vectors)\nindex.add(vectors)\n\n# IVF + PQ 조합 (실전 추천)\nnlist = 1024\nquantizer = faiss.IndexFlatL2(d)\nindex = faiss.IndexIVFPQ(\n    quantizer, d, nlist, m, nbits\n)\nindex.train(vectors)\nindex.add(vectors)`,
+        tradeoff: null,
+        verdict: { type: 'good', text: '1억 벡터 286GB → 9GB (1/32 압축). 단일 GPU에 적재 가능, 검색 0.1ms. 8억 벡터까지 확장 가능.' },
+        code: {
+          lang: 'python',
+          filename: 'pq-compress.py',
+          lines: [
+            '# PQ + GPU — Product Quantization으로 메모리 1/32 압축',
+            'import faiss',
+            'import numpy as np',
+            '',
+            'd = 768          # 임베딩 차원',
+            'm = 96           # 서브벡터 개수 (d % m == 0)',
+            'nbits = 8        # 코드북 비트 → 256 코드',
+            'nlist = 4096     # IVF 클러스터 수',
+            '',
+            '# 학습 샘플 100만 (전체 1억 중 일부)',
+            'rng = np.random.default_rng(0)',
+            'train = rng.standard_normal((1_000_000, d)).astype("float32")',
+            '',
+            '# 1) IVFPQ — coarse(IVF) + fine(PQ) 이중 압축',
+            'quantizer = faiss.IndexFlatL2(d)',
+            'index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)',
+            'index.train(train)  # 256 클러스터 × 96 서브공간',
+            '',
+            '# 3) 1억 벡터를 청크 단위로 add (RAM 절약)',
+            'for chunk in load_chunks(total=100_000_000, chunk=1_000_000):',
+            '    index.add(chunk)',
+            '',
+            '# 4) GPU 전송 — 압축됐으니 9GB만 필요',
+            'res = faiss.StandardGpuResources()',
+            'gpu_index = faiss.index_cpu_to_gpu(res, 0, index)',
+            'gpu_index.nprobe = 10  # 검색 셀 수 (정확도 ↑ / 속도 ↓)',
+            '',
+            '# 5) 검색 — IVF coarse → PQ ADC',
+            'query = rng.standard_normal((1, d)).astype("float32")',
+            'D, I = gpu_index.search(query, k=10)',
+            '#  latency = 0.10 ms · 메모리 9GB (원본 286GB의 1/32)',
+            '',
+            '# 메모리: PQ code 9GB + IVF lists 0.5GB = 9.5GB',
+            '#         → RTX 4090 24GB에 적재 OK',
+          ],
+          highlight: [5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 25, 31, 32, 33],
         },
       },
       {
-        desc: "정리: GPU 가속은 '속도', 양자화는 '메모리'를 최적화합니다. 실전에서는 IVF + PQ + GPU 조합이 가장 많이 쓰입니다. 10억 벡터급에서는 양자화 없이는 메모리에 올릴 수 없습니다. 다음 시각화에서 FAISS의 한계와 보완 방법을 알아봅니다.",
-        left: 'summary',
-        right: 'recommend',
-        summaryData: {
-          title: '최적화 전략 정리',
-          rows: [
-            { scenario: '10만 건 이하', strategy: 'IndexFlatL2', reason: '최적화 불필요, 충분히 빠름' },
-            { scenario: '100만 건, 속도 필요', strategy: 'GPU + IVFFlat', reason: 'GPU로 속도 확보' },
-            { scenario: '1000만 건, 메모리 제약', strategy: 'IVF + PQ', reason: '메모리 절약 + 속도 균형' },
-            { scenario: '10억 건, 프로덕션', strategy: 'GPU + IVF + OPQ', reason: '전체 최적화 필수' },
+        title: 'Step 5. 정확도 손실 — recall@10이 0.99 → 0.92 (trade-off)',
+        desc: 'PQ는 공짜가 아니다. 96바이트로 압축하면서 원본의 미세한 차이가 256 코드 안으로 양자화돼 사라진다. recall@10(true top-10 중 검색이 실제로 반환한 비율)이 IndexFlatL2의 0.99에서 IVFPQ의 0.92로 떨어진다. 7%p 손실. 더 큰 m이나 OPQ(직교 변환)로 회복 가능 — 핵심은 "속도/메모리/정확도" 삼각 trade-off를 데이터에 맞게 튜닝하는 것.',
+        speedBars: [
+          { label: 'CPU IndexFlatL2',      value: 50,   max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'GPU IndexFlatL2',      value: 0.5,  max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'CPU IVFPQ (nprobe=10)', value: 5,   max: 60, color: 'bg-slate-400', highlight: false },
+          { label: 'GPU IVFPQ (nprobe=10)', value: 0.1, max: 60, color: 'bg-slate-400', highlight: false },
+        ],
+        memGauge: null,
+        compress: null,
+        tradeoff: {
+          title: '정확도 vs 속도 trade-off',
+          points: [
+            { label: 'IndexFlatL2 (CPU)',  recall: 0.99, speed: 50,   color: '#64748b', active: false },
+            { label: 'IndexFlatL2 (GPU)',  recall: 0.99, speed: 0.5,  color: '#64748b', active: false },
+            { label: 'IVF (nprobe=10)',    recall: 0.97, speed: 0.3,  color: '#94a3b8', active: false },
+            { label: 'IVFPQ m=96',         recall: 0.92, speed: 0.1,  color: '#7c3aed', active: true  },
+            { label: 'IVFPQ m=48',         recall: 0.85, speed: 0.05, color: '#a78bfa', active: false },
+            { label: 'IVFOPQ m=96',        recall: 0.95, speed: 0.12, color: '#5b21b6', active: false },
           ],
         },
-        recommendData: {
-          title: '다음에 배울 것',
-          desc: 'FAISS는 빠르고 강력하지만, 메타데이터 필터링, 자동 영속성, CRUD, 분산 처리가 없습니다. 이 한계를 어떻게 보완하는지 알아봅니다.',
-          keywords: ['메타데이터', 'persistence', 'ID 매핑', 'pre-filter'],
+        verdict: { type: 'warn', text: 'recall@10: 0.99 → 0.92 (-7%p). m을 키우거나 OPQ로 회복 가능. 워크로드별 튜닝 필수.' },
+        code: {
+          lang: 'python',
+          filename: 'recall-eval.py',
+          lines: [
+            '# Recall 평가 — PQ가 잃는 정확도를 측정',
+            'import faiss',
+            'import numpy as np',
+            '',
+            'd, n_eval = 768, 1000',
+            'rng = np.random.default_rng(7)',
+            'queries = rng.standard_normal((n_eval, d)).astype("float32")',
+            '',
+            '# 1) ground truth — IndexFlatL2 (정확)',
+            'gt_index = faiss.IndexFlatL2(d)',
+            'gt_index.add(corpus)              # 100만 벡터',
+            '_, gt = gt_index.search(queries, k=10)',
+            '',
+            '# 2) 후보 인덱스들',
+            'def make_ivfpq(d, m):',
+            '    q = faiss.IndexFlatL2(d)',
+            '    return faiss.IndexIVFPQ(q, d, 1024, m, 8)',
+            '',
+            'def make_ivfopq(d, m):',
+            '    pq  = faiss.IndexIVFPQ(faiss.IndexFlatL2(d), d, 1024, m, 8)',
+            '    opq = faiss.OPQMatrix(d, m)',
+            '    return faiss.IndexPreTransform(opq, pq)',
+            '',
+            'candidates = {',
+            '    "IVFPQ m=96":  make_ivfpq(d, 96),',
+            '    "IVFPQ m=48":  make_ivfpq(d, 48),',
+            '    "IVFOPQ m=96": make_ivfopq(d, 96),',
+            '}',
+            '',
+            '# 3) 학습 + 추가 + recall 계산',
+            'def recall_at_k(approx, gt, k=10):',
+            '    hits = sum(',
+            '        len(set(a) & set(g)) for a, g in zip(approx, gt)',
+            '    )',
+            '    return hits / (len(gt) * k)',
+            '',
+            'for name, idx in candidates.items():',
+            '    idx.train(corpus); idx.add(corpus); idx.nprobe = 10',
+            '    _, approx = idx.search(queries, k=10)',
+            '    print(f"{name:14s} recall@10 = {recall_at_k(approx, gt):.3f}")',
+            '',
+            '# 출력 예:',
+            '#   IndexFlatL2     recall@10 = 0.990  (정확)',
+            '#   IVFPQ  m=96     recall@10 = 0.920  (-7%p, 1/32 압축)',
+            '#   IVFPQ  m=48     recall@10 = 0.850  (-14%p, 1/64 압축)',
+            '#   IVFOPQ m=96     recall@10 = 0.950  (-4%p, OPQ로 회복)',
+            '',
+            '# 3축 trade-off:',
+            '#   속도↑ = GPU + nprobe↓  ·  메모리↓ = m↓',
+            '#   정확도↑ = m↑ + OPQ + nprobe↑  → 워크로드 튜닝',
+          ],
+          highlight: [9, 10, 11, 12, 33, 34, 35, 36, 37, 38, 45, 46, 47, 48],
         },
       },
     ];
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playRef = useRef(null);
-      const s = STEPS[step];
-      const isEnd = step === STEPS.length - 1;
-
-      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
-      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
-      const nextRef = useRef(next); nextRef.current = next;
-      const prevRef = useRef(prev); prevRef.current = prev;
-      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
-
-      useEffect(() => {
-        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
-        else { clearInterval(playRef.current); }
-        return () => clearInterval(playRef.current);
-      }, [isPlaying]);
-
-      useEffect(() => {
-        const onKey = (e) => {
-          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
-          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
-        };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-      }, []);
-
-      const renderLeft = () => {
-        if (s.left === 'analogy') {
-          const d = s.analogyData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <div className="space-y-3">
-                {d.items.map((item, i) => (
-                  <div key={i} className="flex items-center gap-3 p-3 bg-orange-50 rounded-lg border border-orange-200">
-                    <div className="w-8 h-8 bg-orange-600 text-white rounded-full flex items-center justify-center font-bold text-sm">{item.icon}</div>
-                    <div>
-                      <div className="font-bold text-sm text-orange-800">{item.label} = {item.mapped}</div>
-                      <div className="text-xs text-orange-600">{item.detail}</div>
-                    </div>
+    // ─────────────────────────────────────────────────────
+    // SpeedBars — CPU vs GPU 검색 속도 막대 그래프
+    // ─────────────────────────────────────────────────────
+    function SpeedBars({ bars }) {
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-violet-50 to-violet-100 border border-violet-200 p-3">
+          <div className="text-[11px] font-bold text-violet-800 mb-2 flex items-center gap-1">
+            <span>⚡</span>
+            <span>검색 속도 (100만 × 128d, ms / query · 낮을수록 좋음)</span>
+          </div>
+          <div className="space-y-2">
+            {bars.map((b, i) => {
+              const measured = b.value !== null && b.value !== undefined;
+              const widthPct = measured ? Math.max((b.value / b.max) * 100, 1.5) : 0;
+              return (
+                <div key={i}>
+                  <div className="flex justify-between text-[10px] mb-0.5">
+                    <span className={`font-mono ${b.highlight ? 'text-violet-900 font-bold' : 'text-slate-600'}`}>
+                      {b.label}
+                    </span>
+                    <span className={`font-mono ${b.highlight ? 'text-violet-900 font-bold' : 'text-slate-500'}`}>
+                      {measured ? `${b.value} ms` : '—'}
+                    </span>
                   </div>
-                ))}
-              </div>
-            </div>
-          );
-        }
-        if (s.left === 'benchmark') {
-          const d = s.benchmarkData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <div className="space-y-3">
-                {d.bars.map((bar, i) => (
-                  <div key={i}>
-                    <div className="flex justify-between text-xs mb-1">
-                      <span className="text-slate-600 font-medium">{bar.label}</span>
-                      <span className="font-bold text-slate-800">{bar.value}{bar.unit}</span>
-                    </div>
-                    <div className="bg-slate-100 rounded-full h-4">
-                      <div className={`h-4 rounded-full ${bar.color} transition-all duration-700`}
-                        style={{width: `${Math.max((bar.value / bar.max) * 100, 2)}%`}} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-lg text-xs text-green-700">
-                GPU는 CPU 대비 <b>10~100배</b> 빠른 검색 속도를 제공합니다
-              </div>
-            </div>
-          );
-        }
-        if (s.left === 'memory') {
-          const d = s.memoryData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <div className="space-y-3">
-                {d.items.map((item, i) => (
-                  <div key={i}>
-                    <div className="flex justify-between text-xs mb-1">
-                      <span className="text-slate-600 font-medium">{item.label}</span>
-                      <div className="text-right">
-                        <span className="font-bold text-slate-800">{item.size}</span>
-                        <span className="text-slate-400 ml-2">({item.ratio})</span>
-                      </div>
-                    </div>
-                    <div className="bg-slate-100 rounded-full h-4">
-                      <div className={`h-4 rounded-full ${item.color} transition-all duration-700`} style={{width: item.width}} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          );
-        }
-        if (s.left === 'concept') {
-          const d = s.conceptData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <div className="space-y-2">
-                {d.steps.map((st, i) => (
-                  <div key={i}>
-                    <div className="flex items-center gap-3 p-3 bg-orange-50 rounded-lg border border-orange-200">
-                      <div className="w-7 h-7 bg-orange-600 text-white rounded-full flex items-center justify-center font-bold text-xs">{st.num}</div>
-                      <div>
-                        <div className="font-bold text-sm text-orange-800">{st.label}</div>
-                        <div className="text-xs text-orange-600">{st.detail}</div>
-                      </div>
-                    </div>
-                    {i < d.steps.length - 1 && (
-                      <div className="flex justify-center my-0.5">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#c2410c" strokeWidth="2"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+                  <div className="bg-white/70 rounded-full h-3 border border-violet-200 overflow-hidden">
+                    {measured ? (
+                      <div
+                        className={`h-full rounded-full ${b.color} transition-all duration-700`}
+                        style={{ width: `${widthPct}%` }}
+                      />
+                    ) : (
+                      <div className="h-full w-full flex items-center justify-center">
+                        <span className="text-[9px] text-slate-400 font-mono">측정 전</span>
                       </div>
                     )}
                   </div>
-                ))}
-              </div>
-              <div className="mt-3 p-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">{d.note}</div>
-            </div>
-          );
-        }
-        if (s.left === 'summary') {
-          const d = s.summaryData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <div className="space-y-2">
-                {d.rows.map((row, i) => (
-                  <div key={i} className="p-3 bg-white rounded-lg border border-slate-200">
-                    <div className="flex justify-between items-center mb-1">
-                      <span className="text-xs font-bold text-slate-700">{row.scenario}</span>
-                      <span className="text-xs font-bold text-orange-600 bg-orange-50 px-2 py-0.5 rounded">{row.strategy}</span>
-                    </div>
-                    <div className="text-xs text-slate-500">{row.reason}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          );
-        }
-        return null;
-      };
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
 
-      const renderRight = () => {
-        if (s.right === 'overview') {
-          const d = s.overviewData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <div className="space-y-2">
-                {d.items.map((item, i) => (
-                  <div key={i} className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                    <div className="font-bold text-sm text-slate-700 mb-1">{item.strategy}</div>
-                    <div className="flex justify-between text-xs">
-                      <span className="text-emerald-600">{item.effect}</span>
-                      <span className="text-slate-400">{item.cost}</span>
-                    </div>
-                  </div>
-                ))}
+    // ─────────────────────────────────────────────────────
+    // MemoryGauge — VRAM 사용량 게이지 (overflow 시 빨강)
+    // ─────────────────────────────────────────────────────
+    function MemoryGauge({ gauge }) {
+      const pct = Math.min((gauge.used / gauge.total) * 100, 100);
+      const overflowPct = gauge.overflow ? Math.max((gauge.used / gauge.total - 1) * 100, 0) : 0;
+
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-violet-50 to-violet-100 border border-violet-200 p-3">
+          <div className="text-[11px] font-bold text-violet-800 mb-2 flex items-center gap-1">
+            <span>💾</span>
+            <span>{gauge.label}</span>
+          </div>
+          <div className="bg-white/70 rounded-lg h-8 border border-violet-200 overflow-hidden relative">
+            <div
+              className={`h-full ${gauge.barColor} transition-all duration-700`}
+              style={{ width: `${pct}%` }}
+            />
+            {gauge.overflow && (
+              <div className="absolute top-0 left-0 w-full h-full flex items-center justify-center">
+                <span className="text-xs font-bold text-red-700 font-mono">
+                  ⚠ {gauge.used.toFixed(0)} GB &gt; 한계 {gauge.total} GB
+                </span>
               </div>
-            </div>
-          );
-        }
-        if (s.right === 'code') {
-          const d = s.codeData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{d.title}</div>
-              <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-xs font-mono whitespace-pre-wrap overflow-x-auto leading-relaxed">{d.code}</pre>
-            </div>
-          );
-        }
-        if (s.right === 'recommend') {
-          const d = s.recommendData;
-          return (
-            <div>
-              <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">다음 학습</div>
-              <div className="p-4 bg-orange-50 border border-orange-200 rounded-lg mb-4">
-                <div className="font-bold text-orange-800 mb-2">{d.title}</div>
-                <div className="text-sm text-orange-700">{d.desc}</div>
+            )}
+            {!gauge.overflow && (
+              <div className="absolute top-0 left-0 w-full h-full flex items-center justify-center">
+                <span className="text-xs font-bold text-slate-700 font-mono">
+                  {gauge.used} GB / {gauge.total} GB ({pct.toFixed(1)}%)
+                </span>
               </div>
-              <div className="flex flex-wrap gap-2">
-                {d.keywords.map(kw => (
-                  <span key={kw} className="bg-orange-50 text-orange-700 px-3 py-1 rounded-full text-sm font-medium border border-orange-200">{kw}</span>
-                ))}
-              </div>
-            </div>
-          );
-        }
-        return null;
+            )}
+          </div>
+          <div className="flex justify-between text-[9px] text-violet-600 font-mono mt-1">
+            <span>0</span>
+            <span>VRAM 한계 ({gauge.total} GB)</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // CompressViz — 원본 vs PQ 압축 시각화
+    // ─────────────────────────────────────────────────────
+    function CompressViz({ data }) {
+      const renderBlocks = (count, color, max = 32) => {
+        const blocks = Array.from({ length: max }, (_, i) => i < count);
+        return (
+          <div className="grid grid-cols-16 gap-0.5">
+            {blocks.map((on, i) => (
+              <div
+                key={i}
+                className={`h-2 rounded-sm transition-all duration-700 ${on ? color : 'bg-slate-200'}`}
+              />
+            ))}
+          </div>
+        );
       };
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm">
-              <a href="../index.html" className="inline-flex items-center gap-1 text-orange-700 hover:text-orange-900 font-medium">
-                <span>&larr;</span> 허브로 돌아가기
-              </a>
-            </nav>
+        <div className="rounded-lg bg-gradient-to-br from-violet-50 to-violet-100 border border-violet-200 p-3">
+          <div className="text-[11px] font-bold text-violet-800 mb-2 flex items-center gap-1">
+            <span>📦</span>
+            <span>PQ 압축 시각화 — 벡터 1개 기준</span>
+          </div>
 
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-orange-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part II. FAISS &gt; Chapter 2. FAISS 실전</div>
-                  <h1 className="text-2xl font-bold text-slate-800">II-2-2. FAISS 최적화 — GPU 가속과 양자화</h1>
-                </div>
-              </div>
-              <p className="text-slate-600">일반 도로(CPU)에서 <b>고속도로(GPU)</b>로 바꾸면 속도 10~100배. <b>트럭 적재 최적화(양자화)</b>로 메모리 10~100배 절약.</p>
-            </header>
-
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-orange-700 border-orange-800 text-white">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-orange-200">FAISS 최적화</h3>
-                <span className="text-xs text-orange-200">키보드 &larr;/&rarr;로 단계 이동</span>
-              </div>
-              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+          {/* 원본 */}
+          <div className="mb-3">
+            <div className="flex justify-between text-[10px] mb-1">
+              <span className="font-mono text-slate-600">{data.original.label}</span>
+              <span className="font-mono text-slate-700 font-bold">{data.original.size} ({data.original.dim}d)</span>
             </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderLeft()}
-              </div>
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderRight()}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {['faiss-gpu', 'GpuIndexFlat', 'OPQ', 'SQ8', '메모리 절약', 'throughput'].map(kw => (
-                <span key={kw} className="bg-orange-50 text-orange-700 px-3 py-1 rounded-full text-sm font-medium border border-orange-200">{kw}</span>
+            <div className="grid gap-0.5" style={{ gridTemplateColumns: 'repeat(32, minmax(0, 1fr))' }}>
+              {Array.from({ length: 32 }).map((_, i) => (
+                <div key={i} className="h-3 rounded-sm bg-slate-400" />
               ))}
             </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
-                </button>
-                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-orange-600 hover:bg-orange-700">
-                  {isPlaying ? (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>
-                  ) : (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>
-                  )}
-                </button>
-                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
-                </button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
+            <div className="text-[9px] text-slate-500 mt-0.5 font-mono text-center">
+              32 × 96byte 청크 (3,072 byte)
             </div>
+          </div>
 
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./II-2-1.html" className="text-orange-600 hover:text-orange-800 font-medium">&larr; II-2-1. FAISS 실전 워크플로우</a>
-              <a href="./II-2-3.html" className="text-orange-600 hover:text-orange-800 font-medium">II-2-3. FAISS 한계와 보완 &rarr;</a>
+          {/* 화살표 + 비율 */}
+          <div className="flex items-center justify-center gap-2 my-2">
+            <span className="text-[10px] text-violet-600 font-mono">PQ (m=96, nbits=8)</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" strokeWidth="2">
+              <path d="M12 5v14M5 12l7 7 7-7" />
+            </svg>
+            <span className="px-2 py-0.5 bg-violet-600 text-white rounded text-[10px] font-bold font-mono">
+              {data.ratio} 압축
+            </span>
+          </div>
+
+          {/* 압축 후 */}
+          <div>
+            <div className="flex justify-between text-[10px] mb-1">
+              <span className="font-mono text-violet-800 font-bold">{data.compressed.label}</span>
+              <span className="font-mono text-violet-900 font-bold">{data.compressed.size} ({data.compressed.dim}코드)</span>
+            </div>
+            <div className="grid gap-0.5" style={{ gridTemplateColumns: 'repeat(32, minmax(0, 1fr))' }}>
+              <div className="h-3 rounded-sm bg-violet-600" />
+              {Array.from({ length: 31 }).map((_, i) => (
+                <div key={i} className="h-3 rounded-sm bg-slate-200" />
+              ))}
+            </div>
+            <div className="text-[9px] text-violet-600 mt-0.5 font-mono text-center">
+              1개 청크 (96 byte) — 256 코드 중 하나로 표현
             </div>
           </div>
         </div>
       );
     }
+
+    // ─────────────────────────────────────────────────────
+    // TradeoffChart — 정확도 vs 속도 산점도
+    // ─────────────────────────────────────────────────────
+    function TradeoffChart({ tradeoff }) {
+      const w = 380;
+      const h = 240;
+      const padL = 50;
+      const padR = 12;
+      const padT = 12;
+      const padB = 36;
+      const plotW = w - padL - padR;
+      const plotH = h - padT - padB;
+
+      // x: log10(speed ms), y: recall (0.7~1.0)
+      const xMin = Math.log10(0.04);
+      const xMax = Math.log10(60);
+      const yMin = 0.80;
+      const yMax = 1.00;
+
+      const xPos = (speed) => padL + ((Math.log10(speed) - xMin) / (xMax - xMin)) * plotW;
+      const yPos = (recall) => padT + plotH - ((recall - yMin) / (yMax - yMin)) * plotH;
+
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-violet-50 to-violet-100 border border-violet-200 p-3">
+          <div className="text-[11px] font-bold text-violet-800 mb-2 flex items-center gap-1">
+            <span>🎯</span>
+            <span>{tradeoff.title}</span>
+          </div>
+          <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+            {/* y axis */}
+            <line x1={padL} y1={padT} x2={padL} y2={padT + plotH} stroke="#a78bfa" strokeWidth="1" />
+            {/* x axis */}
+            <line x1={padL} y1={padT + plotH} x2={padL + plotW} y2={padT + plotH} stroke="#a78bfa" strokeWidth="1" />
+
+            {/* y grid + labels */}
+            {[0.80, 0.85, 0.90, 0.95, 1.00].map((v, i) => (
+              <g key={`y${i}`}>
+                <line
+                  x1={padL}
+                  y1={yPos(v)}
+                  x2={padL + plotW}
+                  y2={yPos(v)}
+                  stroke="#e9d5ff"
+                  strokeWidth="0.5"
+                  strokeDasharray="2,2"
+                />
+                <text x={padL - 4} y={yPos(v) + 3} textAnchor="end" fontSize="9" fill="#7c3aed" fontFamily="monospace">
+                  {v.toFixed(2)}
+                </text>
+              </g>
+            ))}
+
+            {/* x grid + labels (log scale) */}
+            {[0.05, 0.1, 0.5, 1, 5, 50].map((v, i) => (
+              <g key={`x${i}`}>
+                <line
+                  x1={xPos(v)}
+                  y1={padT}
+                  x2={xPos(v)}
+                  y2={padT + plotH}
+                  stroke="#e9d5ff"
+                  strokeWidth="0.5"
+                  strokeDasharray="2,2"
+                />
+                <text x={xPos(v)} y={padT + plotH + 12} textAnchor="middle" fontSize="9" fill="#7c3aed" fontFamily="monospace">
+                  {v}
+                </text>
+              </g>
+            ))}
+
+            {/* axis titles */}
+            <text x={padL + plotW / 2} y={h - 4} textAnchor="middle" fontSize="10" fill="#5b21b6" fontFamily="monospace">
+              검색 속도 (ms, log scale, 작을수록 빠름) →
+            </text>
+            <text
+              x={12}
+              y={padT + plotH / 2}
+              textAnchor="middle"
+              fontSize="10"
+              fill="#5b21b6"
+              fontFamily="monospace"
+              transform={`rotate(-90, 12, ${padT + plotH / 2})`}
+            >
+              ↑ recall@10
+            </text>
+
+            {/* points */}
+            {tradeoff.points.map((p, i) => {
+              const cx = xPos(p.speed);
+              const cy = yPos(p.recall);
+              const r = p.active ? 8 : 5;
+              return (
+                <g key={i}>
+                  {p.active && (
+                    <circle cx={cx} cy={cy} r={14} fill="none" stroke={p.color} strokeWidth="2" opacity="0.4">
+                      <animate attributeName="r" from="10" to="18" dur="1.4s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" from="0.6" to="0" dur="1.4s" repeatCount="indefinite" />
+                    </circle>
+                  )}
+                  <circle cx={cx} cy={cy} r={r} fill={p.color} stroke="white" strokeWidth="1.5" />
+                  <text
+                    x={cx + 10}
+                    y={cy + 3}
+                    fontSize="9"
+                    fontWeight={p.active ? 'bold' : 'normal'}
+                    fill={p.color}
+                    fontFamily="monospace"
+                  >
+                    {p.label}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+          <div className="text-[9px] text-violet-700 mt-1 text-center font-mono">
+            우상단(빠르고 정확)이 이상 · 보라 = PQ 강조 · 회색 = 비교군
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Verdict 박스 — 단계 결론
+    // ─────────────────────────────────────────────────────
+    function Verdict({ verdict }) {
+      const styles = {
+        good: 'bg-emerald-50 border-emerald-400 text-emerald-800',
+        warn: 'bg-amber-50 border-amber-400 text-amber-800',
+        fail: 'bg-red-50 border-red-400 text-red-800',
+      };
+      const icons = { good: '✅', warn: '⚠️', fail: '❌' };
+
+      return (
+        <div className={`rounded-lg border-2 p-3 flex items-start gap-2 ${styles[verdict.type]}`}>
+          <span className="text-lg leading-none">{icons[verdict.type]}</span>
+          <div className="flex-1">
+            <div className="text-[10px] uppercase tracking-wider font-bold opacity-70">결론</div>
+            <div className="text-sm font-medium mt-0.5">{verdict.text}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 통합
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">⚡ FAISS 최적화 실측 — 속도 / 메모리 / 정확도</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-3">
+            {/* 속도 막대 (모든 단계 공통) */}
+            <SpeedBars bars={step.speedBars} />
+
+            {/* 메모리 게이지 (1, 2, 3, 4단계) */}
+            {step.memGauge && <MemoryGauge gauge={step.memGauge} />}
+
+            {/* 압축 시각화 (4단계) */}
+            {step.compress && <CompressViz data={step.compress} />}
+
+            {/* trade-off 산점도 (5단계) */}
+            {step.tradeoff && <TradeoffChart tradeoff={step.tradeoff} />}
+
+            {/* 결론 */}
+            {step.verdict && <Verdict verdict={step.verdict} />}
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-3 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-slate-400"></span>CPU
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-violet-600"></span>GPU / 활성
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-emerald-500"></span>여유
+            </span>
+            <span className="flex items-center gap-1 ml-auto">
+              <span className="w-2.5 h-2.5 rounded bg-red-500"></span>한계 초과
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[34rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-violet-500/15 border-l-2 border-violet-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-violet-700 hover:text-violet-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-violet-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. FAISS &gt; Chapter 2. FAISS 실전</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">FAISS 최적화 — GPU 가속과 Quantization</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">CPU 50ms → GPU 0.5ms → PQ로 1억 벡터 압축 → recall trade-off</p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-violet-50 border-2 border-violet-300 rounded-xl p-3 text-sm text-violet-900">
+                💡 다음(II-2-3)에서는 <strong>FAISS의 한계</strong>(메타데이터 필터, persistence, CRUD, 분산)와 보완 전략을 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-violet-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-violet-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-violet-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-violet-600 text-white hover:bg-violet-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-2-1.html" className="text-violet-700 hover:text-violet-900 font-medium">&larr; II-2-1. FAISS 실전 워크플로우</a>
+              <a href="./II-2-3.html" className="text-violet-700 hover:text-violet-900 font-medium">II-2-3. FAISS 한계와 보완 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>

@@ -3,227 +3,894 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vector DB — II-2-3. FAISS 한계와 보완 — 메타데이터, 영속성, 필터링</title>
+  <title>Vector DB — II-2-3. FAISS 한계와 보완 (메타데이터 · 영속성 · 필터링)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    II-2-3. FAISS 한계와 보완 — 메타데이터, 영속성, 필터링
+    학습 목표: FAISS는 "벡터 검색만 잘하는" 라이브러리라는 사실을 5단계로 체험.
+              메타데이터·영속성·필터링은 외부 도구로 보완해야 하며, 본격 프로덕션이면
+              Chroma/pgvector 같은 통합 벡터 DB로 가는 게 합리적이라는 결론으로 닫는다.
+    핵심 비유: FAISS = 도서관 책장 (책 빨리 찾기), 메타데이터 = 도서 카탈로그
+              (제목/저자/장르) — FAISS는 책장만, 카탈로그는 SQLite/Redis가 담당.
+    패턴: fastapi v1 — 좌(LiveDataPane: FAISS 박스 + ID 화살표 + 외부 메타 박스 + 영속성 + 필터)
+                       우(VSCode CodeViewer)
+    색상: vector-db purple
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    const LIMITS = [
-      {
-        name: '메타데이터 필터링',
-        icon: 'M',
-        problem: 'FAISS는 벡터만 저장 — "카테고리=tech인 문서 중에서 검색"이 불가능',
-        solution: 'SQLite/PostgreSQL에 메타데이터를 별도 저장하고, pre-filter 또는 post-filter로 결합',
-        color: 'bg-red-500',
-        lightBg: 'bg-red-50',
-        border: 'border-red-200',
-        text: 'text-red-800',
-      },
-      {
-        name: '자동 영속성',
-        icon: 'P',
-        problem: 'FAISS 인덱스는 메모리에만 존재 — 프로세스 종료 시 사라짐',
-        solution: 'write_index() / read_index()로 수동 저장/로드. 자동 저장은 직접 구현',
-        color: 'bg-amber-500',
-        lightBg: 'bg-amber-50',
-        border: 'border-amber-200',
-        text: 'text-amber-800',
-      },
-      {
-        name: 'CRUD 업데이트',
-        icon: 'U',
-        problem: '벡터 수정/삭제가 제한적 — remove_ids()는 IndexIDMap에서만 지원',
-        solution: 'IndexIDMap으로 감싸서 ID 기반 삭제 지원. 또는 주기적 전체 리빌드',
-        color: 'bg-purple-500',
-        lightBg: 'bg-purple-50',
-        border: 'border-purple-200',
-        text: 'text-purple-800',
-      },
-      {
-        name: '분산 처리',
-        icon: 'D',
-        problem: '단일 머신 전용 — 여러 서버에 분산 배치 불가',
-        solution: '샤딩(데이터 분할) + 각 샤드에 독립 FAISS 인덱스 + 결과 병합 로직 직접 구현',
-        color: 'bg-blue-500',
-        lightBg: 'bg-blue-50',
-        border: 'border-blue-200',
-        text: 'text-blue-800',
-      },
-    ];
-
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   faiss     : { vectors: [{ id, label, hit }] }   — FAISS 박스 안 ID들
+    //   metaDb    : { rows: [{ id, title, category, hit }] } | null
+    //   showLink  : ID 화살표(FAISS → 메타DB)를 그릴지
+    //   persist   : { mode: 'memory'|'save'|'load'|'rebuild', files:[...] } | null
+    //   filter    : { mode: 'pre'|'post', pool:[...], result:[...], note:'' } | null
+    //   conclusion: 마지막 결론 박스 표시
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        desc: "스위스 아미 나이프에도 없는 도구가 있듯, FAISS에도 없는 기능이 있습니다. (1) 메타데이터 필터링, (2) 자동 영속성, (3) CRUD 업데이트, (4) 분산 처리 — 이 4가지는 외부 도구로 보완해야 합니다.",
-        activeLimit: -1,
-        code: null,
-        codeTitle: null,
+        title: 'Step 1. 메타데이터 없음 — FAISS는 ID만 안다',
+        desc: 'FAISS 인덱스에 들어간 벡터는 정수 ID + float 배열뿐. 검색 결과로 "ID=42, 거리=0.13"을 받지만 "그 문서의 title은? category는?"은 답할 수 없다. 메타데이터를 따로 보관할 외부 저장소가 필요하다는 것을 의미한다.',
+        faiss: {
+          vectors: [
+            { id: 17, label: 'vec_17', hit: false },
+            { id: 23, label: 'vec_23', hit: false },
+            { id: 42, label: 'vec_42', hit: true },
+            { id: 56, label: 'vec_56', hit: false },
+            { id: 71, label: 'vec_71', hit: false },
+            { id: 88, label: 'vec_88', hit: false },
+          ],
+          searchHit: { id: 42, dist: 0.13 },
+        },
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {
+          lang: 'python',
+          filename: 'metadata-side-db.py',
+          lines: [
+            '# FAISS는 벡터(float)와 정수 ID만 저장 — 메타데이터는 분리',
+            'import faiss',
+            'import numpy as np',
+            '',
+            '# 1) FAISS 인덱스 생성 (768차원 L2)',
+            'index = faiss.IndexIDMap(faiss.IndexFlatL2(768))',
+            '',
+            '# 2) 벡터 추가 — ID는 직접 부여',
+            'ids     = np.array([17, 23, 42, 56, 71, 88], dtype=np.int64)',
+            'vectors = np.random.rand(6, 768).astype(np.float32)',
+            'index.add_with_ids(vectors, ids)',
+            '',
+            '# 3) 검색 결과는 ID + 거리뿐',
+            'q = np.random.rand(1, 768).astype(np.float32)',
+            'D, I = index.search(q, k=3)',
+            '# I = [[42, 23, 71]]',
+            '# D = [[0.13, 0.27, 0.44]]',
+            '',
+            '# 문제: ID=42가 어떤 문서인지 FAISS는 모른다',
+            '#  - title?    → ✗',
+            '#  - category? → ✗',
+            '#  - 작성일?   → ✗',
+            '# 메타는 다른 저장소(SQLite/Redis/Postgres)에 따로 둬야 한다',
+          ],
+          highlight: [6, 11, 14, 15, 19, 20, 21, 22, 23],
+        },
       },
       {
-        desc: "한계 1: 메타데이터 필터링. FAISS는 벡터만 저장합니다. \"카테고리가 tech인 문서 중에서 유사한 것\"을 찾으려면, SQLite에 메타데이터를 별도 저장하고 pre-filter(먼저 필터 → 검색) 또는 post-filter(검색 → 필터) 패턴을 사용합니다.",
-        activeLimit: 0,
-        codeTitle: '메타데이터 필터링 보완 코드',
-        code: `import faiss\nimport sqlite3\nimport numpy as np\n\n# 1. 메타데이터를 SQLite에 저장\nconn = sqlite3.connect("metadata.db")\nconn.execute("""CREATE TABLE IF NOT EXISTS docs (\n    id INTEGER PRIMARY KEY,\n    title TEXT,\n    category TEXT,\n    created_at TEXT\n)""")\n\n# 2. FAISS에는 벡터만 저장\nindex = faiss.IndexIDMap(faiss.IndexFlatL2(768))\nindex.add_with_ids(vectors, ids)\n\n# 3. Post-filter 패턴\n#    (먼저 넉넉히 검색 → 메타데이터로 필터)\nD, I = index.search(query, k=50)  # 넉넉히\nfiltered = []\nfor idx, dist in zip(I[0], D[0]):\n    if idx == -1: continue\n    row = conn.execute(\n        "SELECT * FROM docs WHERE id=? AND category=?",\n        (int(idx), "tech")\n    ).fetchone()\n    if row:\n        filtered.append((idx, dist, row))\n    if len(filtered) >= 5: break  # 최종 k=5`,
+        title: 'Step 2. 보완 1 — SQLite로 ID → 메타데이터 매핑',
+        desc: 'FAISS 옆에 SQLite를 두고 같은 ID로 메타(title/category/created_at)를 저장한다. 검색은 (1) FAISS로 ID 회수 → (2) SQLite에서 메타 조회 2-step. 단순하지만 효과적이고, ID만 일치시키면 Redis/Postgres로도 똑같이 패턴이 적용된다.',
+        faiss: {
+          vectors: [
+            { id: 17, label: 'vec_17', hit: false },
+            { id: 23, label: 'vec_23', hit: false },
+            { id: 42, label: 'vec_42', hit: true },
+            { id: 56, label: 'vec_56', hit: false },
+            { id: 71, label: 'vec_71', hit: true },
+            { id: 88, label: 'vec_88', hit: false },
+          ],
+          searchHit: { id: 42, dist: 0.13 },
+        },
+        metaDb: {
+          rows: [
+            { id: 17, title: 'Spark 입문',  category: 'data',  hit: false },
+            { id: 23, title: 'K8s 운영',   category: 'infra', hit: false },
+            { id: 42, title: 'FAISS 정리', category: 'ai',    hit: true  },
+            { id: 56, title: 'Airflow',    category: 'data',  hit: false },
+            { id: 71, title: 'pgvector',   category: 'ai',    hit: true  },
+            { id: 88, title: 'Redis cache',category: 'infra', hit: false },
+          ],
+        },
+        showLink: true,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {
+          lang: 'python',
+          filename: 'metadata-side-db.py',
+          lines: [
+            '# 보완: SQLite에 같은 ID로 메타데이터 저장 → 2-step 조회',
+            'import faiss, sqlite3, numpy as np',
+            '',
+            '# 1) 메타데이터 테이블 — FAISS와 같은 정수 ID를 PK로',
+            'conn = sqlite3.connect("metadata.db")',
+            'conn.execute("""',
+            '  CREATE TABLE IF NOT EXISTS docs (',
+            '    id INTEGER PRIMARY KEY,',
+            '    title TEXT,',
+            '    category TEXT,',
+            '    created_at TEXT',
+            '  )',
+            '""")',
+            '',
+            '# 2) 적재 시 두 곳에 같은 ID로 동시 기록',
+            'def insert_doc(doc_id, vector, title, category):',
+            '    index.add_with_ids(vector.reshape(1, -1),',
+            '                       np.array([doc_id], dtype=np.int64))',
+            '    conn.execute(',
+            '      "INSERT INTO docs(id, title, category) VALUES(?,?,?)",',
+            '      (doc_id, title, category),',
+            '    )',
+            '    conn.commit()',
+            '',
+            '# 3) 검색 = FAISS로 ID 회수 → SQLite로 메타 조회',
+            'D, I = index.search(q, k=3)            # [[42, 71, 23]]',
+            'rows = conn.execute(',
+            '  "SELECT id,title,category FROM docs WHERE id IN (?,?,?)",',
+            '  tuple(int(i) for i in I[0])',
+            ').fetchall()',
+            '',
+            '# → [(42, "FAISS 정리", "ai"), (71, "pgvector", "ai"), ...]',
+            '# 핵심: ID라는 끈으로 두 저장소를 묶음 — 동기화는 직접 책임',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 26, 27, 28, 29, 30],
+        },
       },
       {
-        desc: "한계 2: 자동 영속성. FAISS 인덱스는 메모리에만 있어서, 프로세스가 종료되면 사라집니다. write_index()로 파일에 저장하고, 앱 시작 시 read_index()로 로드하는 패턴을 반드시 구현해야 합니다.",
-        activeLimit: 1,
-        codeTitle: '영속성 보완 코드',
-        code: `import faiss\nimport os\n\nINDEX_PATH = "my_index.faiss"\nCHUNKS_PATH = "chunks.pkl"\n\ndef save_index(index, chunks):\n    \"\"\"인덱스와 원본 데이터를 함께 저장\"\"\"\n    faiss.write_index(index, INDEX_PATH)\n    import pickle\n    with open(CHUNKS_PATH, "wb") as f:\n        pickle.dump(chunks, f)\n    print(f"저장 완료: {index.ntotal}개 벡터")\n\ndef load_index():\n    \"\"\"저장된 인덱스와 원본 데이터를 로드\"\"\"\n    if not os.path.exists(INDEX_PATH):\n        return None, None\n    index = faiss.read_index(INDEX_PATH)\n    import pickle\n    with open(CHUNKS_PATH, "rb") as f:\n        chunks = pickle.load(f)\n    print(f"로드 완료: {index.ntotal}개 벡터")\n    return index, chunks\n\n# 앱 시작 시\nindex, chunks = load_index()\nif index is None:\n    index = build_new_index()  # 새로 빌드\n    save_index(index, chunks)`,
+        title: 'Step 3. 영속성 부분 지원 — 인덱스 저장은 되지만 add는 재빌드',
+        desc: 'faiss.write_index() / read_index()로 디스크에 통째로 저장·로드는 가능. 하지만 새 벡터를 add하려면 파일을 다시 쓰거나, IVF 같은 학습형 인덱스는 add가 누적될수록 군집 균형이 깨져 결국 전체 재빌드가 답이 된다. "자동 영속성"은 사용자가 직접 짜야 한다.',
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: {
+          steps: [
+            { kind: 'mem',     label: '메모리 인덱스',       detail: 'index.ntotal = 6', active: true },
+            { kind: 'save',    label: 'write_index()',       detail: 'my_index.faiss (디스크)', active: true },
+            { kind: 'restart', label: '프로세스 재시작',      detail: '메모리 휘발',             active: true },
+            { kind: 'load',    label: 'read_index()',        detail: 'index 복구 ✓',            active: true },
+            { kind: 'add',     label: 'add(new_vector)',     detail: 'IVF면 재학습 필요 ⚠',     active: true },
+            { kind: 'rebuild', label: '주기적 전체 리빌드',   detail: '운영 부담 (cron/jobs)',   active: true },
+          ],
+        },
+        filter: null,
+        conclusion: false,
+        code: {
+          lang: 'python',
+          filename: 'persistence.py',
+          lines: [
+            '# FAISS 영속성 — 저장/로드는 OK, 자동 동기화는 직접 구현',
+            'import faiss, os, pickle',
+            '',
+            'INDEX_PATH  = "my_index.faiss"',
+            'CHUNKS_PATH = "chunks.pkl"',
+            '',
+            '# 1) 저장 — 인덱스와 원본 청크를 함께',
+            'def save_index(index, chunks):',
+            '    faiss.write_index(index, INDEX_PATH)',
+            '    with open(CHUNKS_PATH, "wb") as f:',
+            '        pickle.dump(chunks, f)',
+            '    print(f"저장 완료: {index.ntotal}개 벡터")',
+            '',
+            '# 2) 로드 — 앱 시작 시',
+            'def load_index():',
+            '    if not os.path.exists(INDEX_PATH):',
+            '        return None, None',
+            '    index = faiss.read_index(INDEX_PATH)',
+            '    with open(CHUNKS_PATH, "rb") as f:',
+            '        chunks = pickle.load(f)',
+            '    print(f"로드 완료: {index.ntotal}개 벡터")',
+            '    return index, chunks',
+            '',
+            '# 3) 새 벡터 add — 두 가지 함정',
+            '#   (a) 저장된 파일에는 반영되지 않음 → 다시 write 필요',
+            '#   (b) IVF/PQ 같은 학습형 인덱스는 add가 누적되면',
+            '#       클러스터 균형이 깨져 검색 정확도 하락',
+            'index.add_with_ids(new_vec, new_ids)',
+            'save_index(index, chunks)              # 매번 다시 써야 한다',
+            '',
+            '# 4) 결국 운영에서는 cron으로 "전체 리빌드"가 일반적',
+            '#   - 새 데이터 누적 → 야간에 재학습 + write_index',
+            '#   - "라이브 add + 자동 저장"을 원하면 Chroma/pgvector 권장',
+          ],
+          highlight: [8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30, 32, 33, 34],
+        },
       },
       {
-        desc: "한계 3: CRUD 업데이트. 기본 FAISS 인덱스는 벡터 삭제/수정이 안 됩니다. IndexIDMap으로 감싸면 remove_ids()로 삭제가 가능합니다. 수정은 삭제 → 재추가로 구현합니다. 대규모에서는 주기적 전체 리빌드가 현실적입니다.",
-        activeLimit: 2,
-        codeTitle: 'CRUD 보완 코드',
-        code: `import faiss\nimport numpy as np\n\n# IndexIDMap으로 감싸면 ID 기반 관리 가능\nbase_index = faiss.IndexFlatL2(768)\nindex = faiss.IndexIDMap(base_index)\n\n# Create: ID 지정하여 추가\nids = np.array([100, 101, 102], dtype=np.int64)\nindex.add_with_ids(vectors, ids)\n\n# Delete: ID로 삭제\nids_to_remove = np.array([101], dtype=np.int64)\nindex.remove_ids(ids_to_remove)\nprint(f"남은 벡터: {index.ntotal}")  # 2\n\n# Update: 삭제 → 재추가\ndef update_vector(index, vec_id, new_vector):\n    # 1. 기존 삭제\n    index.remove_ids(\n        np.array([vec_id], dtype=np.int64)\n    )\n    # 2. 새 벡터 추가\n    index.add_with_ids(\n        new_vector.reshape(1, -1),\n        np.array([vec_id], dtype=np.int64)\n    )\n\n# 주의: IVF 인덱스는 remove_ids 후\n# 클러스터 불균형 → 주기적 리빌드 권장`,
+        title: 'Step 4. 필터링 한계 — pre-filter는 어렵고 post-filter는 손실 위험',
+        desc: '"category=ai 중에서 유사한 top-3"이 흔한 요구. FAISS는 인덱스 내부 필터를 제공하지 않는다 (IDSelector 일부 가능). 그래서 (1) pre-filter: 후보 ID를 먼저 SQLite로 걸러 IDSelector로 검색, (2) post-filter: 넉넉히 검색하고 SQLite로 거르기. pre는 작은 후보집에 적합, post는 top-k가 다 빠질 위험.',
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: {
+          query: 'category=ai 중 유사 top-3',
+          pre: {
+            label: 'pre-filter — 먼저 걸러 검색',
+            steps: [
+              { t: 'SQLite: WHERE category="ai"', detail: '→ ID = {42, 71}', good: true },
+              { t: 'IDSelector(ids={42,71})로 FAISS 검색', detail: '후보가 작아 ANN 인덱스 효율 ↓', warn: true },
+              { t: '결과: top-2 (정확)', detail: '✓ 정확하지만 후보 클수록 느려짐', good: true },
+            ],
+          },
+          post: {
+            label: 'post-filter — 넉넉히 검색하고 거르기',
+            steps: [
+              { t: 'FAISS: search(k=50)', detail: '넉넉히 50개 회수', good: true },
+              { t: 'SQLite: category="ai" 필터', detail: '50개 중 ai만 남김', good: true },
+              { t: '결과: 0~3개 (top-k 손실 위험)', detail: '⚠ 카테고리가 희소하면 결과 부족', warn: true },
+            ],
+          },
+        },
+        conclusion: false,
+        code: {
+          lang: 'python',
+          filename: 'pre-filter.py',
+          lines: [
+            '# pre-filter — 메타DB로 먼저 후보 ID를 좁힌 뒤 FAISS 검색',
+            'import faiss, numpy as np',
+            '',
+            '# 1) SQLite로 카테고리 필터된 ID 후보 만들기',
+            'rows = conn.execute(',
+            '  "SELECT id FROM docs WHERE category=?", ("ai",)',
+            ').fetchall()',
+            'candidate_ids = np.array([r[0] for r in rows], dtype=np.int64)',
+            '#  → [42, 71]',
+            '',
+            '# 2) FAISS IDSelector로 후보 안에서만 검색',
+            'sel = faiss.IDSelectorBatch(candidate_ids)',
+            'params = faiss.SearchParametersIVF(sel=sel) \\',
+            '         if hasattr(faiss, "SearchParametersIVF") else None',
+            '',
+            'D, I = index.search(q, k=3, params=params)',
+            '#  → I = [[42, 71, -1]]   (-1 = 후보 부족)',
+            '',
+            '# 장점: 결과 카테고리가 100% "ai" 보장 + 정확한 top-k',
+            '# 단점:',
+            '#  - 후보 ID 리스트가 크면 IDSelector 비용 ↑',
+            '#  - 메타 필터 종류마다 후보 다시 계산 → 캐시 전략 필요',
+            '#  - IndexFlat 외 인덱스는 IDSelector 지원이 부분적',
+            '',
+            '# 적합 상황:',
+            '#  - 카테고리가 소수(< 1만개) → 후보 작아도 됨',
+            '#  - 정확성이 중요 — top-k 손실 허용 안 함',
+          ],
+          highlight: [5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23],
+        },
+        codeAlt: {
+          lang: 'python',
+          filename: 'post-filter.py',
+          lines: [
+            '# post-filter — FAISS로 넉넉히 검색하고 메타DB로 거르기',
+            'import faiss',
+            '',
+            '# 1) k를 크게 잡아 넉넉히 회수 (예: 원하는 5의 10배)',
+            'TARGET_K = 5',
+            'OVERFETCH = 50',
+            'D, I = index.search(q, k=OVERFETCH)',
+            '',
+            '# 2) 결과 ID로 SQLite에서 메타 조회 + 필터',
+            'placeholders = ",".join("?" * len(I[0]))',
+            'rows = conn.execute(',
+            '  f"SELECT id,title,category FROM docs '
+            + 'WHERE id IN ({placeholders}) AND category=?",',
+            '  (*[int(i) for i in I[0]], "ai"),',
+            ').fetchall()',
+            '',
+            '# 3) 거리 순서 유지하며 상위 k만',
+            'meta_by_id = {r[0]: r for r in rows}',
+            'final = []',
+            'for idx in I[0]:',
+            '    if int(idx) in meta_by_id:',
+            '        final.append(meta_by_id[int(idx)])',
+            '    if len(final) >= TARGET_K:',
+            '        break',
+            '',
+            '# 장점: FAISS 인덱스 그대로 활용 — 추가 자료구조 불필요',
+            '# 단점:',
+            '#  - 카테고리가 전체의 1%면 50개 회수해도 0~1개만 통과',
+            '#  - "결과 부족 → 더 가져오기" 재시도 루프가 흔함',
+            '#  - 인기 없는 카테고리 검색에서 결과 누락 위험',
+          ],
+          highlight: [4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 26, 27, 28, 29],
+        },
       },
       {
-        desc: "정리: FAISS는 '벡터 검색 전문 도구'입니다. 메타데이터는 SQLite, 영속성은 write_index, CRUD는 IndexIDMap, 분산은 샤딩으로 보완합니다. 이런 보완이 번거롭다면 Chroma(Part III)나 pgvector(Part IV)가 대안입니다.",
-        activeLimit: -1,
-        codeTitle: 'FAISS vs 대안 — 언제 FAISS를 쓸까?',
-        code: `# FAISS를 선택해야 하는 경우\n# - 검색 속도가 최우선\n# - 대규모 데이터 (100만+ 벡터)\n# - GPU 가속이 필요한 경우\n# - 라이브러리 레벨 제어가 필요한 경우\n\n# 대안을 고려해야 하는 경우\n# - 메타데이터 필터링이 핵심 → Chroma\n# - SQL과 벡터 검색 결합 → pgvector\n# - 빠른 프로토타이핑 → Chroma\n# - ACID 트랜잭션 필요 → pgvector\n\n# 조합 패턴 (실전에서 자주 사용)\n# - FAISS (실시간 검색) + PostgreSQL (메타데이터)\n# - Chroma (개발) → pgvector (프로덕션)\n# - FAISS (캐시) + pgvector (영속 저장)`,
+        title: 'Step 5. 결론 — Chroma / pgvector로 가면 메타·영속·필터가 한 곳에',
+        desc: 'FAISS는 "검색 알고리즘 라이브러리"다. 메타데이터·영속성·필터·CRUD를 모두 직접 짜야 한다면 도메인 코드가 인프라 코드에 잠식된다. 통합 벡터 DB(Chroma·pgvector·Weaviate)는 이 4가지를 처음부터 한 패키지에서 제공한다. 검색 속도/GPU가 절대적으로 중요한 경우만 FAISS, 일반 RAG는 통합 벡터 DB가 합리적.',
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: true,
+        code: {
+          lang: 'markdown',
+          filename: 'recommendation.md',
+          lines: [
+            '# FAISS vs 통합 벡터 DB — 어느 쪽을 고를까',
+            '',
+            '## FAISS가 강한 경우 (그대로 쓰기)',
+            '- 100만 건 이상 + GPU 가속 필요',
+            '- 검색 latency가 mission-critical',
+            '- 메타데이터/필터가 거의 없는 단순 의미 검색',
+            '- 라이브러리로 임베딩 파이프라인에 직접 끼워넣고 싶을 때',
+            '',
+            '## 통합 벡터 DB가 합리적인 경우 (대다수 RAG)',
+            '- 메타데이터 필터링이 일상적',
+            '- "추가/삭제/업데이트"가 라이브로 돌아야 함',
+            '- 자동 영속성 + 백업 + 복제가 필요',
+            '- 운영 인력이 적어 인프라 코드를 줄이고 싶을 때',
+            '',
+            '## 후보',
+            '- Chroma   : 파이썬 친화 · 로컬 시작 · 메타 필터 내장 (Part III)',
+            '- pgvector : Postgres 확장 · SQL과 결합 · 트랜잭션 지원',
+            '- Weaviate : 모듈식 (하이브리드 검색, 멀티테넌시)',
+            '- Milvus   : 대규모 분산',
+            '- Qdrant   : Rust 기반 · 메타 필터 강력',
+            '',
+            '## 자주 쓰는 조합 패턴',
+            '- "FAISS(검색) + SQLite(메타)"      ← 학습/프로토타입',
+            '- "Chroma(전부)"                     ← 단일 컨테이너 RAG',
+            '- "pgvector + Postgres"              ← 기존 RDB 인프라 재활용',
+            '- "FAISS(GPU 캐시) + pgvector(원본)" ← 고급 하이브리드',
+            '',
+            '## 결론',
+            '- FAISS 한계 4종(메타/영속/필터/CRUD)을 직접 짜야 한다면',
+            '  통합 벡터 DB로 가는 것이 코드/운영 모두 단순.',
+            '- Part III(Chroma) → Part IV(pgvector) 순으로 학습 권장.',
+          ],
+          highlight: [3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 27, 28, 29, 30, 31, 32],
+        },
       },
     ];
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playRef = useRef(null);
-      const s = STEPS[step];
-      const isEnd = step === STEPS.length - 1;
+    // ─────────────────────────────────────────────────────
+    // FAISS 박스 — 벡터 ID 카드 그리드
+    // ─────────────────────────────────────────────────────
+    function FaissBox({ faiss }) {
+      if (!faiss) {
+        return (
+          <div className="rounded-lg bg-slate-50 border border-dashed border-slate-300 p-3 text-center text-[11px] text-slate-400 font-mono">
+            (FAISS 박스 — 이 단계에서 사용 안 함)
+          </div>
+        );
+      }
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border-2 border-purple-300 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[11px] font-bold text-purple-800 flex items-center gap-1">
+              <span>📦</span><span>FAISS 인덱스 (in-memory)</span>
+            </div>
+            <span className="text-[9px] font-mono text-purple-600">IndexIDMap(IndexFlatL2(768))</span>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {faiss.vectors.map((v) => (
+              <div
+                key={v.id}
+                className={`rounded-md border-2 p-2 text-center transition-all duration-500 ${
+                  v.hit
+                    ? 'bg-purple-600 border-purple-800 text-white shadow-md scale-105'
+                    : 'bg-white border-purple-200 text-purple-700'
+                }`}
+              >
+                <div className={`text-[10px] uppercase ${v.hit ? 'text-purple-200' : 'text-purple-400'}`}>id</div>
+                <div className="text-base font-mono font-bold">{v.id}</div>
+                <div className={`text-[9px] font-mono ${v.hit ? 'text-purple-100' : 'text-slate-500'}`}>
+                  {v.label}
+                </div>
+              </div>
+            ))}
+          </div>
+          {faiss.searchHit && (
+            <div className="mt-2 px-2 py-1 rounded bg-purple-700 text-white text-[10px] font-mono flex justify-between">
+              <span>검색 결과</span>
+              <span>id={faiss.searchHit.id}, dist={faiss.searchHit.dist}</span>
+            </div>
+          )}
+        </div>
+      );
+    }
 
-      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
-      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
-      const nextRef = useRef(next); nextRef.current = next;
-      const prevRef = useRef(prev); prevRef.current = prev;
-      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
+    // ─────────────────────────────────────────────────────
+    // 메타데이터 SQLite 테이블 박스
+    // ─────────────────────────────────────────────────────
+    function MetaDbBox({ metaDb, showLink }) {
+      if (!metaDb) {
+        return (
+          <div className="rounded-lg bg-slate-50 border border-dashed border-slate-300 p-3 text-center text-[11px] text-slate-400 font-mono">
+            (외부 메타데이터 DB — 아직 연결되지 않음)
+          </div>
+        );
+      }
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-emerald-50 to-emerald-100 border-2 border-emerald-300 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[11px] font-bold text-emerald-800 flex items-center gap-1">
+              <span>🗄️</span><span>SQLite metadata.db</span>
+            </div>
+            {showLink && (
+              <span className="text-[9px] font-mono text-emerald-700 bg-white px-1.5 py-0.5 rounded">
+                ← FAISS id로 join
+              </span>
+            )}
+          </div>
+          <table className="w-full text-[10px] font-mono">
+            <thead>
+              <tr className="bg-emerald-200/50 text-emerald-900">
+                <th className="px-2 py-1 text-left">id</th>
+                <th className="px-2 py-1 text-left">title</th>
+                <th className="px-2 py-1 text-left">category</th>
+              </tr>
+            </thead>
+            <tbody>
+              {metaDb.rows.map((r) => (
+                <tr
+                  key={r.id}
+                  className={`transition-all duration-500 ${
+                    r.hit ? 'bg-emerald-300/60 font-bold text-emerald-900' : 'odd:bg-white even:bg-emerald-50/50 text-slate-700'
+                  }`}
+                >
+                  <td className="px-2 py-1">{r.id}</td>
+                  <td className="px-2 py-1">{r.title}</td>
+                  <td className="px-2 py-1">{r.category}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 영속성 다이어그램 (저장 → 재시작 → 로드 → add → 리빌드)
+    // ─────────────────────────────────────────────────────
+    function PersistDiagram({ persist }) {
+      if (!persist) return null;
+      const colorOf = (k) => {
+        if (k === 'mem')     return 'from-purple-100 to-purple-50 border-purple-300 text-purple-800';
+        if (k === 'save')    return 'from-emerald-100 to-emerald-50 border-emerald-300 text-emerald-800';
+        if (k === 'restart') return 'from-amber-100 to-amber-50 border-amber-300 text-amber-800';
+        if (k === 'load')    return 'from-sky-100 to-sky-50 border-sky-300 text-sky-800';
+        if (k === 'add')     return 'from-rose-100 to-rose-50 border-rose-300 text-rose-800';
+        return 'from-fuchsia-100 to-fuchsia-50 border-fuchsia-300 text-fuchsia-800';
+      };
+      const iconOf = (k) => ({
+        mem: '🧠', save: '💾', restart: '⟲', load: '📂', add: '➕', rebuild: '🔁',
+      }[k] || '•');
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border-2 border-purple-300 p-3">
+          <div className="text-[11px] font-bold text-purple-800 mb-2 flex items-center gap-1">
+            <span>💾</span><span>FAISS 영속성 흐름 — write_index / read_index</span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+            {persist.steps.map((s, i) => (
+              <div
+                key={i}
+                className={`rounded-md border-2 bg-gradient-to-br p-2 text-center transition-all duration-500 ${colorOf(s.kind)}`}
+              >
+                <div className="text-base">{iconOf(s.kind)}</div>
+                <div className="text-[11px] font-bold mt-0.5">{s.label}</div>
+                <div className="text-[9px] mt-0.5 font-mono opacity-80">{s.detail}</div>
+              </div>
+            ))}
+          </div>
+          <div className="text-[9px] text-purple-700 mt-2 text-center font-mono">
+            저장·로드는 OK · 새 add는 다시 write 필요 · 학습형 인덱스는 주기적 리빌드가 안전
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 필터링 시나리오 (pre vs post 나란히 비교)
+    // ─────────────────────────────────────────────────────
+    function FilterScenario({ filter }) {
+      if (!filter) return null;
+      const renderCol = (col, accent) => (
+        <div className={`rounded-lg border-2 ${accent.border} ${accent.bg} p-3`}>
+          <div className={`text-[11px] font-bold mb-2 ${accent.text}`}>
+            {col.label}
+          </div>
+          <ol className="space-y-1.5">
+            {col.steps.map((s, i) => (
+              <li
+                key={i}
+                className={`rounded-md border px-2 py-1.5 text-[10px] flex flex-col gap-0.5 ${
+                  s.warn
+                    ? 'bg-amber-50 border-amber-300 text-amber-900'
+                    : 'bg-white border-slate-200 text-slate-700'
+                }`}
+              >
+                <div className="font-bold font-mono">
+                  <span className="opacity-60 mr-1">{i + 1}.</span>{s.t}
+                </div>
+                <div className="text-[9px] font-mono opacity-80">{s.detail}</div>
+              </li>
+            ))}
+          </ol>
+        </div>
+      );
+      return (
+        <div className="rounded-lg bg-purple-50/50 border-2 border-purple-300 p-3">
+          <div className="text-[11px] font-bold text-purple-800 mb-2 flex items-center justify-between">
+            <span>🔍 필터링 시나리오 — {filter.query}</span>
+            <span className="text-[9px] font-mono text-purple-600">pre vs post 비교</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {renderCol(filter.pre, {
+              border: 'border-sky-300', bg: 'bg-sky-50/60', text: 'text-sky-800',
+            })}
+            {renderCol(filter.post, {
+              border: 'border-rose-300', bg: 'bg-rose-50/60', text: 'text-rose-800',
+            })}
+          </div>
+          <div className="text-[9px] text-purple-700 mt-2 text-center font-mono">
+            pre = 정확하지만 후보 클수록 느림 · post = 빠르지만 결과 누락 위험
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 결론 박스 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function ConclusionBox() {
+      const rows = [
+        { k: '메타데이터',  faiss: 'ID만 — 외부 DB 직접',         alt: '✓ 내장 (필드 schema)' },
+        { k: '영속성',      faiss: 'write/read_index 수동',       alt: '✓ 자동 + WAL/스냅샷' },
+        { k: '필터링',      faiss: 'pre/post 직접',                alt: '✓ where 절 내장' },
+        { k: 'CRUD',        faiss: 'IndexIDMap만 부분',           alt: '✓ upsert/delete' },
+        { k: '운영 부담',   faiss: '높음 (인프라 직접)',           alt: '낮음 (관리 기능 포함)' },
+        { k: '추천 상황',   faiss: 'GPU·대규모·검색 최우선',      alt: '대다수 RAG' },
+      ];
+      return (
+        <div className="rounded-lg bg-white border-2 border-purple-400 overflow-hidden shadow-sm">
+          <div className="bg-purple-100 px-3 py-2 border-b border-purple-200 flex items-center justify-between">
+            <div className="text-xs font-bold text-purple-900">📊 FAISS vs 통합 벡터 DB (Chroma · pgvector)</div>
+            <span className="text-[10px] font-mono text-purple-700">결론</span>
+          </div>
+          <table className="w-full text-[11px]">
+            <thead>
+              <tr className="bg-purple-50 text-left">
+                <th className="px-3 py-2 font-bold text-purple-700 w-1/5">항목</th>
+                <th className="px-3 py-2 font-bold text-slate-700">FAISS 단독</th>
+                <th className="px-3 py-2 font-bold text-purple-700">Chroma / pgvector</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={r.k} className={i % 2 === 0 ? 'bg-white' : 'bg-purple-50/40'}>
+                  <td className="px-3 py-1.5 font-bold text-slate-700 border-r border-slate-100">{r.k}</td>
+                  <td className="px-3 py-1.5 text-slate-700 font-mono">{r.faiss}</td>
+                  <td className="px-3 py-1.5 text-purple-800 font-mono font-semibold">{r.alt}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="bg-purple-50 px-3 py-2 border-t border-purple-200 text-[11px] text-purple-900 leading-relaxed">
+            <strong>결론.</strong> FAISS 한계 4종을 모두 직접 보완해야 한다면 도메인 코드가
+            인프라 코드에 잠식된다. 일반 RAG는 <strong>Chroma (Part III)</strong> 또는
+            <strong> pgvector (Part IV)</strong>로 가는 것이 합리적이다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — Step에 따라 적절한 패널을 보여줌
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📚 도서관 사서 — FAISS는 책장만, 카탈로그는 따로</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          {/* Step 1, 2 — FAISS + (조건부) 메타DB + 화살표 */}
+          {(step.faiss || step.metaDb) && (
+            <div className="space-y-2">
+              <FaissBox faiss={step.faiss} />
+              {step.showLink && (
+                <div className="flex items-center justify-center gap-1 text-[10px] font-mono text-slate-500 py-0.5">
+                  <span>id 화살표</span>
+                  <span className="text-purple-500 text-base leading-none">↓</span>
+                  <span>같은 정수 ID로 join</span>
+                </div>
+              )}
+              <MetaDbBox metaDb={step.metaDb} showLink={step.showLink} />
+            </div>
+          )}
+
+          {/* Step 3 — 영속성 다이어그램 */}
+          {step.persist && <PersistDiagram persist={step.persist} />}
+
+          {/* Step 4 — 필터링 시나리오 */}
+          {step.filter && <FilterScenario filter={step.filter} />}
+
+          {/* Step 5 — 결론 */}
+          {step.conclusion && <ConclusionBox />}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] mt-3 pt-3 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm" style={{ background: '#a78bfa' }}></span>
+              FAISS 박스
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm" style={{ background: '#34d399' }}></span>
+              SQLite 메타
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm" style={{ background: '#fbbf24' }}></span>
+              주의/제약
+            </span>
+            <span className="flex items-center gap-1 ml-auto">
+              <span className="w-2.5 h-2.5 rounded-full bg-slate-300"></span>
+              미사용
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js + 파일 탭
+    //   step.code 외에 step.codeAlt 가 있으면 탭으로 토글
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ step, stepIdx, total }) {
+      const tabs = step.codeAlt ? [step.code, step.codeAlt] : [step.code];
+      const [activeTab, setActiveTab] = useState(0);
+      const code = tabs[Math.min(activeTab, tabs.length - 1)];
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      // 새 단계로 이동하면 첫 탭으로
+      useEffect(() => { setActiveTab(0); }, [stepIdx]);
 
       useEffect(() => {
-        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
-        else { clearInterval(playRef.current); }
-        return () => clearInterval(playRef.current);
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭들 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <div className="flex gap-1 ml-2">
+              {tabs.map((t, i) => (
+                <button
+                  key={i}
+                  onClick={() => setActiveTab(i)}
+                  className={`px-2 py-0.5 text-[11px] font-mono rounded-t transition ${
+                    i === activeTab
+                      ? 'bg-[#282c34] text-purple-200 border-t border-l border-r border-purple-500/40'
+                      : 'bg-[#1e2127] text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {t.filename}
+                </button>
+              ))}
+            </div>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 숨김 코드 */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[32rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-purple-500/15 border-l-2 border-purple-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}{tabs.length > 1 ? ` · tab ${activeTab + 1}/${tabs.length}` : ''}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
           if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
-          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm">
-              <a href="../index.html" className="inline-flex items-center gap-1 text-orange-700 hover:text-orange-900 font-medium">
-                <span>&larr;</span> 허브로 돌아가기
-              </a>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-purple-700 hover:text-purple-900 font-medium">&larr; Vector DB 허브</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-2-3</span>
             </nav>
 
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-orange-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div className="w-9 h-9 bg-purple-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
                 <div>
                   <div className="text-xs text-slate-500 font-medium">Part II. FAISS &gt; Chapter 2. FAISS 실전</div>
-                  <h1 className="text-2xl font-bold text-slate-800">II-2-3. FAISS 한계와 보완 — 메타데이터, 영속성, 필터링</h1>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">FAISS 한계와 보완 — 메타데이터, 영속성, 필터링</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">FAISS는 책장(검색)만 잘한다 — 카탈로그(메타)와 자동 동기화는 외부 도구로</p>
                 </div>
               </div>
-              <p className="text-slate-600"><b>스위스 아미 나이프</b>에도 없는 도구가 있듯, FAISS에도 없는 4가지 기능과 그 보완 방법을 알아봅니다.</p>
             </header>
 
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-orange-700 border-orange-800 text-white">
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer step={step} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 text-sm text-purple-900">
+                💡 다음 Part(III)에서는 <strong>Chroma</strong>로 메타데이터·영속성·필터·CRUD가 한 패키지에 통합된 모습을 직접 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-purple-700 text-white shadow-sm">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-orange-200">FAISS 한계와 보완</h3>
-                <span className="text-xs text-orange-200">키보드 &larr;/&rarr;로 단계 이동</span>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-purple-200">키보드 &larr;/&rarr;</span>
               </div>
-              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-3">
-                {LIMITS.map((lim, i) => (
-                  <div key={i} className={`p-4 rounded-xl border-2 transition-all duration-500 ${
-                    s.activeLimit === i ? `${lim.lightBg} ${lim.border} scale-[1.02] shadow-md` :
-                    s.activeLimit === -1 ? `${lim.lightBg} ${lim.border}` :
-                    (s.activeLimit > i) ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-100 opacity-40'
-                  }`}>
-                    <div className="flex items-center gap-3 mb-2">
-                      <div className={`w-8 h-8 ${s.activeLimit > i ? 'bg-emerald-500' : lim.color} text-white rounded-lg flex items-center justify-center font-bold text-sm transition-colors`}>
-                        {s.activeLimit > i ? '\u2713' : lim.icon}
-                      </div>
-                      <div className={`font-bold text-sm ${s.activeLimit === i ? lim.text : 'text-slate-700'}`}>{lim.name}</div>
-                    </div>
-                    <div className="text-xs text-slate-600 mb-1"><span className="font-bold text-red-500">문제:</span> {lim.problem}</div>
-                    <div className="text-xs text-slate-600"><span className="font-bold text-emerald-500">보완:</span> {lim.solution}</div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {s.code ? (
-                  <div>
-                    <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{s.codeTitle}</div>
-                    <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-xs font-mono whitespace-pre-wrap overflow-x-auto leading-relaxed">{s.code}</pre>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center justify-center h-full text-center py-8">
-                    <div className="text-4xl mb-3">&#x1F52C;</div>
-                    <div className="font-bold text-slate-700 mb-2">FAISS의 4가지 한계</div>
-                    <div className="text-sm text-slate-500 mb-4">각 한계와 보완 코드를<br/>하나씩 살펴봅니다</div>
-                    <div className="space-y-2 text-left w-full max-w-xs">
-                      {LIMITS.map((lim, i) => (
-                        <div key={i} className="flex items-center gap-2 text-sm">
-                          <div className={`w-6 h-6 ${lim.color} text-white rounded flex items-center justify-center font-bold text-xs`}>{lim.icon}</div>
-                          <span className="text-slate-600">{lim.name}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-purple-600 text-white hover:bg-purple-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              {['메타데이터', 'persistence', 'ID 매핑', 'pre-filter', 'post-filter'].map(kw => (
-                <span key={kw} className="bg-orange-50 text-orange-700 px-3 py-1 rounded-full text-sm font-medium border border-orange-200">{kw}</span>
-              ))}
-            </div>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-2-2.html" className="text-slate-500 hover:text-slate-700">&larr; II-2-2 IVF/PQ 인덱스</a>
+              <a href="../index.html" className="text-purple-700 hover:text-purple-900 font-medium">Vector DB 허브 &rarr;</a>
+            </nav>
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
-                </button>
-                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-orange-600 hover:bg-orange-700">
-                  {isPlaying ? (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>
-                  ) : (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>
-                  )}
-                </button>
-                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
-                </button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
-            </div>
-
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./II-2-2.html" className="text-orange-600 hover:text-orange-800 font-medium">&larr; II-2-2. FAISS 최적화</a>
-              <a href="../part3/III-1-1.html" className="text-green-600 hover:text-green-800 font-medium">Part III. Chroma &rarr; III-1-1 &rarr;</a>
-            </div>
           </div>
         </div>
       );
     }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>

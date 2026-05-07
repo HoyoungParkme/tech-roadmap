@@ -9,497 +9,881 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    IV-2-3. pgvector 운영 — 성능 튜닝과 스케일링
+    학습 목표: 자동차 엔진 튜닝처럼, 기본 설정 → 메모리 튜닝 → 인덱스 파라미터 → Read Replica → 한계
+              5단계로 pgvector 프로덕션 운영의 핵심을 이해한다.
+    핵심 비유: 공장 출하 자동차로 레이스 못 나간다 — 단계별로 튜닝하며 latency가 줄고 처리량이 늘어난다
+    패턴: fastapi v1 — 좌(LiveDataPane: latency 시계열 + 메모리 게이지 + 토폴로지 + 매트릭스) / 우(VSCode CodeViewer)
+    색상: pgvector purple
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   latency       : 시계열 [{ t, base, tuned }] (ms)
+    //   memory        : { sharedBuffersPct, maintWorkMemPct, label }
+    //   topology      : { primary, replicas: [{ id, role, qps }], qpsTotal }
+    //   indexParams   : { ivfflat: { lists, probes }, hnsw: { m, ef } } 또는 null
+    //   matrix        : 행 수별 솔루션 매트릭스 표시 여부
+    //   verdict       : 단계별 핵심 한 줄 요약
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        desc: "pgvector를 프로덕션에서 운영하려면 엔진 튜닝이 필요합니다. 자동차가 공장 출하 상태로 레이스에 나갈 수 없듯, 기본 설정만으로는 대규모 벡터 검색에 한계가 있습니다. 6가지 튜닝 영역을 하나씩 살펴봅니다.",
-        left: 'overview',
-        right: 'baseline',
+        title: 'Step 1. 기본 설정 — 공장 출하 상태',
+        desc: 'PostgreSQL 기본 설정의 shared_buffers는 128MB. 일반 OLTP에는 충분하지만 1536차원 벡터를 다루는 pgvector에는 턱없이 부족하다. 인덱스가 메모리에 안 들어가면 매 검색마다 디스크 I/O가 발생하고, latency p99가 200ms 이상으로 튄다.',
+        latency: makeLatency('baseline'),
+        memory: { sharedBuffersPct: 8, maintWorkMemPct: 4, totalRam: 16, label: '기본값 (RAM 16GB 서버)' },
+        topology: { primary: { qps: 50 }, replicas: [], qpsTotal: 50 },
+        indexParams: null,
+        matrix: false,
+        verdict: 'shared_buffers=128MB → 인덱스가 디스크에 머물러 latency 폭증',
+        code: {
+          lang: 'ini',
+          filename: 'postgresql.conf',
+          lines: [
+            '# postgresql.conf — 공장 출하 기본 설정',
+            '# pgvector 운영하기엔 메모리가 너무 작다',
+            '',
+            '# 공유 버퍼 (인덱스/테이블 페이지 캐시)',
+            'shared_buffers = 128MB',
+            '',
+            '# 인덱스 빌드/VACUUM 시 메모리',
+            'maintenance_work_mem = 64MB',
+            '',
+            '# 쿼리 실행 시 임시 메모리 (정렬/해시)',
+            'work_mem = 4MB',
+            '',
+            '# OS 파일시스템 캐시 추정값',
+            'effective_cache_size = 4GB',
+            '',
+            '# 병렬 쿼리 워커 수',
+            'max_parallel_workers_per_gather = 2',
+            '',
+            '# WAL 설정 (복제 가능 모드)',
+            'wal_level = replica',
+            'max_wal_size = 1GB',
+            '',
+            '# 문제점:',
+            '#  1) shared_buffers=128MB → 1536차원 벡터 100만건',
+            '#     인덱스(약 6GB)를 못 담는다',
+            '#  2) maintenance_work_mem=64MB → HNSW 빌드가',
+            '#     external sort 모드로 떨어져 5~10배 느림',
+            '#  3) work_mem=4MB → ORDER BY embedding <=> 외부정렬',
+            '#',
+            '# 결과: latency p99 220ms, throughput 50 qps',
+          ],
+          highlight: [5, 8, 11, 14, 24, 25, 26, 27, 28, 30],
+        },
       },
       {
-        desc: "1단계: 메모리 설정. maintenance_work_mem을 충분히 늘려야 인덱스 빌드가 빨라집니다. shared_buffers와 effective_cache_size도 벡터 검색 성능에 직접 영향을 줍니다.",
-        left: 'memory-config',
-        right: 'memory-impact',
+        title: 'Step 2. 메모리 튜닝 — shared_buffers + maintenance_work_mem',
+        desc: '핵심 두 개를 손본다. shared_buffers를 RAM의 25%(=4GB)로, maintenance_work_mem을 2GB로. 인덱스가 메모리에 상주하면서 검색 latency가 220ms → 35ms로 떨어지고, HNSW 인덱스 빌드 시간도 45분에서 8분으로 줄어든다. 자동차로 치면 엔진 오일과 흡기 필터를 갈아준 셈.',
+        latency: makeLatency('memory'),
+        memory: { sharedBuffersPct: 25, maintWorkMemPct: 12.5, totalRam: 16, label: '메모리 튜닝 후 (RAM 16GB)' },
+        topology: { primary: { qps: 180 }, replicas: [], qpsTotal: 180 },
+        indexParams: null,
+        matrix: false,
+        verdict: 'shared_buffers=4GB · maintenance_work_mem=2GB → 인덱스 RAM 상주, latency 6배 개선',
+        code: {
+          lang: 'sql',
+          filename: 'tune-memory.sql',
+          lines: [
+            '-- tune-memory.sql — 메모리 튜닝 (RAM 16GB 기준)',
+            '-- 자동차 엔진 오일/흡기 필터 교체 단계',
+            '',
+            '-- 1) 영구 설정 변경 (postgresql.conf 등가)',
+            'ALTER SYSTEM SET shared_buffers = \'4GB\';',
+            '   -- RAM의 25%, 인덱스 페이지 캐시 상주',
+            '',
+            'ALTER SYSTEM SET maintenance_work_mem = \'2GB\';',
+            '   -- HNSW 인덱스 빌드 메모리, 클수록 빠름',
+            '',
+            'ALTER SYSTEM SET work_mem = \'256MB\';',
+            '   -- ORDER BY embedding <=> $1 정렬용',
+            '',
+            'ALTER SYSTEM SET effective_cache_size = \'12GB\';',
+            '   -- OS 캐시 합산 추정 (RAM의 75%)',
+            '',
+            '-- 2) 변경 적용 (shared_buffers는 재시작 필요)',
+            'SELECT pg_reload_conf();',
+            '-- $ sudo systemctl restart postgresql',
+            '',
+            '-- 3) 적용 확인',
+            'SHOW shared_buffers;          -- 4GB',
+            'SHOW maintenance_work_mem;    -- 2GB',
+            '',
+            '-- 4) 인덱스 재빌드 (큰 메모리 활용)',
+            'SET maintenance_work_mem = \'4GB\';  -- 세션만',
+            'REINDEX INDEX CONCURRENTLY idx_docs_hnsw;',
+            '   -- 빌드 시간: 45분 → 8분',
+            '',
+            '-- 효과:',
+            '--   인덱스 빌드 45분 → 8분 (5.6x)',
+            '--   latency p99 220ms → 35ms (6.3x)',
+            '--   throughput 50 qps → 180 qps (3.6x)',
+          ],
+          highlight: [5, 8, 11, 14, 27, 28, 31, 32, 33],
+        },
       },
       {
-        desc: "2단계: 인덱스 파라미터 튜닝. IVFFlat의 lists/probes, HNSW의 m/ef_construction을 데이터 규모에 맞게 조절합니다. 너무 작으면 recall이 떨어지고, 너무 크면 리소스 낭비입니다.",
-        left: 'index-tuning',
-        right: 'index-benchmark',
+        title: 'Step 3. 인덱스 파라미터 — IVFFlat lists, HNSW m/ef_construction',
+        desc: '메모리만 올린다고 끝이 아니다. 인덱스 파라미터를 데이터 규모에 맞춰야 한다. IVFFlat의 lists는 sqrt(rows)가 권장값(100만 건이면 1000). HNSW의 m=16/ef_construction=128은 100만 건 일반 권장. recall이 부족하면 ef_search를 검색 시점에 올린다. 너무 키우면 latency 손해, 너무 줄이면 정확도 손해.',
+        latency: makeLatency('index'),
+        memory: { sharedBuffersPct: 25, maintWorkMemPct: 12.5, totalRam: 16, label: '메모리 튜닝 유지' },
+        topology: { primary: { qps: 280 }, replicas: [], qpsTotal: 280 },
+        indexParams: {
+          ivfflat: { lists: 1000, probes: 32, recall: 94 },
+          hnsw: { m: 16, ef: 128, efSearch: 100, recall: 98 },
+        },
+        matrix: false,
+        verdict: 'IVFFlat lists ≈ √rows · HNSW m=16/ef=128 → recall 98%, latency 15ms',
+        code: {
+          lang: 'sql',
+          filename: 'index-params.sql',
+          lines: [
+            '-- index-params.sql — 데이터 규모별 권장값',
+            '-- 자동차의 기어비 — 데이터 양에 맞게 조정',
+            '',
+            '-- IVFFlat: lists 권장 = sqrt(rows)',
+            '-- 10만→316, 100만→1000, 1000만→3162',
+            '',
+            'CREATE INDEX idx_docs_ivf',
+            '  ON documents',
+            '  USING ivfflat (embedding vector_cosine_ops)',
+            '  WITH (lists = 1000);',
+            '   -- 100만건 기준',
+            '',
+            '-- 검색 시점 probes (recall vs latency)',
+            'SET ivfflat.probes = 32;',
+            '   -- probes=10 → recall 88%, latency  6ms',
+            '   -- probes=32 → recall 94%, latency 12ms',
+            '   -- probes=64 → recall 97%, latency 22ms',
+            '',
+            '-- HNSW 파라미터:',
+            '-- m       = 노드당 연결 수   (기본 16)',
+            '-- ef_cons = 빌드 후보 큐    (기본 64)',
+            '-- ef_srch = 검색 후보 큐    (기본 40)',
+            '',
+            'CREATE INDEX idx_docs_hnsw',
+            '  ON documents',
+            '  USING hnsw (embedding vector_cosine_ops)',
+            '  WITH (m = 16, ef_construction = 128);',
+            '   -- 100만~500만 권장',
+            '   -- 1000만+ 이면 m=24, ef_construction=200',
+            '',
+            '-- 검색 시 ef_search 조절',
+            'SET hnsw.ef_search = 100;',
+            '   -- ef_search=40   → recall 92%, latency  4ms',
+            '   -- ef_search=100  → recall 98%, latency  9ms',
+            '   -- ef_search=200  → recall 99%, latency 18ms',
+            '',
+            '-- 권장 매트릭스 (1536차원)',
+            '--   행 수    | IVFFlat lists | HNSW m / ef_cons',
+            '--    10만   |     316       |  16 /  64',
+            '--   100만   |   1,000       |  16 / 128',
+            '--   500만   |   2,236       |  24 / 200',
+            '--  1000만   |   3,162       |  32 / 256',
+          ],
+          highlight: [7, 8, 9, 10, 14, 25, 26, 27, 28, 33],
+        },
       },
       {
-        desc: "3단계: VACUUM과 인덱스 유지보수. 대량 INSERT/DELETE 후 인덱스 품질이 저하됩니다. 정기적 VACUUM과 REINDEX가 성능을 유지하는 핵심입니다.",
-        left: 'vacuum-config',
-        right: 'vacuum-schedule',
+        title: 'Step 4. Read Replica로 검색 분산 — 수평 확장',
+        desc: '단일 인스턴스 튜닝의 한계를 넘으려면 검색 부하를 복제본(Read Replica)으로 분산한다. Primary는 쓰기 전담, Replica 3대가 검색 쿼리를 나눠 받는다. PgBouncer가 앞단에서 라우팅. 1대 280 qps에서 4대 합계 1100 qps로 4배 가까운 throughput. 단점: 복제 지연(replication lag) 1~5초가 있어 방금 INSERT한 데이터는 즉시 안 보인다.',
+        latency: makeLatency('replica'),
+        memory: { sharedBuffersPct: 25, maintWorkMemPct: 12.5, totalRam: 16, label: '각 노드 메모리 튜닝 동일' },
+        topology: {
+          primary: { qps: 50 },
+          replicas: [
+            { id: 'r1', qps: 350 },
+            { id: 'r2', qps: 350 },
+            { id: 'r3', qps: 350 },
+          ],
+          qpsTotal: 1100,
+        },
+        indexParams: null,
+        matrix: false,
+        verdict: 'Primary + Replica×3 → 1100 qps (단일 280 qps의 4배). 쓰기는 Primary, 읽기는 분산',
+        code: {
+          lang: 'yaml',
+          filename: 'read-replica.yaml',
+          lines: [
+            '# read-replica.yaml — Primary + 3 Replica',
+            '# 자동차로 치면 1대 → 4대 동시 운행',
+            '',
+            'apiVersion: postgresql.cnpg.io/v1',
+            'kind: Cluster',
+            'metadata:',
+            '  name: vectordb',
+            'spec:',
+            '  instances: 4         # Primary 1 + Replica 3',
+            '  imageName: pgvector/pgvector:pg16',
+            '',
+            '  postgresql:',
+            '    parameters:',
+            '      shared_buffers: \'4GB\'',
+            '      maintenance_work_mem: \'2GB\'',
+            '      work_mem: \'256MB\'',
+            '      effective_cache_size: \'12GB\'',
+            '      max_wal_senders: \'10\'',
+            '      hot_standby: \'on\'',
+            '',
+            '  bootstrap:',
+            '    initdb:',
+            '      database: vectordb',
+            '      postInitSQL:',
+            '        - CREATE EXTENSION IF NOT EXISTS vector',
+            '',
+            '  storage:',
+            '    size: 200Gi',
+            '    storageClass: ssd-gp3',
+            '',
+            '---',
+            '# PgBouncer — 읽기/쓰기 라우팅',
+            'apiVersion: v1',
+            'kind: ConfigMap',
+            'metadata:',
+            '  name: pgbouncer-config',
+            'data:',
+            '  pgbouncer.ini: |',
+            '    [databases]',
+            '    vectordb_rw = host=vectordb-rw port=5432',
+            '    vectordb_ro = host=vectordb-ro port=5432',
+            '    [pgbouncer]',
+            '    pool_mode = transaction',
+            '    max_client_conn = 1000',
+            '    default_pool_size = 50',
+            '',
+            '# 애플리케이션에서:',
+            '#   INSERT/UPDATE → vectordb_rw  (Primary)',
+            '#   SELECT 검색    → vectordb_ro  (Replica RR)',
+            '#',
+            '# 효과: 280 qps → 1100 qps (3.9x)',
+            '# 주의: 복제 지연 1~5초',
+          ],
+          highlight: [9, 10, 14, 15, 16, 17, 19, 39, 40, 41, 42],
+        },
       },
       {
-        desc: "4단계: 테이블 파티셔닝. 1000만 건 이상이면 날짜/카테고리별로 테이블을 분할합니다. 파티션별 인덱스가 생성되어 검색 범위가 줄어듭니다.",
-        left: 'partition-config',
-        right: 'partition-benefit',
-      },
-      {
-        desc: "5단계: 커넥션 풀링과 스케일링. PgBouncer로 커넥션을 관리하고, 읽기 복제본으로 검색 부하를 분산합니다. 100만 → 1000만 벡터 스케일업 시 필수적인 인프라 구성입니다.",
-        left: 'connection-pool',
-        right: 'scale-checklist',
+        title: 'Step 5. 한계 — 1억 행 이상은 다른 길',
+        desc: 'pgvector + Read Replica로 1000만 행까지는 잘 간다. 그러나 1억 행 이상부터는 단일 PostgreSQL 인스턴스의 인덱스 크기/빌드 시간/검색 latency 모두 한계에 부딪힌다. 이때는 (1) Citus로 수평 샤딩 (2) 별도 vector DB(Milvus, Qdrant, Pinecone) 도입 (3) FAISS GPU 캐시 레이어 추가 — 셋 중 하나를 선택해야 한다. 자동차로 비유하면 일반 도로용 튜닝의 한계, 트럭/스포츠카 등 다른 차종으로 갈아탈 시점.',
+        latency: makeLatency('limit'),
+        memory: { sharedBuffersPct: 25, maintWorkMemPct: 12.5, totalRam: 16, label: '단일 인스턴스 한계' },
+        topology: { primary: { qps: 50 }, replicas: [{ id: 'r1', qps: 350 }, { id: 'r2', qps: 350 }, { id: 'r3', qps: 350 }], qpsTotal: 1100 },
+        indexParams: null,
+        matrix: true,
+        verdict: '1억 행 이상 → Citus 수평 샤딩 / 전용 vector DB / FAISS GPU 캐시',
+        code: {
+          lang: 'markdown',
+          filename: 'scale-recommendation.md',
+          lines: [
+            '# 행 수별 권장 솔루션 매트릭스',
+            '',
+            '## TL;DR',
+            '- 100만~1000만 : pgvector + 메모리 + Replica 충분',
+            '- 1000만~1억  : 파티셔닝 + Replica 5대+, 한계 임박',
+            '- 1억 이상    : Citus / 전용 vector DB / FAISS',
+            '',
+            '## 1. ~ 100만 행',
+            '- 단일 PostgreSQL + pgvector + HNSW',
+            '- shared_buffers=2GB, maintenance_work_mem=1GB',
+            '- Replica 불필요, latency p99 < 20ms',
+            '',
+            '## 2. 100만 ~ 1000만 행',
+            '- shared_buffers=4~8GB, maint=2~4GB',
+            '- Read Replica 2~3대',
+            '- HNSW m=24, ef_construction=200',
+            '- 월별 파티셔닝 도입 검토',
+            '',
+            '## 3. 1000만 ~ 1억 행',
+            '- 파티셔닝 필수 (월별/카테고리별)',
+            '- Read Replica 5대 이상',
+            '- HNSW 빌드 수 시간 — REINDEX 정책 필요',
+            '- 인덱스 50GB+ → RAM 64GB+ 서버 필요',
+            '',
+            '## 4. 1억 행 이상 — 갈아탈 시점',
+            '',
+            '### 옵션 A. Citus 수평 샤딩',
+            '- PostgreSQL 호환 유지, 노드 추가 확장',
+            '- 샤드 키 설계 핵심 (user_id 등)',
+            '- pgvector — Citus 11+ 부분 지원',
+            '',
+            '### 옵션 B. 전용 vector DB',
+            '- Milvus  : 오픈소스, 100억 벡터 검증',
+            '- Qdrant  : Rust 기반, 단일 노드 우수',
+            '- Pinecone: 매니지드, 운영 부담 최소',
+            '',
+            '### 옵션 C. FAISS GPU 캐시 레이어',
+            '- pgvector는 메타데이터 전담',
+            '- FAISS GPU가 hot vector 검색',
+            '- latency < 1ms, 복잡도 상승',
+            '',
+            '## 의사결정',
+            '- PostgreSQL 자산 유지 → Citus',
+            '- 벡터가 핵심 비즈니스 → 전용 vector DB',
+            '- 초저지연 + GPU 보유 → FAISS',
+            '',
+            '## 결론',
+            '> pgvector는 1000만 행까지 일반 세단으로 넉넉.',
+            '> 1억 행은 트럭/스포츠카로 갈아탈 시점.',
+          ],
+          highlight: [4, 5, 6, 27, 28, 29, 30, 33, 34, 35, 38, 39, 40],
+        },
       },
     ];
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playRef = useRef(null);
-      const s = STEPS[step];
-      const isEnd = step === STEPS.length - 1;
-
-      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
-      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
-      const nextRef = useRef(next); nextRef.current = next;
-      const prevRef = useRef(prev); prevRef.current = prev;
-      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
-
-      useEffect(() => {
-        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
-        else { clearInterval(playRef.current); }
-        return () => clearInterval(playRef.current);
-      }, [isPlaying]);
-
-      useEffect(() => {
-        const onKey = (e) => {
-          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
-          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
-        };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-      }, []);
-
-      const renderLeft = () => {
-        switch (s.left) {
-          case 'overview':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">6가지 튜닝 영역</div>
-                <div className="space-y-2">
-                  {[
-                    { num: '1', title: '메모리 설정', desc: 'shared_buffers, work_mem, maintenance_work_mem' },
-                    { num: '2', title: '인덱스 파라미터', desc: 'lists, probes, m, ef_construction' },
-                    { num: '3', title: 'VACUUM / REINDEX', desc: '인덱스 품질 유지, dead tuple 정리' },
-                    { num: '4', title: '테이블 파티셔닝', desc: '대규모 데이터 분할, 파티션별 인덱스' },
-                    { num: '5', title: '커넥션 풀링', desc: 'PgBouncer, 읽기 복제본' },
-                    { num: '6', title: '모니터링', desc: '검색 레이턴시, 인덱스 크기, 쿼리 분석' },
-                  ].map((item, i) => (
-                    <div key={i} className={`flex items-start gap-3 p-3 rounded-lg border ${
-                      i === step ? 'bg-blue-50 border-blue-300 shadow-sm' : 'bg-slate-50 border-slate-200'
-                    }`}>
-                      <div className="w-6 h-6 bg-blue-600 text-white rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0">{item.num}</div>
-                      <div>
-                        <div className="font-bold text-sm text-slate-800">{item.title}</div>
-                        <div className="text-xs text-slate-500">{item.desc}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          case 'memory-config':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">postgresql.conf 메모리 설정</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`# 인덱스 빌드 시 메모리 (중요!)
-maintenance_work_mem = '2GB'
-
-# 공유 버퍼 (전체 RAM의 25%)
-shared_buffers = '4GB'
-
-# 쿼리 실행 시 작업 메모리
-work_mem = '256MB'
-
-# OS 캐시 고려 (전체 RAM의 75%)
-effective_cache_size = '12GB'
-
-# 병렬 쿼리
-max_parallel_workers_per_gather = 4`}</pre>
-                <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
-                  <b>maintenance_work_mem</b>이 가장 중요. HNSW 인덱스 빌드 시 이 값이 작으면 매우 느림
-                </div>
-              </div>
-            );
-          case 'index-tuning':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">데이터 규모별 인덱스 설정</div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm border-collapse">
-                    <thead>
-                      <tr className="bg-slate-100">
-                        <th className="p-2 text-left border border-slate-200">규모</th>
-                        <th className="p-2 text-center border border-slate-200">IVFFlat</th>
-                        <th className="p-2 text-center border border-slate-200">HNSW</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {[
-                        ['10만', 'lists=316', 'm=16, ef=64'],
-                        ['100만', 'lists=1000', 'm=16, ef=128'],
-                        ['500만', 'lists=2236', 'm=24, ef=200'],
-                        ['1000만', 'lists=3162', 'm=32, ef=256'],
-                      ].map(([scale, ivf, hnsw], i) => (
-                        <tr key={i} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
-                          <td className="p-2 border border-slate-200 font-medium">{scale}건</td>
-                          <td className="p-2 border border-slate-200 text-center text-xs font-mono">{ivf}</td>
-                          <td className="p-2 border border-slate-200 text-center text-xs font-mono">{hnsw}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap mt-3">{`-- 검색 시 파라미터 조정
-SET ivfflat.probes = 32;
-SET hnsw.ef_search = 100;`}</pre>
-              </div>
-            );
-          case 'vacuum-config':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">VACUUM & REINDEX</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`-- 일반 VACUUM (경량, 온라인 가능)
-VACUUM ANALYZE documents;
-
--- VACUUM FULL (테이블 재작성, 잠금 필요)
-VACUUM FULL documents;
-
--- 인덱스 재구축
-REINDEX INDEX CONCURRENTLY idx_docs_hnsw;
-
--- dead tuple 확인
-SELECT relname, n_dead_tup, n_live_tup,
-  round(n_dead_tup::numeric /
-    NULLIF(n_live_tup, 0) * 100, 2)
-    AS dead_ratio
-FROM pg_stat_user_tables
-WHERE relname = 'documents';`}</pre>
-              </div>
-            );
-          case 'partition-config':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">테이블 파티셔닝</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap">{`-- 날짜별 파티셔닝
-CREATE TABLE documents (
-  id bigserial,
-  content text,
-  embedding vector(1536),
-  created_at date NOT NULL
-) PARTITION BY RANGE (created_at);
-
--- 월별 파티션 생성
-CREATE TABLE docs_2024_01
-  PARTITION OF documents
-  FOR VALUES FROM ('2024-01-01')
-  TO ('2024-02-01');
-
-CREATE TABLE docs_2024_02
-  PARTITION OF documents
-  FOR VALUES FROM ('2024-02-01')
-  TO ('2024-03-01');
-
--- 각 파티션에 개별 인덱스
-CREATE INDEX ON docs_2024_01
-  USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX ON docs_2024_02
-  USING hnsw (embedding vector_cosine_ops);`}</pre>
-              </div>
-            );
-          case 'connection-pool':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">PgBouncer + 읽기 복제본</div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-sm font-mono whitespace-pre-wrap mb-3">{`# pgbouncer.ini
-[databases]
-vectordb = host=127.0.0.1
-  port=5432 dbname=vectordb
-
-[pgbouncer]
-pool_mode = transaction
-max_client_conn = 1000
-default_pool_size = 50
-reserve_pool_size = 10`}</pre>
-                <div className="space-y-2">
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="font-bold text-xs text-blue-800">쓰기: Primary</div>
-                    <div className="text-xs text-blue-700">INSERT, UPDATE, DELETE, 인덱스 빌드</div>
-                  </div>
-                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
-                    <div className="font-bold text-xs text-emerald-800">읽기: Replica(s)</div>
-                    <div className="text-xs text-emerald-700">벡터 검색 쿼리를 복제본으로 분산</div>
-                  </div>
-                </div>
-              </div>
-            );
-          default: return null;
-        }
-      };
-
-      const renderRight = () => {
-        switch (s.right) {
+    // ─────────────────────────────────────────────────────
+    // 시계열 latency 데이터 생성기 (단계별)
+    //   t = 0..19 (20 포인트), 단위 ms
+    // ─────────────────────────────────────────────────────
+    function makeLatency(stage) {
+      const pts = [];
+      for (let t = 0; t < 20; t++) {
+        let base = 200 + Math.sin(t * 0.7) * 25 + (t % 5 === 0 ? 30 : 0);
+        let tuned;
+        switch (stage) {
           case 'baseline':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">기본값 vs 튜닝 후</div>
-                <div className="space-y-3">
-                  {[
-                    { label: '인덱스 빌드 (100만건)', before: '45분', after: '8분', improvement: '5.6x' },
-                    { label: '검색 레이턴시 (p99)', before: '120ms', after: '15ms', improvement: '8x' },
-                    { label: '동시 검색 처리량', before: '50 qps', after: '300 qps', improvement: '6x' },
-                    { label: 'Recall@10', before: '85%', after: '97%', improvement: '+12%p' },
-                  ].map((item, i) => (
-                    <div key={i} className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                      <div className="font-bold text-xs text-slate-600 mb-2">{item.label}</div>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 text-center">
-                          <div className="text-xs text-red-500">기본값</div>
-                          <div className="font-mono font-bold text-sm text-red-700">{item.before}</div>
-                        </div>
-                        <div className="text-slate-400 font-bold">→</div>
-                        <div className="flex-1 text-center">
-                          <div className="text-xs text-emerald-500">튜닝 후</div>
-                          <div className="font-mono font-bold text-sm text-emerald-700">{item.after}</div>
-                        </div>
-                        <div className="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs font-bold">{item.improvement}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          case 'memory-impact':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">메모리 설정별 영향</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                    <div className="font-bold text-xs text-slate-600 mb-2">maintenance_work_mem vs 빌드 시간</div>
-                    {[
-                      { mem: '256MB', time: '45분', bar: 'w-11/12' },
-                      { mem: '1GB', time: '15분', bar: 'w-7/12' },
-                      { mem: '2GB', time: '8분', bar: 'w-4/12' },
-                      { mem: '4GB', time: '6분', bar: 'w-3/12' },
-                    ].map((item, i) => (
-                      <div key={i} className="flex items-center gap-2 mb-1.5">
-                        <span className="text-xs font-mono w-14 text-slate-600">{item.mem}</span>
-                        <div className="flex-1 bg-slate-200 rounded-full h-4 relative">
-                          <div className={`bg-blue-500 h-4 rounded-full ${item.bar} flex items-center justify-end pr-1`}>
-                            <span className="text-[10px] text-white font-bold">{item.time}</span>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700">
-                    <b>권장:</b> 서버 RAM 16GB → maintenance_work_mem = 2GB<br/>
-                    인덱스 빌드 후 원래 값으로 복원해도 됨
-                  </div>
-                </div>
-              </div>
-            );
-          case 'index-benchmark':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">벤치마크 결과 (100만건, 1536차원)</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="font-bold text-xs text-blue-800 mb-2">IVFFlat (lists=1000, probes=32)</div>
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div className="bg-white p-2 rounded border"><b>빌드:</b> 3분</div>
-                      <div className="bg-white p-2 rounded border"><b>검색:</b> ~8ms</div>
-                      <div className="bg-white p-2 rounded border"><b>Recall:</b> 94%</div>
-                      <div className="bg-white p-2 rounded border"><b>메모리:</b> 1.2GB</div>
-                    </div>
-                  </div>
-                  <div className="p-3 bg-purple-50 border border-purple-200 rounded-lg">
-                    <div className="font-bold text-xs text-purple-800 mb-2">HNSW (m=16, ef_construction=128)</div>
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div className="bg-white p-2 rounded border"><b>빌드:</b> 25분</div>
-                      <div className="bg-white p-2 rounded border"><b>검색:</b> ~5ms</div>
-                      <div className="bg-white p-2 rounded border"><b>Recall:</b> 98%</div>
-                      <div className="bg-white p-2 rounded border"><b>메모리:</b> 3.5GB</div>
-                    </div>
-                  </div>
-                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
-                    <b>결론:</b> 메모리 여유 있으면 HNSW, 메모리 제한 시 IVFFlat
-                  </div>
-                </div>
-              </div>
-            );
-          case 'vacuum-schedule':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">VACUUM 운영 스케줄</div>
-                <div className="space-y-3">
-                  {[
-                    { freq: '매일', task: 'VACUUM ANALYZE', desc: '통계 갱신, 경량 정리', color: 'bg-emerald-50 border-emerald-200' },
-                    { freq: '매주', task: 'dead_ratio 확인', desc: '10% 초과 시 VACUUM FULL 고려', color: 'bg-blue-50 border-blue-200' },
-                    { freq: '매월', task: 'REINDEX CONCURRENTLY', desc: '인덱스 품질 복원 (온라인 가능)', color: 'bg-purple-50 border-purple-200' },
-                    { freq: '분기', task: 'VACUUM FULL (점검 시간)', desc: '테이블 재작성, 디스크 반환', color: 'bg-amber-50 border-amber-200' },
-                  ].map((item, i) => (
-                    <div key={i} className={`p-3 rounded-lg border ${item.color}`}>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="font-bold text-sm">{item.freq}</span>
-                        <span className="text-xs font-mono bg-white px-2 py-0.5 rounded border">{item.task}</span>
-                      </div>
-                      <div className="text-xs text-slate-600">{item.desc}</div>
-                    </div>
-                  ))}
-                </div>
-                <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
-                  <b>주의:</b> VACUUM FULL은 테이블 잠금 발생. 서비스 점검 시간에 수행
-                </div>
-              </div>
-            );
-          case 'partition-benefit':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">파티셔닝 효과</div>
-                <div className="space-y-3">
-                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                    <div className="font-bold text-xs text-slate-600 mb-2">검색 범위 축소</div>
-                    <div className="space-y-1.5">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs w-20 text-slate-500">파티셔닝 전:</span>
-                        <div className="flex-1 bg-red-200 rounded h-4 flex items-center justify-center">
-                          <span className="text-[10px] font-bold text-red-800">1000만건 전체 스캔</span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs w-20 text-slate-500">파티셔닝 후:</span>
-                        <div className="flex gap-1 flex-1">
-                          <div className="bg-slate-200 rounded h-4 flex-1"></div>
-                          <div className="bg-slate-200 rounded h-4 flex-1"></div>
-                          <div className="bg-blue-400 rounded h-4 flex-1 flex items-center justify-center">
-                            <span className="text-[10px] font-bold text-white">이 달만</span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
-                    <div className="font-bold text-xs text-emerald-800 mb-1">파티셔닝 이점</div>
-                    <ul className="text-xs text-emerald-700 space-y-1">
-                      <li>- 검색 대상이 줄어 속도 향상</li>
-                      <li>- 파티션별 VACUUM 가능 (전체 잠금 불필요)</li>
-                      <li>- 오래된 파티션 DROP으로 빠른 삭제</li>
-                      <li>- 인덱스 빌드도 파티션 단위로 병렬 가능</li>
-                    </ul>
-                  </div>
-                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-700">
-                    <b>적용 기준:</b> 500만건 이상, 시간 범위 검색이 빈번한 경우
-                  </div>
-                </div>
-              </div>
-            );
-          case 'scale-checklist':
-            return (
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">스케일업 체크리스트</div>
-                <div className="space-y-2">
-                  {[
-                    { scale: '10만 → 100만', items: ['HNSW 인덱스 적용', 'maintenance_work_mem 1GB+', 'probes/ef_search 튜닝'] },
-                    { scale: '100만 → 500만', items: ['파티셔닝 도입', 'PgBouncer 적용', '읽기 복제본 구성'] },
-                    { scale: '500만 → 1000만', items: ['m=32, ef_construction=256', 'VACUUM 자동화', '모니터링 대시보드'] },
-                    { scale: '1000만+', items: ['수평 샤딩 검토', 'FAISS 캐시 레이어 도입', 'Citus/Aurora 고려'] },
-                  ].map((tier, i) => (
-                    <div key={i} className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                      <div className="font-bold text-sm text-blue-700 mb-1">{tier.scale}</div>
-                      <div className="space-y-0.5">
-                        {tier.items.map((item, j) => (
-                          <div key={j} className="flex items-center gap-2 text-xs text-slate-600">
-                            <span className="w-4 h-4 bg-blue-100 rounded flex items-center justify-center text-blue-600 text-[10px]">&#10003;</span>
-                            {item}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          default: return null;
+            tuned = base; // 같음
+            break;
+          case 'memory':
+            tuned = 35 + Math.sin(t * 0.7) * 6 + (t % 5 === 0 ? 8 : 0);
+            break;
+          case 'index':
+            tuned = 15 + Math.sin(t * 0.5) * 3 + (t % 7 === 0 ? 4 : 0);
+            break;
+          case 'replica':
+            tuned = 12 + Math.sin(t * 0.5) * 2 + (t % 8 === 0 ? 3 : 0);
+            break;
+          case 'limit':
+            // 1억 행 가정 — 다시 튀기 시작
+            tuned = 80 + Math.sin(t * 0.4) * 30 + (t % 4 === 0 ? 50 : 0);
+            break;
+          default:
+            tuned = base;
         }
+        pts.push({ t, base: Math.max(1, base), tuned: Math.max(1, tuned) });
+      }
+      return pts;
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LatencyChart — 튜닝 전(red) vs 튜닝 후(purple) 시계열
+    // ─────────────────────────────────────────────────────
+    function LatencyChart({ data, stepIdx }) {
+      const w = 380;
+      const h = 140;
+      const padL = 32, padR = 8, padT = 10, padB = 22;
+      const innerW = w - padL - padR;
+      const innerH = h - padT - padB;
+      // 동적 max — 최대 270ms 까지 표시
+      const maxY = 270;
+      const xStep = innerW / (data.length - 1);
+
+      const path = (key, color) => {
+        const d = data
+          .map((p, i) => {
+            const x = padL + i * xStep;
+            const y = padT + innerH - (Math.min(p[key], maxY) / maxY) * innerH;
+            return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+          })
+          .join(' ');
+        return d;
       };
+
+      const yTicks = [0, 50, 100, 200];
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm">
-              <a href="../index.html" className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 font-medium">
-                <span>&larr;</span> 허브로 돌아가기
-              </a>
-            </nav>
-
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part IV. pgvector &gt; Chapter 2. pgvector 실전</div>
-                  <h1 className="text-2xl font-bold text-slate-800">IV-2-3. pgvector 운영 — 성능 튜닝과 스케일링</h1>
-                </div>
-              </div>
-              <p className="text-slate-600">자동차 엔진 튜닝처럼 — <b>메모리 설정, 인덱스 파라미터, VACUUM, 파티셔닝, 커넥션 풀링</b>까지 프로덕션 운영의 핵심을 다룹니다.</p>
-            </header>
-
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-blue-700 border-blue-800 text-white">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-200">성능 튜닝 체크리스트</h3>
-                <span className="text-xs text-blue-200">키보드 &larr;/&rarr;로 단계 이동</span>
-              </div>
-              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-3">
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-[11px] font-bold text-purple-800 flex items-center gap-1">
+              <span>📈</span><span>검색 latency (p99, ms)</span>
             </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderLeft()}
-              </div>
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderRight()}
-              </div>
+            <div className="flex gap-2 text-[9px] font-mono">
+              <span className="flex items-center gap-1 text-red-700">
+                <span className="inline-block w-3 h-0.5 bg-red-500"></span>튜닝 전
+              </span>
+              <span className="flex items-center gap-1 text-purple-700">
+                <span className="inline-block w-3 h-0.5 bg-purple-600"></span>현재 단계
+              </span>
             </div>
+          </div>
+          <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+            {/* y축 격자 + 라벨 */}
+            {yTicks.map((v) => {
+              const y = padT + innerH - (v / maxY) * innerH;
+              return (
+                <g key={v}>
+                  <line x1={padL} y1={y} x2={w - padR} y2={y} stroke="#e9d5ff" strokeWidth="0.5" strokeDasharray="2 2" />
+                  <text x={padL - 4} y={y + 3} textAnchor="end" fontSize="8" fill="#7e22ce" fontFamily="monospace">{v}</text>
+                </g>
+              );
+            })}
 
-            <div className="flex flex-wrap gap-2">
-              {['VACUUM', 'maintenance_work_mem', 'partitioning', 'connection pool', 'pgbouncer'].map(kw => (
-                <span key={kw} className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full text-sm font-medium border border-blue-200">{kw}</span>
-              ))}
+            {/* 임계치 라인 (50ms = SLO 가정) */}
+            {(() => {
+              const sy = padT + innerH - (50 / maxY) * innerH;
+              return (
+                <g>
+                  <line x1={padL} y1={sy} x2={w - padR} y2={sy} stroke="#22c55e" strokeWidth="0.8" strokeDasharray="3 2" opacity="0.6" />
+                  <text x={w - padR - 2} y={sy - 2} textAnchor="end" fontSize="8" fill="#15803d" fontFamily="monospace">SLO 50ms</text>
+                </g>
+              );
+            })()}
+
+            {/* baseline (튜닝 전) — 빨간 점선 */}
+            <path d={path('base', '#ef4444')} fill="none" stroke="#ef4444" strokeWidth="1.5" strokeDasharray="3 2" opacity="0.7" />
+
+            {/* tuned (현재 단계) — 보라 굵게 */}
+            <path d={path('tuned', '#7c3aed')} fill="none" stroke="#7c3aed" strokeWidth="2" />
+
+            {/* 마지막 포인트 강조 */}
+            {(() => {
+              const last = data[data.length - 1];
+              const lx = padL + (data.length - 1) * xStep;
+              const ly = padT + innerH - (Math.min(last.tuned, maxY) / maxY) * innerH;
+              return (
+                <g>
+                  <circle cx={lx} cy={ly} r={3.5} fill="#7c3aed" stroke="white" strokeWidth="1" />
+                  <text x={lx - 6} y={ly - 6} textAnchor="end" fontSize="9" fontWeight="bold" fill="#5b21b6" fontFamily="monospace">{last.tuned.toFixed(0)}ms</text>
+                </g>
+              );
+            })()}
+
+            {/* x축 */}
+            <line x1={padL} y1={padT + innerH} x2={w - padR} y2={padT + innerH} stroke="#a78bfa" strokeWidth="0.5" />
+            <text x={padL} y={h - 6} fontSize="8" fill="#7e22ce" fontFamily="monospace">t=0</text>
+            <text x={w - padR} y={h - 6} textAnchor="end" fontSize="8" fill="#7e22ce" fontFamily="monospace">t=20s</text>
+          </svg>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // MemoryGauge — shared_buffers + maintenance_work_mem 게이지
+    // ─────────────────────────────────────────────────────
+    function MemoryGauge({ memory }) {
+      const { sharedBuffersPct, maintWorkMemPct, totalRam, label } = memory;
+      const sharedGB = (totalRam * sharedBuffersPct / 100).toFixed(1);
+      const maintGB = (totalRam * maintWorkMemPct / 100).toFixed(1);
+
+      const Bar = ({ name, pct, gb, color }) => (
+        <div className="mb-2">
+          <div className="flex items-center justify-between text-[10px] font-mono mb-0.5">
+            <span className="text-purple-800 font-bold">{name}</span>
+            <span className="text-purple-600">{gb} GB ({pct.toFixed(1)}%)</span>
+          </div>
+          <div className="h-3 bg-purple-100 rounded-full overflow-hidden border border-purple-200">
+            <div
+              className="h-full rounded-full transition-all duration-700"
+              style={{ width: `${Math.min(100, pct * 4)}%`, background: color }}
+            />
+          </div>
+        </div>
+      );
+
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-3">
+          <div className="text-[11px] font-bold text-purple-800 mb-2 flex items-center gap-1">
+            <span>🧠</span>
+            <span>메모리 사용 — {label}</span>
+          </div>
+          <Bar name="shared_buffers" pct={sharedBuffersPct} gb={sharedGB} color="#7c3aed" />
+          <Bar name="maintenance_work_mem" pct={maintWorkMemPct} gb={maintGB} color="#a78bfa" />
+          <div className="text-[9px] text-purple-700 font-mono mt-1">
+            전체 RAM {totalRam}GB · 25% 권장선
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // ReplicaTopology — Primary + N Replica 토폴로지
+    // ─────────────────────────────────────────────────────
+    function ReplicaTopology({ topology }) {
+      const { primary, replicas, qpsTotal } = topology;
+
+      return (
+        <div className="rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 border border-purple-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[11px] font-bold text-purple-800 flex items-center gap-1">
+              <span>🗄️</span>
+              <span>Primary + Replica 토폴로지</span>
             </div>
+            <span className="text-[10px] font-mono bg-purple-700 text-white px-1.5 py-0.5 rounded">
+              총 {qpsTotal} qps
+            </span>
+          </div>
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
-                </button>
-                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-blue-600 hover:bg-blue-700">
-                  {isPlaying ? (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>
-                  ) : (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>
-                  )}
-                </button>
-                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
-                </button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
+          <svg viewBox="0 0 360 130" className="w-full h-auto">
+            {/* Primary */}
+            <g>
+              <rect x="140" y="10" width="80" height="36" rx="6" fill="#7c3aed" stroke="#5b21b6" strokeWidth="1.5" />
+              <text x="180" y="25" textAnchor="middle" fontSize="10" fontWeight="bold" fill="white" fontFamily="monospace">PRIMARY</text>
+              <text x="180" y="38" textAnchor="middle" fontSize="9" fill="#ddd6fe" fontFamily="monospace">쓰기 {primary.qps} qps</text>
+            </g>
+
+            {/* 복제 화살표 + Replicas */}
+            {replicas.length === 0 ? (
+              <text x="180" y="90" textAnchor="middle" fontSize="10" fill="#a78bfa" fontFamily="monospace">(Replica 없음 — 단일 인스턴스)</text>
+            ) : (
+              replicas.map((r, i) => {
+                const xs = [60, 180, 300];
+                const x = xs[i] || 180;
+                const y = 80;
+                return (
+                  <g key={r.id}>
+                    <line x1="180" y1="46" x2={x + 30} y2={y} stroke="#a78bfa" strokeWidth="1.5" strokeDasharray="3 2" />
+                    <rect x={x} y={y} width="60" height="34" rx="5" fill="#ddd6fe" stroke="#7c3aed" strokeWidth="1.5" />
+                    <text x={x + 30} y={y + 14} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#4c1d95" fontFamily="monospace">Replica {i + 1}</text>
+                    <text x={x + 30} y={y + 26} textAnchor="middle" fontSize="8" fill="#6d28d9" fontFamily="monospace">읽기 {r.qps} qps</text>
+                  </g>
+                );
+              })
+            )}
+
+            {/* PgBouncer 표시 */}
+            {replicas.length > 0 && (
+              <g>
+                <rect x="20" y="10" width="80" height="20" rx="4" fill="#fff" stroke="#7c3aed" strokeWidth="1" strokeDasharray="2 2" />
+                <text x="60" y="24" textAnchor="middle" fontSize="9" fill="#5b21b6" fontFamily="monospace">PgBouncer</text>
+              </g>
+            )}
+          </svg>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // IndexParamsCard — Step 3 보조: lists/probes/m/ef
+    // ─────────────────────────────────────────────────────
+    function IndexParamsCard({ params }) {
+      if (!params) return null;
+      const { ivfflat, hnsw } = params;
+      return (
+        <div className="rounded-lg bg-white border-2 border-purple-300 p-3">
+          <div className="text-[11px] font-bold text-purple-800 mb-2 flex items-center gap-1">
+            <span>🎛️</span>
+            <span>현재 인덱스 파라미터 (100만 행 기준)</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-[10px]">
+            <div className="bg-purple-50 border border-purple-200 rounded p-2">
+              <div className="font-bold text-purple-900 mb-1">IVFFlat</div>
+              <div className="font-mono text-slate-700">lists = <b>{ivfflat.lists}</b></div>
+              <div className="font-mono text-slate-700">probes = <b>{ivfflat.probes}</b></div>
+              <div className="text-purple-700 mt-1">recall {ivfflat.recall}%</div>
             </div>
-
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./IV-2-2.html" className="text-blue-600 hover:text-blue-800 font-medium">&larr; IV-2-2. pgvector 실전</a>
-              <a href="../part5/V-1-1.html" className="text-rose-600 hover:text-rose-800 font-medium">Part V. 비교와 선택 → V-1-1 &rarr;</a>
+            <div className="bg-purple-50 border border-purple-200 rounded p-2">
+              <div className="font-bold text-purple-900 mb-1">HNSW</div>
+              <div className="font-mono text-slate-700">m = <b>{hnsw.m}</b>, ef_cons = <b>{hnsw.ef}</b></div>
+              <div className="font-mono text-slate-700">ef_search = <b>{hnsw.efSearch}</b></div>
+              <div className="text-purple-700 mt-1">recall {hnsw.recall}%</div>
             </div>
           </div>
         </div>
       );
     }
+
+    // ─────────────────────────────────────────────────────
+    // SolutionMatrix — 행 수별 권장 솔루션 매트릭스 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function SolutionMatrix() {
+      const rows = [
+        { range: '~ 100만',     sol: 'pgvector 단일 + HNSW',          color: 'bg-emerald-50 border-emerald-300', tone: 'text-emerald-800' },
+        { range: '100만~1000만', sol: '+ 메모리 튜닝 + Replica 2~3대', color: 'bg-purple-50 border-purple-300',   tone: 'text-purple-800' },
+        { range: '1000만~1억',  sol: '+ 파티셔닝 + Replica 5대+',     color: 'bg-amber-50 border-amber-300',     tone: 'text-amber-800' },
+        { range: '1억 ~ 10억',  sol: 'Citus 샤딩 / 전용 vector DB',   color: 'bg-orange-50 border-orange-300',   tone: 'text-orange-800' },
+        { range: '10억 +',      sol: 'Milvus / Qdrant + FAISS GPU',   color: 'bg-rose-50 border-rose-300',       tone: 'text-rose-800' },
+      ];
+      return (
+        <div className="rounded-lg bg-white border-2 border-purple-300 overflow-hidden">
+          <div className="bg-purple-100 px-3 py-2 border-b border-purple-200">
+            <div className="text-xs font-bold text-purple-900">📐 행 수별 권장 솔루션 매트릭스</div>
+          </div>
+          <div className="p-2 space-y-1.5">
+            {rows.map((r) => (
+              <div
+                key={r.range}
+                className={`flex items-center gap-3 px-3 py-2 rounded border ${r.color}`}
+              >
+                <span className={`font-mono text-xs font-bold w-28 ${r.tone}`}>{r.range}</span>
+                <span className={`text-xs flex-1 ${r.tone}`}>{r.sol}</span>
+              </div>
+            ))}
+          </div>
+          <div className="bg-purple-50 px-3 py-2 border-t border-purple-200 text-[10px] text-purple-700">
+            💡 1억 행 이상부터는 단일 PostgreSQL 한계 — 갈아탈 시점
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 통합 시각화
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step, stepIdx }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">🏎️ 자동차 엔진 튜닝 — pgvector 운영</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          {/* 매트릭스만 표시 (Step 5) */}
+          {step.matrix ? (
+            <div className="space-y-3">
+              <LatencyChart data={step.latency} stepIdx={stepIdx} />
+              <SolutionMatrix />
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {/* 1) latency 시계열 */}
+              <LatencyChart data={step.latency} stepIdx={stepIdx} />
+
+              {/* 2) 메모리 게이지 */}
+              <MemoryGauge memory={step.memory} />
+
+              {/* 3) 토폴로지 */}
+              <ReplicaTopology topology={step.topology} />
+
+              {/* 4) 인덱스 파라미터 (Step 3에서만) */}
+              {step.indexParams && <IndexParamsCard params={step.indexParams} />}
+            </div>
+          )}
+
+          {/* verdict — 단계별 한 줄 요약 */}
+          <div className="mt-3 rounded-lg bg-purple-700 text-white p-3 flex items-start gap-2 shadow-sm">
+            <span className="text-base leading-none">✅</span>
+            <div className="flex-1">
+              <div className="text-[10px] uppercase tracking-wider text-purple-200 font-bold">이번 단계 효과</div>
+              <div className="text-xs font-medium mt-0.5">{step.verdict}</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[36rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-purple-500/15 border-l-2 border-purple-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-purple-700 hover:text-purple-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-3</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-purple-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. pgvector &gt; Chapter 2. pgvector 실전</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">pgvector 운영 — 성능 튜닝과 스케일링</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">자동차 엔진 튜닝 — 메모리, 인덱스 파라미터, Read Replica, 한계까지</p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 text-sm text-purple-900">
+                💡 다음(Part V)에서는 <strong>벡터 DB 비교와 선택</strong> — pgvector / Milvus / Qdrant / Pinecone을 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-purple-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-purple-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-purple-600 text-white hover:bg-purple-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./IV-2-2.html" className="text-purple-700 hover:text-purple-900 font-medium">&larr; IV-2-2. pgvector 실전</a>
+              <a href="../part5/V-1-1.html" className="text-rose-700 hover:text-rose-900 font-medium">Part V. 비교와 선택 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>

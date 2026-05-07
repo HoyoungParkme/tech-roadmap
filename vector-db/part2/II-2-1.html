@@ -3,201 +3,896 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vector DB — II-2-1. FAISS 실전 워크플로우 — 빌드부터 검색까지</title>
+  <title>Vector DB — II-2-1. FAISS 실전 워크플로우 — 빌드/검색/저장</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    II-2-1. FAISS 실전 워크플로우 — 빌드 → 검색 → 저장
+    학습 목표: 1만 텍스트 코퍼스를 IndexIVFFlat으로 빌드하고, 디스크에 저장한 뒤
+              별도 프로세스에서 로드해 검색하는 5단계 실전 흐름과
+              nprobe 튜닝(정확도/속도 trade-off)을 5단계로 이해한다.
+    핵심 비유: 도서관의 카드 카탈로그 — 책 정리(embed) → 카드 정리(build) →
+              서랍에 보관(save) → 다음 사서가 서랍 꺼내(load) → 카드로 책 찾기(search).
+              서랍 몇 개를 뒤지냐(nprobe)에 따라 빠름/정확함이 달라진다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 5 단계 박스 + 인덱스 파일 박스 + 검색 결과)
+                       우(VSCode CodeViewer 5 파일 탭)
+    색상: vector-db purple
+  -->
+
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 5 단계 메타 (좌측 LiveDataPane이 활성 단계 highlight)
+    //   id        : 단계 식별자
+    //   label     : 박스 제목
+    //   sub       : 박스 부제 (실제 동작)
+    //   icon      : 이모지
+    // ─────────────────────────────────────────────────────
     const PIPELINE = [
-      { num: '1', label: '데이터 준비', icon: 'D', color: 'bg-slate-500' },
-      { num: '2', label: '임베딩 생성', icon: 'E', color: 'bg-blue-500' },
-      { num: '3', label: '인덱스 빌드', icon: 'I', color: 'bg-orange-500' },
-      { num: '4', label: '학습 (train)', icon: 'T', color: 'bg-green-500' },
-      { num: '5', label: '검색 (search)', icon: 'S', color: 'bg-purple-500' },
-      { num: '6', label: '저장/로드', icon: 'P', color: 'bg-amber-500' },
+      { id: 'embed',  label: 'Embed',  sub: '1만 텍스트 → 384차원 벡터', icon: '🔤' },
+      { id: 'build',  label: 'Build',  sub: 'IndexIVFFlat + train + add',  icon: '🏗️' },
+      { id: 'save',   label: 'Save',   sub: 'faiss.write_index(...)',       icon: '💾' },
+      { id: 'load',   label: 'Load',   sub: '별도 프로세스 → read_index',  icon: '📂' },
+      { id: 'search', label: 'Search', sub: 'nprobe 튜닝 + top-k',          icon: '🔍' },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 시뮬레이션 데이터
+    //   activeStep  : 활성 단계 (0~4, -1=intro)
+    //   indexFile   : 디스크 인덱스 파일 박스 상태
+    //                 { exists: bool, sizeMb: number, vectors: number }
+    //   searchResult: 검색 결과 카드
+    //                 { query, items: [{rank, doc, dist, hit}], nprobe, latencyMs, recall }
+    //   trainProgress / addProgress : 0~100
+    //   processBadge: 'A' | 'B' (어느 프로세스에서 동작 중인지)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
+      // ── Step 1. Embed ─────────────────────────────────
       {
-        desc: "FAISS 실전 프로젝트는 6단계 파이프라인을 따릅니다. 데이터 준비 → 임베딩 생성 → 인덱스 빌드 → 학습(train) → 검색(search) → 저장/로드. 공장 조립 라인처럼 순서대로 진행하면 됩니다.",
-        activeStep: -1,
-        code: `# FAISS 실전 파이프라인 전체 흐름\n\n# 1. 데이터 준비\ntexts = load_documents("data/")\n\n# 2. 임베딩 생성\nembeddings = embed_model.encode(texts)\n\n# 3. 인덱스 빌드\nindex = faiss.IndexIVFFlat(quantizer, d, nlist)\n\n# 4. 학습\nindex.train(embeddings)\nindex.add(embeddings)\n\n# 5. 검색\nD, I = index.search(query_vec, k=5)\n\n# 6. 저장\nfaiss.write_index(index, "my_index.faiss")`,
-        tip: '각 단계를 하나씩 자세히 살펴봅시다',
-      },
-      {
-        desc: "1단계: 데이터 준비. 원본 텍스트를 청크(chunk)로 분할합니다. 보통 500~1000자 단위로 나누고, 50~100자의 오버랩(overlap)을 줍니다. 오버랩이 없으면 문맥이 잘리는 문제가 생깁니다.",
+        title: 'Step 1. 데이터 준비 — 1만 텍스트를 384차원 벡터로 임베딩',
+        desc: '코퍼스(예: 위키 단락 1만 개)를 SentenceTransformer "all-MiniLM-L6-v2"로 임베딩한다. 결과는 (10000, 384) 크기의 numpy float32 배열. FAISS는 float32만 받으므로 astype 변환이 필수. 이 행렬이 이후 모든 단계의 입력이 된다.',
         activeStep: 0,
-        code: `# 1. 데이터 준비 — 텍스트 청킹\nfrom langchain.text_splitter import (\n    RecursiveCharacterTextSplitter\n)\n\n# 원본 문서 로드\nwith open("document.txt", "r") as f:\n    text = f.read()\n\n# 청크 분할\nsplitter = RecursiveCharacterTextSplitter(\n    chunk_size=500,     # 500자 단위\n    chunk_overlap=50,   # 50자 오버랩\n    separators=["\\n\\n", "\\n", " ", ""]\n)\nchunks = splitter.split_text(text)\nprint(f"총 {len(chunks)}개 청크 생성")`,
-        tip: 'chunk_size는 임베딩 모델의 max_tokens에 맞춰 조절합니다',
+        indexFile: { exists: false, sizeMb: 0, vectors: 0 },
+        searchResult: null,
+        trainProgress: 0,
+        addProgress: 0,
+        embedProgress: 100,
+        processBadge: 'A',
+        code: {
+          lang: 'python',
+          filename: 'embed-corpus.py',
+          lines: [
+            '"""embed-corpus.py — 1만 텍스트를 384차원 벡터로 임베딩."""',
+            'import numpy as np',
+            'import pickle',
+            'from sentence_transformers import SentenceTransformer',
+            '',
+            '# 1) 원본 텍스트 로드 (예: 위키 단락 1만 개)',
+            'with open("corpus.txt", encoding="utf-8") as f:',
+            '    texts = [line.strip() for line in f if line.strip()]',
+            'print(f"문서 수: {len(texts):,}")  # 10,000',
+            '',
+            '# 2) 임베딩 모델 — 384차원, 가볍고 빠름',
+            'model = SentenceTransformer("all-MiniLM-L6-v2")',
+            '',
+            '# 3) 배치 임베딩 — GPU면 1만 개 ~10초',
+            'embeddings = model.encode(',
+            '    texts,',
+            '    batch_size=64,',
+            '    show_progress_bar=True,',
+            '    normalize_embeddings=True,  # L2 정규화',
+            ')',
+            '',
+            '# 4) FAISS 요구사항: float32 + C-contiguous',
+            'embeddings = np.ascontiguousarray(embeddings, dtype="float32")',
+            'print(f"shape: {embeddings.shape}")  # (10000, 384)',
+            '',
+            '# 5) 디스크 저장 — 다음 단계(build)에서 로드',
+            'np.save("corpus.npy", embeddings)',
+            'with open("texts.pkl", "wb") as f:',
+            '    pickle.dump(texts, f)  # 검색 결과 매핑용',
+          ],
+          highlight: [12, 15, 16, 17, 18, 19, 20, 22, 23, 24, 26],
+        },
       },
+
+      // ── Step 2. Build ─────────────────────────────────
       {
-        desc: "2단계: 임베딩 생성. 각 청크를 벡터(숫자 배열)로 변환합니다. OpenAI, Sentence-Transformers, Cohere 등 다양한 모델을 사용할 수 있습니다. 벡터 차원(d)은 모델마다 다릅니다.",
+        title: 'Step 2. 인덱스 빌드 — IndexIVFFlat: train + add',
+        desc: 'IVF(Inverted File)는 벡터 공간을 nlist개 클러스터(보로노이 셀)로 나눈다. train()은 k-means로 중심점을 학습하는 단계 — IVF 계열은 train 없이 add 불가. nlist는 보통 √N. 1만 벡터면 nlist=100. train 후 add()로 모든 벡터를 인덱스에 적재.',
         activeStep: 1,
-        code: `# 2. 임베딩 생성\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# 임베딩 모델 로드\nmodel = SentenceTransformer(\n    "all-MiniLM-L6-v2"  # 384차원\n)\n\n# 배치 단위로 임베딩 생성\nembeddings = model.encode(\n    chunks,\n    batch_size=64,\n    show_progress_bar=True,\n    normalize_embeddings=True\n)\n\n# numpy float32로 변환 (FAISS 요구사항)\nembeddings = np.array(embeddings).astype("float32")\nprint(f"Shape: {embeddings.shape}")  \n# (N, 384) — N개 문서, 384차원`,
-        tip: 'FAISS는 float32만 지원합니다. astype("float32") 필수!',
+        indexFile: { exists: false, sizeMb: 0, vectors: 0 },
+        searchResult: null,
+        trainProgress: 100,
+        addProgress: 100,
+        embedProgress: 100,
+        processBadge: 'A',
+        code: {
+          lang: 'python',
+          filename: 'build.py',
+          lines: [
+            '"""build.py — IndexIVFFlat 인덱스 빌드 (corpus.npy → index 객체)."""',
+            'import faiss',
+            'import numpy as np',
+            '',
+            '# 1) 임베딩 로드',
+            'embeddings = np.load("corpus.npy")  # (10000, 384) float32',
+            'n, d = embeddings.shape',
+            'print(f"n={n:,}, d={d}")',
+            '',
+            '# 2) nlist 결정 — 보통 √N. 1만이면 100',
+            'nlist = int(np.sqrt(n))  # 100',
+            '',
+            '# 3) IndexIVFFlat 생성',
+            '#    - quantizer: 클러스터 중심을 빠르게 찾기 위한 보조 인덱스 (Flat L2)',
+            '#    - 본 인덱스: 각 클러스터에 속한 원본 벡터를 그대로 저장 (Flat)',
+            'quantizer = faiss.IndexFlatL2(d)',
+            'index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)',
+            '',
+            '# 4) train() — k-means로 nlist개 중심점 학습',
+            '#    IVF 계열은 train 없이 add() 호출 시 에러',
+            'assert not index.is_trained',
+            'index.train(embeddings)',
+            'assert index.is_trained',
+            'print("train 완료 — 100개 클러스터 중심점 학습됨")',
+            '',
+            '# 5) add() — 1만 벡터를 클러스터에 분산 적재',
+            'index.add(embeddings)',
+            'print(f"index.ntotal = {index.ntotal:,}")  # 10,000',
+            '',
+            '# 메모리 사용량(대략): n * d * 4 byte = 10000 * 384 * 4 ≈ 15 MB',
+          ],
+          highlight: [11, 12, 16, 17, 21, 22, 23, 27],
+        },
       },
+
+      // ── Step 3. Save ──────────────────────────────────
       {
-        desc: "3단계: 인덱스 선택과 빌드. 데이터 규모에 따라 인덱스를 선택합니다. 10만 건 이하면 Flat, 10만~1000만이면 IVF, 속도 최우선이면 HNSW. IVF 사용 시 train()이 필수입니다.",
+        title: 'Step 3. 저장 — faiss.write_index로 영속화',
+        desc: 'index 객체는 메모리에만 존재하므로 프로세스가 끝나면 사라진다. faiss.write_index(index, path)는 인덱스 구조 + 클러스터 중심 + 모든 벡터를 단일 바이너리 파일로 저장한다. 이 한 줄이 빌드 시간(분~시간)을 1회로 끝내는 핵심.',
         activeStep: 2,
-        code: `# 3. 인덱스 빌드 — 규모별 선택\nimport faiss\n\nd = embeddings.shape[1]  # 384\nn = embeddings.shape[0]  # 벡터 수\n\n# 규모별 인덱스 선택\nif n < 100_000:\n    # 소규모: Flat (전수 검색)\n    index = faiss.IndexFlatL2(d)\n\nelif n < 10_000_000:\n    # 중규모: IVF\n    nlist = int(np.sqrt(n))  # 클러스터 수\n    quantizer = faiss.IndexFlatL2(d)\n    index = faiss.IndexIVFFlat(\n        quantizer, d, nlist\n    )\n\nelse:\n    # 대규모: IVF + PQ\n    nlist = 4096\n    m = 48  # 서브벡터 수\n    quantizer = faiss.IndexFlatL2(d)\n    index = faiss.IndexIVFPQ(\n        quantizer, d, nlist, m, 8\n    )`,
-        tip: 'nlist(클러스터 수)는 보통 sqrt(N)으로 설정합니다',
+        indexFile: { exists: true, sizeMb: 15.4, vectors: 10000 },
+        searchResult: null,
+        trainProgress: 100,
+        addProgress: 100,
+        embedProgress: 100,
+        processBadge: 'A',
+        code: {
+          lang: 'python',
+          filename: 'save.py',
+          lines: [
+            '"""save.py — 빌드된 인덱스를 디스크에 영속화 (write_index 한 줄)."""',
+            'import faiss',
+            'import os',
+            '',
+            '# (build.py 에서 생성한 index 객체가 메모리에 있다고 가정)',
+            '',
+            '# 1) 단일 호출로 저장',
+            'INDEX_PATH = "wiki_10k.index"',
+            'faiss.write_index(index, INDEX_PATH)',
+            '',
+            '# 2) 파일 크기 확인',
+            'size_mb = os.path.getsize(INDEX_PATH) / (1024 * 1024)',
+            'print(f"저장 완료: {INDEX_PATH} ({size_mb:.1f} MB)")',
+            '# → wiki_10k.index (15.4 MB)',
+            '',
+            '# 무엇이 저장되는가?',
+            '#   - 인덱스 타입 헤더 (IndexIVFFlat) + 메트릭(L2)',
+            '#   - quantizer (100개 클러스터 중심점)',
+            '#   - 1만 벡터 (각 클러스터 inverted list 안에)',
+            '#   - 벡터 → 원본 id 매핑',
+            '',
+            '# 주의: 원본 텍스트는 별도 저장!',
+            '#   FAISS 인덱스는 "벡터 + id"만 들고 있다.',
+            '#   "id 7 → 어떤 문장?"은 직접 관리해야 한다.',
+            '#   → 보통 texts.pkl / SQLite / parquet로 매핑 보관',
+            '',
+            '# 빌드 비용을 1회로 끝내는 핵심:',
+            '#   embed (수십 분) + train (수 분) + add (수 분)',
+            '#   → 1번 실행 후 .index 파일 1개로 결과 응고',
+            '#   → 서비스에서는 read_index 1초만 들이면 즉시 검색 가능',
+          ],
+          highlight: [8, 9, 12, 13, 14, 17, 18, 19, 20, 23, 24, 25],
+        },
       },
+
+      // ── Step 4. Load + Search (without nprobe tune) ──
       {
-        desc: "4단계: 학습(train)과 벡터 추가(add). IVF 계열 인덱스는 반드시 train()을 먼저 호출해야 합니다. train()은 클러스터 중심점을 학습하는 과정입니다. Flat 인덱스는 train 불필요.",
+        title: 'Step 4. 로드 + 검색 — 별도 프로세스에서 read_index → search',
+        desc: '실서비스에서는 빌드 프로세스(A)와 검색 프로세스(B)가 다르다. B는 빌드 코드를 모른 채 .index 파일만 읽으면 끝. faiss.read_index가 즉시 검색 가능한 객체를 복원한다. 쿼리 임베딩 → search(qv, k=5) → 거리 D, id I 두 배열 반환. nprobe 기본값 1이라 일부 클러스터만 본다 — 빠르지만 정답을 놓칠 수 있다.',
         activeStep: 3,
-        code: `# 4. 학습 + 벡터 추가\n\n# IVF 인덱스는 train() 필수\nif not index.is_trained:\n    print("인덱스 학습 중...")\n    index.train(embeddings)\n    print("학습 완료!")\n\n# 벡터 추가\nindex.add(embeddings)\nprint(f"저장된 벡터: {index.ntotal}")\n\n# 배치 추가 (대규모 데이터)\nbatch_size = 10_000\nfor i in range(0, n, batch_size):\n    batch = embeddings[i:i+batch_size]\n    index.add(batch)\n    print(f"  {i+len(batch)}/{n} 추가 완료")\n\n# ID를 직접 지정하려면:\n# index = faiss.IndexIDMap(index)\n# index.add_with_ids(embeddings, ids)`,
-        tip: 'train()은 전체 데이터 중 일부로도 가능합니다 (대규모 시 샘플링)',
+        indexFile: { exists: true, sizeMb: 15.4, vectors: 10000 },
+        searchResult: {
+          query: '강아지 훈련 방법',
+          nprobe: 1,
+          latencyMs: 0.4,
+          recall: 0.62,
+          items: [
+            { rank: 1, id: 4821, doc: '강아지 배변 훈련은 일관된 시간표가 핵심...', dist: 0.182, hit: true },
+            { rank: 2, id:  912, doc: '클리커 훈련은 긍정 강화 기법으로...',         dist: 0.241, hit: true },
+            { rank: 3, id: 7330, doc: '반려견 산책 시 리드줄 사용법...',             dist: 0.298, hit: false },
+          ],
+        },
+        trainProgress: 100,
+        addProgress: 100,
+        embedProgress: 100,
+        processBadge: 'B',
+        code: {
+          lang: 'python',
+          filename: 'load.py',
+          lines: [
+            '"""load.py — 검색 프로세스(B). 빌드 프로세스(A)와 완전히 분리."""',
+            'import faiss',
+            'import numpy as np',
+            'import pickle',
+            'from sentence_transformers import SentenceTransformer',
+            '',
+            '# 1) 인덱스 로드 — 1초 안에 끝남 (15 MB)',
+            'index = faiss.read_index("wiki_10k.index")',
+            'print(f"loaded: {index.ntotal:,} vectors, "',
+            '      f"is_trained={index.is_trained}, "',
+            '      f"nlist={index.nlist}")',
+            '',
+            '# 2) 원본 텍스트 매핑 로드 (id → 문장)',
+            'with open("texts.pkl", "rb") as f:',
+            '    texts = pickle.load(f)',
+            '',
+            '# 3) 같은 임베딩 모델 로드 (쿼리도 동일 공간이어야 함)',
+            'model = SentenceTransformer("all-MiniLM-L6-v2")',
+            '',
+            '# 4) 쿼리 임베딩',
+            'query = "강아지 훈련 방법"',
+            'qv = model.encode([query], normalize_embeddings=True)',
+            'qv = np.ascontiguousarray(qv, dtype="float32")',
+            '',
+            '# 5) 검색 — D: 거리(L2²), I: 원본 id',
+            'k = 5',
+            'D, I = index.search(qv, k)',
+            '',
+            'for rank, (idx, dist) in enumerate(zip(I[0], D[0]), 1):',
+            '    if idx == -1: continue  # 결과 없음',
+            '    print(f"{rank}위 (id={idx}, dist={dist:.3f})")',
+            '    print(f"  {texts[idx][:60]}...")',
+            '',
+            '# nprobe 기본값 1 — 가장 가까운 클러스터 1개만 탐색',
+            '#   → 빠르지만(<1ms) 일부 정답이 다른 클러스터에 있으면 놓침',
+            '#   → recall@5 ≈ 60% (Step 5 에서 튜닝)',
+          ],
+          highlight: [8, 9, 10, 11, 26, 27, 34, 35, 36],
+        },
       },
+
+      // ── Step 5. nprobe 튜닝 ───────────────────────────
       {
-        desc: "5단계: 검색. 쿼리 벡터를 만들고 search()를 호출합니다. IVF 인덱스는 nprobe(탐색할 클러스터 수)를 조절해 속도와 정확도의 균형을 맞춥니다.",
+        title: 'Step 5. nprobe 튜닝 — 정확도/속도 trade-off',
+        desc: 'nprobe = "탐색할 클러스터 수". nprobe=1이면 가장 가까운 클러스터만, nprobe=10이면 가까운 10개를 본다. 클수록 정답 누락이 줄어 recall↑, 대신 검사 벡터가 많아져 latency↑. 보통 nlist의 5~20%(여기선 5~20)가 sweet spot. nprobe=10에서 recall@5가 0.62 → 0.96으로 점프, latency는 0.4ms → 1.8ms로 4배 — 그래도 ms 미만.',
         activeStep: 4,
-        code: `# 5. 검색\n\n# 쿼리 임베딩 생성\nquery_text = "강아지 훈련 방법"\nquery_vec = model.encode([query_text])\nquery_vec = np.array(query_vec).astype("float32")\n\n# IVF 인덱스: nprobe 설정\nif hasattr(index, 'nprobe'):\n    index.nprobe = 10  # 기본값 1, 높일수록 정확\n\n# 검색 실행\nk = 5  # 상위 5개\nD, I = index.search(query_vec, k)\n\n# 결과 출력\nfor rank, (idx, dist) in enumerate(zip(I[0], D[0])):\n    if idx == -1:  # 결과 없음\n        continue\n    print(f"{rank+1}위: {chunks[idx][:80]}...")\n    print(f"   거리: {dist:.4f}")`,
-        tip: 'nprobe를 높이면 정확도 증가, 속도 감소. 보통 1~20 범위에서 조절',
-      },
-      {
-        desc: "6단계: 인덱스 저장과 로드. write_index()로 파일에 저장하고, read_index()로 불러옵니다. 인덱스 빌드는 시간이 오래 걸릴 수 있으므로, 한 번 빌드 후 저장해두는 것이 필수입니다.",
-        activeStep: 5,
-        code: `# 6. 인덱스 저장/로드\n\n# 인덱스 저장\nfaiss.write_index(index, "my_index.faiss")\nprint("인덱스 저장 완료!")\n\n# 인덱스 로드\nindex = faiss.read_index("my_index.faiss")\nprint(f"로드 완료: {index.ntotal}개 벡터")\n\n# 주의: 원본 문서는 별도 저장 필요!\nimport pickle\nwith open("chunks.pkl", "wb") as f:\n    pickle.dump(chunks, f)\n\n# 로드 시\nwith open("chunks.pkl", "rb") as f:\n    chunks = pickle.load(f)\n\n# FAISS는 벡터만 저장!\n# 원본 데이터 매핑은 직접 관리해야 함`,
-        tip: 'FAISS 인덱스 파일 + 원본 데이터 파일을 함께 관리하세요',
+        indexFile: { exists: true, sizeMb: 15.4, vectors: 10000 },
+        searchResult: {
+          query: '강아지 훈련 방법',
+          nprobe: 10,
+          latencyMs: 1.8,
+          recall: 0.96,
+          items: [
+            { rank: 1, id: 4821, doc: '강아지 배변 훈련은 일관된 시간표가 핵심...',   dist: 0.182, hit: true },
+            { rank: 2, id:  912, doc: '클리커 훈련은 긍정 강화 기법으로...',           dist: 0.241, hit: true },
+            { rank: 3, id: 6104, doc: '강아지 사회화 훈련 — 4~16주 결정적 시기...',   dist: 0.255, hit: true },
+            { rank: 4, id: 2517, doc: '"앉아" "기다려" 기본 명령어 가르치기...',       dist: 0.273, hit: true },
+            { rank: 5, id: 7330, doc: '반려견 산책 시 리드줄 사용법...',               dist: 0.298, hit: true },
+          ],
+        },
+        trainProgress: 100,
+        addProgress: 100,
+        embedProgress: 100,
+        processBadge: 'B',
+        showTradeoff: true,
+        code: {
+          lang: 'python',
+          filename: 'search.py',
+          lines: [
+            '"""search.py — nprobe 튜닝으로 recall ↔ latency 균형 잡기."""',
+            'import faiss',
+            'import numpy as np',
+            'import time',
+            '',
+            'index = faiss.read_index("wiki_10k.index")',
+            '',
+            '# nprobe 별 측정 — ground truth 는 IndexFlatL2 전수 검색으로 사전 계산',
+            'queries = np.load("queries.npy")              # (100, 384)',
+            'gt = np.load("ground_truth_top5.npy")         # (100, 5)',
+            '',
+            'for nprobe in [1, 2, 5, 10, 20, 50]:',
+            '    index.nprobe = nprobe',
+            '    t0 = time.perf_counter()',
+            '    D, I = index.search(queries, k=5)',
+            '    elapsed = (time.perf_counter() - t0) * 1000 / len(queries)',
+            '    recall = np.mean([',
+            '        len(set(I[i]) & set(gt[i])) / 5',
+            '        for i in range(len(queries))',
+            '    ])',
+            '    print(f"nprobe={nprobe:>2}  recall={recall:.2f}  latency={elapsed:.2f} ms")',
+            '',
+            '# 출력 예시 (nlist=100):',
+            '#   nprobe= 1  recall=0.62  latency=0.42 ms',
+            '#   nprobe= 5  recall=0.91  latency=1.20 ms',
+            '#   nprobe=10  recall=0.96  latency=1.78 ms  ← sweet spot',
+            '#   nprobe=20  recall=0.98  latency=3.10 ms',
+            '#   nprobe=50  recall=0.99  latency=7.40 ms (Flat 거의 동등)',
+            '',
+            '# 운영 팁: nprobe 는 런타임 변경 가능(재빌드 불필요)',
+            '#   → A/B 테스트로 SLA 만족하는 최대 값 선택',
+            'index.nprobe = 10  # 최종 결정',
+          ],
+          highlight: [12, 13, 14, 15, 16, 21, 24, 25, 26, 27, 28, 32],
+        },
       },
     ];
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playRef = useRef(null);
-      const s = STEPS[step];
-      const isEnd = step === STEPS.length - 1;
+    // ─────────────────────────────────────────────────────
+    // 5 단계 박스 (좌측 LiveDataPane 상단)
+    //   activeStep 가 -1 이면 모두 회색, 그 외엔 active 박스 강조
+    // ─────────────────────────────────────────────────────
+    function PipelineBoxes({ activeStep }) {
+      return (
+        <div className="grid grid-cols-5 gap-1.5">
+          {PIPELINE.map((p, i) => {
+            const isActive = activeStep === i;
+            const isDone   = activeStep > i;
+            const base =
+              'relative rounded-lg border-2 px-2 py-2 text-center transition-all duration-500';
+            const cls = isActive
+              ? 'bg-purple-600 border-purple-800 text-white shadow-md scale-105'
+              : isDone
+              ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+              : 'bg-slate-50 border-slate-200 text-slate-400';
+            return (
+              <div key={p.id} className={`${base} ${cls}`}>
+                <div className="text-lg leading-none mb-0.5">{p.icon}</div>
+                <div className="text-[11px] font-bold leading-tight">{p.label}</div>
+                <div className={`text-[8px] mt-0.5 leading-tight font-mono ${
+                  isActive ? 'text-purple-100' : isDone ? 'text-emerald-700' : 'text-slate-400'
+                }`}>
+                  {p.sub}
+                </div>
+                {isActive && (
+                  <span className="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-purple-300 animate-ping" />
+                )}
+                {isDone && (
+                  <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-emerald-500 text-white text-[9px] flex items-center justify-center font-bold">✓</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
 
-      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
-      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
-      const nextRef = useRef(next); nextRef.current = next;
-      const prevRef = useRef(prev); prevRef.current = prev;
-      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
+    // ─────────────────────────────────────────────────────
+    // 화살표 (단계 간 연결선)
+    // ─────────────────────────────────────────────────────
+    function StepArrows({ activeStep }) {
+      return (
+        <div className="grid grid-cols-5 gap-1.5 px-3 -my-1">
+          {[0, 1, 2, 3].map((i) => {
+            const colored = activeStep > i;
+            return (
+              <div key={i} className="col-span-1 flex justify-end pr-0">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                  stroke={colored ? '#10b981' : '#cbd5e1'} strokeWidth="3"
+                  className="transition-colors">
+                  <path d="M5 12h14M13 6l6 6-6 6" />
+                </svg>
+              </div>
+            );
+          })}
+          <div />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 진행 막대 (Embed/Train/Add — Step 1~2 시각 보강)
+    // ─────────────────────────────────────────────────────
+    function ProgressBar({ label, value, color }) {
+      return (
+        <div>
+          <div className="flex justify-between text-[10px] font-mono mb-0.5">
+            <span className="text-slate-600">{label}</span>
+            <span className="text-slate-700 font-bold">{value}%</span>
+          </div>
+          <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+            <div
+              className={`h-full ${color} transition-all duration-700 rounded-full`}
+              style={{ width: `${value}%` }}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 인덱스 파일 박스 (디스크 표현)
+    // ─────────────────────────────────────────────────────
+    function IndexFileBox({ file, processBadge }) {
+      const exists = file && file.exists;
+      return (
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${
+          exists ? 'bg-purple-50 border-purple-400' : 'bg-slate-50 border-dashed border-slate-300'
+        }`}>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5 text-[11px] font-bold text-slate-700">
+              <span>💿</span>
+              <span>디스크 인덱스 파일</span>
+            </div>
+            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+              processBadge === 'A'
+                ? 'bg-blue-100 text-blue-700 border border-blue-300'
+                : 'bg-amber-100 text-amber-700 border border-amber-300'
+            }`}>
+              process {processBadge}
+            </span>
+          </div>
+
+          {exists ? (
+            <div className="bg-white rounded border border-purple-200 p-2 font-mono text-[11px]">
+              <div className="flex items-center gap-2 mb-1.5">
+                <span className="text-base">📄</span>
+                <span className="font-bold text-purple-800">wiki_10k.index</span>
+                <span className="ml-auto text-purple-700 font-bold">{file.sizeMb.toFixed(1)} MB</span>
+              </div>
+              <div className="text-[10px] text-slate-600 space-y-0.5 pl-1">
+                <div>type:    <span className="text-purple-700">IndexIVFFlat</span></div>
+                <div>metric:  <span className="text-purple-700">L2</span></div>
+                <div>nlist:   <span className="text-purple-700">100</span></div>
+                <div>vectors: <span className="text-purple-700">{file.vectors.toLocaleString()}</span></div>
+                <div>dim:     <span className="text-purple-700">384</span></div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-center py-3 text-[11px] text-slate-400 font-mono">
+              (아직 저장된 인덱스 없음)
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 검색 결과 카드
+    // ─────────────────────────────────────────────────────
+    function SearchResultCard({ result }) {
+      if (!result) {
+        return (
+          <div className="rounded-lg border-2 border-dashed border-slate-300 bg-slate-50 p-3 text-center text-[11px] text-slate-400 font-mono">
+            (Step 4 부터 검색 결과 표시)
+          </div>
+        );
+      }
+      const isHighRecall = result.recall >= 0.9;
+      return (
+        <div className={`rounded-lg border-2 p-3 ${
+          isHighRecall ? 'bg-emerald-50 border-emerald-300' : 'bg-amber-50 border-amber-300'
+        }`}>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span>🔍</span>
+              <span className="text-[11px] font-bold text-slate-700">검색 결과</span>
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-mono">
+              <span className="bg-white px-1.5 py-0.5 rounded border border-slate-300 text-slate-700">
+                nprobe = <b className="text-purple-700">{result.nprobe}</b>
+              </span>
+              <span className="bg-white px-1.5 py-0.5 rounded border border-slate-300 text-slate-700">
+                {result.latencyMs.toFixed(1)} ms
+              </span>
+              <span className={`px-1.5 py-0.5 rounded border font-bold ${
+                isHighRecall
+                  ? 'bg-emerald-600 text-white border-emerald-700'
+                  : 'bg-amber-500 text-white border-amber-600'
+              }`}>
+                recall@5 = {result.recall.toFixed(2)}
+              </span>
+            </div>
+          </div>
+
+          <div className="bg-purple-700 text-white rounded px-2 py-1.5 mb-2 flex items-center gap-2">
+            <span className="text-base">❓</span>
+            <span className="text-[12px] font-bold">{result.query}</span>
+          </div>
+
+          <div className="space-y-1">
+            {result.items.map((it) => (
+              <div
+                key={it.rank}
+                className={`flex items-start gap-2 rounded px-2 py-1.5 text-[11px] font-mono border ${
+                  it.hit
+                    ? 'bg-white border-emerald-200'
+                    : 'bg-slate-50 border-slate-200 opacity-70'
+                }`}
+              >
+                <span className={`flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                  it.hit ? 'bg-emerald-500 text-white' : 'bg-slate-300 text-slate-600'
+                }`}>
+                  {it.rank}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-slate-800 truncate">{it.doc}</div>
+                  <div className="text-[9px] text-slate-500 mt-0.5">
+                    id={it.id} · L2²={it.dist.toFixed(3)}
+                    {it.hit ? ' · ✓ 정답' : ' · 관련도 낮음'}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // nprobe trade-off 표 (Step 5 보강)
+    // ─────────────────────────────────────────────────────
+    function TradeoffTable() {
+      const rows = [
+        { np:  1, rec: 0.62, ms: 0.42, mark: '' },
+        { np:  2, rec: 0.78, ms: 0.71, mark: '' },
+        { np:  5, rec: 0.91, ms: 1.20, mark: '' },
+        { np: 10, rec: 0.96, ms: 1.78, mark: '★ sweet spot' },
+        { np: 20, rec: 0.98, ms: 3.10, mark: '' },
+        { np: 50, rec: 0.99, ms: 7.40, mark: '~ Flat 동등' },
+      ];
+      return (
+        <div className="rounded-lg bg-white border-2 border-purple-300 overflow-hidden">
+          <div className="bg-purple-100 px-3 py-1.5 border-b border-purple-200 text-[11px] font-bold text-purple-900">
+            📈 nprobe → recall · latency trade-off
+          </div>
+          <table className="w-full text-[11px] font-mono">
+            <thead>
+              <tr className="bg-purple-50 text-left text-[10px]">
+                <th className="px-2 py-1 font-bold text-purple-700 w-16">nprobe</th>
+                <th className="px-2 py-1 font-bold text-purple-700">recall@5</th>
+                <th className="px-2 py-1 font-bold text-purple-700">latency</th>
+                <th className="px-2 py-1 font-bold text-purple-700">비고</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const sweet = r.mark.includes('sweet');
+                return (
+                  <tr key={r.np} className={sweet ? 'bg-purple-50' : 'bg-white'}>
+                    <td className={`px-2 py-1 ${sweet ? 'font-bold text-purple-800' : 'text-slate-700'}`}>
+                      {r.np}
+                    </td>
+                    <td className="px-2 py-1">
+                      <div className="flex items-center gap-1">
+                        <div className="w-20 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-emerald-500 transition-all"
+                            style={{ width: `${r.rec * 100}%` }}
+                          />
+                        </div>
+                        <span className="text-slate-700">{r.rec.toFixed(2)}</span>
+                      </div>
+                    </td>
+                    <td className="px-2 py-1">
+                      <div className="flex items-center gap-1">
+                        <div className="w-16 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-amber-500 transition-all"
+                            style={{ width: `${Math.min(100, r.ms * 12)}%` }}
+                          />
+                        </div>
+                        <span className="text-slate-700">{r.ms.toFixed(2)} ms</span>
+                      </div>
+                    </td>
+                    <td className={`px-2 py-1 text-[10px] ${
+                      sweet ? 'text-purple-700 font-bold' : 'text-slate-500'
+                    }`}>
+                      {r.mark}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 종합
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-bold text-slate-700">📚 FAISS 워크플로우 — 5단계 시뮬레이션</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          {/* 5단계 박스 */}
+          <PipelineBoxes activeStep={step.activeStep} />
+          <StepArrows activeStep={step.activeStep} />
+
+          {/* 진행 막대 */}
+          <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200 space-y-1.5">
+            <ProgressBar label="① embed (10000 / 10000 vectors)"  value={step.embedProgress} color="bg-blue-500" />
+            <ProgressBar label="② train (k-means, nlist=100)"     value={step.trainProgress} color="bg-orange-500" />
+            <ProgressBar label="② add (vectors → cluster lists)"  value={step.addProgress}   color="bg-purple-500" />
+          </div>
+
+          {/* 인덱스 파일 박스 */}
+          <IndexFileBox file={step.indexFile} processBadge={step.processBadge} />
+
+          {/* 검색 결과 또는 trade-off 표 */}
+          {step.showTradeoff ? (
+            <>
+              <SearchResultCard result={step.searchResult} />
+              <TradeoffTable />
+            </>
+          ) : (
+            <SearchResultCard result={step.searchResult} />
+          )}
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-3 text-[10px] pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-purple-600" />
+              현재 단계
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-emerald-500" />
+              완료
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-blue-100 border border-blue-300" />
+              process A (build)
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded bg-amber-100 border border-amber-300" />
+              process B (search)
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js + 라인번호 + 강조
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
-        else { clearInterval(playRef.current); }
-        return () => clearInterval(playRef.current);
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500" />
+              <span className="w-3 h-3 rounded-full bg-yellow-500" />
+              <span className="w-3 h-3 rounded-full bg-green-500" />
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더 — 라인 번호 + 강조 */}
+          <div className="overflow-auto max-h-[36rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-purple-500/15 border-l-2 border-purple-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
           if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
-          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm">
-              <a href="../index.html" className="inline-flex items-center gap-1 text-orange-700 hover:text-orange-900 font-medium">
-                <span>&larr;</span> 허브로 돌아가기
-              </a>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-purple-700 hover:text-purple-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-2-1</span>
             </nav>
 
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-orange-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div className="w-9 h-9 bg-purple-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
                 <div>
                   <div className="text-xs text-slate-500 font-medium">Part II. FAISS &gt; Chapter 2. FAISS 실전</div>
-                  <h1 className="text-2xl font-bold text-slate-800">II-2-1. FAISS 실전 워크플로우 — 빌드부터 검색까지</h1>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">FAISS 실전 워크플로우 — 빌드 → 검색 → 저장</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">1만 텍스트 임베딩 → IVF 인덱스 빌드 → 디스크 저장 → 별도 프로세스 로드 → nprobe 튜닝</p>
                 </div>
               </div>
-              <p className="text-slate-600">데이터 준비부터 인덱스 저장까지, 실전 FAISS 프로젝트의 <b>6단계 파이프라인</b>을 코드와 함께 따라갑니다.</p>
             </header>
 
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-orange-700 border-orange-800 text-white">
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-purple-50 border-2 border-purple-300 rounded-xl p-3 text-sm text-purple-900">
+                💡 다음(II-2-2)에서는 <strong>FAISS 최적화</strong> — IVF + PQ 양자화, GPU 인덱스, 메모리 매핑(mmap)으로 1억 건 스케일까지 다룬다
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-purple-700 text-white shadow-sm">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-orange-200">FAISS 실전 파이프라인</h3>
-                <span className="text-xs text-orange-200">키보드 &larr;/&rarr;로 단계 이동</span>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-purple-200">키보드 &larr;/&rarr;</span>
               </div>
-              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">파이프라인 단계</div>
-                <div className="space-y-2">
-                  {PIPELINE.map((p, i) => (
-                    <div key={i}>
-                      <div className={`flex items-center gap-3 p-3 rounded-xl border-2 transition-all duration-500 ${
-                        s.activeStep === i ? 'bg-orange-50 border-orange-300 scale-[1.02] shadow-md' :
-                        s.activeStep === -1 ? 'bg-white border-slate-200' :
-                        s.activeStep > i ? 'bg-emerald-50 border-emerald-200' : 'bg-white border-slate-100 opacity-50'
-                      }`}>
-                        <div className={`w-8 h-8 ${s.activeStep === i ? 'bg-orange-600' : s.activeStep > i ? 'bg-emerald-500' : p.color} text-white rounded-full flex items-center justify-center font-bold text-sm transition-colors`}>
-                          {s.activeStep > i ? '\u2713' : p.num}
-                        </div>
-                        <div>
-                          <div className={`font-bold text-sm ${s.activeStep === i ? 'text-orange-800' : 'text-slate-700'}`}>{p.label}</div>
-                        </div>
-                      </div>
-                      {i < PIPELINE.length - 1 && (
-                        <div className="flex justify-center my-0.5">
-                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={s.activeStep > i ? '#22c55e' : '#cbd5e1'} strokeWidth="2"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">
-                  {s.activeStep >= 0 ? `${PIPELINE[s.activeStep].num}단계: ${PIPELINE[s.activeStep].label} 코드` : '전체 파이프라인 코드'}
-                </div>
-                <pre className="bg-slate-800 text-slate-100 rounded-lg p-4 text-xs font-mono whitespace-pre-wrap overflow-x-auto leading-relaxed mb-4">{s.code}</pre>
-                <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg">
-                  <div className="text-xs font-bold text-amber-700 mb-1">실전 팁</div>
-                  <div className="text-xs text-amber-600">{s.tip}</div>
-                </div>
-              </div>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-purple-600 text-white hover:bg-purple-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              {['train()', 'add()', 'search()', 'write_index()', 'read_index()', 'batch'].map(kw => (
-                <span key={kw} className="bg-orange-50 text-orange-700 px-3 py-1 rounded-full text-sm font-medium border border-orange-200">{kw}</span>
+            {/* 키워드 칩 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['IndexIVFFlat', 'train()', 'add()', 'write_index()', 'read_index()', 'nprobe', 'recall@5'].map(kw => (
+                <span
+                  key={kw}
+                  className="bg-purple-50 text-purple-700 px-3 py-1 rounded-full text-xs font-mono font-medium border border-purple-200"
+                >
+                  {kw}
+                </span>
               ))}
             </div>
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
-                </button>
-                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-orange-600 hover:bg-orange-700">
-                  {isPlaying ? (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>
-                  ) : (
-                    <><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>
-                  )}
-                </button>
-                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
-                </button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
-            </div>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-1-2.html" className="text-purple-700 hover:text-purple-900 font-medium">&larr; II-1-2 FAISS 인덱스 종류</a>
+              <a href="./II-2-2.html" className="text-purple-700 hover:text-purple-900 font-medium">II-2-2 FAISS 최적화 &rarr;</a>
+            </nav>
 
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./II-1-2.html" className="text-orange-600 hover:text-orange-800 font-medium">&larr; II-1-2. FAISS 인덱스 종류</a>
-              <a href="./II-2-2.html" className="text-orange-600 hover:text-orange-800 font-medium">II-2-2. FAISS 최적화 &rarr;</a>
-            </div>
           </div>
         </div>
       );
     }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
