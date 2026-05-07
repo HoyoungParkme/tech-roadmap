@@ -3,301 +3,651 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Observability 학습 — 분산 시스템 디버깅 흐름</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <title>Observability 학습 — IV-2-2. 분산 시스템 디버깅 흐름</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🩺</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     IV-2-2. 분산 시스템 디버깅 흐름
-    학습 목표: Metrics → Logs → Traces 순서로 5xx 알람을 추적하는 실전 디버깅 루틴 체득
-    핵심 비유: "병원 내원 기록 역추적" — 알람=내원, Metrics=활력, Logs=진료기록, Traces=동선
-    구조: 4단계 (alert / isolate / logs / root)
+    학습 목표: Alert → Isolate → Logs → Root 4단계로 5xx 알람을 추적하는 실전 루틴 체득
+    핵심 비유: "병원 내원 기록 역추적" — 활력(Metrics) → 진료기록(Logs) → 동선(Traces)
+    패턴: fastapi 표준 — 좌(LiveDataPane: 디버깅 흐름 시각화) / 우(VSCode 코드)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // 5개 서비스 (Step 2에서 cart-service만 빨강)
+    const SERVICES = [
+      { id: 'gateway',  name: 'gateway',       icon: '🌐' },
+      { id: 'cart',     name: 'cart-service',  icon: '🛒' },
+      { id: 'product',  name: 'product-svc',   icon: '📦' },
+      { id: 'payment',  name: 'payment-svc',   icon: '💳' },
+      { id: 'user',     name: 'user-service',  icon: '👤' },
+    ];
+
+    // 4 STEPS — 디버깅 흐름 (시간순)
     const STEPS = [
       {
-        title: 'Step 1. 알람 — "새벽 3시 Slack 호출 (환자 내원)"',
-        desc: 'Alertmanager가 SLO 위반(checkout API p99 > 500ms)을 감지하고 #ops-oncall로 호출. 잠 깨고 노트북 연다. 첫 행동은 "큰 그림부터" — 어느 서비스가 어떤 패턴으로 아픈지 활력(Metrics)으로 본다. 절대 로그부터 grep하지 마라 — 시야가 좁아진다.',
-        block: {
-          kind: 'shell',
-          code: `# Slack #ops-oncall — 03:14 KST
-┌─────────────────────────────────────────────────────────────┐
-│ 🚨 [CRITICAL] CheckoutLatencyHigh                            │
-│ ─────────────────────────────────────────────────────────── │
-│ Summary  : checkout API p99 latency > 500ms (SLO 위반)       │
-│ Service  : checkout-api  /  Cluster: prod-asia               │
-│ Started  : 2026-05-06 03:11:42 KST  (3분 지속)               │
-│ Runbook  : https://wiki/runbook#CheckoutLatencyHigh          │
-│ Grafana  : https://grafana/d/checkout?from=now-1h            │
-│ Silence  : https://alertmanager/#/silences/new               │
-└─────────────────────────────────────────────────────────────┘
-
-# 첫 30초 — Acknowledge 누르고 큰 그림 잡기
-$ pd ack --incident=INC-9921 --comment "investigating"
-
-# 다음 행동 (순서 중요!)
-1. Grafana 열기 (Metrics — 어디가/얼마나 아픈가)   ← Step 2
-2. Loki에서 5xx 로그 (Logs — 무슨 에러인가)         ← Step 3
-3. trace_id로 점프 (Traces — 어느 코드가 원인인가) ← Step 4
-
-# 안티패턴
-✗ kubectl logs부터 치기 (로그 바다 — 길 잃음)
-✗ pod 재시작부터 (증거 휘발 — 사후 분석 불가)`,
-        },
         focus: 'alert',
+        title: 'Step 1. Alert — "5xx 급증, PagerDuty 호출"',
+        desc: '새벽 3시. PagerDuty가 운다. checkout flow의 5xx가 분당 12 → 187로 급증. SLO 위반 알람이 발화한다. Alertmanager는 Prometheus의 임계 위반 규칙을 평가해 즉시 oncall 엔지니어를 호출한다. 첫 행동 = ack 누르고 큰 그림부터.',
+        liveData: 'alertFiring',
+        legend: '5xx 급증 → PagerDuty Critical 발화',
+        code: {
+          lang: 'yaml',
+          filename: 'alertmanager-rule.yml — 5xx 급증 룰',
+          lines: [
+            '# Prometheus alert rule — 5xx 급증 감지',
+            'groups:',
+            '  - name: checkout_slo',
+            '    interval: 30s',
+            '    rules:',
+            '      - alert: CheckoutErrorBudgetBurn',
+            '        expr: |',
+            '          sum(rate(http_requests_total{',
+            '            job="checkout", status=~"5.."',
+            '          }[5m]))',
+            '          /',
+            '          sum(rate(http_requests_total{',
+            '            job="checkout"',
+            '          }[5m])) > 0.05',
+            '        for: 2m',
+            '        labels:',
+            '          severity: critical',
+            '          team: payments-oncall',
+            '        annotations:',
+            '          summary: "5xx error rate > 5% for 2m"',
+            '          runbook: "https://wiki/runbook/checkout-5xx"',
+            '',
+            '# PagerDuty receiver — Critical 발화 시 전화/SMS',
+            '# 03:14 KST — INC-9921 fired',
+            '# $ pd ack --incident=INC-9921 --comment "investigating"',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13],
+        },
       },
       {
-        title: 'Step 2. 격리 — "활력 모니터로 어느 과인지 (RED method)"',
-        desc: 'Grafana 대시보드 열고 RED(Rate / Errors / Duration) 3종을 동시에 본다. checkout만 느린지, 같은 시점 traffic 폭증인지, 에러율은 어떻게 변했는지. 이 단계에서 "checkout-api → payment-service 호출이 느림"까지 좁힌다. 아직 코드는 안 본다.',
-        block: {
-          kind: 'yaml',
-          code: `# Grafana 대시보드에서 같은 시간 창(03:00~03:20)으로 3개 패널 동시에 본다
-
-# 1) Rate — traffic 폭증인가? (단순 부하 vs 실제 장애 구분)
-sum by (service) (
-  rate(http_requests_total{cluster="prod-asia"}[1m])
-)
-# → checkout 800rps (평소 700rps). 폭증 아님 → 외부 부하 X
-
-# 2) Errors — 5xx 비율 (SLO 핵심 신호)
-sum by (service) (
-  rate(http_requests_total{status=~"5..", cluster="prod-asia"}[1m])
-)
-/ sum by (service) (
-  rate(http_requests_total{cluster="prod-asia"}[1m])
-)
-# → checkout: 0.8% → 4.2% (5x ↑)
-# → payment : 0.1% → 3.9% (downstream도 같이 ↑)  ← 의심!
-# → cart    : 변화 없음
-
-# 3) Duration — p50 / p95 / p99 (꼬리 지연)
-histogram_quantile(0.99,
-  sum by (le, service) (
-    rate(http_request_duration_seconds_bucket[5m])
-  )
-)
-# → checkout p99: 180ms → 540ms
-# → payment  p99:  90ms → 460ms   ← 여기가 진짜 환자
-
-# 결론: payment-service가 느려져서 checkout이 같이 죽는 중
-# → 다음(Step 3): payment의 5xx 로그를 까본다`,
-        },
         focus: 'isolate',
+        title: 'Step 2. Isolate — "5 서비스 중 cart-service만 빨강"',
+        desc: 'Grafana RED 대시보드를 연다. 5개 서비스의 Error rate를 한 화면에서 동시에 본다. gateway / product / payment / user는 평소 그대로 (초록). cart-service만 5xx가 치솟는다 (빨강). 범위가 한 서비스로 좁혀졌다 — 이제 cart의 로그를 까볼 시간.',
+        liveData: 'serviceMatrix',
+        legend: 'cart-service만 5xx 폭발 — 다른 4 서비스는 정상',
+        code: {
+          lang: 'shell',
+          filename: 'grafana-explore.sh — 서비스별 에러율 PromQL',
+          lines: [
+            '# Grafana → Explore → Prometheus 데이터소스',
+            '# 5개 서비스 동시 에러율 (RED method - Errors)',
+            '',
+            'sum by (service) (',
+            '  rate(http_requests_total{',
+            '    cluster="prod-asia",',
+            '    status=~"5.."',
+            '  }[1m])',
+            ')',
+            '/',
+            'sum by (service) (',
+            '  rate(http_requests_total{',
+            '    cluster="prod-asia"',
+            '  }[1m])',
+            ')',
+            '',
+            '# 결과 (분당 평균):',
+            '# gateway      : 0.02%  ✓ 정상',
+            '# product-svc  : 0.05%  ✓ 정상',
+            '# payment-svc  : 0.08%  ✓ 정상',
+            '# user-service : 0.01%  ✓ 정상',
+            '# cart-service : 18.4%  ✗ 폭발  ← 범인',
+            '',
+            '# kubectl로 영향 범위 추가 확인',
+            '$ kubectl get pods -n prod -l app=cart-service',
+            '$ kubectl top pods -n prod -l app=cart-service',
+            '# → CPU/MEM 정상. 코드 또는 의존성 문제로 좁힘',
+          ],
+          highlight: [21, 22],
+        },
       },
       {
-        title: 'Step 3. 본문 검사 — "진료기록 → trace_id 점프"',
-        desc: 'Loki에서 payment의 5xx 로그를 LogQL로 잡고, 한 줄을 클릭해 trace_id를 얻는다. 구조화 로그(JSON) + trace_id 주입이 여기서 빛난다 — 한 클릭으로 Logs ↔ Traces가 연결된다. 검색 속도가 곧 MTTR.',
-        block: {
-          kind: 'yaml',
-          code: `# Grafana → Explore → Loki 데이터소스
-# 같은 시간 창(03:00~03:20) 유지
-
-# 1) payment의 5xx 로그만 추출 (정규식으로 5\\d\\d 매칭)
-{app="payment", cluster="prod-asia"} |~ "5\\d\\d" | json
-# → 1분당 ~30 라인 hit. 첫 한 줄을 펼친다
-
-# 2) 한 에러 라인 (JSON 구조화 로그)
-{
-  "ts": "2026-05-06T03:12:08.214Z",
-  "level": "ERROR",
-  "service": "payment",
-  "endpoint": "/charge",
-  "status": 500,
-  "user_id": 7421,
-  "trace_id": "a3f1c8e2d9b04f7a8e1c2d3b4f5a6c7d",   ← 핵심
-  "span_id":  "9b04f7a8e1c2d3b4",
-  "error": "DB query timeout (4012ms > 4000ms)",
-  "query": "SELECT * FROM payment_methods WHERE user_id IN (?, ?, ?, ...)"
-}
-
-# 3) trace_id로 Tempo/Jaeger 즉시 점프
-# Grafana Loki 패널의 trace_id 필드 → "View trace" 버튼 클릭
-# (또는 derived field 설정으로 trace_id를 링크화)
-#
-# URL 예: https://grafana/explore?datasource=tempo&traceId=a3f1c8e2...
-
-# 핵심 — 이 점프가 가능한 이유
-# - 모든 서비스가 OTel SDK로 trace_id를 자동 전파
-# - 로그 포맷에 trace_id 필드를 표준으로 주입
-# - Grafana derived field로 Loki ↔ Tempo 링크
-# → 다음(Step 4): trace tree에서 단일 span을 본다`,
-        },
         focus: 'logs',
+        title: 'Step 3. Logs — "cart-service 로그 → DB connection timeout"',
+        desc: 'Loki에서 cart-service 로그를 LogQL로 잡고 5xx만 필터한다. 같은 에러 메시지가 반복: "DB connection timeout (waited 5000ms for pool)". 커넥션 풀이 고갈됐다는 신호다. 한 라인을 펼쳐서 trace_id를 잡는다 — 다음 단계에서 trace tree로 점프.',
+        liveData: 'logSearch',
+        legend: 'DB connection timeout 반복 — pool exhaustion 의심',
+        code: {
+          lang: 'shell',
+          filename: 'loki-query.sh — cart-service 5xx 로그 검색',
+          lines: [
+            '# Grafana → Explore → Loki',
+            '# cart-service의 5xx 로그를 LogQL로 추출',
+            '',
+            '{app="cart-service", cluster="prod-asia"}',
+            '  |~ "5\\d\\d"',
+            '  | json',
+            '  | level="ERROR"',
+            '',
+            '# 추출된 에러 라인 (JSON 구조화 로그)',
+            '{',
+            '  "ts": "2026-05-06T03:13:42.187Z",',
+            '  "level": "ERROR",',
+            '  "service": "cart-service",',
+            '  "endpoint": "GET /cart/{user_id}",',
+            '  "status": 500,',
+            '  "trace_id": "a3f1c8e2d9b04f7a8e1c2d3b4f5a6c7d",',
+            '  "span_id":  "9b04f7a8e1c2d3b4",',
+            '  "error": "DB connection timeout (waited 5000ms for pool)",',
+            '  "pool.size": 20,',
+            '  "pool.in_use": 20,',
+            '  "pool.waiters": 47',
+            '}',
+            '',
+            '# 패턴: 같은 메시지가 분당 ~150 라인 반복',
+            '# - pool.in_use == pool.size (20/20)',
+            '# - waiters 계속 누적 (47 → 81 → ...)',
+            '# → connection pool 고갈이 강력한 가설',
+            '',
+            '# 다음 — trace_id로 Tempo 점프 (Step 4)',
+            '# https://grafana/explore?datasource=tempo&traceId=a3f1...',
+          ],
+          highlight: [18, 19, 20, 21],
+        },
       },
       {
-        title: 'Step 4. 근본 원인 — "동선(Traces)으로 단일 span 분석"',
-        desc: 'Tempo에서 trace tree를 펼치면 payment의 DB call span 하나가 4초를 잡아먹고 있다. 그 안에 IN-list 쿼리 N개. 어제 배포에서 add_to_cart 시 payment_methods를 user 단위가 아니라 cart item마다 N+1로 부르도록 바뀜. 코드 fix → 알람 해소.',
-        block: {
-          kind: 'shell',
-          code: `# Tempo / Jaeger UI — trace_id=a3f1c8e2... 를 폭포수로 본다
-
-trace_id: a3f1c8e2d9b04f7a8e1c2d3b4f5a6c7d   total: 4180ms
-├─ checkout-api  POST /checkout                              4180ms ████████████████████
-│  ├─ cart-service  validate_cart                              45ms ▎
-│  ├─ payment-service  POST /charge                          4087ms ███████████████████  ← 범인
-│  │  ├─ payment-service  load_user_methods                  4012ms ███████████████████
-│  │  │  └─ db.query  SELECT * FROM payment_methods          4011ms ███████████████████
-│  │  │       attrs:
-│  │  │         db.statement = "SELECT ... WHERE user_id IN (?,?,?,...x47)"
-│  │  │         db.rows      = 47 parameters
-│  │  │         peer.service = "postgres-primary"
-│  │  └─ payment-service  charge_card                          73ms ▍
-│  └─ ledger-service  record_txn                               40ms ▎
-
-# Critical Path = payment-service.load_user_methods (4012ms / 4180ms = 96%)
-
-# git blame 으로 어제 배포 확인
-$ git log --oneline -- payment/methods.py | head -3
-b7c2f1a (2026-05-05) refactor: load methods per cart item   ← 이놈
-3d9e4a2 (2026-05-01) feat: add 3DS verification
-
-# 코드 fix — 단일 쿼리로 합치기 (N+1 제거)
-- for item in cart.items:                        # N번 호출
--     methods += db.query(load_methods_for(item))
-+ methods = db.query(load_methods_for_user(user_id))   # 1번 호출
-
-# 배포 → 5분 후 Grafana 패널 회복 → Alertmanager auto-resolve
-$ pd resolve --incident=INC-9921 --comment "N+1 query fix deployed (b7c2f1a → revert/fix)"
-
-# 회고 (다음 OnCall을 위해)
-✓ MTTR: 23분 (Metrics 5분 + Logs 8분 + Traces 6분 + 배포 4분)
-✓ 핵심: trace_id가 모든 pillar를 연결 → 검색 시간 절약
-→ Part V에서는 이 흐름을 SLO/Incident/OnCall 정책으로 정착시킨다`,
-        },
         focus: 'root',
+        title: 'Step 4. Root — "trace tree → DB pool 고갈 (해결)"',
+        desc: 'Tempo에서 trace를 펼치면 root span(GET /cart) 아래 db.acquire_connection이 5000ms를 잡아먹고 timeout. pool size=20인데 in-flight 쿼리가 47개. 어제 배포에서 트랜잭션 with-block을 빠뜨려 커넥션이 반환 안 되고 있었다. fix 배포 → 5분 후 알람 auto-resolve.',
+        liveData: 'rootCause',
+        legend: 'Root cause = DB connection pool exhaustion (배포 b7c2f1a)',
+        code: {
+          lang: 'yaml',
+          filename: 'fix-pool-leak.yaml — root cause + fix',
+          lines: [
+            '# Tempo trace tree (trace_id=a3f1c8e2...)',
+            '#',
+            '# cart-service GET /cart/123              5012ms ████████',
+            '#   └─ db.acquire_connection             5000ms ████████  ← 범인',
+            '#       attrs:',
+            '#         pool.size      = 20',
+            '#         pool.in_use    = 20',
+            '#         pool.waiters   = 47',
+            '#         timeout_ms     = 5000',
+            '#         outcome        = "timeout"',
+            '#',
+            '# git blame — 어제 배포 (b7c2f1a) 확인',
+            '$ git log --oneline cart/repository.py | head -3',
+            'b7c2f1a refactor: inline db queries (transaction 누락)  ← 이놈',
+            '3d9e4a2 feat: add cart bulk update',
+            '',
+            '# 코드 fix — with 블록으로 connection 자동 반환',
+            'BEFORE:',
+            '  conn = pool.acquire()',
+            '  rows = conn.execute("SELECT * FROM cart WHERE ...")',
+            '  return rows  # conn 반환 누락 → leak',
+            '',
+            'AFTER:',
+            '  with pool.acquire() as conn:        # 자동 release',
+            '      rows = conn.execute("...")',
+            '      return rows',
+            '',
+            '# 배포 → 5분 후 pool.in_use 정상 (20 → 4)',
+            '# Alertmanager auto-resolve INC-9921',
+            '$ pd resolve --incident=INC-9921 \\',
+            '    --comment "pool leak fix deployed"',
+            '',
+            '# 회고 — MTTR 23분 (Alert 1m / Isolate 5m / Logs 8m / Root 9m)',
+          ],
+          highlight: [22, 23, 24, 25],
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      python: { label: 'Python', textColor: '#86efac' },
-      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
-      yaml:   { label: 'YAML',   textColor: '#fde68a' },
-    };
-
-    const DEBUG = [
-      { key: 'alert',   emoji: '🚨', name: '알람',      note: 'Metrics 임계 초과' },
-      { key: 'isolate', emoji: '📊', name: '격리',      note: '어느 서비스/엔드포인트' },
-      { key: 'logs',    emoji: '📝', name: '본문 검사', note: 'Logs + trace_id 점프' },
-      { key: 'root',    emoji: '🎯', name: '근본 원인', note: '단일 span 분석' },
-    ];
-
-    function DebugCards({ focus }) {
+    // ── 좌측 LiveDataPane: 단계별 디버깅 흐름 시각화
+    function LiveDataPane({ step, stepIdx }) {
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">🩺 병원 내원 기록 역추적 (분산 디버깅)</div>
-          <div className="grid grid-cols-4 gap-2">
-            {DEBUG.map((d) => {
-              const isActive = focus === d.key;
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🩺</span>
+              <span className="text-xs font-bold text-slate-700">디버깅 흐름 (시간순)</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">step {stepIdx + 1}/4 — {step.focus}</span>
+          </div>
+
+          {/* 4단계 진행 표시 (Stepper) */}
+          <div className="px-4 pt-4">
+            <div className="flex items-center justify-between">
+              {['alert', 'isolate', 'logs', 'root'].map((k, i) => {
+                const isDone = i < stepIdx;
+                const isActive = i === stepIdx;
+                return (
+                  <React.Fragment key={k}>
+                    <div className="flex flex-col items-center">
+                      <div className={`w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold border-2 transition-all ${
+                        isActive ? 'bg-red-500 border-red-700 text-white scale-110 shadow-lg shadow-red-500/40 pulse-ring' :
+                        isDone   ? 'bg-red-200 border-red-400 text-red-800' :
+                                   'bg-slate-100 border-slate-300 text-slate-400'
+                      }`}>
+                        {i + 1}
+                      </div>
+                      <div className={`text-[10px] mt-1 font-bold ${isActive ? 'text-red-700' : isDone ? 'text-red-500' : 'text-slate-400'}`}>
+                        {k}
+                      </div>
+                    </div>
+                    {i < 3 && (
+                      <div className={`flex-1 h-0.5 mx-1 ${i < stepIdx ? 'bg-red-300' : 'bg-slate-200'}`} />
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 단계별 상세 시각화 */}
+          <div className="p-4 min-h-[320px]" key={`live-${stepIdx}`}>
+            {step.liveData === 'alertFiring'   && <AlertFiring />}
+            {step.liveData === 'serviceMatrix' && <ServiceMatrix />}
+            {step.liveData === 'logSearch'     && <LogSearch />}
+            {step.liveData === 'rootCause'     && <RootCause />}
+          </div>
+
+          {/* 범례 */}
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\.\s*/, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 1 — 알람 발화 (빨간 박스 펄스)
+    function AlertFiring() {
+      return (
+        <div className="space-y-3 fade-in">
+          <div className="bg-gradient-to-br from-red-600 to-red-700 rounded-lg p-4 border-4 border-red-800 shadow-xl shadow-red-500/40 alert-pulse">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[11px] font-bold text-red-100 tracking-wider">PAGERDUTY · CRITICAL</span>
+              <span className="text-[10px] text-red-200 font-mono">03:14 KST</span>
+            </div>
+            <div className="text-white font-bold text-lg mb-1">🚨 CheckoutErrorBudgetBurn</div>
+            <div className="text-red-100 text-xs leading-relaxed">
+              5xx error rate <span className="font-mono bg-red-900/50 px-1 rounded">5.0% → 18.4%</span> for 2m
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+              <div className="bg-red-900/40 rounded px-2 py-1">
+                <div className="text-red-300">service</div>
+                <div className="text-white font-mono">checkout</div>
+              </div>
+              <div className="bg-red-900/40 rounded px-2 py-1">
+                <div className="text-red-300">cluster</div>
+                <div className="text-white font-mono">prod-asia</div>
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+              <div className="text-[10px] text-slate-500">5xx (분당)</div>
+              <div className="text-base font-bold text-red-600">187</div>
+              <div className="text-[10px] text-slate-400">평소 12</div>
+            </div>
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+              <div className="text-[10px] text-slate-500">SLO 잔여</div>
+              <div className="text-base font-bold text-red-600">12%</div>
+              <div className="text-[10px] text-slate-400">budget burn</div>
+            </div>
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-2">
+              <div className="text-[10px] text-slate-500">notify</div>
+              <div className="text-base font-bold text-red-600">📞</div>
+              <div className="text-[10px] text-slate-400">on-call</div>
+            </div>
+          </div>
+          <div className="text-[11px] text-slate-500 italic text-center">
+            ack → 큰 그림 (RED dashboard) → 범위 좁히기
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2 — 5 서비스 중 cart만 빨강
+    function ServiceMatrix() {
+      return (
+        <div className="space-y-3 fade-in">
+          <div className="text-[11px] font-bold text-slate-600 mb-1">RED 대시보드 — 5 서비스 동시 비교</div>
+          <div className="space-y-2">
+            {SERVICES.map((s, i) => {
+              const isCart = s.id === 'cart';
+              const errRate = isCart ? 18.4 : [0.02, 0, 0.05, 0.08, 0.01][i];
               return (
                 <div
-                  key={d.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                  key={s.id}
+                  className={`flex items-center gap-3 p-2.5 rounded-lg border-2 fade-in transition-all ${
+                    isCart ? 'bg-red-50 border-red-400 shadow-md shadow-red-500/30 scale-[1.02]'
+                           : 'bg-emerald-50 border-emerald-200'
+                  }`}
+                  style={{ animationDelay: `${i * 100}ms` }}
                 >
-                  <div className="text-2xl">{d.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{d.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{d.note}</div>
+                  <span className="text-xl">{s.icon}</span>
+                  <div className="flex-1">
+                    <div className={`text-xs font-bold font-mono ${isCart ? 'text-red-800' : 'text-slate-700'}`}>{s.name}</div>
+                    <div className="mt-1 h-2 bg-slate-200 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full grow-bar ${isCart ? 'bg-red-500' : 'bg-emerald-500'}`}
+                        style={{
+                          '--target-width': `${Math.min(100, isCart ? 92 : errRate * 100)}%`,
+                          animationDelay: `${i * 100 + 200}ms`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className={`text-right ${isCart ? 'text-red-700' : 'text-emerald-700'}`}>
+                    <div className="text-base font-bold font-mono">{errRate.toFixed(2)}%</div>
+                    <div className="text-[10px]">{isCart ? '✗ 범인' : '✓ 정상'}</div>
+                  </div>
                 </div>
               );
             })}
+          </div>
+          <div className="text-[11px] text-slate-500 italic text-center pt-1">
+            범위 좁힘: cart-service 한 곳 → 다음 로그 검색
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3 — 로그 검색 → DB connection timeout
+    function LogSearch() {
+      const lines = [
+        { ts: '03:13:42', msg: 'DB connection timeout (waited 5000ms)', err: true },
+        { ts: '03:13:43', msg: 'DB connection timeout (waited 5000ms)', err: true },
+        { ts: '03:13:44', msg: 'DB connection timeout (waited 5000ms)', err: true },
+        { ts: '03:13:45', msg: 'pool.in_use=20/20  waiters=47', err: true },
+        { ts: '03:13:46', msg: 'DB connection timeout (waited 5000ms)', err: true },
+        { ts: '03:13:47', msg: 'pool.in_use=20/20  waiters=81', err: true },
+      ];
+      return (
+        <div className="space-y-3 fade-in">
+          <div className="bg-slate-900 rounded-lg overflow-hidden border border-slate-700">
+            <div className="bg-slate-800 px-3 py-1.5 flex items-center gap-2 border-b border-slate-700">
+              <span className="text-[10px] text-slate-400 font-mono">Loki · {`{app="cart-service"} |~ "5\\d\\d"`}</span>
+              <span className="ml-auto text-[10px] text-red-400 font-mono">hit: 187/min</span>
+            </div>
+            <div className="p-2 space-y-1 max-h-[200px] overflow-auto">
+              {lines.map((l, i) => (
+                <div
+                  key={i}
+                  className="flex items-start gap-2 text-[10px] font-mono fade-in"
+                  style={{ animationDelay: `${i * 80}ms` }}
+                >
+                  <span className="text-slate-500 shrink-0">{l.ts}</span>
+                  <span className="text-red-500 shrink-0 font-bold">ERROR</span>
+                  <span className="text-red-300">{l.msg}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="bg-amber-50 border-2 border-amber-300 rounded-lg p-3">
+            <div className="text-[11px] font-bold text-amber-900 mb-1">🔍 패턴 발견</div>
+            <div className="text-[11px] text-amber-800 leading-snug">
+              <span className="font-mono bg-amber-100 px-1 rounded">pool.in_use=20/20</span> + waiters 누적 (47→81)
+              <br />→ <strong>connection pool 고갈</strong> 가설. trace_id로 Tempo 점프.
+            </div>
+            <div className="mt-2 text-[10px] font-mono text-amber-700 truncate">
+              trace_id: a3f1c8e2d9b04f7a8e1c2d3b4f5a6c7d
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4 — root span 식별 + 해결책
+    function RootCause() {
+      const spans = [
+        { name: 'cart-service GET /cart/123', dur: 5012, depth: 0, root: true },
+        { name: 'db.acquire_connection',       dur: 5000, depth: 1, root: true },
+        { name: 'pool.wait',                   dur: 5000, depth: 2, root: true },
+      ];
+      const MAX = 5012;
+      return (
+        <div className="space-y-3 fade-in">
+          <div className="text-[11px] font-bold text-slate-600">Tempo trace tree</div>
+          <div className="bg-slate-50 rounded-lg p-3 space-y-1.5 border border-slate-200">
+            {spans.map((s, i) => (
+              <div key={i} className="flex items-center gap-2 fade-in" style={{ animationDelay: `${i * 150}ms` }}>
+                <div className="w-[160px] shrink-0 text-[10px] font-mono text-slate-700 truncate" style={{ paddingLeft: `${s.depth * 12}px` }}>
+                  {s.depth > 0 && <span className="text-slate-300 mr-1">└─</span>}
+                  <span className={s.root ? 'text-red-700 font-bold' : ''}>{s.name}</span>
+                </div>
+                <div className="flex-1 relative h-5 bg-white rounded border border-slate-200">
+                  <div
+                    className="absolute top-0 left-0 h-full rounded bg-red-500 border border-red-700 shadow shadow-red-500/40 grow-bar"
+                    style={{
+                      '--target-width': `${(s.dur / MAX) * 100}%`,
+                      animationDelay: `${i * 150 + 100}ms`,
+                    }}
+                  >
+                    <span className="absolute inset-0 px-1.5 flex items-center text-[9px] font-bold text-red-50">{s.dur}ms</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-red-50 border-2 border-red-300 rounded-lg p-3">
+            <div className="text-[11px] font-bold text-red-900 mb-1">🎯 Root Cause</div>
+            <div className="text-[11px] text-red-800 leading-snug">
+              <strong>DB connection pool 고갈</strong> — 어제 배포 <span className="font-mono bg-red-100 px-1 rounded">b7c2f1a</span>에서
+              with 블록을 빠뜨려 connection leak 발생. pool size=20인데 in-flight 47개로 timeout 5000ms 발화.
+            </div>
+          </div>
+
+          <div className="bg-emerald-50 border-2 border-emerald-300 rounded-lg p-3">
+            <div className="text-[11px] font-bold text-emerald-900 mb-1">✅ 해결</div>
+            <div className="text-[11px] text-emerald-800 leading-snug font-mono">
+              with pool.acquire() as conn:  # 자동 release
+            </div>
+            <div className="text-[10px] text-emerald-700 mt-1">
+              배포 후 5분 — pool.in_use 20→4, INC-9921 auto-resolve. MTTR 23분.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
           </div>
         </div>
       );
     }
 
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
 
-      const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
-      };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
       handleNextRef.current = handleNext;
       handlePrevRef.current = handlePrev;
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
         setIsPlaying((p) => !p);
       };
 
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
+      const step = STEPS[stepIdx];
 
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">분산 시스템 디버깅 흐름</h1>
-                <p className="text-sm text-slate-500 mt-1">병원 내원 기록 역추적 — 알람 → 격리 → 본문 검사 → 근본 원인</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar {
+              width: 0;
+              animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards;
+            }
+            @keyframes alertPulse {
+              0%, 100% { box-shadow: 0 10px 25px -5px rgba(239, 68, 68, 0.5); transform: scale(1); }
+              50%      { box-shadow: 0 20px 40px -5px rgba(239, 68, 68, 0.9); transform: scale(1.02); }
+            }
+            .alert-pulse {
+              animation: alertPulse 1.6s ease-in-out infinite;
+            }
+            @keyframes pulseRing {
+              0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+              50%      { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+            }
+            .pulse-ring {
+              animation: pulseRing 1.4s ease-in-out infinite;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-red-600 hover:text-red-800 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-red-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. Observability &gt; Chapter 2. 디버깅 흐름</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">분산 시스템 디버깅 흐름</h1>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                병원 내원 기록 역추적 — <strong>Alert → Isolate → Logs → Root</strong> 4단계.
+                <code className="bg-slate-100 px-1 rounded text-xs mx-1">5xx 알람</code>이 떴을 때
+                범위를 좁히고 <code className="bg-slate-100 px-1 rounded text-xs">trace_id</code>로 root span을 잡는 실전 루틴.
+              </p>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <DebugCards focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+            {/* 설명 */}
+            <div className="p-4 rounded-xl bg-red-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-red-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-red-200">키보드 &larr;/&rarr;</span>
               </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            {step.focus === 'root' && (
-              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
-                💡 Part IV 완성. 다음(Part V)에서는 실전 운영 — SLO 정책 / Incident / OnCall / 체크리스트
+            {/* 마지막 단계: 다음 안내 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-red-50 border-2 border-red-300 text-red-900 text-sm">
+                💡 Part IV 완성. 다음(Part V)에서는 <strong>실전 SRE 운영</strong>
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
               </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-red-600 text-white hover:bg-red-700 transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./IV-2-1.html" className="text-slate-500 hover:text-slate-700">&larr; IV-2-1</a>
+              <a href="../index.html" className="text-red-600 hover:text-red-800 font-medium">허브 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

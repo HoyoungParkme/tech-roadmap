@@ -3,269 +3,611 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Observability 학습 — PromQL 쿼리</title>
+  <title>Observability 학습 — II-1-2. PromQL 쿼리</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     II-1-2. PromQL 쿼리
     학습 목표: 시간 시리즈를 selector → range → rate → aggregation 순으로 조립한다.
     핵심 비유: "시간 시리즈 SQL" — SQL이 행/열을 다룬다면 PromQL은 시간 시리즈를 다룬다.
-    구조: 4단계 (Selector / Range Vector / Rate / Aggregation)
+    패턴: fastapi 표준 — 좌(LiveDataPane: 쿼리 결과 시각화) / 우(VSCode 코드)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // 시계열 차트 시간축 0~300초 (5분)
+    const TIME_MAX = 300;
+
+    // ── Step 1 instant vector 결과: 인스턴스/상태별 카운터 절대값
+    const INSTANT_ROWS = [
+      { instance: 'api-1', status: '200', value: 184320 },
+      { instance: 'api-1', status: '404', value: 412 },
+      { instance: 'api-1', status: '500', value: 38 },
+      { instance: 'api-2', status: '200', value: 192715 },
+      { instance: 'api-2', status: '404', value: 397 },
+      { instance: 'api-2', status: '500', value: 51 },
+      { instance: 'api-3', status: '200', value: 178902 },
+      { instance: 'api-3', status: '404', value: 405 },
+      { instance: 'api-3', status: '500', value: 24 },
+    ];
+
+    // ── Step 2 range vector: 5분간 누적 카운터 (monotonic 증가) — instance별 시계열
+    // 시점 t=0 ~ 300초, 15초 간격 21개 샘플
+    function buildCounterSeries(seed, slope, jitter) {
+      const samples = [];
+      let v = seed;
+      for (let t = 0; t <= TIME_MAX; t += 15) {
+        v += slope + (Math.sin(t * 0.07 + seed) * jitter);
+        samples.push({ t, v: Math.round(v) });
+      }
+      return samples;
+    }
+    const RANGE_SERIES = [
+      { label: 'api-1', color: '#ef4444', samples: buildCounterSeries(184000, 130, 18) },
+      { label: 'api-2', color: '#f97316', samples: buildCounterSeries(192400, 145, 22) },
+      { label: 'api-3', color: '#dc2626', samples: buildCounterSeries(178600, 122, 16) },
+    ];
+
+    // ── Step 3 rate(): 초당 변화율 — Counter 의 기울기 (req/sec)
+    // 누적값에서 차분을 내고 5분 평균
+    function buildRateSeries(slope, jitter) {
+      const samples = [];
+      for (let t = 0; t <= TIME_MAX; t += 15) {
+        const rps = slope / 15 + Math.sin(t * 0.045) * (jitter / 6) + Math.cos(t * 0.13) * 0.4;
+        samples.push({ t, v: Math.max(0, +rps.toFixed(2)) });
+      }
+      return samples;
+    }
+    const RATE_SERIES = [
+      { label: 'api-1', color: '#ef4444', samples: buildRateSeries(130, 18) },
+      { label: 'api-2', color: '#f97316', samples: buildRateSeries(145, 22) },
+      { label: 'api-3', color: '#dc2626', samples: buildRateSeries(122, 16) },
+    ];
+
+    // ── Step 4 sum by(status): 상태별 합산 — 2xx / 4xx / 5xx
+    function buildAggSeries(base, jitter, phase) {
+      const samples = [];
+      for (let t = 0; t <= TIME_MAX; t += 15) {
+        const v = base + Math.sin(t * 0.05 + phase) * jitter + Math.cos(t * 0.11) * (jitter / 3);
+        samples.push({ t, v: Math.max(0, +v.toFixed(2)) });
+      }
+      return samples;
+    }
+    const AGG_SERIES = [
+      { label: 'status="2xx"', color: '#10b981', samples: buildAggSeries(26.0, 1.2, 0) },
+      { label: 'status="4xx"', color: '#f59e0b', samples: buildAggSeries(0.45, 0.18, 1) },
+      { label: 'status="5xx"', color: '#ef4444', samples: buildAggSeries(0.18, 0.10, 2) },
+    ];
+    // topk(3) 결과 — 5xx 발생 인스턴스 순위
+    const TOPK_5XX = [
+      { instance: 'api-2', rps: 0.34 },
+      { instance: 'api-1', rps: 0.25 },
+      { instance: 'api-3', rps: 0.16 },
+    ];
+
+    // ── 4 STEPS — 좌측 LiveDataPane이 보여줄 데이터 + 우측 코드
     const STEPS = [
       {
-        title: 'Step 1. Selector — 메트릭 + 라벨 필터로 시계열 고르기',
-        desc: '메트릭 이름 뒤에 { } 로 라벨을 좁힌다. 결과는 instant vector — 각 시계열의 "지금 한 시점" 값. SQL의 WHERE에 해당. status="500" 만 남기고, job="api" 인스턴스만 본다.',
-        block: {
-          kind: 'yaml',
-          code: `# 메트릭 이름만 — 모든 시계열의 현재 값
-http_requests_total
-
-# 라벨 필터로 좁히기 (instant vector)
-http_requests_total{job="api", status="500"}
-
-# 정규식 매칭 (=~)도 가능
-http_requests_total{job="api", status=~"5.."}    # 5xx 전체
-http_requests_total{job="api", status!="200"}    # 200 제외
-
-# 결과 형태 (instant vector — 시점 1개의 값)
-# {job="api", instance="api-1", status="500"}  3
-# {job="api", instance="api-2", status="500"}  7
-# {job="api", instance="api-3", status="500"}  2
-#
-# → SQL: SELECT * FROM http_requests_total
-#         WHERE job='api' AND status='500'`,
-        },
+        title: 'Step 1. Selector — 메트릭 + 라벨 필터로 instant vector',
+        desc: '메트릭 이름 뒤에 { } 로 라벨을 좁힌다. 결과는 instant vector — 각 시계열의 "지금 한 시점" 카운터 값이다. 표 하나에 instance × status 별로 행이 늘어선다. SQL 의 SELECT … WHERE … 와 같다.',
+        kind: 'instant',
+        legend: 'instant vector — 각 시계열의 현재 1개 값. 그래프가 아닌 표 형태.',
         focus: 'selector',
+        code: {
+          lang: 'yaml',
+          filename: 'query.promql — Step 1 selector',
+          lines: [
+            '# 메트릭 이름만 — 모든 시계열의 현재 값',
+            'http_requests_total',
+            '',
+            '# 라벨 필터로 좁히기 (instant vector)',
+            'http_requests_total{job="api"}',
+            '',
+            '# 정규식 매칭(=~)도 가능',
+            'http_requests_total{job="api", status=~"5.."}    # 5xx 전체',
+            'http_requests_total{job="api", status!="200"}    # 200 제외',
+            '',
+            '# 결과 형태 (instant vector — 시점 1개)',
+            '# {instance="api-1", status="200"}  184320',
+            '# {instance="api-1", status="404"}     412',
+            '# {instance="api-1", status="500"}      38',
+            '# {instance="api-2", status="200"}  192715',
+            '# ...',
+            '',
+            '# 비유 → SQL',
+            '#   SELECT instance, status, value',
+            '#   FROM http_requests_total',
+            '#   WHERE job = \'api\'',
+          ],
+          highlight: [5, 8],
+        },
       },
       {
         title: 'Step 2. Range Vector — [5m] 으로 시간 범위 잘라내기',
-        desc: '[5m] 을 붙이면 instant vector → range vector. "최근 5분의 모든 샘플"을 들고 온다. 그래프나 rate/increase 같은 함수의 입력으로 쓰인다. 단독으로는 그래프에 못 그림 (값이 시점 1개가 아니라 배열).',
-        block: {
-          kind: 'yaml',
-          code: `# instant vector — 한 시점
-http_requests_total{job="api", status="500"}
-
-# range vector — 최근 5분의 샘플 묶음
-http_requests_total{job="api", status="500"}[5m]
-
-# 결과 형태 (range vector)
-# {job="api", instance="api-1", status="500"}
-#   1230 @ t-280s
-#   1232 @ t-265s
-#   1235 @ t-250s
-#   ...                      # 5분치 샘플 ~20개
-#   1287 @ t-15s
-#
-# 시간 단위
-# [30s]  [1m]  [5m]  [1h]  [1d]
-#
-# 주의: range vector 는 그래프에 직접 못 그린다
-# → 반드시 rate(), increase(), avg_over_time() 같은
-#    함수로 감싸서 instant vector 로 변환해야 함`,
-        },
+        desc: '[5m] 을 붙이면 instant vector → range vector. "최근 5분의 모든 샘플"을 들고 온다. 각 instance 마다 ~20 개 샘플이 시간축 위에 점점 우상향한다 (Counter 는 monotonic). 단독으로는 그래프에 못 그리므로 곧 rate() 로 감싼다.',
+        kind: 'rangeChart',
+        series: RANGE_SERIES,
+        yLabel: '카운터 누적값',
+        legend: 'range vector — 5분 윈도우의 누적 샘플. monotonic 증가 (Counter).',
         focus: 'range',
+        code: {
+          lang: 'yaml',
+          filename: 'query.promql — Step 2 range vector',
+          lines: [
+            '# instant vector — 한 시점',
+            'http_requests_total{job="api"}',
+            '',
+            '# range vector — 최근 5분의 샘플 묶음',
+            'http_requests_total{job="api"}[5m]',
+            '',
+            '# 결과 형태 (range vector)',
+            '# {instance="api-1"}',
+            '#   184320 @ t-300s',
+            '#   184452 @ t-285s',
+            '#   184579 @ t-270s',
+            '#   ...                         # 5분치 ~20개',
+            '#   185621 @ t-15s',
+            '',
+            '# 시간 단위',
+            '# [30s]  [1m]  [5m]  [1h]  [1d]',
+            '',
+            '# 주의: range vector 는 그래프에 직접 못 그린다',
+            '# → rate(), increase(), avg_over_time() 으로 감싸',
+            '#   instant vector 로 변환 필요',
+          ],
+          highlight: [5],
+        },
       },
       {
         title: 'Step 3. Rate — Counter 의 초당 변화율 추출',
-        desc: 'Counter 는 monotonic 증가만 한다 (재시작 시 0으로 리셋). 절대값은 의미 없고, "초당 얼마나 늘었나" 가 핵심. rate() 는 range vector 를 받아 초당 평균 증가율을 돌려준다. p99 latency 는 histogram bucket 에 같은 패턴을 적용한다.',
-        block: {
-          kind: 'yaml',
-          code: `# Counter 절대값 — 의미 없음 (시작 이후 누적)
-http_requests_total{job="api"}
-# = 1,234,567   (재시작하면 0으로 리셋)
-
-# rate() — 초당 평균 증가율 (req/sec)
-rate(http_requests_total{job="api"}[5m])
-# = 12.4         (지난 5분간 초당 12.4 요청)
-
-# increase() — 같은 구간의 절대 증가량 (= rate * 구간초)
-increase(http_requests_total{job="api"}[5m])
-# = 3,720        (5분 동안 3720건)
-
-# irate() — 마지막 두 샘플만 (순간 변화율, 노이즈 큼)
-irate(http_requests_total{job="api"}[5m])
-
-# Histogram bucket 도 같은 패턴 — p99 latency 의 입력
-rate(http_request_duration_seconds_bucket{job="api"}[5m])
-# → 각 bucket(le="0.1", "0.5", "1", ...) 의 초당 증가율
-# → 다음 step 의 histogram_quantile() 입력으로 사용
-
-# 규칙: Counter 는 항상 rate() 로 감싸기`,
-        },
+        desc: 'Counter 는 절대값이 무의미하다 (재시작 시 0 리셋). rate() 는 range vector 를 받아 초당 평균 증가율(req/sec)을 돌려준다. 누적 곡선의 기울기를 뽑는 셈. 차트가 평탄한 라인으로 바뀌고, 인스턴스별로 8~10 RPS 부근을 흐른다.',
+        kind: 'rangeChart',
+        series: RATE_SERIES,
+        yLabel: 'req/sec',
+        legend: 'rate(...[5m]) — 초당 평균 증가율. 이제 instant vector 라 그래프 가능.',
         focus: 'rate',
+        code: {
+          lang: 'yaml',
+          filename: 'query.promql — Step 3 rate()',
+          lines: [
+            '# Counter 절대값 — 의미 없음 (시작 이후 누적)',
+            'http_requests_total{job="api"}',
+            '# = 1,234,567   (재시작하면 0으로 리셋)',
+            '',
+            '# rate() — 초당 평균 증가율 (req/sec)',
+            'rate(http_requests_total{job="api"}[5m])',
+            '# {instance="api-1"} 8.6',
+            '# {instance="api-2"} 9.8',
+            '# {instance="api-3"} 8.2',
+            '',
+            '# increase() — 같은 구간의 절대 증가량 (= rate * 구간초)',
+            'increase(http_requests_total{job="api"}[5m])',
+            '# = 3,720        (5분 동안 3720건)',
+            '',
+            '# irate() — 마지막 두 샘플만 (순간 변화율, 노이즈 큼)',
+            'irate(http_requests_total{job="api"}[5m])',
+            '',
+            '# 규칙: Counter 는 항상 rate() 로 감싸기',
+          ],
+          highlight: [6],
+        },
       },
       {
-        title: 'Step 4. Aggregation — sum by / histogram_quantile 로 집계',
-        desc: 'sum by(label) 로 라벨별 합계 (SQL GROUP BY). histogram_quantile(0.99, ...) 는 bucket 의 rate 를 받아 p99 latency 를 계산. 두 패턴을 조합하면 "지난 5분 5xx 비율" SLO 식이 된다.',
-        block: {
-          kind: 'yaml',
-          code: `# 1) status 별 초당 요청 수 — 라벨별 집계
-sum by(status) (
-  rate(http_requests_total{job="api"}[5m])
-)
-# {status="200"} 124.5
-# {status="404"}   3.2
-# {status="500"}   1.8
-
-# 2) p99 latency — histogram bucket → 분위수
-histogram_quantile(0.99,
-  sum by(le) (
-    rate(http_request_duration_seconds_bucket{job="api"}[5m])
-  )
-)
-# = 0.412   (지난 5분 99% 요청이 412ms 이내)
-
-# 3) 5분 SLO — 5xx 에러율
-sum(rate(http_requests_total{job="api", status=~"5.."}[5m]))
-  /
-sum(rate(http_requests_total{job="api"}[5m]))
-# = 0.014   (1.4% — SLO 1% 초과 → 알림)
-
-# SQL 비유
-#   PromQL: sum by(status) (rate(metric[5m]))
-#   SQL   : SELECT status, SUM(req)/300 AS rps
-#           FROM metric
-#           WHERE ts > now() - INTERVAL '5 min'
-#           GROUP BY status`,
-        },
+        title: 'Step 4. Aggregation — sum by(status) + topk',
+        desc: 'sum by(status) 로 라벨별 합계 (SQL GROUP BY). 인스턴스를 합치고 status 만 살리면 2xx/4xx/5xx 세 라인이 남는다. 5xx 비율이 SLO 를 넘기면 알림. 옆 카드의 topk(3) 는 가장 5xx 가 많이 나는 인스턴스 3 개를 보여준다.',
+        kind: 'aggChart',
+        series: AGG_SERIES,
+        topk: TOPK_5XX,
+        yLabel: 'req/sec',
+        legend: 'sum by(status) — 인스턴스 차원을 접고 status 라벨만 유지.',
         focus: 'agg',
+        code: {
+          lang: 'yaml',
+          filename: 'query.promql — Step 4 aggregation',
+          lines: [
+            '# 1) status 별 초당 요청 수 — 라벨별 집계',
+            'sum by(status) (',
+            '  rate(http_requests_total{job="api"}[5m])',
+            ')',
+            '# {status="200"} 26.4',
+            '# {status="404"}  0.45',
+            '# {status="500"}  0.18',
+            '',
+            '# 2) 5xx 가 가장 많은 인스턴스 top 3',
+            'topk(3,',
+            '  sum by(instance) (',
+            '    rate(http_requests_total{status=~"5..", job="api"}[5m])',
+            '  )',
+            ')',
+            '',
+            '# 3) 5분 SLO — 5xx 에러율',
+            'sum(rate(http_requests_total{status=~"5..", job="api"}[5m]))',
+            '  /',
+            'sum(rate(http_requests_total{job="api"}[5m]))',
+            '# = 0.014   (1.4% — SLO 1% 초과 → 알림)',
+          ],
+          highlight: [2, 3, 4, 11, 12, 13, 14, 15],
+        },
       },
     ];
 
-    // KIND_STYLE 3종 — yaml/python/shell
-    const KIND_STYLE = {
-      yaml:   { label: 'PromQL', textColor: '#fde68a' },  // amber — 쿼리 강조
-      python: { label: 'Python', textColor: '#86efac' },
-      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
-    };
+    // ────────────────────────────────────────────────────────
+    // 좌측: LiveDataPane — Step 별로 다른 시각화
+    // ────────────────────────────────────────────────────────
 
-    const PROMQL = [
-      { key: 'selector', emoji: '🎯', name: 'Selector',     note: '메트릭 + 라벨' },
-      { key: 'range',    emoji: '📊', name: 'Range Vector', note: '[5m] 시간 범위' },
-      { key: 'rate',     emoji: '🔢', name: 'Rate',         note: '초당 변화율' },
-      { key: 'agg',      emoji: '📈', name: 'Aggregation',  note: 'sum by / quantile' },
-    ];
-
-    function PromQLCards({ focus }) {
+    function InstantTable({ rows }) {
+      // status 별 색
+      const statusClass = (s) => {
+        if (s === '200') return 'text-emerald-700 bg-emerald-50 border-emerald-200';
+        if (s === '404') return 'text-amber-700 bg-amber-50 border-amber-200';
+        return 'text-red-700 bg-red-50 border-red-300 font-bold';
+      };
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">🔍 시간 시리즈 쿼리 (PromQL)</div>
-          <div className="grid grid-cols-4 gap-2">
-            {PROMQL.map((s) => {
-              const isActive = focus === s.key;
-              return (
-                <div
-                  key={s.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
-                >
-                  <div className="text-2xl">{s.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
-                </div>
-              );
-            })}
+        <div className="p-3">
+          <div className="overflow-hidden rounded-lg border border-slate-200">
+            <table className="w-full text-[11px] font-mono">
+              <thead className="bg-slate-100 text-slate-600">
+                <tr>
+                  <th className="px-3 py-2 text-left">instance</th>
+                  <th className="px-3 py-2 text-left">status</th>
+                  <th className="px-3 py-2 text-right">value</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i} className="border-t border-slate-100 fade-in" style={{ animationDelay: `${i * 50}ms` }}>
+                    <td className="px-3 py-1.5 text-slate-700">{r.instance}</td>
+                    <td className="px-3 py-1.5">
+                      <span className={`inline-block px-2 py-0.5 rounded border text-[10px] ${statusClass(r.status)}`}>
+                        {r.status}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 text-right text-slate-800 tabular-nums">{r.value.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-2 text-[10px] text-slate-500">
+            행 {rows.length}개 — instance × status 조합. 시점 1개의 instant vector.
           </div>
         </div>
       );
     }
 
+    // 라인 차트 (SVG) — series: [{ label, color, samples: [{t,v}] }]
+    function LineChart({ series, yLabel }) {
+      // 자동 y 범위
+      const allV = series.flatMap((s) => s.samples.map((p) => p.v));
+      const yMin = Math.min(...allV);
+      const yMax = Math.max(...allV);
+      const yPad = (yMax - yMin) * 0.1 || 1;
+      const yLo = yMin - yPad;
+      const yHi = yMax + yPad;
+
+      // SVG viewBox
+      const W = 480, H = 220, padL = 50, padR = 12, padT = 10, padB = 24;
+      const innerW = W - padL - padR;
+      const innerH = H - padT - padB;
+
+      const xPos = (t) => padL + (t / TIME_MAX) * innerW;
+      const yPos = (v) => padT + (1 - (v - yLo) / (yHi - yLo)) * innerH;
+
+      const xTicks = [0, 60, 120, 180, 240, 300];
+      const yTicks = [0, 0.25, 0.5, 0.75, 1].map((p) => yLo + p * (yHi - yLo));
+
+      return (
+        <div className="p-3">
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto">
+            {/* y 그리드 + 라벨 */}
+            {yTicks.map((v, i) => {
+              const y = yPos(v);
+              return (
+                <g key={i}>
+                  <line x1={padL} y1={y} x2={W - padR} y2={y} stroke="#e2e8f0" strokeWidth="1" />
+                  <text x={padL - 6} y={y + 3} textAnchor="end" fontSize="9" fill="#94a3b8" fontFamily="monospace">
+                    {v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(v < 10 ? 2 : 0)}
+                  </text>
+                </g>
+              );
+            })}
+            {/* x 라벨 */}
+            {xTicks.map((t) => (
+              <g key={t}>
+                <line x1={xPos(t)} y1={padT} x2={xPos(t)} y2={H - padB} stroke="#f1f5f9" strokeWidth="1" />
+                <text x={xPos(t)} y={H - padB + 14} textAnchor="middle" fontSize="9" fill="#94a3b8" fontFamily="monospace">
+                  -{(TIME_MAX - t)}s
+                </text>
+              </g>
+            ))}
+            {/* y 축 라벨 */}
+            <text x={10} y={padT + 8} fontSize="9" fill="#64748b" fontFamily="monospace">{yLabel}</text>
+            {/* 라인 + 점 */}
+            {series.map((s, si) => {
+              const d = s.samples.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xPos(p.t).toFixed(1)} ${yPos(p.v).toFixed(1)}`).join(' ');
+              return (
+                <g key={si}>
+                  <path d={d} fill="none" stroke={s.color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                        className="line-draw" style={{ animationDelay: `${si * 200}ms` }} />
+                  {s.samples.filter((_, i) => i % 4 === 0).map((p, i) => (
+                    <circle key={i} cx={xPos(p.t)} cy={yPos(p.v)} r="2" fill={s.color} opacity="0.7" />
+                  ))}
+                </g>
+              );
+            })}
+          </svg>
+          {/* 범례 */}
+          <div className="mt-2 flex flex-wrap gap-3">
+            {series.map((s, i) => (
+              <div key={i} className="flex items-center gap-1.5 text-[10px] font-mono text-slate-600">
+                <span className="inline-block w-3 h-1 rounded" style={{ background: s.color }} />
+                {s.label}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function TopkPanel({ topk }) {
+      const max = Math.max(...topk.map((r) => r.rps));
+      return (
+        <div className="px-3 pb-3">
+          <div className="text-[10px] font-bold text-slate-600 mb-2 mt-1">topk(3) — 5xx 가 가장 많은 인스턴스</div>
+          <div className="space-y-1.5">
+            {topk.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 fade-in" style={{ animationDelay: `${600 + i * 120}ms` }}>
+                <span className="w-16 text-[11px] font-mono text-slate-700">{r.instance}</span>
+                <div className="flex-1 h-4 bg-slate-100 rounded relative overflow-hidden">
+                  <div className="absolute top-0 left-0 h-full bg-red-500 rounded grow-bar"
+                       style={{ '--target-width': `${(r.rps / max) * 100}%`, animationDelay: `${700 + i * 120}ms` }} />
+                </div>
+                <span className="w-14 text-right text-[11px] font-mono text-slate-700 tabular-nums">{r.rps.toFixed(2)} rps</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step, stepIdx }) {
+      const animKey = `step-${stepIdx}`;
+      const headerLabel = (
+        step.focus === 'selector' ? 'instant vector — 표' :
+        step.focus === 'range'    ? 'range vector — 5분 누적' :
+        step.focus === 'rate'     ? 'rate() — 초당 변화율' :
+                                    'sum by(status) + topk'
+      );
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📊</span>
+              <span className="text-xs font-bold text-slate-700">PromQL 결과</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">{headerLabel}</span>
+          </div>
+
+          <div key={animKey}>
+            {step.kind === 'instant'    && <InstantTable rows={INSTANT_ROWS} />}
+            {step.kind === 'rangeChart' && <LineChart series={step.series} yLabel={step.yLabel} />}
+            {step.kind === 'aggChart'   && (
+              <>
+                <LineChart series={step.series} yLabel={step.yLabel} />
+                <TopkPanel topk={step.topk} />
+              </>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[10px] text-slate-500 leading-snug">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ────────────────────────────────────────────────────────
+    // 우측: VSCode 스타일 코드 뷰어 — yaml 을 PromQL 처럼 보이게 라벨 override
+    // ────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      // yaml → PromQL 라벨 override (highlight.js 는 yaml 모드 그대로 사용)
+      const langLabel = code.lang === 'yaml' ? 'PromQL' : code.lang;
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{langLabel}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ────────────────────────────────────────────────────────
+    // App
+    // ────────────────────────────────────────────────────────
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
 
-      const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
-      };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
       handleNextRef.current = handleNext;
       handlePrevRef.current = handlePrev;
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
         setIsPlaying((p) => !p);
       };
 
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
+      const step = STEPS[stepIdx];
 
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">PromQL 쿼리</h1>
-                <p className="text-sm text-slate-500 mt-1">시간 시리즈 SQL — selector → range → rate → aggregation</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar {
+              width: 0;
+              animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards;
+            }
+            @keyframes lineDraw {
+              from { stroke-dasharray: 1200; stroke-dashoffset: 1200; }
+              to   { stroke-dasharray: 1200; stroke-dashoffset: 0; }
+            }
+            .line-draw {
+              animation: lineDraw 900ms ease-out forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-red-600 hover:text-red-800 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-1-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-red-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. Observability &gt; Chapter 1. Metrics</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">PromQL 쿼리</h1>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                시간 시리즈 SQL — <strong>selector → range → rate → aggregation</strong>.
+                메트릭 이름과 라벨로 시계열을 고르고(<code className="bg-slate-100 px-1 rounded text-xs">{`{ }`}</code>),
+                시간 범위로 자르고(<code className="bg-slate-100 px-1 rounded text-xs">[5m]</code>),
+                초당 변화율로 바꾸고(<code className="bg-slate-100 px-1 rounded text-xs">rate()</code>),
+                라벨로 합친다(<code className="bg-slate-100 px-1 rounded text-xs">sum by(status)</code>).
+              </p>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <PromQLCards focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+            {/* 설명 */}
+            <div className="p-4 rounded-xl bg-red-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-red-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-red-200">키보드 &larr;/&rarr;</span>
               </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            {step.focus === 'agg' && (
-              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
-                💡 다음(II-2-1)에서는 Grafana — PromQL 결과를 대시보드로 시각화
+            {/* 마지막 단계: 다음 안내 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-red-50 border-2 border-red-300 text-red-900 text-sm">
+                💡 다음(II-2-1)에서는 <strong>Grafana 대시보드 — PromQL 결과를 패널로 시각화</strong>
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
               </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-red-600 text-white hover:bg-red-700 transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-1-1.html" className="text-slate-500 hover:text-slate-700">&larr; II-1-1 메트릭 모델</a>
+              <a href="./II-2-1.html" className="text-red-600 hover:text-red-800 font-medium">II-2-1 Grafana 대시보드 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

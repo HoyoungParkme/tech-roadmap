@@ -3,314 +3,662 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Observability 학습 — 로그 수집 파이프라인 (Fluent Bit / Vector / Promtail)</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📔</text></svg>" />
+  <title>Observability 학습 — III-2-1. 로그 수집 파이프라인 (Fluent Bit / Vector)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📦</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
     III-2-1. 로그 수집 파이프라인 (Fluent Bit / Vector / Promtail)
-    학습 목표: 흩어진 로그를 모으는 파이프라인의 4단계(source/parser/filter/sink)를 이해한다.
-    핵심 비유: "택배 집하장" — 흩어진 로그를 한 곳에 모아 분류·라벨링 후 적절한 백엔드로 전송
-    구조: 4단계 (source / parser / filter / sink)
+    학습 목표: 로그 수집 4단계(source / parser / filter / sink)를 흐름도로 이해
+    핵심 비유: "택배 집하장" — Source(입고) → Parser(개봉/분류) → Filter(라벨/노이즈 제거) → Sink(배송)
+    패턴: fastapi 표준 — 좌(LiveDataPane: 4노드 파이프라인 + 로그 카운터/막대) / 우(VSCode 코드)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ── 4 STEPS — 각 단계마다 활성화되는 파이프라인 노드와 카운터/지표가 다르다
     const STEPS = [
       {
-        title: 'Step 1. Source — "어디서 로그를 줍나?" (컨테이너 / 파일 / journald)',
-        desc: '로그 출처는 다양하다. 컨테이너 stdout/stderr, 일반 파일 tail, systemd journald, syslog, 네트워크 수신까지. K8s에서는 노드별 DaemonSet으로 띄워서 각 노드의 /var/log/containers/*.log 를 한꺼번에 읽는다. 집하장에 트럭이 들어오는 입구다.',
-        block: {
-          kind: 'yaml',
-          code: `# fluent-bit-daemonset.yaml — K8s 노드별 1개씩 띄움
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: fluent-bit
-  namespace: logging
-spec:
-  selector:
-    matchLabels: { app: fluent-bit }
-  template:
-    metadata:
-      labels: { app: fluent-bit }
-    spec:
-      containers:
-        - name: fluent-bit
-          image: fluent/fluent-bit:3.0
-          volumeMounts:
-            - { name: varlog,  mountPath: /var/log }
-            - { name: dockerc, mountPath: /var/lib/docker/containers, readOnly: true }
-      volumes:
-        - { name: varlog,  hostPath: { path: /var/log } }
-        - { name: dockerc, hostPath: { path: /var/lib/docker/containers } }
----
-# fluent-bit.conf — 입력(source) 정의
-[INPUT]
-    Name              tail
-    Path              /var/log/containers/*.log
-    Parser            docker            # 컨테이너 stdout JSON 파싱
-    Tag               kube.*
-    Refresh_Interval  5
-    DB                /var/log/flb.db   # 어디까지 읽었는지 체크포인트
-[INPUT]
-    Name              systemd
-    Tag               host.*
-    Systemd_Filter    _SYSTEMD_UNIT=kubelet.service`,
+        title: 'Step 1. Source — 흩어진 로그를 한 입구로',
+        desc: '컨테이너 stdout, 호스트 파일, syslog/journald 까지 출처가 제각각이다. Fluent Bit/Vector를 노드별 DaemonSet으로 띄워 모든 입구를 하나의 수집기로 빨아들인다. 집하장 입고 게이트 — 트럭이 어디서 오든 일단 들어오고, 이때 어디서 왔는지(tag)만 기록한다.',
+        active: 'source',
+        sources: [
+          { id: 'app',    label: 'app stdout',     rate: 6200, color: 'red'   },
+          { id: 'file',   label: 'file tail',      rate: 2400, color: 'amber' },
+          { id: 'syslog', label: 'syslog/journal', rate: 1400, color: 'amber' },
+        ],
+        parsedRows: null,
+        filterStats: null,
+        sinkBars: null,
+        title2: '3 sources → 1 collector (10K events/s)',
+        legend: 'tag로 출처 기록만, 본문은 그대로 흘러간다',
+        code: {
+          lang: 'yaml',
+          filename: 'fluent-bit.conf — INPUT (source)',
+          lines: [
+            '# 컨테이너 stdout — K8s 노드별 DaemonSet',
+            '[INPUT]',
+            '    Name              tail',
+            '    Path              /var/log/containers/*.log',
+            '    Parser            docker          # JSON 라인 파싱',
+            '    Tag               kube.*',
+            '    Refresh_Interval  5',
+            '    DB                /var/log/flb.db # 어디까지 읽었는지 체크포인트',
+            '',
+            '# 일반 파일 tail',
+            '[INPUT]',
+            '    Name              tail',
+            '    Path              /var/log/app/*.log',
+            '    Tag               app.*',
+            '',
+            '# systemd journald',
+            '[INPUT]',
+            '    Name              systemd',
+            '    Tag               host.*',
+            '    Systemd_Filter    _SYSTEMD_UNIT=kubelet.service',
+            '',
+            '# → 출처가 다 다르지만 한 collector로 모인다',
+          ],
+          highlight: [3, 12, 18],
         },
-        focus: 'source',
       },
       {
-        title: 'Step 2. Parser — "송장 스티커 읽기" (JSON / regex 추출)',
-        desc: '로그 한 줄을 의미 있는 필드로 쪼갠다. JSON 로그는 자동 파싱, nginx access log 같은 텍스트는 regex로 method/status/path 분리. 파싱 실패한 라인은 dead letter queue로 보내 나중에 분석. 송장 스티커를 읽어 어디로 갈지 분류표를 만드는 단계.',
-        block: {
-          kind: 'yaml',
-          code: `# parsers.conf — Fluent Bit parser 정의
-[PARSER]
-    Name        docker
-    Format      json
-    Time_Key    time
-    Time_Format %Y-%m-%dT%H:%M:%S.%L%z
-
-[PARSER]
-    Name        nginx
-    Format      regex
-    Regex       ^(?<remote>[^ ]*) - (?<user>[^ ]*) \\[(?<time>[^\\]]*)\\] "(?<method>\\S+)(?: +(?<path>[^\\"]*?)(?: +\\S*)?)?" (?<status>[^ ]*) (?<size>[^ ]*)
-    Time_Key    time
-    Time_Format %d/%b/%Y:%H:%M:%S %z
-
-# fluent-bit.conf — Parser 적용 + 실패 처리
-[FILTER]
-    Name         parser
-    Match        kube.*nginx*
-    Key_Name     log               # 원본 텍스트 필드
-    Parser       nginx
-    Reserve_Data On                # 파싱 실패해도 원본 보존
-    Preserve_Key On
-
-# 파싱 실패 라인 → dead letter (별도 sink로 라우팅)
-[OUTPUT]
-    Name   file
-    Match  kube.*unparsed*
-    Path   /var/log/dlq/
-    Format plain
-# → 운영자가 정규식 보강 후 재처리 가능`,
+        title: 'Step 2. Parser — 송장 스티커 읽고 구조화',
+        desc: '한 줄 텍스트를 의미 있는 필드로 쪼갠다. JSON은 자동 파싱, nginx access log 같은 텍스트는 regex로 method/status/path 추출. raw 문자열이 표(table) 한 행으로 변신한다. 집하장에서 박스 송장을 읽고 분류 정보를 만드는 단계.',
+        active: 'parser',
+        sources: [
+          { id: 'app',    label: 'app stdout',     rate: 6200, color: 'red'   },
+          { id: 'file',   label: 'file tail',      rate: 2400, color: 'amber' },
+          { id: 'syslog', label: 'syslog/journal', rate: 1400, color: 'amber' },
+        ],
+        parsedRows: [
+          { ts: '12:01:03', level: 'INFO',  method: 'GET',  path: '/api/cart',  status: 200, ms: 18 },
+          { ts: '12:01:03', level: 'WARN',  method: 'POST', path: '/api/pay',   status: 402, ms: 240 },
+          { ts: '12:01:04', level: 'ERROR', method: 'GET',  path: '/api/order', status: 500, ms: 880 },
+          { ts: '12:01:04', level: 'INFO',  method: 'GET',  path: '/api/auth',  status: 200, ms: 9   },
+        ],
+        filterStats: null,
+        sinkBars: null,
+        title2: 'raw text → 구조화 필드 (timestamp, level, method, status, ms)',
+        legend: '파싱 실패 라인은 dead letter로 빠져 나중에 재처리',
+        code: {
+          lang: 'yaml',
+          filename: 'parsers.conf — JSON / regex 파서',
+          lines: [
+            '# JSON 파서 — 컨테이너 stdout',
+            '[PARSER]',
+            '    Name        docker',
+            '    Format      json',
+            '    Time_Key    time',
+            '    Time_Format %Y-%m-%dT%H:%M:%S.%L%z',
+            '',
+            '# 정규식 파서 — nginx access log',
+            '[PARSER]',
+            '    Name        nginx',
+            '    Format      regex',
+            '    Regex       ^(?<remote>[^ ]*) - (?<user>[^ ]*) "(?<method>\\S+) (?<path>[^"]*?) HTTP/[\\d.]+" (?<status>\\d+) (?<size>\\d+)',
+            '',
+            '# fluent-bit.conf — Parser FILTER 적용',
+            '[FILTER]',
+            '    Name         parser',
+            '    Match        kube.*nginx*',
+            '    Key_Name     log              # 원본 텍스트 필드',
+            '    Parser       nginx',
+            '    Reserve_Data On               # 파싱 실패해도 원본 보존',
+            '',
+            '# 파싱 실패 → DLQ로 라우팅 (별도 sink)',
+            '[OUTPUT]',
+            '    Name   file',
+            '    Match  *unparsed*',
+            '    Path   /var/log/dlq/',
+          ],
+          highlight: [3, 10, 16, 23],
         },
-        focus: 'parser',
       },
       {
-        title: 'Step 3. Filter — "라벨 붙이고 민감정보 가린다" (enrich / mask / sample)',
-        desc: 'namespace, pod_name, node 같은 K8s 메타데이터를 자동으로 라벨링하고, password/token 필드는 마스킹한다. 트래픽이 너무 많으면 sampling으로 1/10만 보내서 비용 절감. 집하장에서 박스에 지역 라벨 붙이고, 깨질 위험 표시 붙이는 단계.',
-        block: {
-          kind: 'yaml',
-          code: `# Vector — transforms 단계 (TOML/YAML 둘 다 지원)
-sources:
-  app_logs:
-    type: kubernetes_logs            # K8s 메타 자동 enrich
-
-transforms:
-  enrich:
-    type: remap
-    inputs: [app_logs]
-    source: |
-      # K8s 메타데이터 → 로그 라벨로 승격
-      .namespace = .kubernetes.pod_namespace
-      .app       = .kubernetes.pod_labels.app
-      .env       = get_env_var!("CLUSTER_ENV")
-
-  mask_secrets:
-    type: remap
-    inputs: [enrich]
-    source: |
-      # 민감 필드 마스킹 (정규식 치환)
-      .message = replace(.message, r'("password"\\s*:\\s*)"[^"]*"', "$1\\"***\\"")
-      .message = replace(.message, r'(Bearer\\s+)[A-Za-z0-9._-]+',  "$1***")
-
-  sample_debug:
-    type: sample
-    inputs: [mask_secrets]
-    rate: 10                          # DEBUG 레벨만 1/10
-    key_field: level
-    exclude:
-      type: vrl
-      source: '.level != "debug"'    # ERROR/WARN/INFO는 100% 통과
-
-# → 라벨은 풍부하게, 본문은 안전하게, 양은 적당히`,
+        title: 'Step 3. Filter — 노이즈 제거 + 라벨링 + 마스킹',
+        desc: 'DEBUG 로그 1/10만 sampling, healthcheck 200 응답은 drop, password/token은 마스킹, K8s namespace/app 메타데이터는 라벨로 승격. 들어오는 10K rps를 1K rps로 줄여 다운스트림 비용·부하를 1/10로 떨어뜨린다. 집하장에서 파손 위험 박스 골라내고, 지역 라벨 붙이고, 비싼 박스는 별도 보관.',
+        active: 'filter',
+        sources: [
+          { id: 'app',    label: 'app stdout',     rate: 6200, color: 'red'   },
+          { id: 'file',   label: 'file tail',      rate: 2400, color: 'amber' },
+          { id: 'syslog', label: 'syslog/journal', rate: 1400, color: 'amber' },
+        ],
+        parsedRows: [
+          { ts: '12:01:03', level: 'INFO',  method: 'GET',  path: '/api/cart',  status: 200, ms: 18 },
+          { ts: '12:01:03', level: 'WARN',  method: 'POST', path: '/api/pay',   status: 402, ms: 240 },
+          { ts: '12:01:04', level: 'ERROR', method: 'GET',  path: '/api/order', status: 500, ms: 880 },
+          { ts: '12:01:04', level: 'INFO',  method: 'GET',  path: '/api/auth',  status: 200, ms: 9   },
+        ],
+        filterStats: {
+          inRate: 10000,
+          outRate: 1000,
+          drops: [
+            { name: 'DEBUG sample 1/10', dropped: 5400 },
+            { name: 'healthcheck drop',  dropped: 2200 },
+            { name: 'noise/exclude',     dropped: 1400 },
+          ],
         },
-        focus: 'filter',
+        sinkBars: null,
+        title2: '10,000 → 1,000 events/s (90% 감량) + 라벨/마스킹',
+        legend: 'sample · drop · mask · enrich — 비용은 1/10, 가치는 그대로',
+        code: {
+          lang: 'yaml',
+          filename: 'vector.toml — transforms (filter)',
+          lines: [
+            '[sources.app_logs]',
+            '  type = "kubernetes_logs"          # K8s 메타 자동 enrich',
+            '',
+            '# ① K8s 메타데이터를 라벨로 승격',
+            '[transforms.enrich]',
+            '  type = "remap"',
+            '  inputs = ["app_logs"]',
+            '  source = """',
+            '    .namespace = .kubernetes.pod_namespace',
+            '    .app       = .kubernetes.pod_labels.app',
+            '    .env       = get_env_var!("CLUSTER_ENV")',
+            '  """',
+            '',
+            '# ② 민감 정보 마스킹',
+            '[transforms.mask]',
+            '  type = "remap"',
+            '  inputs = ["enrich"]',
+            '  source = """',
+            '    .message = replace(.message, r\'("password":\\s*)"[^"]*"\', "$1\\"***\\"")',
+            '    .message = replace(.message, r\'(Bearer\\s+)[A-Za-z0-9._-]+\', "$1***")',
+            '  """',
+            '',
+            '# ③ DEBUG 1/10 sample — ERROR/WARN/INFO는 100%',
+            '[transforms.sample_debug]',
+            '  type = "sample"',
+            '  inputs = ["mask"]',
+            '  rate = 10',
+            '  exclude.type = "vrl"',
+            '  exclude.source = \'.level != "debug"\'',
+            '',
+            '# ④ healthcheck/200 drop',
+            '[transforms.drop_health]',
+            '  type = "filter"',
+            '  inputs = ["sample_debug"]',
+            '  condition = \'.path != "/healthz" && .status != 200 || .level != "info"\'',
+          ],
+          highlight: [5, 15, 24, 32],
+        },
       },
       {
-        title: 'Step 4. Sink — "어디로 보낼까?" (Loki / ES / S3 / Kafka 동시 다중)',
-        desc: '하나의 로그를 여러 곳으로 동시에 보낸다. Loki(라벨 기반 저렴), Elasticsearch(전문 검색), S3(장기 보관 — 컴플라이언스), Kafka(다른 시스템 fan-out). 출구가 여러 개인 집하장. 백엔드 하나 죽어도 나머지는 흘러가도록 sink별로 buffer 둔다.',
-        block: {
-          kind: 'yaml',
-          code: `# Vector — 같은 이벤트를 4개 sink로 동시 송출
-sinks:
-  loki:                          # 라벨 기반, 저렴, Grafana 연계
-    type: loki
-    inputs: [sample_debug]
-    endpoint: http://loki:3100
-    labels:
-      namespace: "{{ namespace }}"
-      app:       "{{ app }}"
-      level:     "{{ level }}"
-    encoding: { codec: json }
-
-  elasticsearch:                 # 전문 검색, 복잡한 쿼리
-    type: elasticsearch
-    inputs: [sample_debug]
-    endpoints: ["http://es:9200"]
-    bulk: { index: "logs-%Y.%m.%d" }
-    buffer: { type: disk, max_size: 1073741824 }   # 1GB 디스크 버퍼
-
-  s3_archive:                    # 장기 보관 (90일+ 컴플라이언스)
-    type: aws_s3
-    inputs: [sample_debug]
-    bucket: company-log-archive
-    key_prefix: "year=%Y/month=%m/day=%d/"
-    compression: gzip
-    batch: { max_bytes: 10485760, timeout_secs: 300 }
-
-  kafka_fanout:                  # SIEM/이상탐지로 fan-out
-    type: kafka
-    inputs: [sample_debug]
-    bootstrap_servers: kafka:9092
-    topic: "logs.{{ namespace }}"
-    encoding: { codec: json }
-# → 하나가 느려도 다른 sink는 영향 없음 (sink별 독립 buffer)`,
+        title: 'Step 4. Sink — 한 이벤트, 여러 백엔드',
+        desc: '같은 이벤트를 Loki(라벨 기반·저렴), Elasticsearch(전문 검색), S3(장기 보관·컴플라이언스), Kafka(SIEM/이상탐지 fan-out)로 동시에 보낸다. sink별 독립 buffer라 ES가 죽어도 Loki/S3는 흘러간다. 출구 4개짜리 집하장 — 같은 박스를 용도별로 다른 트럭에 싣는다.',
+        active: 'sink',
+        sources: [
+          { id: 'app',    label: 'app stdout',     rate: 6200, color: 'red'   },
+          { id: 'file',   label: 'file tail',      rate: 2400, color: 'amber' },
+          { id: 'syslog', label: 'syslog/journal', rate: 1400, color: 'amber' },
+        ],
+        parsedRows: [
+          { ts: '12:01:03', level: 'INFO',  method: 'GET',  path: '/api/cart',  status: 200, ms: 18 },
+          { ts: '12:01:03', level: 'WARN',  method: 'POST', path: '/api/pay',   status: 402, ms: 240 },
+          { ts: '12:01:04', level: 'ERROR', method: 'GET',  path: '/api/order', status: 500, ms: 880 },
+          { ts: '12:01:04', level: 'INFO',  method: 'GET',  path: '/api/auth',  status: 200, ms: 9   },
+        ],
+        filterStats: {
+          inRate: 10000,
+          outRate: 1000,
+          drops: [
+            { name: 'DEBUG sample 1/10', dropped: 5400 },
+            { name: 'healthcheck drop',  dropped: 2200 },
+            { name: 'noise/exclude',     dropped: 1400 },
+          ],
         },
-        focus: 'sink',
+        sinkBars: [
+          { id: 'loki',   label: 'Loki',          mb: 12.4, note: '라벨 기반 / 저렴',         color: 'red'   },
+          { id: 'es',     label: 'Elasticsearch', mb: 18.6, note: '전문 검색 / 인덱스',       color: 'amber' },
+          { id: 's3',     label: 'S3 archive',    mb:  4.2, note: '90일+ 컴플라이언스',       color: 'sky'   },
+          { id: 'kafka',  label: 'Kafka',         mb:  9.0, note: 'SIEM / 이상탐지 fan-out',  color: 'cyan'  },
+        ],
+        title2: '1 event → 4 sinks 동시 송출 (sink별 독립 buffer)',
+        legend: '하나가 느려져도 다른 sink는 영향 없음',
+        code: {
+          lang: 'yaml',
+          filename: 'vector.toml — sinks (4개 동시 송출)',
+          lines: [
+            '# ① Loki — 라벨 기반, 저렴, Grafana 연계',
+            '[sinks.loki]',
+            '  type = "loki"',
+            '  inputs = ["drop_health"]',
+            '  endpoint = "http://loki:3100"',
+            '  labels.namespace = "{{ namespace }}"',
+            '  labels.app       = "{{ app }}"',
+            '  labels.level     = "{{ level }}"',
+            '  encoding.codec   = "json"',
+            '',
+            '# ② Elasticsearch — 전문 검색',
+            '[sinks.elasticsearch]',
+            '  type = "elasticsearch"',
+            '  inputs = ["drop_health"]',
+            '  endpoints = ["http://es:9200"]',
+            '  bulk.index = "logs-%Y.%m.%d"',
+            '  buffer.type = "disk"             # 1GB 디스크 버퍼',
+            '  buffer.max_size = 1073741824',
+            '',
+            '# ③ S3 — 장기 보관 (컴플라이언스)',
+            '[sinks.s3_archive]',
+            '  type = "aws_s3"',
+            '  inputs = ["drop_health"]',
+            '  bucket = "company-log-archive"',
+            '  key_prefix = "year=%Y/month=%m/day=%d/"',
+            '  compression = "gzip"',
+            '  batch.max_bytes = 10485760',
+            '',
+            '# ④ Kafka — fan-out (SIEM/이상탐지)',
+            '[sinks.kafka_fanout]',
+            '  type = "kafka"',
+            '  inputs = ["drop_health"]',
+            '  bootstrap_servers = "kafka:9092"',
+            '  topic = "logs.{{ namespace }}"',
+            '  encoding.codec = "json"',
+          ],
+          highlight: [2, 12, 21, 30],
+        },
       },
     ];
 
-    const KIND_STYLE = {
-      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
-      python: { label: 'Python', textColor: '#86efac' },
-      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    // ── 색상 매핑 (red 메인)
+    const COLOR = {
+      red:   { bar: 'bg-red-500',   border: 'border-red-600',   text: 'text-red-50',   shadow: 'shadow-red-500/40',   light: 'bg-red-100',   ring: 'ring-red-400'   },
+      amber: { bar: 'bg-amber-500', border: 'border-amber-600', text: 'text-amber-50', shadow: 'shadow-amber-500/40', light: 'bg-amber-100', ring: 'ring-amber-400' },
+      sky:   { bar: 'bg-sky-500',   border: 'border-sky-600',   text: 'text-sky-50',   shadow: 'shadow-sky-500/40',   light: 'bg-sky-100',   ring: 'ring-sky-400'   },
+      cyan:  { bar: 'bg-cyan-500',  border: 'border-cyan-600',  text: 'text-cyan-50',  shadow: 'shadow-cyan-500/40',  light: 'bg-cyan-100',  ring: 'ring-cyan-400'  },
     };
 
-    const SHIPPER = [
-      { key: 'source', emoji: '📦', name: 'Source', note: 'stdout / file / journald' },
-      { key: 'parser', emoji: '🔍', name: 'Parser', note: 'JSON / regex 추출' },
-      { key: 'filter', emoji: '🏷️', name: 'Filter', note: '라벨 추가 / drop' },
-      { key: 'sink',   emoji: '🚚', name: 'Sink',   note: 'Loki / ES / Kafka' },
+    // ── 단계 노드 정의 (4 노드 파이프라인)
+    const PIPELINE_NODES = [
+      { key: 'source', emoji: '📥', name: 'Source',  sub: 'tail / journald'        },
+      { key: 'parser', emoji: '🔍', name: 'Parser',  sub: 'JSON / regex'           },
+      { key: 'filter', emoji: '🏷️', name: 'Filter',  sub: 'sample · drop · mask'   },
+      { key: 'sink',   emoji: '🚚', name: 'Sink',    sub: 'Loki / ES / S3 / Kafka' },
     ];
 
-    function ShipperCards({ focus }) {
+    // ── 좌측: 로그 파이프라인 LiveDataPane
+    function LogPipelinePane({ step, stepIdx }) {
+      const animKey = `step-${stepIdx}`;
+      const currentNodeIdx = PIPELINE_NODES.findIndex((n) => n.key === step.active);
+
       return (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-          <div className="text-xs font-bold text-slate-700 mb-3">📦 택배 집하장 (로그 수집 파이프라인)</div>
-          <div className="grid grid-cols-4 gap-2">
-            {SHIPPER.map((s) => {
-              const isActive = focus === s.key;
-              return (
-                <div
-                  key={s.key}
-                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-red-100 border-2 border-red-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
-                >
-                  <div className="text-2xl">{s.emoji}</div>
-                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
-                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📦</span>
+              <span className="text-xs font-bold text-slate-700">로그 수집 파이프라인</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">collector=fluent-bit / vector</span>
+          </div>
+
+          {/* 4 노드 + 화살표 */}
+          <div className="p-3" key={animKey}>
+            <div className="flex items-stretch gap-1">
+              {PIPELINE_NODES.map((n, i) => {
+                const isActive = n.key === step.active;
+                const isPast   = i < currentNodeIdx;
+                return (
+                  <React.Fragment key={n.key}>
+                    <div
+                      className={`flex-1 rounded-lg border-2 p-2 text-center transition-all duration-300 fade-in ${
+                        isActive
+                          ? 'bg-red-50 border-red-500 ring-2 ring-red-300 scale-[1.04]'
+                          : isPast
+                          ? 'bg-slate-50 border-slate-300 opacity-70'
+                          : 'bg-white border-slate-200 opacity-60'
+                      }`}
+                      style={{ animationDelay: `${i * 90}ms` }}
+                    >
+                      <div className="text-xl">{n.emoji}</div>
+                      <div className={`text-xs font-bold mt-0.5 ${isActive ? 'text-red-700' : 'text-slate-700'}`}>{n.name}</div>
+                      <div className="text-[9px] text-slate-500 mt-0.5 leading-tight">{n.sub}</div>
+                    </div>
+                    {i < PIPELINE_NODES.length - 1 && (
+                      <div className="flex items-center px-0.5">
+                        <span className={`text-base ${i < currentNodeIdx ? 'text-red-500' : 'text-slate-300'}`}>›</span>
+                      </div>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
+            {/* 단계별 동적 LiveData */}
+            <div className="mt-3 space-y-3">
+
+              {/* ── source 카운터 (모든 단계에서 보여줌) */}
+              <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[11px] font-bold text-slate-700">📥 입고 카운터 (events/s)</span>
+                  <span className="text-[10px] text-slate-500 font-mono">
+                    합계 {step.sources.reduce((a, s) => a + s.rate, 0).toLocaleString()}/s
+                  </span>
                 </div>
-              );
-            })}
+                <div className="space-y-1">
+                  {step.sources.map((s, i) => {
+                    const c = COLOR[s.color];
+                    const max = Math.max(...step.sources.map((x) => x.rate));
+                    const w = (s.rate / max) * 100;
+                    return (
+                      <div key={s.id} className="flex items-center gap-2 fade-in" style={{ animationDelay: `${i * 80}ms` }}>
+                        <div className="w-[110px] text-[11px] font-mono text-slate-700 truncate">{s.label}</div>
+                        <div className="flex-1 relative h-4 bg-slate-100 rounded">
+                          <div
+                            className={`absolute top-0 left-0 h-full rounded ${c.bar} ${c.border} border ${c.shadow} shadow grow-bar`}
+                            style={{ '--target-width': `${w}%`, animationDelay: `${i * 80 + 100}ms` }}
+                          />
+                        </div>
+                        <div className="w-[60px] text-right text-[11px] font-mono font-bold text-slate-700">{s.rate.toLocaleString()}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* ── Step 2+: 파싱된 표 */}
+              {step.parsedRows && (
+                <div className="rounded-lg border border-slate-200 bg-white p-2.5 fade-in" style={{ animationDelay: '300ms' }}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[11px] font-bold text-slate-700">🔍 파싱 결과 (raw → 구조화)</span>
+                    <span className="text-[10px] text-slate-500 font-mono">parser=docker(json) / nginx(regex)</span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[10px] font-mono">
+                      <thead>
+                        <tr className="text-slate-500 border-b border-slate-200">
+                          <th className="text-left py-1 pr-2">ts</th>
+                          <th className="text-left py-1 pr-2">level</th>
+                          <th className="text-left py-1 pr-2">method</th>
+                          <th className="text-left py-1 pr-2">path</th>
+                          <th className="text-right py-1 pr-2">status</th>
+                          <th className="text-right py-1">ms</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {step.parsedRows.map((r, i) => {
+                          const lvlColor =
+                            r.level === 'ERROR' ? 'text-red-600 font-bold'
+                            : r.level === 'WARN' ? 'text-amber-600 font-bold'
+                            : 'text-slate-600';
+                          return (
+                            <tr key={i} className="border-b border-slate-100 fade-in" style={{ animationDelay: `${350 + i * 60}ms` }}>
+                              <td className="py-1 pr-2 text-slate-500">{r.ts}</td>
+                              <td className={`py-1 pr-2 ${lvlColor}`}>{r.level}</td>
+                              <td className="py-1 pr-2 text-slate-700">{r.method}</td>
+                              <td className="py-1 pr-2 text-slate-700 truncate max-w-[120px]">{r.path}</td>
+                              <td className="py-1 pr-2 text-right text-slate-700">{r.status}</td>
+                              <td className="py-1 text-right text-slate-700">{r.ms}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Step 3+: Filter 통계 */}
+              {step.filterStats && (
+                <div className="rounded-lg border border-red-200 bg-red-50/60 p-2.5 fade-in" style={{ animationDelay: '500ms' }}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[11px] font-bold text-red-800">🏷️ Filter 효과 (rate 감량)</span>
+                    <span className="text-[10px] text-red-700 font-mono font-bold">
+                      {step.filterStats.inRate.toLocaleString()} → {step.filterStats.outRate.toLocaleString()} ev/s
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    {step.filterStats.drops.map((d, i) => {
+                      const w = (d.dropped / step.filterStats.inRate) * 100;
+                      return (
+                        <div key={d.name} className="flex items-center gap-2 fade-in" style={{ animationDelay: `${550 + i * 80}ms` }}>
+                          <div className="w-[140px] text-[10px] font-mono text-slate-700 truncate">{d.name}</div>
+                          <div className="flex-1 relative h-3 bg-white rounded">
+                            <div
+                              className="absolute top-0 left-0 h-full rounded bg-red-400 border border-red-500 grow-bar"
+                              style={{ '--target-width': `${w}%`, animationDelay: `${600 + i * 80}ms` }}
+                            />
+                          </div>
+                          <div className="w-[70px] text-right text-[10px] font-mono font-bold text-red-700">-{d.dropped.toLocaleString()}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Step 4: Sink 막대 차트 */}
+              {step.sinkBars && (
+                <div className="rounded-lg border border-slate-200 bg-white p-2.5 fade-in" style={{ animationDelay: '700ms' }}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[11px] font-bold text-slate-700">🚚 Sink 송출 (MB/s)</span>
+                    <span className="text-[10px] text-slate-500 font-mono">독립 buffer / fan-out</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {step.sinkBars.map((b, i) => {
+                      const c = COLOR[b.color];
+                      const max = Math.max(...step.sinkBars.map((x) => x.mb));
+                      const w = (b.mb / max) * 100;
+                      return (
+                        <div key={b.id} className="flex items-center gap-2 fade-in" style={{ animationDelay: `${750 + i * 100}ms` }}>
+                          <div className="w-[90px]">
+                            <div className="text-[11px] font-bold text-slate-700">{b.label}</div>
+                            <div className="text-[9px] text-slate-500 leading-tight">{b.note}</div>
+                          </div>
+                          <div className="flex-1 relative h-5 bg-slate-100 rounded">
+                            <div
+                              className={`absolute top-0 left-0 h-full rounded ${c.bar} ${c.border} border ${c.shadow} shadow grow-bar`}
+                              style={{ '--target-width': `${w}%`, animationDelay: `${800 + i * 100}ms` }}
+                            >
+                              <span className={`absolute inset-0 px-1.5 flex items-center text-[9px] font-bold ${c.text}`}>
+                                {b.mb.toFixed(1)} MB/s
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 범례/제목 */}
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-700 font-bold mb-1">{step.title2}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[32rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
           </div>
         </div>
       );
     }
 
     function App() {
-      const [currentStep, setCurrentStep] = useState(0);
+      const [stepIdx, setStepIdx] = useState(0);
       const [isPlaying, setIsPlaying] = useState(false);
       const intervalRef = useRef(null);
-      const handleNextRef = useRef(null);
-      const handlePrevRef = useRef(null);
 
-      const handleNext = () => {
-        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
-        else setIsPlaying(false);
-      };
-      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
       handleNextRef.current = handleNext;
       handlePrevRef.current = handlePrev;
 
       useEffect(() => {
         if (!isPlaying) return;
-        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
         return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') handleNextRef.current();
-          if (e.key === 'ArrowLeft') handlePrevRef.current();
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       const togglePlay = () => {
-        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
         setIsPlaying((p) => !p);
       };
 
-      const step = STEPS[currentStep];
-      const blockStyle = KIND_STYLE[step.block.kind];
+      const step = STEPS[stepIdx];
 
       return (
-        <div className="min-h-screen bg-slate-50 p-6">
-          <div className="max-w-6xl mx-auto">
-            <div className="mb-6 flex items-start justify-between gap-4">
-              <div>
-                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
-                <h1 className="text-2xl font-bold text-slate-800 mt-1">로그 수집 파이프라인 (Fluent Bit / Vector / Promtail)</h1>
-                <p className="text-sm text-slate-500 mt-1">택배 집하장 — 흩어진 로그를 모아 분류·라벨링 후 전송</p>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar {
+              width: 0;
+              animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-red-600 hover:text-red-800 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-2-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-red-600 text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. Observability &gt; Chapter 2. Logs</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">로그 수집 파이프라인 (Fluent Bit / Vector / Promtail)</h1>
+                </div>
               </div>
-              <div className="text-right">
-                <div className="text-[11px] text-slate-400">Step</div>
-                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
-              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                택배 집하장 — <strong>흩어진 로그를 모아 분류·라벨링 후 전송</strong>.
+                <code className="bg-slate-100 px-1 rounded text-xs">Source</code> →
+                <code className="bg-slate-100 px-1 rounded text-xs mx-1">Parser</code> →
+                <code className="bg-slate-100 px-1 rounded text-xs">Filter</code> →
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">Sink</code> 4단계 흐름.
+              </p>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LogPipelinePane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
-              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
-              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
-            </div>
-
-            <ShipperCards focus={step.focus} />
-
-            <div className="bg-slate-900 rounded-xl p-4 mb-6">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+            {/* 설명 */}
+            <div className="p-4 rounded-xl bg-red-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-red-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-red-200">키보드 &larr;/&rarr;</span>
               </div>
-              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
-{step.block.code}
-              </pre>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            {step.focus === 'sink' && (
-              <div className="bg-red-50 border-2 border-red-300 rounded-xl p-3 mb-6 text-xs text-red-900">
-                💡 다음(III-2-2)에서는 로그 검색·집계 — LogQL/KQL
+            {/* 마지막 단계: 다음 안내 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-red-50 border-2 border-red-300 text-red-900 text-sm">
+                💡 다음(III-2-2)에서는 <strong>로그 검색·집계 — LogQL</strong>
               </div>
             )}
 
-            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
-              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
-              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
-                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
-                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
               </button>
-              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
-                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-red-600 text-white hover:bg-red-700 transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
             </div>
 
-            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./III-1-2.html" className="text-slate-500 hover:text-slate-700">&larr; III-1-2</a>
+              <a href="./III-2-2.html" className="text-red-600 hover:text-red-800 font-medium">III-2-2 LogQL 검색 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );
