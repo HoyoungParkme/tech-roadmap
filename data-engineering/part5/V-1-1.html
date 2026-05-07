@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — 데이터 카탈로그 (Glue / DataHub / Atlas)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-1-1. 데이터 카탈로그 (Data Catalog — Glue / DataHub / Atlas)
+    학습 목표: 데이터셋 메타정보를 한 곳에 모아 검색/추천하고 lineage·governance까지 관리.
+    핵심 비유: "도서관 카탈로그 + 사서" — 어떤 데이터가 어디에 있고 누구 소유인지, 검색 한 번으로 찾는다.
+    구조: 4단계 (metadata 등록 / search / lineage / governance)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Metadata — Glue Crawler 자동 등록',
+        desc: 'S3·RDS·Redshift에 흩어진 데이터셋의 schema/owner/SLA/PII 태그를 사람이 일일이 적을 수 없다. Glue Crawler가 주기적으로 스캔해서 카탈로그에 자동 등록 — "도서관 사서가 새 책을 매일 정리".',
+        block: {
+          kind: 'yaml',
+          code: `# AWS Glue Crawler 정의 (CDK/Terraform 발췌)
+Crawler:
+  Name: orders-crawler
+  Role: arn:aws:iam::...:role/GlueCrawlerRole
+  DatabaseName: analytics_db
+  Targets:
+    S3Targets:
+      - Path: s3://datalake/raw/orders/
+  Schedule: cron(0 2 * * ? *)   # 매일 02:00 UTC
+
+# 등록되는 메타데이터 (자동 추출)
+Table: orders
+  Location: s3://datalake/raw/orders/
+  Format: parquet
+  Columns:
+    - { name: order_id,    type: string,    pii: false }
+    - { name: customer_id, type: string,    pii: true  }   # PII 태그
+    - { name: amount,      type: decimal,   pii: false }
+  Owner: data-platform@company.com
+  SLA: freshness <= 1h
+  Tags: [domain:sales, tier:gold]`,
+        },
+        focus: 'metadata',
+      },
+      {
+        title: 'Step 2. Search — DataHub 전문 검색 + Facet 필터',
+        desc: '"고객 매출 관련 테이블 어디 있지?"를 Slack에 묻지 말고 카탈로그에서 검색. Full-text + facet 필터 (domain/tier/owner)로 좁힌다. DataHub REST API로 프로그램 연동도 가능.',
+        block: {
+          kind: 'python',
+          code: `# - DataHub 검색 API 호출
+import requests
+
+DATAHUB_URL = "http://datahub-gms:8080"
+
+# - "customer revenue" 키워드 + facet 필터
+payload = {
+    "input": "customer revenue",
+    "entity": "dataset",
+    "filters": [
+        {"field": "domain",      "value": "sales"},
+        {"field": "tier",        "value": "gold"},
+        {"field": "owners",      "value": "data-platform"},
+    ],
+    "start": 0,
+    "count": 10,
+}
+res = requests.post(
+    f"{DATAHUB_URL}/api/v2/search",
+    json=payload,
+).json()
+
+# - 결과: 매칭 데이터셋 + 점수
+for hit in res["entities"]:
+    print(hit["urn"], hit["matchedFields"])
+# urn:li:dataset:(prod,analytics_db.orders,PROD)  ['name','description']
+# urn:li:dataset:(prod,analytics_db.customers,PROD) ['tags']`,
+        },
+        focus: 'search',
+      },
+      {
+        title: 'Step 3. Lineage — Column-level 상·하류 추적',
+        desc: '"이 컬럼 바꾸면 뭐가 깨지지?"의 답. Spark/Airflow가 emit한 lineage 이벤트로 upstream(원천) → downstream(파생 테이블·대시보드) 그래프를 그린다. 컬럼 단위까지 추적해 영향도 분석.',
+        block: {
+          kind: 'yaml',
+          code: `# Apache Atlas / DataHub Lineage 이벤트 (OpenLineage 포맷)
+event:
+  eventType: COMPLETE
+  job:
+    namespace: airflow
+    name: daily_revenue_agg
+  inputs:
+    - namespace: s3://datalake
+      name: raw/orders
+      schema:
+        - { name: order_id,    type: string }
+        - { name: customer_id, type: string }
+        - { name: amount,      type: decimal }
+  outputs:
+    - namespace: redshift://analytics
+      name: mart.daily_revenue
+      schema:
+        - { name: date,         type: date }
+        - { name: total_amount, type: decimal }
+      columnLineage:
+        total_amount:
+          - { input: orders.amount, transform: SUM }
+        date:
+          - { input: orders.order_ts, transform: DATE_TRUNC }
+
+# 카탈로그 UI에서 클릭 → 그래프 표시
+# raw.orders.amount  →  mart.daily_revenue.total_amount
+#                    →  dashboard:revenue-daily (Looker)`,
+        },
+        focus: 'lineage',
+      },
+      {
+        title: 'Step 4. Governance — Access Policy + GDPR 태그',
+        desc: 'PII 컬럼은 마스킹, 재무팀만 접근 등 규칙을 카탈로그에 선언. Glossary로 사내 용어를 통일하고 GDPR·개인정보보호법 보존 정책까지 메타로 관리. "사서가 대출 자격을 확인".',
+        block: {
+          kind: 'yaml',
+          code: `# DataHub Access Policy + Glossary
+policies:
+  - name: pii-mask-customer-id
+    resource:
+      type: dataset
+      filter: { tag: pii }
+    actions:
+      - DATA_READ_QUERY
+    effect: ALLOW
+    transform:
+      column: customer_id
+      method: SHA256_MASK         # 평문 노출 차단
+    principals:
+      - group: analyst
+
+  - name: finance-only-revenue
+    resource:
+      filter: { name: mart.daily_revenue }
+    actions: [DATA_READ_QUERY]
+    effect: ALLOW
+    principals:
+      - group: finance
+
+glossary:
+  - term: Revenue
+    definition: 부가세 제외 순매출 (KRW)
+    owner: finance@company.com
+  - term: Active Customer
+    definition: 최근 30일 내 1회 이상 결제
+    related: [customers.last_order_at]
+
+retention:
+  - dataset: raw/orders
+    gdpr: true
+    retention_days: 1095          # 3년 후 자동 삭제`,
+        },
+        focus: 'governance',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+    };
+
+    const CATALOG = [
+      { key: 'metadata',   emoji: '📋',  name: 'Metadata',   note: 'schema/owner/PII' },
+      { key: 'search',     emoji: '🔍',  name: 'Search',     note: 'full-text + facet' },
+      { key: 'lineage',    emoji: '🧬',  name: 'Lineage',    note: 'up/downstream' },
+      { key: 'governance', emoji: '🏛️', name: 'Governance', note: 'policy + glossary' },
+    ];
+
+    function CatalogCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">📚 도서관 카탈로그 + 사서 (Data Catalog)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {CATALOG.map((c) => {
+              const isActive = focus === c.key;
+              return (
+                <div
+                  key={c.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{c.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{c.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{c.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">데이터 카탈로그 (Glue / DataHub / Atlas)</h1>
+                <p className="text-sm text-slate-500 mt-1">도서관 카탈로그 + 사서 — 메타정보 검색 + 추천 + lineage</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <CatalogCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'governance' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(V-1-2)에서는 데이터 품질 — Great Expectations로 스키마·값·신선도 검증
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

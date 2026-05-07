@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — Queue / Pub-Sub</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📬</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-1. Queue / Pub-Sub — SQS / Pub/Sub / Service Bus
+    학습 목표: 비동기 메시징의 두 패턴 — Queue(1:1) vs Pub-Sub(1:N) + DLQ + FIFO
+    핵심 비유: "우편함 vs 라디오 방송" — Queue=특정인 우편함, Pub-Sub=라디오 동시 청취
+    구조: 4단계 (queue / pubsub / dlq / fifo)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Queue — 우편함 (SQS Standard, 1:1 소비)',
+        desc: 'Queue는 한 메시지를 하나의 Consumer가 받아 처리한다(워커 풀에서 분배). SQS Standard는 at-least-once + 무순서. Visibility Timeout 동안은 다른 워커에게 보이지 않게 잠그고, 처리 완료 시 명시적으로 Delete 해야 큐에서 사라진다. 처리 실패면 자동 재시도.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — SQS Standard Queue + Worker IAM
+resource "aws_sqs_queue" "orders" {
+  name                       = "orders-queue"
+  visibility_timeout_seconds = 60      # 워커가 처리할 시간 (초과 시 재배달)
+  message_retention_seconds  = 345600  # 4일 보관
+  receive_wait_time_seconds  = 20      # Long polling (빈 응답 비용 절감)
+
+  # 처리 실패 시 DLQ로 이동 (Step 3 참고)
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.orders_dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+
+# 흐름 — 1:1 소비 (한 메시지 = 한 워커)
+#
+#   Producer ──► [SQS Queue] ──► Worker A  (msg 1)
+#                              ├► Worker B  (msg 2)
+#                              └► Worker C  (msg 3)
+#
+#   Worker가 ReceiveMessage → 처리 → DeleteMessage
+#   처리 도중 죽으면? Visibility Timeout 만료 후 다른 워커에게 재배달
+#
+# 사용처: 주문 처리, 이메일 발송, 영상 인코딩 잡 등 백그라운드 작업
+# 특징: 트래픽 스파이크를 큐가 흡수 → 워커는 자기 속도로 처리 (decoupling)`,
+        },
+        focus: 'queue',
+      },
+      {
+        title: 'Step 2. Pub-Sub — 라디오 방송 (Pub/Sub, 1:N fan-out)',
+        desc: '한 메시지를 여러 Subscriber가 동시에 받는다. Topic에 publish → 구독한 모든 subscription이 각자 사본을 받는다. 주문 한 건이 발생하면 결제팀·재고팀·알림팀이 동시에 처리하는 구조. Subscriber 추가/제거가 Producer 코드 변경 없이 가능 (decoupling).',
+        block: {
+          kind: 'yaml',
+          code: `# GCP Pub/Sub — Topic 1개 + Subscription N개 (Terraform)
+resource "google_pubsub_topic" "order_events" {
+  name = "order-events"
+}
+
+# 결제 서비스 구독
+resource "google_pubsub_subscription" "billing_sub" {
+  name  = "billing-sub"
+  topic = google_pubsub_topic.order_events.name
+  ack_deadline_seconds = 30
+}
+
+# 재고 서비스 구독
+resource "google_pubsub_subscription" "inventory_sub" {
+  name  = "inventory-sub"
+  topic = google_pubsub_topic.order_events.name
+  ack_deadline_seconds = 30
+}
+
+# 알림 서비스 구독 (push 방식 — Cloud Run으로 자동 전달)
+resource "google_pubsub_subscription" "notify_sub" {
+  name  = "notify-sub"
+  topic = google_pubsub_topic.order_events.name
+  push_config {
+    push_endpoint = "https://notify-svc-xxx.run.app/events"
+  }
+}
+
+# 흐름 — 1:N fan-out (한 메시지 = 모든 Sub가 사본 수신)
+#
+#                     ┌──► billing-sub   ──► 결제 서비스
+#   Publisher ──► Topic ──► inventory-sub ──► 재고 서비스
+#                     └──► notify-sub    ──► 알림 서비스 (push)
+#
+# 비교: AWS는 SNS(Topic) + SQS(Sub) 조합, Azure는 Service Bus Topics`,
+        },
+        focus: 'pubsub',
+      },
+      {
+        title: 'Step 3. DLQ — 실패 메시지 격리 (Dead Letter Queue)',
+        desc: '처리 실패가 반복되는 메시지를 본 큐에서 빼서 별도 DLQ로 격리한다. maxReceiveCount(예: 5)를 넘으면 자동 이동. 본 큐를 "독성 메시지" 한 건이 막아버리는 사고를 막는다. DLQ는 별도로 알람/조사 후 수동 재처리.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — 본 큐 + DLQ 한 쌍 (redrive 설정)
+resource "aws_sqs_queue" "orders_dlq" {
+  name                      = "orders-dlq"
+  message_retention_seconds = 1209600  # 14일 (조사 시간 확보)
+}
+
+resource "aws_sqs_queue" "orders" {
+  name                       = "orders-queue"
+  visibility_timeout_seconds = 60
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.orders_dlq.arn
+    maxReceiveCount     = 5    # 5번 재시도 후 DLQ로 이동
+  })
+}
+
+# CloudWatch Alarm — DLQ에 메시지가 쌓이면 알람
+resource "aws_cloudwatch_metric_alarm" "dlq_alarm" {
+  alarm_name          = "orders-dlq-not-empty"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  statistic           = "Maximum"
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  period              = 60
+  evaluation_periods  = 1
+  dimensions          = { QueueName = aws_sqs_queue.orders_dlq.name }
+  alarm_actions       = [aws_sns_topic.oncall.arn]
+}
+
+# 흐름 — 독성 메시지 차단
+#
+#   msg X ──► [orders-queue] ──► Worker (실패 5회)
+#                              └► [orders-dlq] (격리) ──► 알람 ──► 사람 조사
+#
+# DLQ가 없으면? msg X가 5xx 에러로 무한 재시도하며 본 큐를 막음`,
+        },
+        focus: 'dlq',
+      },
+      {
+        title: 'Step 4. FIFO — 순서 보장 (SQS FIFO + dedup)',
+        desc: 'Standard Queue는 무순서·중복 가능. 결제·재고처럼 순서가 중요하면 FIFO Queue를 쓴다. MessageGroupId가 같은 메시지는 발행 순서대로 한 번씩만 전달된다(exactly-once). 단일 그룹 내 처리량은 초당 ~300건으로 제한됨 — 그룹을 잘게 쪼개면(예: user_id) 병렬도 확보.',
+        block: {
+          kind: 'python',
+          code: `# boto3 — SQS FIFO에 publish (그룹 ID + dedup ID)
+import boto3
+import json
+import uuid
+
+sqs = boto3.client("sqs", region_name="ap-northeast-2")
+QUEUE_URL = "https://sqs.ap-northeast-2.amazonaws.com/123/orders.fifo"
+
+# - 같은 user_id의 이벤트는 발행 순서대로 보장됨
+def publish_order_event(user_id: str, event: dict) -> None:
+    """주문 이벤트를 FIFO 큐에 발행한다.
+
+    Args:
+        user_id: MessageGroupId — 그룹 내에서만 순서 보장
+        event:   payload (created/paid/shipped 등)
+    """
+    sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps(event),
+        MessageGroupId=user_id,                       # - 그룹 = 순서 단위
+        MessageDeduplicationId=str(uuid.uuid4()),     # - 5분 내 중복 자동 제거
+    )
+
+# 사용 예 — 같은 유저는 created → paid → shipped 순으로 처리됨
+publish_order_event("user-42", {"type": "created", "order_id": "o-1"})
+publish_order_event("user-42", {"type": "paid",    "order_id": "o-1"})
+publish_order_event("user-42", {"type": "shipped", "order_id": "o-1"})
+
+# - 다른 유저는 다른 그룹 → 병렬 처리 가능
+publish_order_event("user-99", {"type": "created", "order_id": "o-2"})
+
+# 흐름 비교
+#
+#   Standard FIFO 없이:  paid → created → shipped (뒤바뀜 가능)
+#   FIFO + GroupId:      created → paid → shipped (그룹 내 순서 보장)
+#
+# 그룹 설계 팁
+#   - 그룹을 너무 크게 잡으면(예: "global") 병렬도 0
+#   - 보통 user_id / order_id / device_id 단위로 쪼갬`,
+        },
+        focus: 'fifo',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const MESSAGING = [
+      { key: 'queue',  emoji: '📬', name: 'Queue',   note: 'SQS 1:1' },
+      { key: 'pubsub', emoji: '📻', name: 'Pub-Sub', note: 'Pub/Sub 1:N' },
+      { key: 'dlq',    emoji: '💀', name: 'DLQ',     note: '실패 격리' },
+      { key: 'fifo',   emoji: '🔢', name: 'FIFO',    note: '순서 보장' },
+    ];
+
+    function MessagingCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">📬 우편함 vs 라디오 방송 (Queue / Pub-Sub)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {MESSAGING.map((m) => {
+              const isActive = focus === m.key;
+              return (
+                <div
+                  key={m.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{m.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{m.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{m.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Queue / Pub-Sub</h1>
+                <p className="text-sm text-slate-500 mt-1">우편함 vs 라디오 방송 — SQS / Pub/Sub / Service Bus</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <MessagingCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'fifo' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(III-2-2)에서는 Cache / CDN 심화 — 동네 슈퍼 vs 본사
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — 비용 최적화 (Reserved / Spot / Savings Plans)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>💰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-2. 비용 최적화 — Reserved / Savings Plans / Spot
+    학습 목표: On-Demand 정가에서 벗어나 약정/경매로 30~90% 절감
+    핵심 비유: "정기 구독 vs 떨이세일"
+      - On-Demand=정가, Reserved=1년 약정 30% off,
+      - Spot=경매 90% off (방해 가능), Savings Plans=약정 금액 자동 적용
+    구조: 4단계 (On-Demand / Reserved / Spot / Savings Plans)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. On-Demand — 정가, 유연 (시간당 과금)',
+        desc: 'On-Demand는 약정 없이 시간(또는 초) 단위로 정가 과금. 트래픽이 들쑥날쑥하거나 단기 PoC, 개발/테스트 환경에 적합. 유연성 최고지만 비용도 가장 높다. 기준선(baseline) 워크로드는 Reserved/Savings Plans로, 변동분만 On-Demand로 두는 게 정석.',
+        block: {
+          kind: 'shell',
+          code: `# -- AWS EC2 On-Demand 가격표 (ap-northeast-2 / Linux) ----
+# 가격은 예시이며 시기/리전에 따라 다름. 항상 공식 페이지 확인.
+
+INSTANCE        vCPU  MEM   ON-DEMAND $/hr   1Y RESERVED $/hr   3Y RESERVED $/hr
+t3.medium       2     4GB   $0.052           $0.033 (-37%)      $0.022 (-58%)
+m6i.large       2     8GB   $0.120           $0.076 (-37%)      $0.050 (-58%)
+m6i.xlarge      4     16GB  $0.240           $0.152 (-37%)      $0.100 (-58%)
+c6i.2xlarge     8     16GB  $0.408           $0.257 (-37%)      $0.171 (-58%)
+r6i.xlarge      4     32GB  $0.317           $0.200 (-37%)      $0.133 (-58%)
+
+# -- 한 달 비용 계산 (730시간 기준) ------------------------
+m6i.large On-Demand : $0.120 * 730 = $87.6 / month
+m6i.large 1Y RI     : $0.076 * 730 = $55.5 / month  (-$32.1)
+m6i.large 3Y RI     : $0.050 * 730 = $36.5 / month  (-$51.1)
+
+# -- 언제 On-Demand를 쓰나 ---------------------------------
+[O] 트래픽 변동 큰 burst 워크로드 (이벤트, 광고)
+[O] 단기 PoC / 개발 / QA 환경
+[O] 1년 미만 단명 프로젝트
+[X] 24/7 항상 켜진 prod (-> Reserved/SP)
+[X] batch / fault-tolerant (-> Spot)`,
+        },
+        focus: 'on_demand',
+      },
+      {
+        title: 'Step 2. Reserved Instance — 1/3년 약정, 30~70% 할인',
+        desc: 'RI는 1년 또는 3년 약정으로 인스턴스 타입을 예약하고 정가 대비 30~70% 할인. Standard RI는 더 싸지만 타입 변경 불가, Convertible RI는 비싸지만 패밀리 변경 가능. All Upfront(전액 선납)가 가장 싸고, No Upfront(월납)는 살짝 비싸다.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — EC2 Reserved Instance 구매
+# (실제로는 콘솔/CLI에서 구매; Terraform은 데이터 소스로 조회 후 태깅 권장)
+resource "aws_ec2_capacity_reservation" "web_baseline" {
+  instance_type     = "m6i.large"
+  instance_platform = "Linux/UNIX"
+  availability_zone = "ap-northeast-2a"
+  instance_count    = 10            # 항상 켜진 baseline 10대
+  tenancy           = "default"
+  end_date_type     = "unlimited"
+  tags = {
+    Project = "web-prod"
+    Owner   = "platform"
+  }
+}
+
+# -- Standard vs Convertible 비교 ---------------------------
+# Standard RI
+#   할인율: 최대 -72% (3Y All Upfront)
+#   변경:   AZ / 사이즈 변경만 가능 (같은 패밀리 내)
+#   판매:   Marketplace에서 되팔기 가능
+#
+# Convertible RI
+#   할인율: 최대 -54% (3Y All Upfront)
+#   변경:   패밀리/OS/테넌시까지 교환 가능 (m6i -> c6i OK)
+#   판매:   되팔기 불가
+#
+# -- 결제 옵션 ----------------------------------------------
+# All Upfront      : 전액 선납      (-72%)  현금 흐름 OK일 때
+# Partial Upfront  : 일부 선납      (-70%)  중간
+# No Upfront       : 월납           (-66%)  현금 보호
+
+# -- RI 매칭 흐름 (자동) ------------------------------------
+# 같은 리전/AZ/타입의 인스턴스 실행 -> RI 할인 자동 적용
+# 미사용 RI 시간은 그냥 소멸 (그래서 baseline만 약정)`,
+        },
+        focus: 'reserved',
+      },
+      {
+        title: 'Step 3. Spot — 경매, 최대 90% 할인 (방해 가능)',
+        desc: 'Spot은 AWS의 남는 용량을 경매로 싸게 파는 방식. 최대 90% 할인이지만 2분 전 알림 후 회수될 수 있다. Stateless 워커, 배치, CI/CD, ML training, EKS의 비핵심 노드 그룹에 적합. interruption handler로 graceful shutdown 구현 필수.',
+        block: {
+          kind: 'yaml',
+          code: `# EKS Managed Node Group — Spot worker (Terraform)
+resource "aws_eks_node_group" "spot_workers" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "spot-batch"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = var.private_subnets
+
+  capacity_type  = "SPOT"                       # -- 핵심
+  instance_types = ["m6i.large", "m5.large", "m5a.large"]  # 다양화 = 회수 위험 분산
+
+  scaling_config {
+    desired_size = 5
+    min_size     = 0
+    max_size     = 50
+  }
+
+  # -- Spot 노드에만 taint -> 핵심 워크로드는 Spot에 안 뜨게
+  taint {
+    key    = "spot"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+
+  labels = { lifecycle = "spot", workload = "batch" }
+  tags   = { Name = "spot-batch", AutoScale = "yes" }
+}
+
+# -- Pod 쪽 toleration + nodeSelector ----------------------
+# (배치/스테이트리스 워크로드만 spot에 뜨게)
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: batch-worker }
+spec:
+  template:
+    spec:
+      tolerations:
+        - key: spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector: { lifecycle: spot }
+      terminationGracePeriodSeconds: 110   # Spot 회수 알림 120s 이내 종료
+
+# -- AWS Node Termination Handler (필수) -------------------
+# Helm: aws-node-termination-handler
+# - Spot interruption notice를 감지해 cordon + drain
+# - in-flight 작업이 graceful 종료되도록 SIGTERM 전파
+# - 평균 spot 회수율: 5% 미만 (다양화 적용 시)`,
+        },
+        focus: 'spot',
+      },
+      {
+        title: 'Step 4. Savings Plans — 약정 금액, 자동 적용 (Compute vs EC2)',
+        desc: 'Savings Plans는 "시간당 $X 쓸게"로 약정하면 RI보다 유연하게 할인. Compute SP는 모든 패밀리/리전/Lambda/Fargate까지 적용(최대 -66%), EC2 Instance SP는 특정 패밀리/리전 한정이지만 더 싸다(최대 -72%). 대부분의 회사는 Compute SP가 정답.',
+        block: {
+          kind: 'shell',
+          code: `# -- Savings Plans 비교 매트릭스 ---------------------------
+
+                            Compute SP        EC2 Instance SP   Reserved Instance
+약정 단위                   $/hr (금액)       $/hr (금액)       인스턴스 개수
+최대 할인                   -66%              -72%              -72%
+EC2 적용                    O (모든 패밀리)   O (지정 패밀리)   O (지정 타입)
+Fargate / Lambda 적용       O                 X                 X
+패밀리 변경                 O (자동)          X                 △ (Convertible만)
+리전 변경                   O (자동)          X                 X
+Marketplace 되팔기          X                 X                 O (Standard만)
+유연성                      ★★★★★             ★★★               ★★
+
+# -- 추천 ---------------------------------------------------
+# 99%의 회사: Compute SP 1Y/3Y로 baseline 80% 커버
+#   -> EC2 + Fargate + Lambda 까지 한 번에 할인
+#   -> 패밀리 바꿔도(m6i -> c7i) 그대로 할인 적용
+
+# -- 구매 흐름 (AWS Cost Explorer) -------------------------
+$ aws ce get-savings-plans-purchase-recommendation \\
+    --savings-plans-type COMPUTE_SP \\
+    --term-in-years ONE_YEAR \\
+    --payment-option ALL_UPFRONT \\
+    --lookback-period-in-days SIXTY_DAYS
+
+# 결과 예시
+# Recommended commitment: $4.20/hr (Compute SP, 1Y, All Upfront)
+# Estimated savings:      $11,025 / year (-31%)
+# Coverage:               87% of baseline
+
+# -- 황금 조합 (실무 정석) ---------------------------------
+# baseline 70~80% : Compute Savings Plans 1Y/3Y
+# 변동분          : On-Demand
+# 배치/stateless  : Spot (최대 90% off)
+# -> 평균 -55% 절감, 유연성 유지`,
+        },
+        focus: 'savings_plan',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const PRICING = [
+      { key: 'on_demand',     emoji: '💵', name: 'On-Demand',     note: '정가 / 유연' },
+      { key: 'reserved',      emoji: '💎', name: 'Reserved',      note: '1·3Y 약정 -30~70%' },
+      { key: 'spot',          emoji: '🎰', name: 'Spot',          note: '경매 -90% (회수)' },
+      { key: 'savings_plan',  emoji: '📊', name: 'Savings Plans', note: '약정 금액 자동' },
+    ];
+
+    function PricingCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">💰 정기 구독 vs 떨이세일 (Pricing)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {PRICING.map((p) => {
+              const isActive = focus === p.key;
+              return (
+                <div
+                  key={p.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{p.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{p.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{p.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">비용 최적화 — Reserved / Spot / Savings Plans</h1>
+                <p className="text-sm text-slate-500 mt-1">정기 구독 vs 떨이세일 — 약정/경매로 30~90% 절감</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <PricingCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'savings_plan' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(IV-2-1)에서는 FinOps — 회사 가계부 (태깅 / Cost Explorer / Budget 알람 / Showback·Chargeback)
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

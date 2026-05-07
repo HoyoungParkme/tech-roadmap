@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Kafka (분산 메시지 큐)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📬</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-2. Kafka — 분산 메시지 큐
+    학습 목표: Topic / Partition / Consumer Group / Exactly-Once 4가지 핵심 개념 이해
+    핵심 비유: "우체국 분류" — 토픽=수신함, 파티션=칸막이, consumer group=배달부 팀
+    구조: 4단계 (topic / partition / consumer / exactly_once)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Topic — "수신함 만들기" (이름 붙은 메시지 통)',
+        desc: '토픽은 메시지가 모이는 논리적 채널이다. "주문 토픽", "결제 토픽"처럼 도메인별로 분리한다. 우체국에 "1번 수신함은 주문, 2번은 결제" 라고 칸을 나눠놓는 것. Producer가 토픽으로 보내면 Consumer가 토픽에서 읽어간다. 토픽은 추가만 가능한 로그(append-only log)로 기록된다.',
+        block: {
+          kind: 'shell',
+          code: `# 토픽 생성 — "orders" 라는 수신함 만들기
+kafka-topics.sh --create \\
+  --bootstrap-server kafka:9092 \\
+  --topic orders \\
+  --partitions 1 \\
+  --replication-factor 1
+
+# 토픽 목록 확인
+kafka-topics.sh --bootstrap-server kafka:9092 --list
+# orders
+# payments
+# user-events
+
+# 토픽 상세 보기
+kafka-topics.sh --bootstrap-server kafka:9092 \\
+  --describe --topic orders
+# Topic: orders  PartitionCount: 1  ReplicationFactor: 1
+#   Partition: 0  Leader: 1  Replicas: 1  Isr: 1
+
+# 메시지 한 번 보내보기 (Producer CLI)
+echo '{"order_id":1,"amount":1000}' | \\
+  kafka-console-producer.sh --bootstrap-server kafka:9092 --topic orders
+
+# 메시지 읽기 (Consumer CLI, 처음부터)
+kafka-console-consumer.sh --bootstrap-server kafka:9092 \\
+  --topic orders --from-beginning
+# {"order_id":1,"amount":1000}`,
+        },
+        focus: 'topic',
+      },
+      {
+        title: 'Step 2. Partition — "칸막이로 병렬 처리" (replication 으로 안전하게)',
+        desc: '파티션은 토픽을 여러 개로 쪼갠 물리적 단위다. 파티션 6개면 Consumer 6개가 동시에 읽을 수 있어 처리량이 6배. replication-factor 3은 같은 파티션을 3개 브로커에 복제 — 1대가 죽어도 데이터 손실 없음. 우체국 칸막이를 늘리면 동시에 분류 가능, 사본을 다른 지점에도 두면 화재에도 안전.',
+        block: {
+          kind: 'shell',
+          code: `# 운영용 토픽 — partition 6개 + replication 3
+kafka-topics.sh --create \\
+  --bootstrap-server kafka:9092 \\
+  --topic orders \\
+  --partitions 6 \\
+  --replication-factor 3 \\
+  --config min.insync.replicas=2 \\
+  --config retention.ms=604800000   # 7일 보관
+
+# 파티션 분배 확인 — 브로커 3대에 균등 분산
+kafka-topics.sh --bootstrap-server kafka:9092 \\
+  --describe --topic orders
+# Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+# Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+# Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2
+# ... (6개)
+
+# 파티션 키 = order_id 로 보내면 같은 주문은 같은 파티션 → 순서 보장
+# 키가 없으면 round-robin (순서 보장 X, 처리량 최대)
+
+# 파티션 늘리기는 가능, 줄이기는 불가 (처음부터 여유 있게 잡자)
+kafka-topics.sh --bootstrap-server kafka:9092 \\
+  --alter --topic orders --partitions 12`,
+        },
+        focus: 'partition',
+      },
+      {
+        title: 'Step 3. Consumer Group — "배달부 팀" (group_id 로 팀 묶기)',
+        desc: '같은 group_id 를 가진 Consumer 들은 한 팀이 되어 파티션을 나눠 읽는다. 파티션 6개 + Consumer 3명이면 1명당 2파티션 담당. group_id 가 다르면 별개 팀이라 같은 메시지를 각자 처리(fan-out). offset 은 "어디까지 읽었나" 체크포인트. auto.offset.reset 은 처음 붙을 때 어디부터 읽을지 결정.',
+        block: {
+          kind: 'python',
+          code: `# - Consumer Group 예시 (kafka-python)
+from kafka import KafkaConsumer
+import json
+
+consumer = KafkaConsumer(
+    "orders",
+    bootstrap_servers=["kafka:9092"],
+    group_id="order-processor",        # - 같은 group_id = 한 팀
+    auto_offset_reset="earliest",      # - 처음 붙을 때: earliest/latest
+    enable_auto_commit=False,          # - 수동 커밋 (안전한 처리)
+    value_deserializer=lambda m: json.loads(m.decode()),
+)
+
+for msg in consumer:
+    # - msg.partition / msg.offset 로 어느 칸의 몇 번째 메시지인지 확인
+    print(f"p={msg.partition} off={msg.offset} val={msg.value}")
+
+    try:
+        process_order(msg.value)              # - 비즈니스 로직
+        consumer.commit()                     # - 처리 완료 후 offset 저장
+    except Exception:
+        # - 커밋 안 하면 재시작 시 다시 읽힘 (at-least-once)
+        raise
+
+# - 같은 group_id 로 Consumer 3개 띄우면 파티션 6개를 2개씩 나눠가짐
+# - 다른 group_id 면 같은 메시지를 각자 처리 (fan-out)
+# - Consumer 늘려도 파티션 수까지만 병렬 (그 이상은 idle)`,
+        },
+        focus: 'consumer',
+      },
+      {
+        title: 'Step 4. Exactly-Once — "정확히 한 번" (Idempotent + Transactional)',
+        desc: '기본은 at-least-once (중복 가능). 결제처럼 중복이 치명적인 경우 Exactly-Once가 필요. Producer 에 enable.idempotence=true 켜면 같은 메시지 재전송해도 중복 저장 안 됨. Kafka Streams 의 processing.guarantee=exactly_once_v2 는 read-process-write 전체를 트랜잭션으로 묶어 정확히 한 번 처리한다.',
+        block: {
+          kind: 'python',
+          code: `# - Idempotent Producer — 재전송해도 중복 없음
+from kafka import KafkaProducer
+import json
+
+producer = KafkaProducer(
+    bootstrap_servers=["kafka:9092"],
+    enable_idempotence=True,           # - Producer ID + 시퀀스로 중복 제거
+    acks="all",                        # - 모든 ISR 복제 확인 후 ack
+    retries=10,                        # - 네트워크 오류 시 재시도
+    max_in_flight_requests_per_connection=5,
+    value_serializer=lambda v: json.dumps(v).encode(),
+)
+producer.send("orders", {"order_id": 1, "amount": 1000})
+producer.flush()
+
+# - Kafka Streams — read-process-write 전체를 트랜잭션으로
+# - (Java 예시지만 개념은 동일)
+"""
+Properties props = new Properties();
+props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG,
+          StreamsConfig.EXACTLY_ONCE_V2);   # - 정확히 한 번 보장
+props.put(StreamsConfig.APPLICATION_ID_CONFIG, "order-aggregator");
+
+StreamsBuilder b = new StreamsBuilder();
+b.stream("orders")
+ .groupByKey()
+ .aggregate(...)             # - 집계
+ .toStream()
+ .to("orders-summary");      # - 결과 토픽 — 입력 commit + 출력 send 가 원자적
+"""
+
+# - Exactly-Once 비용: throughput 약간 감소 (트랜잭션 오버헤드)
+# - 결제/재고 같은 도메인에서만 켜고, 로그/메트릭은 at-least-once 로 충분`,
+        },
+        focus: 'exactly_once',
+      },
+    ];
+
+    const KIND_STYLE = {
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const KAFKA = [
+      { key: 'topic',         emoji: '📬', name: 'Topic',          note: '수신함' },
+      { key: 'partition',     emoji: '🗂️', name: 'Partition',      note: '칸막이 (병렬성)' },
+      { key: 'consumer',      emoji: '👥', name: 'Consumer Group', note: '배달부 팀' },
+      { key: 'exactly_once',  emoji: '🎯', name: 'Exactly-Once',   note: '정확히 한 번' },
+    ];
+
+    function KafkaCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">📬 우체국 분류 (Kafka)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {KAFKA.map((k) => {
+              const isActive = focus === k.key;
+              return (
+                <div
+                  key={k.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{k.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{k.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{k.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Kafka — 분산 메시지 큐</h1>
+                <p className="text-sm text-slate-500 mt-1">우체국 분류 — 토픽 / 파티션 / Consumer Group / Exactly-Once</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <KafkaCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'exactly_once' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(IV-2-1)에서는 Streaming SQL — 흐르는 강에 그물 던지기
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

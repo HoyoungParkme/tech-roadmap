@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — CloudWatch / Stackdriver / Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🩺</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-1. CloudWatch / Stackdriver / Monitor
+    학습 목표: 클라우드 네이티브 모니터링 — 메트릭/로그/알람/대시보드 통합
+    핵심 비유: "클라우드 건강검진" — 메트릭(혈압) + 로그(병력) + 알람(이상신호) + 대시보드(차트)
+    구조: 4단계 (metrics / logs / alarms / dashboard)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Metrics — CPU/메모리/네트워크/EBS + Custom Namespace',
+        desc: 'CloudWatch는 EC2/RDS/ELB가 자동으로 보내는 빌트인 메트릭(CPU, 네트워크, EBS IOPS)을 5분 단위로 수집한다. Custom Metric은 namespace + dimension으로 직접 push. Terraform으로 metric 자체를 코드화해 PutMetricData 호출까지 IaC로 관리.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — Custom Metric + CloudWatch Agent 설정
+# (1) EC2에 CloudWatch Agent 설치 — 메모리/디스크 같은 OS 메트릭은 default가 아님
+resource "aws_ssm_parameter" "cw_agent" {
+  name  = "/cloudwatch-agent/config"
+  type  = "String"
+  value = jsonencode({
+    metrics = {
+      namespace = "MyApp/Production"        # ← custom namespace
+      metrics_collected = {
+        mem  = { measurement = ["mem_used_percent"] }
+        disk = { measurement = ["used_percent"], resources = ["/"] }
+      }
+      append_dimensions = {
+        InstanceId = "\${aws:InstanceId}"
+        AutoScalingGroupName = "\${aws:AutoScalingGroupName}"
+      }
+    }
+  })
+}
+
+# (2) 애플리케이션에서 직접 push — boto3
+import boto3
+cw = boto3.client("cloudwatch")
+cw.put_metric_data(
+    Namespace="MyApp/Orders",
+    MetricData=[{
+        "MetricName": "OrdersCreated",
+        "Dimensions": [{"Name": "Env", "Value": "prod"}],
+        "Value": 1, "Unit": "Count",
+    }]
+)
+# 빌트인: AWS/EC2, AWS/RDS, AWS/ELB (자동, 무료 5분 단위)
+# 커스텀: MyApp/* (PutMetricData 호출당 과금, 1분 단위)`,
+        },
+        focus: 'metrics',
+      },
+      {
+        title: 'Step 2. Logs — Log Group + Insights 쿼리',
+        desc: 'CloudWatch Logs는 애플리케이션 로그를 Log Group(논리 묶음) → Log Stream(인스턴스별)으로 적재. Logs Insights는 SQL 비슷한 쿼리 언어로 수억 라인을 초 단위로 검색. ERROR 발생 시점, p99 지연 패턴, 특정 user_id의 요청 흐름까지 추적.',
+        block: {
+          kind: 'shell',
+          code: `# (1) CloudWatch Agent로 /var/log/app/*.log → Log Group으로 전송
+$ aws logs create-log-group --log-group-name /myapp/api
+$ aws logs put-retention-policy \\
+    --log-group-name /myapp/api --retention-in-days 30
+
+# (2) Logs Insights 쿼리 — 콘솔/CLI 모두 가능
+# 최근 1시간 ERROR 로그 상위 10건 + 발생 횟수
+fields @timestamp, @message
+| filter @message like /ERROR/
+| stats count() as errors by bin(5m)
+| sort @timestamp desc
+| limit 10
+
+# p99 latency가 500ms 넘는 요청만 추출
+fields @timestamp, request_id, latency_ms, path
+| filter latency_ms > 500
+| stats count() by path
+| sort count desc
+
+# 특정 user_id의 모든 요청 흐름 (분산 추적)
+fields @timestamp, @message
+| filter user_id = "u_42"
+| sort @timestamp asc
+
+# CLI에서 실행
+$ aws logs start-query \\
+    --log-group-name /myapp/api \\
+    --start-time \$(date -d '1 hour ago' +%s) \\
+    --end-time   \$(date +%s) \\
+    --query-string 'fields @timestamp, @message | filter @message like /ERROR/'
+# → query_id 받고 get-query-results로 polling`,
+        },
+        focus: 'logs',
+      },
+      {
+        title: 'Step 3. Alarms — Threshold + SNS / PagerDuty',
+        desc: 'Metric의 statistic(Avg/Max/p99)이 N분 동안 임계치를 넘으면 ALARM 상태. SNS Topic이 트리거 → 이메일/Slack/PagerDuty/Lambda로 분기. composite alarm으로 "CPU↑ AND 에러율↑" 동시 조건도 가능. 알람 피로(false positive) 줄이려고 datapoints_to_alarm을 신중히 설정.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — Alarm + SNS + PagerDuty 연동
+resource "aws_sns_topic" "alerts" {
+  name = "prod-alerts"
+}
+
+resource "aws_sns_topic_subscription" "pagerduty" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "https"
+  endpoint  = "https://events.pagerduty.com/integration/<KEY>/enqueue"
+}
+
+# CPU > 80% 5분 연속이면 알람
+resource "aws_cloudwatch_metric_alarm" "high_cpu" {
+  alarm_name          = "ec2-high-cpu"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  statistic           = "Average"
+  period              = 60          # 1분 buckets
+  evaluation_periods  = 5           # 5번 연속
+  datapoints_to_alarm = 5           # 5개 모두 위반
+  threshold           = 80
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  dimensions          = { InstanceId = aws_instance.web.id }
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]   # 복구도 통보
+}
+
+# 5xx 에러율 > 1% (math expression)
+resource "aws_cloudwatch_metric_alarm" "high_5xx" {
+  alarm_name          = "alb-5xx-rate"
+  evaluation_periods  = 3
+  threshold           = 1
+  comparison_operator = "GreaterThanThreshold"
+  metric_query {
+    id          = "e1"
+    expression  = "100 * (m_5xx / m_total)"
+    label       = "5xx error rate (%)"
+    return_data = true
+  }
+  metric_query { id = "m_5xx"   metric { metric_name = "HTTPCode_Target_5XX_Count" namespace = "AWS/ApplicationELB" period = 60 stat = "Sum" } }
+  metric_query { id = "m_total" metric { metric_name = "RequestCount"               namespace = "AWS/ApplicationELB" period = 60 stat = "Sum" } }
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}`,
+        },
+        focus: 'alarms',
+      },
+      {
+        title: 'Step 4. Dashboard — JSON + Custom Widgets',
+        desc: '대시보드는 JSON 한 덩어리로 정의 → IaC로 관리. line/stacked/number/text/log widget 조합. 환경(dev/stg/prod)별 분리, 팀별 view 분리. 한 화면에 4 Golden Signal(latency/traffic/errors/saturation)을 깔아두면 사고 시 1분 안에 어느 정거장이 막혔는지 본다.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — CloudWatch Dashboard (JSON body)
+resource "aws_cloudwatch_dashboard" "prod" {
+  dashboard_name = "prod-overview"
+  dashboard_body = jsonencode({
+    widgets = [
+      # (1) line widget — ALB 4xx/5xx 추이
+      {
+        type = "metric", x = 0, y = 0, width = 12, height = 6,
+        properties = {
+          title = "ALB Errors (last 1h)",
+          metrics = [
+            ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", "app/main"],
+            [".",                  "HTTPCode_Target_5XX_Count", ".",            "."],
+          ],
+          view = "timeSeries", stat = "Sum", period = 60, region = "ap-northeast-2",
+        },
+      },
+      # (2) number widget — 현재 RPS
+      {
+        type = "metric", x = 12, y = 0, width = 6, height = 6,
+        properties = {
+          title = "Requests / sec",
+          metrics = [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "app/main"]],
+          view = "singleValue", stat = "Sum", period = 60,
+        },
+      },
+      # (3) log widget — 최근 ERROR 라인
+      {
+        type = "log", x = 0, y = 6, width = 18, height = 6,
+        properties = {
+          title  = "Recent ERRORs",
+          query  = "SOURCE '/myapp/api' | filter @message like /ERROR/ | sort @timestamp desc | limit 50",
+          region = "ap-northeast-2", view = "table",
+        },
+      },
+      # (4) text widget — 운영 메모/runbook 링크
+      {
+        type = "text", x = 0, y = 12, width = 18, height = 2,
+        properties = { markdown = "**On-call**: #ops-prod · **Runbook**: https://wiki/runbook" },
+      },
+    ]
+  })
+}
+# GCP는 Cloud Monitoring + Logs Explorer, Azure는 Azure Monitor + Log Analytics
+# — 이름만 다를 뿐 같은 4축(metric/log/alarm/dashboard) 구조`,
+        },
+        focus: 'dashboard',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const CLOUDMON = [
+      { key: 'metrics',   emoji: '📊', name: 'Metrics',   note: 'CPU/메모리/네트워크/EBS' },
+      { key: 'logs',      emoji: '📝', name: 'Logs',      note: '앱 로그 + Insights 쿼리' },
+      { key: 'alarms',    emoji: '🚨', name: 'Alarms',    note: 'threshold + SNS/PagerDuty' },
+      { key: 'dashboard', emoji: '📺', name: 'Dashboard', note: '차트 + custom widgets' },
+    ];
+
+    function CloudMonCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🩺 클라우드 건강검진 (CloudWatch)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {CLOUDMON.map((c) => {
+              const isActive = focus === c.key;
+              return (
+                <div
+                  key={c.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{c.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{c.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">{c.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">CloudWatch / Stackdriver / Monitor</h1>
+                <p className="text-sm text-slate-500 mt-1">클라우드 건강검진 — 메트릭 + 로그 + 알람 + 대시보드 통합</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <CloudMonCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'dashboard' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(IV-1-2)에서는 비용 최적화 — 정기 구독 vs 떨이세일
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

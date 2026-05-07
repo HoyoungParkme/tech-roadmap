@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Lambda vs Kappa 아키텍처</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-2-2. Lambda vs Kappa 아키텍처
+    학습 목표: 배치+스트리밍 두 path의 Lambda vs 스트리밍 한 path의 Kappa, 무엇을 언제 고를까
+    핵심 비유: "두 강 vs 한 강" — Lambda(batch+stream) vs Kappa(stream only)
+    구조: 4단계 (lambda / kappa / contrast / choose)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Lambda 아키텍처 — "두 강이 흐른다 (Batch + Speed)"',
+        desc: 'Nathan Marz가 제안한 고전 — 같은 데이터를 두 path로 흘린다. Batch layer는 Spark/Hadoop으로 정확한 결과를, Speed layer는 Storm/Flink로 최신 근사치를 만든다. Serving layer가 둘을 합쳐 사용자에게 응답. 정확도와 신선도를 모두 챙기지만 같은 로직을 두 번 짜야 한다.',
+        block: {
+          kind: 'shell',
+          code: `# Lambda 아키텍처 — 두 강(path)
+# ─────────────────────────────────────────────────────────
+#                      ┌─────────────────────────────┐
+#  raw events ──┬──▶  │ Batch Layer (Spark/Hadoop) │  ← 정확
+#               │      │  매시간/매일 전체 재계산    │
+#               │      └────────────┬────────────────┘
+#               │                   │
+#               │      ┌────────────▼────────────────┐
+#               │      │ Serving Layer (HBase/Druid) │ ◀─ 사용자 쿼리
+#               │      └────────────▲────────────────┘
+#               │                   │
+#               │      ┌────────────┴────────────────┐
+#               └─▶  │ Speed Layer (Storm/Flink)   │  ← 최신 (근사)
+#                      │  실시간 윈도우 집계          │
+#                      └─────────────────────────────┘
+# ─────────────────────────────────────────────────────────
+
+# 사용자 응답 = Batch 결과(어제까지) + Speed 결과(오늘 실시간) MERGE
+
+# 예: 일일 활성 사용자(DAU) 카운트
+#  - Batch:  Spark가 매일 새벽 전체 재집계 → 정확한 D-1 DAU
+#  - Speed:  Flink가 Kafka로 실시간 카운트 → 오늘 진행 중 DAU
+#  - Serving: 두 결과 합쳐 "어제 + 오늘 현재" 응답
+
+# 강점
+# - 배치는 정확성/재처리, 스트림은 신선도 — 둘 다 챙김
+# - 배치 layer가 truth source → 스트림 버그가 영구 손상 안 만듦
+
+# 약점
+# - 같은 비즈니스 로직을 Spark + Flink 두 코드베이스로 유지
+# - 두 결과 머지 로직이 Serving layer에 추가 복잡도
+# - 운영 비용 2배 (클러스터 둘, 모니터링 둘)`,
+        },
+        focus: 'lambda',
+      },
+      {
+        title: 'Step 2. Kappa 아키텍처 — "한 강만 흐른다 (Stream Only)"',
+        desc: 'Jay Kreps(LinkedIn)가 제안한 단순화 — Kafka에 모든 이벤트를 길게(예: 30일) 보관하고, Flink/Spark Streaming으로만 처리한다. 재처리가 필요하면 Kafka의 처음부터 replay. Event Sourcing 사상과 결합되어 코드 한 벌, 인프라 한 세트로 끝난다.',
+        block: {
+          kind: 'shell',
+          code: `# Kappa 아키텍처 — 한 강(path)
+# ─────────────────────────────────────────────────────────
+#                      ┌──────────────────────────────┐
+#  raw events ──▶ Kafka │ Stream Processor (Flink)    │ ──▶ Serving
+#  (보존 30일+)         │  - 실시간 처리 v1            │     (Druid/Pinot)
+#                      │  - 로직 변경 시 v2 띄워서    │
+#                      │    Kafka offset=0부터 replay │
+#                      └──────────────────────────────┘
+# ─────────────────────────────────────────────────────────
+
+# 핵심: Kafka가 "변경 불가능한 이벤트 로그" (Event Sourcing)
+#   → 과거를 다시 흘리면 동일한 결과 재생산 (재처리 = replay)
+
+# 재처리 시나리오
+# 1) 새 잡 v2를 띄우고 Kafka offset=earliest부터 처리
+# 2) v2가 따라잡으면 Serving DB의 v1 테이블 ↔ v2 테이블 스왑
+# 3) v1 잡 종료, 끝
+#
+# (Lambda처럼 "Spark 코드를 따로 짤" 필요 없음)
+
+# 같은 DAU 예시 (Kappa)
+flink run \\
+  --class com.example.DauJob \\
+  dau-stream.jar \\
+  --kafka-topic events \\
+  --kafka-offset earliest      # 과거부터 다시 → 정확한 결과 재생산
+
+# 강점
+# - 코드 한 벌, 클러스터 한 세트 (운영 단순)
+# - 비즈니스 로직 변경 시 replay로 백필 — 머지 코드 없음
+# - 항상 "최신 코드 = 최신 결과"
+
+# 약점
+# - Kafka 보존 기간이 한계 (수년치는 보통 무리, S3 보조 필요)
+# - 무거운 배치 집계는 스트림 엔진에 부담 (스테이트 폭증)
+# - 일부 도메인(ML 재학습 등)은 여전히 배치가 자연스러움`,
+        },
+        focus: 'kappa',
+      },
+      {
+        title: 'Step 3. 비교 — 복잡도 / 일관성 / 비용',
+        desc: '같은 문제를 두 방식이 어떻게 푸는지 한눈에. 코드 중복(Lambda는 2배), 결과 일관성(Lambda는 머지 시점 차이, Kappa는 단일 진실), 인프라 비용(Lambda는 클러스터 2종, Kappa는 1종+Kafka 장기 보존). 각 축의 트레이드오프가 선택의 근거가 된다.',
+        block: {
+          kind: 'shell',
+          code: `# 축별 비교 — Lambda vs Kappa
+# ─────────────────────────────────────────────────────────
+# 축                    Lambda                   Kappa
+# ─────────────────────────────────────────────────────────
+# 코드 중복             Spark + Flink 2벌        Flink 1벌
+#                       (같은 로직 두 번)         (단일 코드베이스)
+#
+# 결과 일관성           Batch≠Speed 머지         단일 stream 결과
+#                       시점 차로 일시 불일치     항상 일관
+#
+# 재처리 방법           Batch 재실행             Kafka replay
+#                       (정확하지만 느림)         (offset=0 → 따라잡기)
+#
+# 인프라 비용           Spark + Flink + Serving  Kafka(긴 보존) + Flink
+#                       클러스터 2종 + 머지 로직  Kafka 디스크↑
+#
+# 운영 복잡도           높음 (모니터링/장애 2배)  중 (스트림 1종)
+#
+# 적합 도메인           정확도 절대 우선          신선도 + 단순성 우선
+#                       (재무/리포팅, 규제)        (UX 카운터, 알람, IoT)
+#
+# 스테이트 크기 한계    배치가 무한대 OK         Flink 스테이트 한계 有
+#                                                (RocksDB/체크포인트)
+# ─────────────────────────────────────────────────────────
+
+# 한 줄 요약
+# Lambda: "정확함을 위해 복잡함을 산다"
+# Kappa : "단순함을 위해 Kafka 보존료를 낸다"`,
+        },
+        focus: 'contrast',
+      },
+      {
+        title: 'Step 4. 선택 — 어느 걸 골라야 하나',
+        desc: '"정확도가 절대 우선이고 무거운 배치 집계가 많다" → Lambda. "단순성과 최신성이 우선이고 스트림 엔진 한 벌로 충분하다" → Kappa. 2026년 실무는 Kappa 선호가 우세 (Flink + Iceberg + Kafka 장기보존 조합). 그래도 재무/규제 도메인은 여전히 Lambda가 안전하다.',
+        block: {
+          kind: 'shell',
+          code: `# 의사결정 — 어느 걸 고를까
+# ─────────────────────────────────────────────────────────
+# 질문                                          → 답
+# ─────────────────────────────────────────────────────────
+# "재무·규제 보고서, 1원도 틀리면 안 되나?"     → Lambda
+# "야간 재계산으로 매일 수백 TB 다시 돌리나?"   → Lambda
+# "Spark/Hadoop 자산이 이미 깊게 깔렸나?"       → Lambda
+#
+# "최신성이 정확도만큼 중요한가?"               → Kappa
+# "팀 사이즈가 작아 코드 한 벌이 절실한가?"     → Kappa
+# "Kafka 운영 + 30일+ 보존이 가능한가?"         → Kappa
+# "Event Sourcing 사상으로 시스템 짜는가?"      → Kappa
+# ─────────────────────────────────────────────────────────
+
+# 2026 실무 트렌드
+# - Kappa 우세: Flink + Iceberg(테이블 포맷) + Kafka 장기 보존
+#   → 스트림으로 처리하고 Iceberg에 적재 → 배치 쿼리도 같은 테이블에서
+#   → "사실상 한 강이지만 두 view를 본다" (Streaming Lakehouse)
+#
+# - Lambda 잔존 도메인
+#   · 재무 마감/규제 보고 (정확성 + 감사 추적)
+#   · ML 재학습 (Petabyte 배치 + 실시간 피처)
+#   · 레거시 Spark 자산이 큰 조직
+
+# 결정 트리 한 줄
+#   정확도 ≫ 단순성 ─▶ Lambda
+#   단순성 ≫ 운영비 ─▶ Kappa
+#   둘 다 원하면  ─▶ Streaming Lakehouse (Flink + Iceberg)`,
+        },
+        focus: 'choose',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const ARCHITECTURE = [
+      { key: 'lambda',   emoji: '🔱', name: 'Lambda',   note: 'Batch + Speed' },
+      { key: 'kappa',    emoji: '🌊', name: 'Kappa',    note: 'Stream only' },
+      { key: 'contrast', emoji: '⚖️', name: '비교',     note: '복잡도/비용' },
+      { key: 'choose',   emoji: '🎯', name: '선택',     note: '의사결정' },
+    ];
+
+    function ArchitectureCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🌊 두 강 vs 한 강 (Lambda vs Kappa)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {ARCHITECTURE.map((t) => {
+              const isActive = focus === t.key;
+              return (
+                <div
+                  key={t.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{t.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{t.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{t.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Lambda vs Kappa 아키텍처</h1>
+                <p className="text-sm text-slate-500 mt-1">두 강 vs 한 강 — Batch+Stream 두 path의 Lambda vs Stream only의 Kappa</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <ArchitectureCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'choose' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(V-1-1)에서는 Data Catalog — 도서관 카탈로그 + 사서
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

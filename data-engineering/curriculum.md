@@ -61,11 +61,11 @@
 - **다음 섹션**: III-2-1
 
 ### Section III-2-1. Apache Spark
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Apache Spark 시각화 보기](part3/III-2-1.html) — Driver / Executor / DataFrame / Optimization (분산 요리사 비유)
 - **다음 섹션**: III-2-2
 
 ### Section III-2-2. dbt (Data Build Tool)
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [dbt 시각화 보기](part3/III-2-2.html) — Model / Test / Docs / Lineage (SQL 빌드 시스템 비유)
 - **다음 섹션**: IV-1-1
 
 ---
@@ -73,19 +73,19 @@
 ## Part IV. 통합 & Streaming
 
 ### Section IV-1-1. Airflow ML/DE DAG
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Airflow DAG 시각화 보기](part4/IV-1-1.html) — Sensor/Extract/Transform/Load (공장 작업 순서표 비유)
 - **다음 섹션**: IV-1-2
 
 ### Section IV-1-2. Kafka 개론
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Kafka 시각화 보기](part4/IV-1-2.html) — Topic / Partition / Consumer / Exactly-Once (우체국 분류 비유)
 - **다음 섹션**: IV-2-1
 
 ### Section IV-2-1. Streaming SQL (ksqlDB / Flink)
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Streaming SQL 시각화 보기](part4/IV-2-1.html) — Unbounded / Window / Watermark / CEP (흐르는 강에 그물 비유)
 - **다음 섹션**: IV-2-2
 
 ### Section IV-2-2. Lambda vs Kappa 아키텍처
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Lambda vs Kappa 시각화 보기](part4/IV-2-2.html) — 두 강 vs 한 강 비유
 - **다음 섹션**: V-1-1
 
 ---
@@ -93,17 +93,17 @@
 ## Part V. 거버넌스 & 실전
 
 ### Section V-1-1. Data Catalog (Glue/DataHub)
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Data Catalog 시각화 보기](part5/V-1-1.html) — Metadata / Search / Lineage / Governance (도서관 카탈로그 + 사서 비유)
 - **다음 섹션**: V-1-2
 
 ### Section V-1-2. 데이터 품질 (Great Expectations)
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [데이터 품질 시각화 보기](part5/V-1-2.html) — Expectation / Validation / Docs / CI (식품 검사 비유)
 - **다음 섹션**: V-2-1
 
 ### Section V-2-1. Lineage & Privacy
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Lineage & Privacy 시각화 보기](part5/V-2-1.html) — Lineage / PII / Consent / Right to Erase (족보 + 비밀번호 비유)
 - **다음 섹션**: V-2-2
 
 ### Section V-2-2. 실전 체크리스트
-- **시각화 연결**: 향후 구현 예정
-- **다음 섹션**: 없음
+- **시각화 연결**: [실전 체크리스트 시각화 보기](part5/V-2-2.html) — Storage/Pipeline/Quality/Governance (DE 출항 점검표 비유, **DE 100% 완성 🎉**)
+- **다음 섹션**: 없음 (DE 16번째 학습 자료, 100% 완성)

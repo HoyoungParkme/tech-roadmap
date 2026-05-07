@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Lineage & Privacy</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-2-1. Lineage & Privacy
+    학습 목표: 데이터 추적(lineage) + GDPR / PII 보호 4축
+    핵심 비유: "족보 + 비밀번호" — 어디서 왔는지 + 누가 봤는지
+    구조: 4단계 (lineage / pii / consent / right_to_erase)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Lineage — "족보를 그린다" (OpenLineage + column-level)',
+        desc: 'source → raw → staging → mart → BI 까지 end-to-end 추적. column-level lineage 가 있으면 "이 지표가 왜 이 값인가" 5분 안에 답이 나온다. dbt / Airflow / Spark 가 OpenLineage 표준으로 자동 emit.',
+        block: {
+          kind: 'yaml',
+          code: `# OpenLineage 통합 — column-level
+# ───────────────────────────────────────────────
+# Airflow DAG
+extra_packages:
+  - openlineage-airflow
+
+env:
+  OPENLINEAGE_URL: https://marquez.company.com
+  OPENLINEAGE_NAMESPACE: prod-de
+
+# dbt 프로젝트 (dbt-ol wrapper)
+run_command: dbt-ol run --select fct_orders
+
+# 자동 emit 되는 정보
+job:
+  name: fct_orders.run
+  inputs:
+    - dataset: raw.orders          # 원천
+    - dataset: stg.customers       # 중간
+  outputs:
+    - dataset: mart.fct_orders     # 결과
+  column_lineage:
+    revenue:                        # 컬럼 단위
+      - { input: raw.orders.amount, transformation: SUM }
+      - { input: stg.customers.tier, transformation: JOIN }
+
+# 활용
+# - "revenue 가 왜 어제 0 이지?" -> raw.orders 입력 끊김 즉시 추적
+# - 컬럼 1개 삭제 시 영향받는 BI 대시보드 자동 검색`,
+        },
+        focus: 'lineage',
+      },
+      {
+        title: 'Step 2. PII — "비밀번호를 채운다" (Presidio + Faker 마스킹)',
+        desc: '주민번호 / 카드번호 / 이메일 같은 민감 정보는 raw 진입 시점에 자동 분류 후 마스킹 / 암호화 / 토큰화 셋 중 하나로 처리. analytics 사용자는 마스킹 본만 본다. Presidio 가 스캔, Faker 가 가짜 값 생성.',
+        block: {
+          kind: 'python',
+          code: `# - Presidio + Faker — PII 자동 마스킹
+# - raw -> staging 단계에서 적용
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from faker import Faker
+
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+fake = Faker("ko_KR")
+
+# - 마스킹 / 암호화 / 토큰화 3가지 정책
+POLICY = {
+    "EMAIL_ADDRESS":   "mask",       # a***@b.com
+    "PHONE_NUMBER":    "fake",       # Faker 로 가짜 값
+    "CREDIT_CARD":     "encrypt",    # AES-256 (analytics 접근 금지)
+    "KR_RRN":          "tokenize",   # 일관된 토큰 (JOIN 용)
+}
+
+def scrub(text: str) -> str:
+    """PII 스캔 후 정책에 따라 변환한다."""
+    results = analyzer.analyze(text=text, language="ko")
+    # - 정책 매핑은 운영자가 yaml 로 관리 권장
+    return anonymizer.anonymize(text=text, analyzer_results=results).text
+
+# - CI 검증: production schema 의 PII 컬럼은 strict rule
+# - 접근 로그 audit (누가 / 언제 / 어떤 컬럼 조회) -> 1년 보존`,
+        },
+        focus: 'pii',
+      },
+      {
+        title: 'Step 3. Consent — "본 사람 명단" (consent_db + tag based filter)',
+        desc: '사용자가 어떤 목적에 동의했는가를 별도 DB 에 기록. 마케팅 / 분석 / 광고 목적별 boolean. 모든 분석 쿼리는 consent_db 와 JOIN 해서 동의자만 필터. dbt model 단계에서 자동 적용 (governance 태그).',
+        block: {
+          kind: 'yaml',
+          code: `# consent 기반 필터 — dbt + tag
+# ───────────────────────────────────────────────
+# consent_db.user_consent 스키마
+columns:
+  - { name: user_id,       type: string }
+  - { name: marketing_ok,  type: boolean }
+  - { name: analytics_ok,  type: boolean }
+  - { name: ads_ok,        type: boolean }
+  - { name: updated_at,    type: timestamp }
+
+# dbt model — analytics 용도
+models:
+  - name: mart_user_behavior
+    config:
+      tags: ["pii", "consent_required"]
+    sql: |
+      SELECT b.*
+      FROM {{ ref('stg_user_behavior') }} b
+      JOIN {{ source('consent','user_consent') }} c
+        USING (user_id)
+      WHERE c.analytics_ok = TRUE   -- 동의자만
+
+# CI hook (governance)
+# - tag=consent_required 모델은 consent JOIN 필수 검증
+# - 검증 실패 -> PR merge 차단
+# - 동의 철회 시 다음 dbt run 부터 자동 제외`,
+        },
+        focus: 'consent',
+      },
+      {
+        title: 'Step 4. Right to Erase — "기록 삭제 요청" (soft delete + cascade DW + Lake)',
+        desc: 'GDPR Art.17 — 사용자가 삭제 요청 시 모든 시스템에서 30일 내 제거. soft delete 로 시작 (audit 보존), 30일 후 cascade hard delete 로 DW + Lake + 백업까지. lineage 가 있어야 cascade 대상 자동 발견.',
+        block: {
+          kind: 'python',
+          code: `# - GDPR right to erasure — cascade pipeline
+# - soft delete -> 30일 grace -> hard delete (DW + Lake + 백업)
+from datetime import datetime, timedelta
+
+def erase_request(user_id: str) -> dict:
+    """사용자 삭제 요청을 접수하고 cascade 작업을 큐잉한다."""
+    now = datetime.utcnow()
+    # - 1) soft delete 즉시 (analytics 노출 차단)
+    db.execute(
+        "UPDATE users SET deleted_at = %s WHERE id = %s",
+        (now, user_id),
+    )
+    # - 2) lineage 로 downstream 자동 탐지
+    targets = lineage_api.descendants(f"users.{user_id}")
+    # - DW: mart.* / stg.*  / Lake: s3://raw/users/* / 백업
+    for t in targets:
+        erase_queue.enqueue(t, user_id, exec_at=now + timedelta(days=30))
+
+    audit_log.write({
+        "event": "gdpr_erase_request",
+        "user_id": user_id,
+        "targets": targets,
+        "scheduled_hard_delete": (now + timedelta(days=30)).isoformat(),
+    })
+    return {"status": "scheduled", "targets": len(targets)}
+
+# - 30일 후 cascade hard delete (Airflow DAG)
+# - DW: DELETE / Lake: rewrite parquet without user / 백업: marker file
+# - 완료 후 사용자에게 confirmation email`,
+        },
+        focus: 'right_to_erase',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const PRIVACY_AXES = [
+      { key: 'lineage',        emoji: '🧬', name: 'Lineage',        note: 'column-level 추적' },
+      { key: 'pii',            emoji: '🔒', name: 'PII',            note: '마스킹 / 암호화' },
+      { key: 'consent',        emoji: '📝', name: 'Consent',        note: '동의 기록' },
+      { key: 'right_to_erase', emoji: '🗑️', name: 'Right to Erase', note: 'GDPR 삭제' },
+    ];
+
+    function PrivacyCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🧬 족보 + 비밀번호 (Lineage & Privacy)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {PRIVACY_AXES.map((c) => {
+              const isActive = focus === c.key;
+              return (
+                <div
+                  key={c.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{c.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{c.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{c.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Lineage & Privacy</h1>
+                <p className="text-sm text-slate-500 mt-1">족보 + 비밀번호 — 데이터 추적 + GDPR</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <PrivacyCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'right_to_erase' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(V-2-2)에서는 DE 출항 점검표 (실전 체크리스트)
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

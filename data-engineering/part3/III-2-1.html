@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Apache Spark</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-1. Apache Spark
+    학습 목표: 분산 처리 엔진 — 한 주방장(드라이버)이 여러 보조 요리사(워커)에게 일을 분배.
+    핵심 비유: "분산 요리사" — Driver가 일을 쪼개 Executor들에게 분산, 결과를 합친다.
+    구조: 4단계 (driver / executor / dataframe / optimization)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Driver — 주방장 (SparkSession + DAG 빌드)',
+        desc: 'Driver는 클러스터의 마스터. SparkSession을 만들고 사용자의 코드를 받아 논리적 실행 계획(DAG)을 빌드한다. 직접 데이터를 처리하지 않고, 작업을 stage/task로 쪼개 Executor에게 분배·조율한다. Driver가 죽으면 잡 전체가 종료.',
+        block: {
+          kind: 'python',
+          code: `# Driver — SparkSession 생성 + DAG 빌드
+from pyspark.sql import SparkSession
+
+# 클러스터 진입점 (Driver 프로세스에서 실행)
+spark = (
+    SparkSession.builder
+    .appName("orders-daily")
+    .master("yarn")                         # yarn / k8s / spark://...
+    .config("spark.executor.instances", 10) # 워커 10대
+    .config("spark.executor.cores", 4)
+    .config("spark.executor.memory", "8g")
+    .getOrCreate()
+)
+
+# 아래 transformation은 "계획"만 만든다 — 실제 실행 X (lazy)
+df = spark.read.parquet("s3://lake/orders/")
+daily = (
+    df.filter("year = 2026")
+      .groupBy("day")
+      .sum("amount")
+)
+# 여기까지는 DAG 빌드만 — Driver 메모리에 plan 저장
+# action (count/show/write) 호출 시점에 stage로 쪼개 Executor에 전송
+daily.write.parquet("s3://lake/curated/daily/")  # ← 여기서 실제 실행`,
+        },
+        focus: 'driver',
+      },
+      {
+        title: 'Step 2. Executor — 보조 요리사 (RDD/DataFrame 분산 실행)',
+        desc: 'Executor는 워커 노드의 JVM 프로세스. Driver가 보낸 task를 실제로 처리한다. 데이터는 partition 단위로 쪼개져 각 Executor에 분산되고, partition 하나당 task 하나가 돈다. 결과는 메모리/디스크에 캐시되거나 다음 stage로 shuffle.',
+        block: {
+          kind: 'python',
+          code: `# Executor 동작 — partition 단위 병렬 처리
+# (Driver에서 본 코드, 실제 task는 Executor에서 실행)
+
+df = spark.read.parquet("s3://lake/orders/")
+# 파일이 200개면 기본적으로 200 partition → 200 task 생성
+
+# partition 수 직접 제어
+print(df.rdd.getNumPartitions())   # 200
+
+# narrow transformation — partition 안에서만 (shuffle X, 빠름)
+df2 = df.filter("amount > 100").select("order_id", "amount")
+
+# wide transformation — shuffle 발생 (Executor 간 네트워크 이동)
+df3 = df2.groupBy("user_id").sum("amount")
+# - groupBy/join/distinct 는 같은 키끼리 모이려면 shuffle 필수
+# - shuffle은 비싸다: 디스크 쓰기 + 네트워크 + 디스크 읽기
+
+# 캐시 — 자주 쓰는 중간 결과는 메모리에 (Executor 메모리 사용)
+df3.cache()
+df3.count()           # 첫 action 시 캐시 적재
+df3.filter(...).show()  # 캐시에서 즉시 읽음`,
+        },
+        focus: 'executor',
+      },
+      {
+        title: 'Step 3. DataFrame — 분산 테이블 + Catalyst 최적화',
+        desc: 'DataFrame은 partition으로 쪼개진 분산 테이블. SQL과 거의 1:1로 매핑되고, Catalyst Optimizer가 논리 계획을 자동으로 재작성해 효율적인 물리 계획으로 바꾼다. predicate pushdown, column pruning이 자동 적용되어 Parquet과 만나면 스캔량이 크게 준다.',
+        block: {
+          kind: 'python',
+          code: `# DataFrame API + Catalyst 자동 최적화
+from pyspark.sql import functions as F
+
+orders = spark.read.parquet("s3://lake/orders/")    # 컬럼 50개
+users  = spark.read.parquet("s3://lake/users/")
+
+# - 사용자가 쓴 코드 (논리 계획)
+result = (
+    orders.join(users, "user_id")
+          .filter(F.col("amount") > 100)
+          .select("user_id", "amount", "country")
+)
+
+# - Catalyst가 자동으로 다시 쓴 물리 계획
+# -  1) Predicate pushdown : filter(amount>100)을 join 이전으로 이동
+# -  2) Column pruning     : Parquet에서 user_id/amount/country만 읽음
+# -  3) Join reorder       : 작은 쪽을 build side로
+# -> 사용자는 그냥 SQL스럽게 쓰면 끝, 최적화는 엔진이 처리
+
+# 실제 실행 계획 확인
+result.explain(mode="formatted")
+# == Physical Plan ==
+# *(2) Project [user_id, amount, country]
+# +- *(2) BroadcastHashJoin [user_id], [user_id], Inner
+#    :- *(1) Filter (amount > 100)
+#    :  +- FileScan parquet [user_id,amount] PushedFilters: [GreaterThan(amount,100)]
+#    +- BroadcastExchange ...
+#       +- FileScan parquet [user_id,country]`,
+        },
+        focus: 'dataframe',
+      },
+      {
+        title: 'Step 4. Optimization — AQE / Broadcast Join / Repartition',
+        desc: 'Adaptive Query Execution(AQE)은 실제 stage 결과 통계를 보고 다음 stage 계획을 런타임에 다시 짠다. 작은 테이블은 broadcast join으로 shuffle을 없애고, skew된 partition은 자동 분할. partition 수도 데이터 크기에 맞춰 조정해야 small-file/메모리 문제를 피한다.',
+        block: {
+          kind: 'python',
+          code: `# 1) AQE — 런타임 자동 최적화 (Spark 3.0+)
+spark.conf.set("spark.sql.adaptive.enabled", True)
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", True)
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", True)
+# - shuffle 후 작은 partition들을 자동으로 합침 (small-file 방지)
+# - skew 감지 시 큰 partition을 자동 분할
+
+# 2) Broadcast Join — 작은 테이블은 모든 Executor에 복제 (shuffle X)
+from pyspark.sql.functions import broadcast
+big   = spark.read.parquet("s3://lake/events/")    # 1 TB
+small = spark.read.parquet("s3://lake/dim_user/")  # 50 MB
+
+joined = big.join(broadcast(small), "user_id")
+# - small을 모든 Executor로 복제 → shuffle 없이 local join
+# - 보통 10MB~100MB 이하 테이블에 효과적
+
+# 3) Repartition — partition 수 조정
+df = spark.read.parquet("s3://lake/raw/")
+# - partition 너무 많음 → task overhead, small file
+# - 너무 적음 → Executor 메모리 부족, 병렬도 ↓
+
+df = df.repartition(200, "user_id")   # shuffle 후 200개로 (key 기반)
+df = df.coalesce(50)                  # shuffle 없이 줄이기 (write 직전)
+
+# 다음(III-2-2)에서는 dbt — SQL 빌드 시스템`,
+        },
+        focus: 'optimization',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const SPARK = [
+      { key: 'driver',       emoji: '👨‍🍳', name: 'Driver',       note: '작업 분배 (master)' },
+      { key: 'executor',     emoji: '👷',   name: 'Executor',     note: '워커 노드 실행' },
+      { key: 'dataframe',    emoji: '📊',   name: 'DataFrame',    note: 'Catalyst 최적화' },
+      { key: 'optimization', emoji: '⚡',   name: 'Optimization', note: 'AQE / broadcast' },
+    ];
+
+    function SparkCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">👨‍🍳 분산 요리사 (Apache Spark)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {SPARK.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Apache Spark</h1>
+                <p className="text-sm text-slate-500 mt-1">분산 요리사 — Driver가 일을 쪼개 Executor에게 분배</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <SparkCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'optimization' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(III-2-2)에서는 dbt — SQL 빌드 시스템
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

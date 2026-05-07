@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Engineering 학습 — Streaming SQL (ksqlDB / Flink SQL)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-2-1. Streaming SQL (ksqlDB / Flink SQL)
+    학습 목표: 끊임없이 흐르는 stream 위에서 SQL window 쿼리로 실시간 집계
+    핵심 비유: "흐르는 강에 그물 던지기" — 시간 window 로 잘라서 그물 안에 들어온 것만 집계
+    구조: 4단계 (unbounded / window / watermark / cep)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Unbounded — 끝이 없는 stream',
+        desc: '배치 SQL은 "끝이 있는 테이블"을 한 번에 읽지만, Streaming SQL은 끝이 없는 stream 위에서 동작한다. Kafka topic을 CREATE STREAM 으로 선언하면 이후 INSERT 되는 모든 메시지가 자동으로 들어온다. 쿼리는 계속 실행되며 결과도 stream으로 흘러나간다.',
+        block: {
+          kind: 'yaml',
+          code: `# ksqlDB — Kafka topic 을 stream 으로 선언
+CREATE STREAM clicks (
+  user_id   BIGINT,
+  page      STRING,
+  ts        TIMESTAMP
+) WITH (
+  KAFKA_TOPIC = 'clicks',
+  VALUE_FORMAT = 'JSON',
+  TIMESTAMP   = 'ts'
+);
+
+# Flink SQL — 동일 개념, DDL 형식
+CREATE TABLE clicks (
+  user_id   BIGINT,
+  page      STRING,
+  ts        TIMESTAMP(3),
+  WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+) WITH (
+  'connector' = 'kafka',
+  'topic'     = 'clicks',
+  'format'    = 'json'
+);
+
+# 핵심 차이 — 배치 vs 스트리밍
+# ─────────────────────────────────────────────────
+# 배치 SQL                  Streaming SQL
+# ─────────────────────────────────────────────────
+# 끝이 있는 테이블          끝이 없는 stream
+# 한 번 실행 → 결과 1회     계속 실행 → 결과 stream
+# COUNT(*) → 정수            COUNT(*) → 매 순간 갱신
+# ─────────────────────────────────────────────────`,
+        },
+        focus: 'unbounded',
+      },
+      {
+        title: 'Step 2. Window — Tumble / Hop / Session',
+        desc: '끝이 없는 stream을 시간으로 잘라야 집계가 가능. TUMBLE은 겹치지 않는 고정 구간(1분/1분/1분), HOP은 겹치는 슬라이딩(5분 window 1분마다), SESSION은 활동 간격으로 자동 묶음(idle 30분). "그물의 모양"이 다르다.',
+        block: {
+          kind: 'yaml',
+          code: `# 1) TUMBLE — 겹치지 않는 고정 구간 (가장 일반)
+SELECT
+  TUMBLE_START(ts, INTERVAL '1' MINUTE) AS win_start,
+  page,
+  COUNT(*) AS clicks
+FROM clicks
+GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), page;
+# [10:00-10:01)  /home  142
+# [10:01-10:02)  /home  158
+# [10:02-10:03)  /home  133
+
+# 2) HOP — 슬라이딩 window (겹침)
+SELECT
+  HOP_START(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) AS win_start,
+  COUNT(*) AS clicks_5min
+FROM clicks
+GROUP BY HOP(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE);
+# 1분마다 "지난 5분" 합 → 부드러운 추세선
+
+# 3) SESSION — 활동 간격으로 자동 그룹
+SELECT
+  user_id,
+  SESSION_START(ts, INTERVAL '30' MINUTE) AS session_start,
+  COUNT(*) AS page_views
+FROM clicks
+GROUP BY SESSION(ts, INTERVAL '30' MINUTE), user_id;
+# user_id=42  10:00~10:25  (8 views, 30분 idle 후 종료)
+
+# 비유: 강에 그물 던지기
+# TUMBLE  = 1분짜리 그물 차례차례
+# HOP     = 5분짜리 그물 1분마다 겹쳐서
+# SESSION = 물고기 무리 지나갈 때까지 기다렸다 닫기`,
+        },
+        focus: 'window',
+      },
+      {
+        title: 'Step 3. Watermark — late event 처리',
+        desc: '네트워크 지연으로 10:01:30 이벤트가 10:02:05에 도착할 수 있다. Watermark는 "이 시각 이전 이벤트는 더 안 올 거다"라는 약속. WATERMARK FOR ts AS ts - INTERVAL \'5\' SECOND 는 "최대 5초 늦게 올 수 있다고 가정"한다는 뜻. 그 이후 도착하면 late event로 처리.',
+        block: {
+          kind: 'yaml',
+          code: `# Flink SQL — WATERMARK 선언 (DDL 안에)
+CREATE TABLE clicks (
+  user_id BIGINT,
+  page    STRING,
+  ts      TIMESTAMP(3),
+  WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+) WITH ( 'connector' = 'kafka', ... );
+
+# 의미
+# - "이벤트 시각(ts) 보다 5초 늦게까지는 도착할 수 있다"
+# - watermark = max(ts) - 5s
+# - watermark 가 window 끝을 지나면 → window 닫고 결과 emit
+
+# 동작 예시 — TUMBLE 1분 window [10:00 ~ 10:01)
+# ─────────────────────────────────────────────────────
+# 도착 시각        이벤트 ts        watermark    상태
+# ─────────────────────────────────────────────────────
+# 10:00:30         10:00:25         10:00:20     window 채우는 중
+# 10:00:55         10:00:50         10:00:45     ...
+# 10:01:04         10:00:59         10:00:54     아직 window 안 닫힘
+# 10:01:10         10:01:05         10:01:00     watermark = 10:01:00
+#                                                → window [10:00,10:01) 닫고 결과 emit
+# 10:01:12         10:00:58         (late!)      이미 닫힘 → late event
+
+# late event 처리 옵션
+# 1) 버림 (기본)
+# 2) side output 으로 별도 처리
+# 3) ALLOWED LATENESS — window 를 더 오래 열어둠 (재emit)
+
+# 트레이드오프
+# watermark 짧게 → 결과 빠름,  late event 많아짐
+# watermark 길게 → 결과 늦음,  정확도 ↑`,
+        },
+        focus: 'watermark',
+      },
+      {
+        title: 'Step 4. CEP — MATCH_RECOGNIZE 패턴 매칭 (Flink)',
+        desc: 'Complex Event Processing — stream 안에서 "A 다음 B 다음 C" 같은 시퀀스 패턴을 찾는다. Flink SQL의 MATCH_RECOGNIZE 는 정규식처럼 패턴을 정의하고 매칭된 구간을 출력. 사기 탐지(로그인 → 비밀번호 변경 → 대규모 송금), 이상 거래, 클릭 퍼널 분석 등에 쓴다.',
+        block: {
+          kind: 'yaml',
+          code: `# Flink SQL — MATCH_RECOGNIZE
+# 시나리오: 같은 사용자의 "큰 이체 → 5분 내 또 큰 이체" 사기 패턴 탐지
+
+SELECT *
+FROM transfers
+MATCH_RECOGNIZE (
+  PARTITION BY user_id
+  ORDER BY ts
+  MEASURES
+    A.ts     AS first_ts,
+    B.ts     AS second_ts,
+    A.amount AS first_amt,
+    B.amount AS second_amt
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (A B)
+  WITHIN INTERVAL '5' MINUTE
+  DEFINE
+    A AS A.amount > 1000000,
+    B AS B.amount > 1000000
+);
+# user_id=42, first_ts=10:01:00 amt=1.2M
+#             second_ts=10:03:30 amt=2.5M
+# → 사기 의심 alert 발송
+
+# 패턴 문법 (정규식 유사)
+# A B          A 다음 B
+# A B+         A 다음 B 1번 이상
+# A B* C       A 다음 B 0번 이상, C
+# A B? C       A 다음 B 0~1번, C
+
+# 활용 예
+# - 사기: login_fail{3,} → login_success → transfer
+# - 퍼널: view → cart → checkout → purchase
+# - 이탈: active → idle{10m} → ...
+# - IoT:  temp_normal → temp_high → temp_critical
+
+# ksqlDB는 MATCH_RECOGNIZE 가 없어 — 단순 패턴은 JOIN 으로 흉내`,
+        },
+        focus: 'cep',
+      },
+    ];
+
+    // KIND_STYLE 3종 — yaml label은 'SQL'로 오버라이드
+    const KIND_STYLE = {
+      yaml:   { label: 'SQL',    textColor: '#5eead4' },  // teal — Streaming SQL 강조
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+    };
+
+    const STREAM_SQL = [
+      { key: 'unbounded', emoji: '🌊', name: 'Unbounded', note: '끊임없는 stream' },
+      { key: 'window',    emoji: '⏰', name: 'Window',    note: 'Tumble / Hop / Session' },
+      { key: 'watermark', emoji: '💧', name: 'Watermark', note: 'late event 처리' },
+      { key: 'cep',       emoji: '🎯', name: 'CEP',       note: 'pattern matching' },
+    ];
+
+    function StreamSQLCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🌊 흐르는 강에 그물 (Streaming SQL)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {STREAM_SQL.map((s) => {
+              const isActive = focus === s.key;
+              return (
+                <div
+                  key={s.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-teal-100 border-2 border-teal-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{s.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{s.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{s.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Streaming SQL (ksqlDB / Flink SQL)</h1>
+                <p className="text-sm text-slate-500 mt-1">흐르는 강에 그물 던지기 — unbounded stream 위 SQL window 쿼리</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <StreamSQLCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'cep' && (
+              <div className="bg-teal-50 border-2 border-teal-300 rounded-xl p-3 mb-6 text-xs text-teal-900">
+                💡 다음(IV-2-2)에서는 Lambda vs Kappa 아키텍처
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -61,11 +61,11 @@
 - **다음 섹션**: III-2-1
 
 ### Section III-2-1. Queue / Pub-Sub
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Queue / Pub-Sub 시각화 보기](part3/III-2-1.html) — Queue / Pub-Sub / DLQ / FIFO (우편함 vs 라디오 비유)
 - **다음 섹션**: III-2-2
 
 ### Section III-2-2. Cache / CDN 심화
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Cache / CDN 시각화 보기](part3/III-2-2.html) — In-Memory / CDN / Cache-Aside / Invalidation (동네 슈퍼 vs 본사 비유)
 - **다음 섹션**: IV-1-1
 
 ---
@@ -73,19 +73,19 @@
 ## Part IV. 모니터링 + 비용 최적화
 
 ### Section IV-1-1. CloudWatch / Stackdriver / Monitor
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [CloudWatch 시각화 보기](part4/IV-1-1.html) — Metrics / Logs / Alarms / Dashboard (클라우드 건강검진 비유)
 - **다음 섹션**: IV-1-2
 
 ### Section IV-1-2. 비용 최적화 (Reserved/Spot)
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [비용 최적화 시각화 보기](part4/IV-1-2.html) — On-Demand / Reserved / Spot / Savings Plan (정기 구독 vs 떨이세일 비유)
 - **다음 섹션**: IV-2-1
 
 ### Section IV-2-1. FinOps 기초
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [FinOps 시각화 보기](part4/IV-2-1.html) — Tagging / Showback / Chargeback / Optimization (회사 가계부 + 절약 코치 비유)
 - **다음 섹션**: IV-2-2
 
 ### Section IV-2-2. Multi-region & DR
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Multi-region DR 시각화 보기](part4/IV-2-2.html) — Backup-Restore / Pilot Light / Warm Standby / Multi-Active (두 도시 백업 비유)
 - **다음 섹션**: V-1-1
 
 ---
@@ -93,17 +93,17 @@
 ## Part V. 실전 운영
 
 ### Section V-1-1. Well-Architected Framework
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Well-Architected 시각화 보기](part5/V-1-1.html) — Ops+Security / Reliability / Performance / Cost (5축 점검 비유)
 - **다음 섹션**: V-1-2
 
 ### Section V-1-2. 보안 체크리스트
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [보안 체크리스트 시각화 보기](part5/V-1-2.html) — Identity / Network / Data / Audit (침입자 차단 12 항목 비유)
 - **다음 섹션**: V-2-1
 
 ### Section V-2-1. 운영 자동화 (Runbook/Playbook)
-- **시각화 연결**: 향후 구현 예정
+- **시각화 연결**: [Runbook 시각화 보기](part5/V-2-1.html) — Runbook / Playbook / SSM Automation / Chaos (비상 매뉴얼 + 자동 대응 비유)
 - **다음 섹션**: V-2-2
 
 ### Section V-2-2. 실전 체크리스트
-- **시각화 연결**: 향후 구현 예정
-- **다음 섹션**: 없음
+- **시각화 연결**: [실전 체크리스트 시각화 보기](part5/V-2-2.html) — Reliability / Security / Performance / Cost (Cloud 출항 점검표, **Cloud Infra 100% 완성 🎉**)
+- **다음 섹션**: 없음 (Cloud 17번째 학습 자료, 100% 완성)

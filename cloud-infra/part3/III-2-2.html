@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — Cache / CDN 심화</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🏪</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-2. Cache / CDN 심화
+    학습 목표: ElastiCache(Redis/Memcached) + CloudFront(CDN) + Cache-Aside 패턴 + Invalidation 전략
+    핵심 비유: "동네 슈퍼 vs 본사" — 자주 쓰는 데이터를 가까이(Cache) / 전 세계 가장자리 배포(CDN)
+    구조: 4단계 (In-Memory / CDN / Cache-Aside / Invalidation)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. In-Memory — ElastiCache (Redis / Memcached)',
+        desc: 'Redis = 자료구조(List/Hash/Sorted Set/Pub-Sub) + 영속성. Memcached = 단순 KV + 멀티 스레드. 세션/리더보드/실시간 카운터는 Redis, 단순 캐시는 Memcached. ElastiCache는 매니지드 — replica + 자동 페일오버 제공.',
+        block: {
+          kind: 'yaml',
+          code: `# Terraform — ElastiCache Redis cluster (replica + 자동 페일오버)
+resource "aws_elasticache_replication_group" "session_cache" {
+  replication_group_id = "app-session-cache"
+  description          = "세션/캐시 (Redis 7)"
+  engine               = "redis"
+  engine_version       = "7.1"
+  node_type            = "cache.t4g.small"   # 개발: small / 운영: r7g.large
+  num_cache_clusters   = 2                    # primary + replica 1
+
+  # 페일오버 (운영 필수)
+  automatic_failover_enabled = true
+  multi_az_enabled           = true
+
+  # 보안 (전송/저장 모두 암호화)
+  transit_encryption_enabled = true
+  at_rest_encryption_enabled = true
+  auth_token                 = var.redis_auth_token  # AUTH 비밀번호
+
+  subnet_group_name  = aws_elasticache_subnet_group.private.name
+  security_group_ids = [aws_security_group.cache.id]
+
+  parameter_group_name = "default.redis7"
+
+  # 스냅샷 (운영 권장)
+  snapshot_retention_limit = 7   # 7일 보관
+  snapshot_window          = "03:00-05:00"
+
+  tags = { Env = "prod", Service = "session" }
+}
+
+# Memcached 비교 (단순 KV / 멀티 스레드)
+# resource "aws_elasticache_cluster" "simple" {
+#   engine     = "memcached"
+#   node_type  = "cache.t4g.small"
+#   num_cache_nodes = 3   # 샤딩 (consistent hash)
+# }`,
+        },
+        focus: 'in_memory',
+      },
+      {
+        title: 'Step 2. CDN — CloudFront (전 세계 Edge 배포)',
+        desc: 'CDN = 정적 자원(이미지/JS/CSS/영상)을 사용자와 가까운 Edge에 캐싱. CloudFront는 400+ PoP. Origin은 S3/ALB/EC2. Behavior로 경로별 정책 분기 (예: `/api/*`는 캐시 끄고, `/static/*`은 1년 캐시). HTTPS + WAF 무료.',
+        block: {
+          kind: 'yaml',
+          code: `# CloudFront Distribution + Behavior (CloudFormation)
+Resources:
+  CDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_200   # 한국/일본/북미 (전 세계는 PriceClass_All)
+        HttpVersion: http2and3
+        IPV6Enabled: true
+
+        # Origin 2개 (S3 정적 + ALB 동적)
+        Origins:
+          - Id: S3StaticOrigin
+            DomainName: !GetAtt StaticBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/\${OAI}
+          - Id: AlbApiOrigin
+            DomainName: !GetAtt Alb.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+
+        # 기본 동작 (정적)
+        DefaultCacheBehavior:
+          TargetOriginId: S3StaticOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Compress: true                # gzip/brotli 자동
+
+        # 경로별 분기 (동적은 캐시 끔)
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: AlbApiOrigin
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+
+        # 보안 (WAF + ACM 인증서)
+        WebACLId: !GetAtt WAF.Arn
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Cert
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021`,
+        },
+        focus: 'cdn',
+      },
+      {
+        title: 'Step 3. Cache-Aside — Read-Through 패턴',
+        desc: 'Cache-Aside (Lazy Loading) = 1) 캐시 GET → 2) hit면 반환 / miss면 DB 조회 → 3) 결과를 캐시에 SET. 가장 흔한 패턴. 단점: 첫 요청은 항상 miss(cold start) + 데이터 stale 가능. 해결: warm-up 스크립트 + 적절한 TTL.',
+        block: {
+          kind: 'python',
+          code: `# Cache-Aside 패턴 — Redis GET → DB miss → SET
+import json
+import redis
+from typing import Optional
+
+# -- 클라이언트 (싱글톤 권장 — 매 요청마다 connect 금지)
+_redis = redis.Redis(
+    host="app-session-cache.xxxx.cache.amazonaws.com",
+    port=6379,
+    ssl=True,
+    decode_responses=True,
+    socket_timeout=0.5,    # 캐시 장애 시 빠르게 fallback
+)
+
+CACHE_TTL_SEC = 300  # 5분 — 데이터 특성에 맞춰 조정
+
+def get_user_profile(user_id: int) -> dict:
+    """사용자 프로필 조회 (Cache-Aside)."""
+    cache_key = f"user:profile:{user_id}"
+
+    # -- 1. 캐시 GET
+    try:
+        cached = _redis.get(cache_key)
+        if cached:
+            return json.loads(cached)   # HIT
+    except redis.RedisError:
+        pass  # -- 캐시 장애 시 DB로 fallback (서비스 멈춤 방지)
+
+    # -- 2. MISS → DB 조회
+    profile = _fetch_from_db(user_id)
+    if profile is None:
+        return {}
+
+    # -- 3. 캐시에 SET (TTL 필수 — 무한 stale 방지)
+    try:
+        _redis.setex(cache_key, CACHE_TTL_SEC, json.dumps(profile))
+    except redis.RedisError:
+        pass   # 저장 실패해도 응답은 정상
+
+    return profile
+
+def _fetch_from_db(user_id: int) -> Optional[dict]:
+    """DB에서 사용자 프로필 조회."""
+    # ... SQLAlchemy / psycopg2 쿼리
+    return {"id": user_id, "name": "alice"}
+
+# 주의 — Thundering Herd
+# 인기 키 만료 순간 동시 요청 100개가 모두 DB로 가는 문제.
+# 해결: SETNX 락 + 짧은 jitter, 또는 stale-while-revalidate.`,
+        },
+        focus: 'cache_aside',
+      },
+      {
+        title: 'Step 4. Invalidation — TTL + 강제 무효화 (CDN/Cache 모두)',
+        desc: '캐시 무효화 = 컴퓨터 과학 2대 난제. 전략: 1) TTL(시간 만료) — 단순/안전, 2) 명시적 DELETE(쓰기 시 invalidate) — 정확하지만 누락 위험, 3) Versioned Key (`v=2` 쿼리) — 신구 공존 가능. CDN은 invalidation API + 비싸므로 versioned URL 권장.',
+        block: {
+          kind: 'shell',
+          code: `# -- Redis TTL 전략 ----------------------------------
+# 1) 데이터 특성별 TTL
+#    - 사용자 프로필: 5분 (자주 변경 안 함)
+#    - 상품 가격:    30초 (정확성 중요)
+#    - 인기 글 목록: 60초 (트래픽 분산)
+$ redis-cli SETEX product:42 30 '{"price":12000}'
+
+# 2) 쓰기 시 명시적 무효화 (write-through 보완)
+$ redis-cli DEL user:profile:1234
+$ redis-cli DEL user:settings:1234
+
+# 3) Pattern으로 일괄 삭제 (운영 주의 — KEYS 대신 SCAN)
+$ redis-cli --scan --pattern "user:1234:*" | xargs redis-cli DEL
+
+# -- CloudFront Invalidation API ---------------------
+# 강제 무효화 (월 1000 path 무료, 이후 path당 \$0.005)
+$ aws cloudfront create-invalidation \\
+    --distribution-id E1A2B3C4D5E6F7 \\
+    --paths "/static/css/main.css" "/index.html"
+
+# 결과 확인
+$ aws cloudfront get-invalidation \\
+    --distribution-id E1A2B3C4D5E6F7 \\
+    --id I2J3K4L5M6N7O8
+
+# -- Versioned URL 패턴 (권장) -----------------------
+# 빌드 해시를 파일명에 박아서 새 파일 = 새 URL
+# /static/main.a1b2c3d4.js  ← 캐시 1년 + immutable
+# /static/main.e5f6g7h8.js  ← 새 배포 시 새 해시
+# 무효화 API 불필요 + 롤백도 즉시 (이전 해시 그대로 살아있음)
+
+# 정리 체크리스트
+[ ] 모든 캐시 키에 TTL (무한 보관 금지)
+[ ] 핫 키는 짧은 TTL + jitter (Thundering Herd 방지)
+[ ] CDN은 versioned URL + Cache-Control: immutable
+[ ] Invalidation API는 긴급 hotfix 용도로만`,
+        },
+        focus: 'invalidation',
+      },
+    ];
+
+    const KIND_STYLE = {
+      python: { label: 'Python', textColor: '#86efac' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+    };
+
+    const CACHE = [
+      { key: 'in_memory',    emoji: '⚡', name: 'In-Memory',   note: 'Redis / Memcached' },
+      { key: 'cdn',          emoji: '🌐', name: 'CDN',         note: 'CloudFront' },
+      { key: 'cache_aside',  emoji: '🔄', name: 'Cache-Aside', note: 'Read-Through' },
+      { key: 'invalidation', emoji: '🗑️', name: 'Invalidation', note: 'TTL + 강제' },
+    ];
+
+    function CacheCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">🏪 동네 슈퍼 vs 본사 (Cache / CDN)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {CACHE.map((c) => {
+              const isActive = focus === c.key;
+              return (
+                <div
+                  key={c.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{c.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{c.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{c.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">Cache / CDN 심화</h1>
+                <p className="text-sm text-slate-500 mt-1">동네 슈퍼 vs 본사 — ElastiCache / CloudFront / Cache-Aside / Invalidation</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <CacheCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'invalidation' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(IV-1-1)에서는 CloudWatch — 클라우드 건강검진
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cloud Infra 학습 — 운영 자동화 (Runbook / Playbook)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-2-1. 운영 자동화 — Runbook / Playbook
+    학습 목표: incident 발생 시 수동 절차(Runbook) → 자동화(Playbook) → 자동 복구(SSM) → 의도적 장애 주입(Chaos)
+    핵심 비유: "비상 매뉴얼 + 자동 대응" — 사람이 읽는 절차서에서 시작해 코드로 자동화
+    구조: 4단계 (runbook / playbook / ssm_automation / chaos)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Runbook — "사람이 읽는 비상 매뉴얼"',
+        desc: '5xx 급증 같은 incident가 발생하면 새벽에 깨어난 oncall이 5분 안에 첫 조치를 할 수 있어야 한다. Markdown 절차서 — 증상/영향/즉시 조치/진단/에스컬레이션 5단계로 구조화. 모든 alert에는 runbook URL을 annotation으로 링크. 분기마다 리뷰 필수.',
+        block: {
+          kind: 'shell',
+          code: `# Runbook 템플릿 (wiki/runbook/HighErrorRate.md)
+# Alertmanager의 annotations.runbook → 이 문서로 직접 링크
+---
+title: HighErrorRate (5xx > 5%)
+severity: critical
+owner: ops-team
+last_reviewed: 2026-04-15
+---
+
+## 1. 증상 (Symptom)
+- 5xx 에러율 5% 초과 5분 지속
+- Grafana 링크: https://grafana/d/api-errors
+
+## 2. 영향 (Impact)
+- 사용자 결제 실패 / 주문 누락
+- 매출 영향 시간당 ~500만원 추정
+
+## 3. 즉시 조치 (5분 안에) ⚠️
+1. Slack #incident 채널에 ack: "/ack HighErrorRate"
+2. Grafana 대시보드 확인 → 어느 endpoint?
+3. 최근 30분 배포 있었나? → ArgoCD 확인
+4. YES → 즉시 rollback ("kubectl rollout undo deploy/api")
+5. NO → Step 4 진단으로
+
+## 4. 진단 단계 (10~30분)
+- [ ] CloudWatch Logs 검색: /aws/api ERROR
+- [ ] X-Ray trace에서 슬로우 endpoint 확인
+- [ ] RDS connection pool 포화 여부 (max_conn vs active)
+- [ ] 외부 API 응답 시간 (결제 PG 등)
+
+## 5. 에스컬레이션 (30분 미해결)
+- 2차: @backend-lead 호출
+- 비즈니스 영향: PM @hong 통보
+- 1시간 미해결: 인시던트 commander 지명
+
+# 절대 규칙
+# - alert PR에 runbook URL 없으면 reject
+# - 분기마다 runbook 리뷰 (오래된 명령어 방지)`,
+        },
+        focus: 'runbook',
+      },
+      {
+        title: 'Step 2. Playbook — "Ansible로 코드화한 복구 절차"',
+        desc: 'Runbook의 수동 단계를 코드로 옮긴 것이 Playbook. Ansible / SaltStack 등 IaC 도구로 멱등성(idempotent) 있게 작성. 사람이 명령어 외울 필요 없이 ansible-playbook 한 줄. 단, 아직 사람이 트리거 — 다음 단계는 완전 자동화.',
+        block: {
+          kind: 'yaml',
+          code: `# ansible/playbooks/restart-api.yml
+# 사용: $ ansible-playbook restart-api.yml -e "env=prod"
+---
+- name: Restart API service after high error rate
+  hosts: "tag_Service_api:&tag_Env_{{ env }}"
+  serial: "30%"           # 한 번에 30%씩 (rolling)
+  max_fail_percentage: 10 # 10% 실패 시 중단
+  become: true
+
+  pre_tasks:
+    - name: drain instance from ALB
+      community.aws.elb_target_group:
+        target_group_arn: "{{ tg_arn }}"
+        targets:
+          - Id: "{{ ansible_ec2_instance_id }}"
+        state: absent
+      delegate_to: localhost
+
+    - name: wait for in-flight requests
+      ansible.builtin.wait_for:
+        timeout: 30
+
+  tasks:
+    - name: pull latest image
+      community.docker.docker_image:
+        name: "{{ image_repo }}:{{ image_tag }}"
+        source: pull
+
+    - name: restart api container
+      community.docker.docker_container:
+        name: api
+        image: "{{ image_repo }}:{{ image_tag }}"
+        restart_policy: always
+        state: started
+        recreate: yes
+
+    - name: health check
+      ansible.builtin.uri:
+        url: "http://localhost:8080/healthz"
+        status_code: 200
+      retries: 10
+      delay: 3
+
+  post_tasks:
+    - name: re-register to ALB
+      community.aws.elb_target_group:
+        target_group_arn: "{{ tg_arn }}"
+        targets:
+          - Id: "{{ ansible_ec2_instance_id }}"
+        state: present
+      delegate_to: localhost
+
+# 핵심 포인트
+# - serial + max_fail_percentage = canary 배포 패턴
+# - drain → restart → health → re-register 순서 = zero-downtime
+# - 동일한 playbook 여러 번 실행해도 결과 같음 (idempotent)`,
+        },
+        focus: 'playbook',
+      },
+      {
+        title: 'Step 3. SSM Automation — "AWS가 알아서 복구한다"',
+        desc: 'AWS Systems Manager Automation document(SSM document)는 EventBridge 알람과 연결해 사람 없이 자동 트리거. CPU 95% 5분 → 자동 재시작, EBS 90% → 자동 확장. CloudWatch alarm → EventBridge → SSM Run Document 체인. 사람은 결과만 Slack으로 받는다.',
+        block: {
+          kind: 'yaml',
+          code: `# ssm-automation-restart-unhealthy.yaml
+# CloudWatch Alarm → EventBridge → SSM Document 자동 실행
+---
+schemaVersion: '0.3'
+description: 'Restart unhealthy EC2 when CPU > 95% for 5min'
+assumeRole: 'arn:aws:iam::123456789012:role/SSMAutomationRole'
+
+parameters:
+  InstanceId:
+    type: String
+    description: 'EC2 instance to restart'
+
+mainSteps:
+  - name: tagBeforeRestart
+    action: 'aws:createTags'
+    inputs:
+      ResourceType: EC2
+      ResourceIds: ['{{ InstanceId }}']
+      Tags:
+        - Key: 'AutoRestart'
+          Value: '{{ global:DATE_TIME }}'
+
+  - name: stopInstance
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds: ['{{ InstanceId }}']
+      DesiredState: stopped
+
+  - name: startInstance
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds: ['{{ InstanceId }}']
+      DesiredState: running
+
+  - name: notifySlack
+    action: 'aws:invokeLambdaFunction'
+    inputs:
+      FunctionName: 'slack-incident-notifier'
+      Payload: |
+        {
+          "channel": "#incident",
+          "text": "🔄 Auto-restarted {{ InstanceId }} (CPU>95%)"
+        }
+
+# EventBridge Rule 연결 (Terraform)
+# resource "aws_cloudwatch_event_rule" "high_cpu" {
+#   event_pattern = jsonencode({
+#     source      = ["aws.cloudwatch"],
+#     detail-type = ["CloudWatch Alarm State Change"],
+#     detail = { state = { value = ["ALARM"] } }
+#   })
+# }
+# resource "aws_cloudwatch_event_target" "ssm" {
+#   rule = aws_cloudwatch_event_rule.high_cpu.name
+#   arn  = "arn:aws:ssm:::automation-definition/Restart-Unhealthy"
+# }
+
+# 운영 규칙
+# - 자동 복구는 1회만 시도 (loop 방지)
+# - 2회 연속 발생 시 사람 호출 (PagerDuty)
+# - 모든 자동 작업은 audit 로그 (CloudTrail)`,
+        },
+        focus: 'ssm_automation',
+      },
+      {
+        title: 'Step 4. Chaos Engineering — "의도적으로 장애를 일으켜 본다"',
+        desc: '실제 장애가 나기 전에 평소 업무 시간에 일부러 깨뜨려 본다. AWS FIS(Fault Injection Simulator) / Gremlin / Chaos Monkey로 EC2 종료, 네트워크 지연, DB 페일오버 등을 주입. 분기 1회 game day로 팀 전체 대응 훈련. Runbook/Playbook이 실제로 동작하는지 검증.',
+        block: {
+          kind: 'yaml',
+          code: `# fis-experiment-az-failure.yaml
+# AWS Fault Injection Simulator — AZ 1개 다운 시뮬레이션
+---
+description: 'Simulate AZ failure - terminate 50% EC2 in ap-northeast-2a'
+roleArn: 'arn:aws:iam::123456789012:role/FISRole'
+
+stopConditions:
+  - source: 'aws:cloudwatch:alarm'
+    value: 'arn:aws:cloudwatch:ap-northeast-2:...:alarm/p99-latency-breach'
+    # SLO 깨지면 즉시 실험 중단 (안전장치)
+
+targets:
+  apiServers:
+    resourceType: 'aws:ec2:instance'
+    resourceTags:
+      Service: 'api'
+      Env: 'staging'             # ⚠️ prod 직접 X, staging 먼저
+    selectionMode: 'PERCENT(50)'
+    filters:
+      - path: 'Placement.AvailabilityZone'
+        values: ['ap-northeast-2a']
+
+actions:
+  terminateApi:
+    actionId: 'aws:ec2:terminate-instances'
+    targets:
+      Instances: 'apiServers'
+
+  injectNetworkLatency:
+    actionId: 'aws:ssm:send-command'
+    parameters:
+      documentArn: 'arn:aws:ssm:::document/AWSFIS-Run-Network-Latency'
+      duration: 'PT5M'
+      latencyMilliseconds: '500'
+    targets:
+      Instances: 'apiServers'
+
+# Game Day 실행 절차 (분기 1회)
+# 1. T-7d: 일정 공지 + 시나리오 공유
+# 2. T-1d: staging 환경 dry-run
+# 3. T 0:   prod 실험 시작 (오전 10시 = 인원 풀가동)
+# 4. 관찰: Auto-scaling 동작? Runbook 잘 따라가나?
+# 5. T+1h: 실험 종료, 즉시 후기 회의
+# 6. T+1d: postmortem + Runbook 개선 PR
+
+# Game Day 합격 기준
+# - SLO 위반 0건 (또는 stopCondition으로 자동 중단)
+# - MTTA < 5분, MTTR < 30분
+# - 모든 oncall 멤버가 runbook으로 자력 대응 가능
+
+# 안티패턴
+# ✗ "그냥 한 번 해보자" → 시나리오 없이 prod = 실제 사고
+# ✗ stopCondition 없는 실험 → 무한 장애
+# ✗ 회고 없는 game day → 학습 0`,
+        },
+        focus: 'chaos',
+      },
+    ];
+
+    const KIND_STYLE = {
+      yaml:   { label: 'YAML',   textColor: '#fde68a' },
+      shell:  { label: 'Bash',   textColor: '#a5f3fc' },
+      python: { label: 'Python', textColor: '#86efac' },
+    };
+
+    const AUTOMATION = [
+      { key: 'runbook',         emoji: '📖', name: 'Runbook',        note: '사람이 읽는 절차서' },
+      { key: 'playbook',        emoji: '🤖', name: 'Playbook',       note: 'Ansible 자동화' },
+      { key: 'ssm_automation',  emoji: '🛠️', name: 'SSM Automation', note: 'AWS 자동 복구' },
+      { key: 'chaos',           emoji: '💥', name: 'Chaos',          note: '의도적 장애 주입' },
+    ];
+
+    function AutomationCards({ focus }) {
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+          <div className="text-xs font-bold text-slate-700 mb-3">📖 비상 매뉴얼 + 자동 대응 (Runbook / Playbook)</div>
+          <div className="grid grid-cols-4 gap-2">
+            {AUTOMATION.map((a) => {
+              const isActive = focus === a.key;
+              return (
+                <div
+                  key={a.key}
+                  className={`rounded-lg p-3 text-center transition-all ${isActive ? 'bg-blue-100 border-2 border-blue-400 scale-105' : 'bg-slate-50 border border-slate-200'}`}
+                >
+                  <div className="text-2xl">{a.emoji}</div>
+                  <div className="text-xs font-bold text-slate-800 mt-1">{a.name}</div>
+                  <div className="text-[10px] text-slate-500 mt-1">{a.note}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [currentStep, setCurrentStep] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const handleNextRef = useRef(null);
+      const handlePrevRef = useRef(null);
+
+      const handleNext = () => {
+        if (currentStep < STEPS.length - 1) setCurrentStep((c) => c + 1);
+        else setIsPlaying(false);
+      };
+      const handlePrev = () => setCurrentStep((c) => Math.max(0, c - 1));
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => handleNextRef.current(), 4500);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') handleNextRef.current();
+          if (e.key === 'ArrowLeft') handlePrevRef.current();
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (currentStep === STEPS.length - 1) setCurrentStep(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[currentStep];
+      const blockStyle = KIND_STYLE[step.block.kind];
+
+      return (
+        <div className="min-h-screen bg-slate-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <a href="../index.html" className="text-xs text-slate-500 hover:text-slate-700">← 허브로</a>
+                <h1 className="text-2xl font-bold text-slate-800 mt-1">운영 자동화 — Runbook / Playbook</h1>
+                <p className="text-sm text-slate-500 mt-1">비상 매뉴얼 + 자동 대응 — Runbook / Playbook / SSM / Chaos</p>
+              </div>
+              <div className="text-right">
+                <div className="text-[11px] text-slate-400">Step</div>
+                <div className="text-2xl font-bold text-slate-700">{currentStep + 1} / {STEPS.length}</div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+              <div className="font-bold text-slate-800 text-lg mb-2">{step.title}</div>
+              <p className="text-sm text-slate-600 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <AutomationCards focus={step.focus} />
+
+            <div className="bg-slate-900 rounded-xl p-4 mb-6">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-[10px] text-slate-400">{blockStyle.label}</span>
+              </div>
+              <pre className="font-mono text-sm overflow-x-auto whitespace-pre" style={{ color: blockStyle.textColor }}>
+{step.block.code}
+              </pre>
+            </div>
+
+            {step.focus === 'chaos' && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-3 mb-6 text-xs text-blue-900">
+                💡 다음(V-2-2)에서는 Cloud 출항 점검표 — 실전 체크리스트
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3 bg-white rounded-xl shadow-sm border border-slate-200 p-3">
+              <button onClick={handlePrev} disabled={currentStep === 0} aria-label="이전 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">← 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-5 py-2 rounded-md bg-slate-800 text-white text-sm font-medium hover:bg-slate-700">
+                {isPlaying ? '⏸ 정지' : (currentStep === STEPS.length - 1 ? '↻ 처음부터' : '▶ 자동 재생')}
+              </button>
+              <button onClick={handleNext} disabled={currentStep === STEPS.length - 1} aria-label="다음 단계"
+                className="px-4 py-2 rounded-md bg-slate-100 text-slate-700 text-sm font-medium hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed">다음 →</button>
+            </div>
+
+            <p className="text-center text-[11px] text-slate-400 mt-3">키보드 ←/→ 로 단계 이동 가능</p>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
