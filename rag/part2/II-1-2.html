@@ -9,332 +9,783 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    II-1-2. 전처리 파이프라인 — clean / normalize / dedupe / OCR
+    학습 목표: 로딩된 원본의 잡음을 5단계로 깨끗한 텍스트로 만들어
+              검색 품질을 끌어올리는 과정을 직관적으로 이해한다.
+    핵심 비유: 음식 재료 손질 — 씻기 → 껍질 → 상한 부분 → 스캔 텍스트 살리기 → 완성
+    패턴: fastapi v1 — 좌(LiveDataPane: raw/cleaned 박스 + 변환 시각화) / 우(VSCode CodeViewer)
+    색상: rag rose
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    const PIPELINE_STAGES = [
-      { label: '노이즈 제거', icon: '\uD83E\uDDF9', desc: '헤더, 푸터, 광고, 네비게이션 등 불필요한 요소 제거' },
-      { label: '정규화', icon: '\uD83D\uDD27', desc: '유니코드 통일, 공백 정리, 특수문자 처리' },
-      { label: '중복 제거', icon: '\uD83D\uDD91\uFE0F', desc: '동일/유사 문서 감지 및 제거' },
-      { label: '필터링', icon: '\uD83D\uDD0D', desc: '최소 길이 미달, 의미 없는 문서 제외' },
+    // ─────────────────────────────────────────────────────
+    // 원본 문서 — 잡음이 가득한 사내 인사규정 페이지
+    //   각 라인에 line 번호 / 카테고리 / 텍스트
+    //   카테고리(kind):
+    //     'noise'   : 헤더/푸터/광고 — Step 2에서 line-through
+    //     'normal'  : 본문이지만 공백/전각 미정규 — Step 2에서 cleaned
+    //     'dupe'    : 중복 문서 — Step 3에서 line-through
+    //     'image'   : 스캔 이미지 placeholder — Step 4에서 OCR로 텍스트 채워짐
+    // ─────────────────────────────────────────────────────
+    const RAW_LINES = [
+      { n: 1,  kind: 'noise',  raw: '===== 헤더: 주식회사 ABC =====' },
+      { n: 2,  kind: 'noise',  raw: 'Navigation: Home | About | Contact' },
+      { n: 3,  kind: 'noise',  raw: 'Copyright 2024 ABC Corp.' },
+      { n: 4,  kind: 'normal', raw: '제1장   인사규정' },
+      { n: 5,  kind: 'normal', raw: '1.1 근무시간은　오전 9시부터 오후 6시까지로 한다．' },
+      { n: 6,  kind: 'noise',  raw: '[광고] 신입사원 모집중! 지금 바로 지원하세요!' },
+      { n: 7,  kind: 'normal', raw: '1.2 연차 휴가는 다음과 같다:' },
+      { n: 8,  kind: 'dupe',   raw: '1.2 연차 휴가는 다음과 같다:  (중복 페이지)' },
+      { n: 9,  kind: 'image',  raw: '[image: scan_p3.png — 스캔 이미지]', ocr: '   - 1년 미만: 월 1일' },
+      { n: 10, kind: 'image',  raw: '[image: scan_p4.png — 스캔 이미지]', ocr: '   - 3년 이상: 15일 + 근속년수×1일' },
+      { n: 11, kind: 'noise',  raw: '===== 푸터: Copyright 2024 =====' },
     ];
 
-    const BEFORE_TEXT = `===== 헤더: 주식회사 ABC =====
-Navigation: Home | About | Contact
-Copyright 2024 ABC Corp.
+    // 정제된 라인 (Step 2 normalize 적용 후) — 잡음 제거 + 전각/이상 공백 정규화
+    const CLEANED_NORMAL = {
+      4:  '제1장 인사규정',
+      5:  '1.1 근무시간은 오전 9시부터 오후 6시까지로 한다.',
+      7:  '1.2 연차 휴가는 다음과 같다:',
+    };
 
-제1장   인사규정
-
-1.1 근무시간은　오전 9시부터 오후 6시까지로 한다．
-단，플렉스타임 적용 부서는 예외로 한다．
-
-[광고] 신입사원 모집중! 지금 바로 지원하세요!
-
-1.2 연차 휴가는 다음과 같다:
-  - 1년 미만: 월 1일
-  - 1년 이상～3년 미만:  15일
-  - 3년 이상: 15일 + 근속년수×1일
-
-===== 푸터: Copyright 2024 =====
-Navigation: Home | About | Contact`;
-
-    const AFTER_TEXT = `제1장 인사규정
-
-1.1 근무시간은 오전 9시부터 오후 6시까지로 한다.
-단, 플렉스타임 적용 부서는 예외로 한다.
-
-1.2 연차 휴가는 다음과 같다:
-  - 1년 미만: 월 1일
-  - 1년 이상~3년 미만: 15일
-  - 3년 이상: 15일 + 근속년수x1일`;
-
+    // ─────────────────────────────────────────────────────
+    // 5단계 STEPS 정의
+    //   각 step의 dataState:
+    //     leftLines  : 좌측 raw 박스에 표시할 라인 (kind/state 포함)
+    //     rightLines : 우측 cleaned 박스에 표시할 라인 (없으면 빈 박스)
+    //     stats      : 하단 통계 패널 (raw bytes / cleaned bytes / 잡음 비율 …)
+    //     highlightKind : 이 step에서 강조할 카테고리 (raw 박스에서 깜빡)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        desc: "전처리는 음식 재료 손질과 같습니다. 아무리 좋은 재료도 씻고, 껍질 벗기고, 상한 부분을 잘라내야 요리할 수 있습니다. 문서도 마찬가지 — 로딩된 원본에는 노이즈가 가득합니다.",
-        activeStage: -1, showBefore: true, showAfter: false, showCode: false
+        title: 'Step 1. 원본 — 헤더/푸터/광고 잡음',
+        desc: '로딩된 원본 페이지에는 본문 외에도 헤더, 푸터, 네비게이션, 광고, 중복 페이지, 스캔 이미지가 뒤섞여 있다. 이 상태로 청킹하면 모든 청크에 "Copyright 2024"가 박혀 임베딩 품질이 무너진다. 좌측 raw 박스에는 11라인 모두 표시되고, 우측 cleaned 박스는 비어있다.',
+        leftLines: RAW_LINES.map((l) => ({ ...l, state: 'raw' })),
+        rightLines: [],
+        highlightKind: null,
+        stats: { rawBytes: 423, cleanedBytes: 0, noiseRatio: null, dupes: 0, ocr: 0 },
+        code: {
+          lang: 'python',
+          filename: 'raw.py',
+          lines: [
+            '# Step 1. 원본 페이지 — 잡음 가득한 그대로의 텍스트',
+            'from langchain_community.document_loaders import WebBaseLoader',
+            '',
+            '# 사내 인사규정 페이지 (HTML)를 그대로 로딩',
+            'loader = WebBaseLoader("https://abc.corp/hr/policy.html")',
+            'docs = loader.load()',
+            '',
+            'print(docs[0].page_content[:200])',
+            '#  ===== 헤더: 주식회사 ABC =====',
+            '#  Navigation: Home | About | Contact',
+            '#  Copyright 2024 ABC Corp.',
+            '#  제1장   인사규정                          ← 전각 공백',
+            '#  1.1 근무시간은　오전 9시부터 오후 6시까지로 한다．  ← 전각 마침표',
+            '#  [광고] 신입사원 모집중! 지금 바로 지원하세요!',
+            '#  1.2 연차 휴가는 다음과 같다:',
+            '#  1.2 연차 휴가는 다음과 같다:                ← 중복 페이지 사본',
+            '#  [image: scan_p3.png]                       ← 본문이 이미지!',
+            '#  [image: scan_p4.png]',
+            '#  ===== 푸터: Copyright 2024 =====',
+            '',
+            '# ─── 문제 ───',
+            '#  1) 헤더·푸터·광고 = 모든 페이지 반복 → 청크마다 박힘',
+            '#  2) 전각 공백/마침표 → "오전 9시" 검색해도 못 찾음',
+            '#  3) 같은 단락이 두 번 등장 → 중복 청크',
+            '#  4) 본문 일부가 스캔 이미지 → 검색에서 통째로 누락',
+            '',
+            '# 다음 4단계: clean → normalize → dedupe → OCR',
+          ],
+          highlight: [4, 5, 6, 8, 12, 13, 16, 17, 18, 26],
+        },
       },
       {
-        desc: "[1단계] 노이즈 제거 — 헤더, 푸터, 네비게이션, 광고 같은 '껍질'을 벗겨냅니다. 이 요소들은 검색 품질을 크게 떨어뜨리는 주범입니다.",
-        activeStage: 0, showBefore: true, showAfter: false, showCode: true
+        title: 'Step 2. Clean — HTML 태그 제거, 공백 정규화',
+        desc: '첫 번째 칼질. 헤더(=== 헤더 ===), 푸터, 네비게이션, 광고, Copyright 같은 정규식 매칭 잡음을 한 번에 잘라낸다. 동시에 NFKC 유니코드 정규화로 전각 공백·전각 마침표를 반각으로 통일한다. 좌측 잡음 라인은 line-through로 사라지고, 우측 cleaned 박스에 깨끗해진 본문 3라인이 처음 나타난다.',
+        leftLines: RAW_LINES.map((l) => ({
+          ...l,
+          state: l.kind === 'noise' ? 'removed' : 'raw',
+        })),
+        rightLines: [
+          { n: 4, text: CLEANED_NORMAL[4], state: 'new' },
+          { n: 5, text: CLEANED_NORMAL[5], state: 'new' },
+          { n: 7, text: CLEANED_NORMAL[7], state: 'new' },
+          { n: 8, text: '1.2 연차 휴가는 다음과 같다:', state: 'pending', label: 'dupe?' },
+          { n: 9, text: '[image: scan_p3.png]', state: 'pending', label: 'image?' },
+          { n: 10, text: '[image: scan_p4.png]', state: 'pending', label: 'image?' },
+        ],
+        highlightKind: 'noise',
+        stats: { rawBytes: 423, cleanedBytes: 312, noiseRatio: 26, dupes: 0, ocr: 0 },
+        code: {
+          lang: 'python',
+          filename: 'clean.py',
+          lines: [
+            '# Step 2. Clean — HTML 태그 제거 + 정규식 잡음 컷 + NFKC 정규화',
+            'import re',
+            'import unicodedata',
+            'from bs4 import BeautifulSoup',
+            '',
+            'NOISE_PATTERNS = [',
+            '    r"={3,}.*?={3,}",          # ===== 헤더 ===== 형태',
+            '    r"Navigation:.*?$",        # 네비게이션',
+            '    r"Copyright\\s+\\d{4}.*?$", # 저작권 표시',
+            '    r"\\[광고\\].*?$",         # [광고] 라인',
+            ']',
+            '',
+            'def clean(text: str) -> str:',
+            '    """헤더·푸터·광고 정규식 컷 + NFKC 정규화."""',
+            '    # 1) HTML 태그가 있으면 BeautifulSoup 으로 텍스트만',
+            '    if "<" in text and ">" in text:',
+            '        text = BeautifulSoup(text, "html.parser").get_text()',
+            '',
+            '    # 2) 잡음 라인 정규식으로 제거',
+            '    for pat in NOISE_PATTERNS:',
+            '        text = re.sub(pat, "", text, flags=re.MULTILINE)',
+            '',
+            '    # 3) NFKC — 전각 공백·전각 마침표 → 반각',
+            '    #    "오전　9시" → "오전 9시"  /  "한다．" → "한다."',
+            '    text = unicodedata.normalize("NFKC", text)',
+            '',
+            '    # 4) 연속 공백·빈 줄 압축',
+            '    text = re.sub(r"[ \\t]+", " ", text)',
+            '    text = re.sub(r"\\n{3,}", "\\n\\n", text)',
+            '    return text.strip()',
+            '',
+            '# ✓ 잡음 4종(헤더/푸터/네비/광고) 제거',
+            '# ✓ 전각 → 반각 통일 (검색 일치율 ↑)',
+            '# 효과: 423B → 312B (잡음 26%↓)',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 10, 13, 17, 20, 21, 25, 28, 29],
+        },
       },
       {
-        desc: "[2단계] 정규화 — 전각 문자를 반각으로, 불규칙한 공백을 정리하고, 유니코드를 통일합니다. '오전 9시'와 '오전　9시'가 같은 텍스트임을 보장합니다.",
-        activeStage: 1, showBefore: false, showAfter: false, showCode: true
+        title: 'Step 3. Dedupe — 중복 페이지 제거 (hash)',
+        desc: '같은 단락이 여러 소스에서 중복 로딩되는 일은 흔하다. 페이지네이션 사이트, RSS+웹스크래핑 동시 수집, A/B 페이지 변형 같은 경우. 본문을 정규화한 뒤 MD5/SHA256 해시를 키로 set 에 넣어 O(N)으로 중복을 잡는다. 좌측 8번 줄 (중복 페이지) 라인이 line-through로 사라지고, 우측 cleaned 박스에서도 사라져 6라인 중 5라인만 남는다.',
+        leftLines: RAW_LINES.map((l) => ({
+          ...l,
+          state:
+            l.kind === 'noise' ? 'removed' :
+            l.kind === 'dupe'  ? 'removed' :
+            'raw',
+        })),
+        rightLines: [
+          { n: 4, text: CLEANED_NORMAL[4], state: 'kept' },
+          { n: 5, text: CLEANED_NORMAL[5], state: 'kept' },
+          { n: 7, text: CLEANED_NORMAL[7], state: 'kept' },
+          { n: 9, text: '[image: scan_p3.png]', state: 'pending', label: 'image?' },
+          { n: 10, text: '[image: scan_p4.png]', state: 'pending', label: 'image?' },
+        ],
+        highlightKind: 'dupe',
+        stats: { rawBytes: 423, cleanedBytes: 286, noiseRatio: 32, dupes: 1, ocr: 0 },
+        code: {
+          lang: 'python',
+          filename: 'dedupe.py',
+          lines: [
+            '# Step 3. Dedupe — 본문 해시 기반 중복 제거 (O(N))',
+            'import hashlib',
+            'from typing import Iterable',
+            'from langchain_core.documents import Document',
+            '',
+            'def _content_hash(text: str) -> str:',
+            '    """공백 정규화 후 MD5 16바이트 해시."""',
+            '    normalized = " ".join(text.split())',
+            '    return hashlib.md5(normalized.encode("utf-8")).hexdigest()',
+            '',
+            'def dedupe(docs: Iterable[Document]) -> list[Document]:',
+            '    """완전 일치 중복만 제거. 유사 중복은 다음 단계."""',
+            '    seen: set[str] = set()',
+            '    unique: list[Document] = []',
+            '    for doc in docs:',
+            '        h = _content_hash(doc.page_content)',
+            '        if h in seen:',
+            '            continue              # 중복 → skip',
+            '        seen.add(h)',
+            '        unique.append(doc)',
+            '',
+            '    removed = sum(1 for _ in docs) - len(unique)',
+            '    print(f"중복 제거: {removed}건")',
+            '    return unique',
+            '',
+            '# 본 예시: "1.2 연차 휴가는 다음과 같다:" 가',
+            '#         페이지네이션 미스로 두 번 로딩됨 → 1건 제거',
+            '',
+            '# 💡 의미적 중복(80% 유사)은 별도 — MinHash/LSH 또는',
+            '#    embedding 코사인 임계치 기반으로 한 단계 더 거를 수 있다.',
+            '#    실무에선 보통 정확 중복(이 단계)만 잡고 청킹 후 추가 검증.',
+          ],
+          highlight: [2, 6, 7, 8, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24],
+        },
       },
       {
-        desc: "[3단계] 중복 제거 — 동일한 내용이 여러 소스에서 로딩될 수 있습니다. 해시 기반 또는 유사도 기반으로 중복을 감지하고 제거합니다.",
-        activeStage: 2, showBefore: false, showAfter: false, showCode: true
+        title: 'Step 4. OCR — 이미지/스캔 PDF에서 텍스트 추출',
+        desc: '의외로 자주 빠뜨리는 단계. 사내 정책 PDF의 일부 페이지가 스캔본이거나, 표/그림이 이미지로만 들어있는 경우가 많다. Tesseract 또는 PaddleOCR로 이미지에서 텍스트를 뽑아 본문에 합친다. 좌측 9·10번 라인의 "[image: scan_p3.png]" placeholder 가 OCR 텍스트로 채워지고, 우측 cleaned 박스 마지막 두 줄에 "1년 미만: 월 1일" 같은 본문이 등장한다.',
+        leftLines: RAW_LINES.map((l) => ({
+          ...l,
+          state:
+            l.kind === 'noise' ? 'removed' :
+            l.kind === 'dupe'  ? 'removed' :
+            l.kind === 'image' ? 'ocred' :
+            'raw',
+        })),
+        rightLines: [
+          { n: 4, text: CLEANED_NORMAL[4], state: 'kept' },
+          { n: 5, text: CLEANED_NORMAL[5], state: 'kept' },
+          { n: 7, text: CLEANED_NORMAL[7], state: 'kept' },
+          { n: 9,  text: '   - 1년 미만: 월 1일', state: 'new', label: 'OCR' },
+          { n: 10, text: '   - 3년 이상: 15일 + 근속년수×1일', state: 'new', label: 'OCR' },
+        ],
+        highlightKind: 'image',
+        stats: { rawBytes: 423, cleanedBytes: 348, noiseRatio: 18, dupes: 1, ocr: 2 },
+        code: {
+          lang: 'python',
+          filename: 'ocr.py',
+          lines: [
+            '# Step 4. OCR — 이미지/스캔 PDF에서 텍스트 추출',
+            'import pytesseract',
+            'from PIL import Image',
+            'from pathlib import Path',
+            'from langchain_core.documents import Document',
+            '',
+            'def ocr_image(path: str | Path, lang: str = "kor+eng") -> str:',
+            '    """이미지 1장 → 텍스트.',
+            '    Args:',
+            '        path: 이미지 또는 스캔 PDF 페이지 경로',
+            '        lang: tesseract 언어 코드 (한글+영어 혼용 권장)',
+            '    Returns:',
+            '        OCR 인식 결과 텍스트 (실패 시 빈 문자열)',
+            '    """',
+            '    img = Image.open(path)',
+            '    return pytesseract.image_to_string(img, lang=lang).strip()',
+            '',
+            'def ocr_inline(doc: Document) -> Document:',
+            '    """본문의 [image: …] placeholder 를 실제 OCR 텍스트로 치환."""',
+            '    text = doc.page_content',
+            '    for placeholder, src in doc.metadata.get("images", []):',
+            '        try:',
+            '            extracted = ocr_image(src)',
+            '        except Exception as e:                # OCR 실패는 본문 유지',
+            '            extracted = f"[ocr-failed: {e}]"',
+            '        text = text.replace(placeholder, extracted)',
+            '    doc.page_content = text',
+            '    return doc',
+            '',
+            '# scan_p3.png  →  "   - 1년 미만: 월 1일"',
+            '# scan_p4.png  →  "   - 3년 이상: 15일 + 근속년수×1일"',
+            '',
+            '# ⚠ 한계: 글씨가 흐리면 정확도 ↓ → 전처리(이진화/대비) 필요',
+            '# 💡 PDF 스캔: pdf2image 로 페이지를 PNG로 뽑고 위 함수에 투입',
+          ],
+          highlight: [2, 3, 4, 7, 15, 16, 18, 21, 22, 23, 26, 27],
+        },
       },
       {
-        desc: "Before / After를 비교해봅시다. 왼쪽의 노이즈 가득한 원본이 오른쪽처럼 깔끔하게 정제됩니다. 이렇게 정제된 텍스트가 다음 Chunking 단계로 넘어갑니다.",
-        activeStage: -1, showBefore: true, showAfter: true, showCode: false
+        title: 'Step 5. 결과 — 깨끗한 텍스트 (검색 품질 ↑)',
+        desc: '4단계를 거친 최종 cleaned 텍스트. 잡음 4종은 사라졌고 중복 1건이 빠졌으며 스캔 이미지 2장이 본문 텍스트로 살아났다. 길이는 423B → 348B로 약간 줄었지만 "내용 밀도"가 압도적으로 높아진다. 이 상태에서 청킹 → 임베딩 → 인덱싱으로 넘어가면 "근무시간"·"연차 휴가" 같은 질문에 정확한 청크가 회수된다.',
+        leftLines: RAW_LINES.map((l) => ({
+          ...l,
+          state:
+            l.kind === 'noise' ? 'removed' :
+            l.kind === 'dupe'  ? 'removed' :
+            l.kind === 'image' ? 'ocred' :
+            'raw',
+        })),
+        rightLines: [
+          { n: 4, text: CLEANED_NORMAL[4], state: 'kept' },
+          { n: 5, text: CLEANED_NORMAL[5], state: 'kept' },
+          { n: 7, text: CLEANED_NORMAL[7], state: 'kept' },
+          { n: 9,  text: '   - 1년 미만: 월 1일', state: 'kept' },
+          { n: 10, text: '   - 3년 이상: 15일 + 근속년수×1일', state: 'kept' },
+        ],
+        highlightKind: null,
+        stats: { rawBytes: 423, cleanedBytes: 348, noiseRatio: 18, dupes: 1, ocr: 2, final: true },
+        code: {
+          lang: 'python',
+          filename: 'pipeline.py',
+          lines: [
+            '# Step 5. 전처리 파이프라인 — 4 단계를 한 번에',
+            'from typing import Iterable',
+            'from langchain_core.documents import Document',
+            '',
+            'from clean  import clean',
+            'from dedupe import dedupe',
+            'from ocr    import ocr_inline',
+            '',
+            'MIN_LEN = 50  # 50자 미만 청크 후보는 의미 없음 → 폐기',
+            '',
+            'def preprocess(docs: Iterable[Document]) -> list[Document]:',
+            '    """원본 문서 묶음 → 깨끗한 문서 묶음.',
+            '',
+            '    Pipeline:',
+            '        1) clean       — HTML/잡음 정규식 컷 + NFKC',
+            '        2) ocr_inline  — [image: …] → 실제 텍스트',
+            '        3) length 필터 — 너무 짧으면 제거',
+            '        4) dedupe      — content hash 로 중복 컷',
+            '    """',
+            '    cleaned: list[Document] = []',
+            '    for doc in docs:',
+            '        # 1·2) 본문 정제 + OCR',
+            '        doc.page_content = clean(doc.page_content)',
+            '        doc = ocr_inline(doc)',
+            '',
+            '        # 3) 길이 필터',
+            '        if len(doc.page_content) < MIN_LEN:',
+            '            continue',
+            '        cleaned.append(doc)',
+            '',
+            '    # 4) 중복 제거 — 마지막에 한 번에',
+            '    return dedupe(cleaned)',
+            '',
+            '# 본 예시 결과:',
+            '#   원본 423B  → 정제 348B  (잡음 18%↓)',
+            '#   중복 1건 제거 / OCR 2건 복원',
+            '#   ⇒ 다음 단계 Chunking 으로 안전하게 전달',
+            '',
+            '# 🚀 운영 팁:',
+            '#   - clean 정규식은 도메인별로 추가 (사내 도구·메타 태그)',
+            '#   - dedupe 는 정확 중복만 — 의미 중복은 청킹 후 검증',
+            '#   - OCR 실패 케이스는 metadata 에 플래그 → 모니터링',
+          ],
+          highlight: [2, 3, 5, 6, 7, 11, 14, 15, 16, 17, 18, 19, 21, 23, 24, 25, 27, 32],
+        },
       },
     ];
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playRef = useRef(null);
-      const s = STEPS[step];
-      const isEnd = step === STEPS.length - 1;
+    // ─────────────────────────────────────────────────────
+    // 좌측 위: Raw 박스 — 원본 라인을 색·취소선으로 표시
+    //   state:
+    //     'raw'      : 정상 (slate)
+    //     'removed'  : 제거됨 (line-through, 회색)
+    //     'ocred'    : OCR 처리됨 (rose 강조 + 화살표)
+    //   highlightKind 가 일치하면 살짝 ring 효과
+    // ─────────────────────────────────────────────────────
+    function RawPane({ lines, highlightKind }) {
+      return (
+        <div className="bg-white rounded-lg border-2 border-rose-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">📄</span>
+              <span className="text-[11px] font-bold text-rose-800">raw text (원본)</span>
+            </div>
+            <span className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded font-mono">
+              {lines.length} lines
+            </span>
+          </div>
+          <div className="bg-rose-50/40 rounded border border-rose-100 p-2 max-h-72 overflow-y-auto">
+            <div className="space-y-0.5 font-mono text-[10px] leading-snug">
+              {lines.map((l) => {
+                const isRemoved = l.state === 'removed';
+                const isOcred = l.state === 'ocred';
+                const focus = highlightKind && l.kind === highlightKind;
+                let cls = 'text-slate-700';
+                if (isRemoved) cls = 'text-slate-400 line-through';
+                if (l.kind === 'noise' && !isRemoved) cls = 'text-slate-700';
+                if (l.kind === 'dupe' && !isRemoved) cls = 'text-amber-700';
+                if (l.kind === 'image' && !isRemoved && !isOcred) cls = 'text-purple-700';
+                if (isOcred) cls = 'text-emerald-700 font-semibold';
+                let badge = null;
+                if (l.kind === 'noise') {
+                  badge = <span className={`text-[8px] px-1 rounded font-bold ${isRemoved ? 'bg-slate-300 text-slate-500' : 'bg-rose-200 text-rose-800'}`}>noise</span>;
+                } else if (l.kind === 'dupe') {
+                  badge = <span className={`text-[8px] px-1 rounded font-bold ${isRemoved ? 'bg-slate-300 text-slate-500' : 'bg-amber-300 text-amber-800'}`}>dupe</span>;
+                } else if (l.kind === 'image') {
+                  badge = <span className={`text-[8px] px-1 rounded font-bold ${isOcred ? 'bg-emerald-500 text-white' : 'bg-purple-300 text-purple-800'}`}>{isOcred ? 'OCR ✓' : 'image'}</span>;
+                }
+                return (
+                  <div key={l.n} className={`flex items-start gap-1.5 px-1 py-0.5 rounded transition-all duration-500 ${focus ? 'bg-rose-200/50 ring-1 ring-rose-300' : ''}`}>
+                    <span className="select-none text-slate-400 w-5 text-right flex-shrink-0">{l.n}</span>
+                    <span className="w-12 flex-shrink-0">{badge}</span>
+                    <span className={`flex-1 whitespace-pre-wrap break-all ${cls}`}>
+                      {isOcred && l.ocr ? (
+                        <>
+                          <span className="line-through text-slate-400">{l.raw}</span>
+                          <span className="text-emerald-600 mx-1">→</span>
+                          <span>{l.ocr}</span>
+                        </>
+                      ) : l.raw}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
 
-      const next = () => setStep(p => { if (p < STEPS.length - 1) return p + 1; setIsPlaying(false); return p; });
-      const prev = () => { if (step > 0) { setStep(p => p - 1); setIsPlaying(false); } };
-      const nextRef = useRef(next); nextRef.current = next;
-      const prevRef = useRef(prev); prevRef.current = prev;
-      const toggle = () => { if (isEnd) setStep(0); setIsPlaying(p => !p); };
+    // ─────────────────────────────────────────────────────
+    // 좌측 아래: Cleaned 박스 — 정제된 라인이 단계별로 채워짐
+    //   state:
+    //     'new'      : 이번 단계에서 새로 들어옴 (rose ring + animate)
+    //     'kept'     : 유지 (rose 채움)
+    //     'pending'  : 아직 미해결 (점선 회색 — 다음 단계가 처리)
+    // ─────────────────────────────────────────────────────
+    function CleanedPane({ lines, stats }) {
+      return (
+        <div className="bg-white rounded-lg border-2 border-emerald-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">✨</span>
+              <span className="text-[11px] font-bold text-emerald-800">cleaned text (정제)</span>
+            </div>
+            <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-mono">
+              {lines.length} lines · {stats.cleanedBytes}B
+            </span>
+          </div>
+          <div className="bg-emerald-50/40 rounded border border-emerald-100 p-2 min-h-[10rem] max-h-72 overflow-y-auto">
+            {lines.length === 0 ? (
+              <div className="text-center text-[10px] text-slate-400 italic py-10">
+                (아직 비어있음 — 정제 시작 전)
+              </div>
+            ) : (
+              <div className="space-y-0.5 font-mono text-[10px] leading-snug">
+                {lines.map((l) => {
+                  let frame = 'border border-emerald-200 bg-white';
+                  let textCls = 'text-emerald-900';
+                  if (l.state === 'new') {
+                    frame = 'border border-emerald-400 bg-emerald-100 ring-2 ring-emerald-300';
+                    textCls = 'text-emerald-900 font-semibold';
+                  } else if (l.state === 'pending') {
+                    frame = 'border border-dashed border-slate-300 bg-slate-50';
+                    textCls = 'text-slate-400 italic';
+                  }
+                  return (
+                    <div key={l.n} className={`flex items-start gap-1.5 px-1.5 py-1 rounded transition-all duration-500 ${frame}`}>
+                      <span className="select-none text-slate-400 w-5 text-right flex-shrink-0">{l.n}</span>
+                      {l.label && (
+                        <span className={`text-[8px] px-1 rounded font-bold flex-shrink-0 ${l.state === 'new' ? 'bg-emerald-500 text-white animate-pulse' : 'bg-slate-300 text-slate-500'}`}>
+                          {l.label}
+                        </span>
+                      )}
+                      <span className={`flex-1 whitespace-pre-wrap break-all ${textCls}`}>{l.text}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          {/* 통계 패널 */}
+          <div className="grid grid-cols-3 gap-1.5 mt-2 text-[9px] font-mono">
+            <div className="bg-rose-50 border border-rose-200 rounded px-1.5 py-1 text-center">
+              <div className="text-rose-500 uppercase tracking-wider text-[8px]">raw</div>
+              <div className="text-rose-700 font-bold">{stats.rawBytes} B</div>
+            </div>
+            <div className="bg-emerald-50 border border-emerald-200 rounded px-1.5 py-1 text-center">
+              <div className="text-emerald-500 uppercase tracking-wider text-[8px]">cleaned</div>
+              <div className="text-emerald-700 font-bold">{stats.cleanedBytes} B</div>
+            </div>
+            <div className="bg-slate-50 border border-slate-200 rounded px-1.5 py-1 text-center">
+              <div className="text-slate-500 uppercase tracking-wider text-[8px]">noise</div>
+              <div className="text-slate-700 font-bold">
+                {stats.noiseRatio === null ? '—' : `${stats.noiseRatio}%`}
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-1.5 mt-1.5 text-[9px] font-mono">
+            <div className="bg-amber-50 border border-amber-200 rounded px-1.5 py-1 text-center">
+              <div className="text-amber-500 uppercase tracking-wider text-[8px]">dupes removed</div>
+              <div className="text-amber-700 font-bold">{stats.dupes}</div>
+            </div>
+            <div className="bg-purple-50 border border-purple-200 rounded px-1.5 py-1 text-center">
+              <div className="text-purple-500 uppercase tracking-wider text-[8px]">ocr recovered</div>
+              <div className="text-purple-700 font-bold">{stats.ocr}</div>
+            </div>
+          </div>
+          {stats.final && (
+            <div className="mt-2 text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-1.5 font-medium">
+              ✓ 다음 단계 Chunking 으로 안전 전달 가능
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단: Raw 박스 / 하단: Cleaned 박스 + 통계
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📑 raw → cleaned 변환</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-3">
+            <RawPane lines={step.leftLines} highlightKind={step.highlightKind} />
+            <CleanedPane lines={step.rightLines} stats={step.stats} />
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-rose-300"></span>noise
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-amber-300"></span>dupe
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-purple-300"></span>image (OCR)
+            </span>
+            <span className="flex items-center gap-1 ml-auto">
+              <span className="w-2 h-2 rounded bg-emerald-500"></span>cleaned
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js + 라인 번호
+    //   파일명 탭(raw.py, clean.py, dedupe.py, ocr.py, pipeline.py)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying) { playRef.current = setInterval(() => nextRef.current(), 3000); }
-        else { clearInterval(playRef.current); }
-        return () => clearInterval(playRef.current);
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      // 5개 파일 탭 — 현재 step의 filename이 active
+      const tabs = ['raw.py', 'clean.py', 'dedupe.py', 'ocr.py', 'pipeline.py'];
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 (5개) */}
+          <div className="bg-[#21252b] px-3 pt-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5 mb-1">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <div className="flex items-end gap-0.5 ml-2 overflow-x-auto">
+              {tabs.map((t) => {
+                const active = t === code.filename;
+                return (
+                  <span
+                    key={t}
+                    className={`px-2.5 py-1 text-[10px] font-mono rounded-t-md whitespace-nowrap transition ${
+                      active
+                        ? 'bg-[#282c34] text-rose-300 border-t border-l border-r border-slate-700 font-bold'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    {t}
+                  </span>
+                );
+              })}
+            </div>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase pb-1">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[42rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-rose-500/15 border-l-2 border-rose-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines · {code.filename}</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 4 버튼 + 키보드 + 3000ms 자동재생
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
       }, [isPlaying]);
 
       useEffect(() => {
         const onKey = (e) => {
           if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
-          if (e.key === 'ArrowLeft') { e.preventDefault(); prevRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm">
-              <a href="../index.html" className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 font-medium"><span>&larr;</span> 허브로 돌아가기</a>
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-rose-700 hover:text-rose-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-1-2</span>
             </nav>
 
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div className="w-9 h-9 bg-rose-600 text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
                 <div>
                   <div className="text-xs text-slate-500 font-medium">Part II. 데이터 준비 &gt; Chapter 1. 문서 수집과 전처리</div>
-                  <h1 className="text-2xl font-bold text-slate-800">II-1-2. 전처리 파이프라인</h1>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">II-1-2. 전처리 파이프라인 — clean / normalize / dedupe / OCR</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">음식 재료 손질 — 잡음 제거 → 정규화 → 중복 컷 → OCR 복원</p>
                 </div>
               </div>
-              <p className="text-slate-600"><b>음식 재료 손질</b>을 떠올려 보세요. 씻기 → 껍질 벗기기 → 상한 부분 제거 → 손질 완료. 문서 전처리도 같은 단계를 거칩니다.</p>
             </header>
 
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-blue-700 border-blue-800 text-white">
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-rose-50 border-2 border-rose-300 rounded-xl p-3 text-sm text-rose-900">
+                💡 정리: <strong>clean</strong>(잡음 컷) → <strong>NFKC</strong>(전각 통일) → <strong>dedupe</strong>(중복 제거) → <strong>OCR</strong>(이미지 복원). 이 4단계만 거쳐도 검색 품질이 눈에 띄게 올라간다. 다음(II-1-3)에서는 메타데이터 보존과 활용을 다룬다.
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-rose-700 text-white shadow-sm">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-blue-200">전처리 4단계</h3>
-                <span className="text-xs text-blue-200">키보드 &larr;/&rarr;</span>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-rose-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-rose-200">키보드 &larr;/&rarr;</span>
               </div>
-              <p className="text-lg font-medium leading-relaxed">{s.desc}</p>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-4">
-                {s.showBefore && s.showAfter ? (
-                  <div className="space-y-4">
-                    <div className="bg-white rounded-xl border border-red-200 p-4">
-                      <div className="text-xs font-bold text-red-600 uppercase tracking-wider mb-2">Before (원본)</div>
-                      <pre className="text-xs bg-red-50 p-3 rounded-lg border border-red-100 overflow-x-auto whitespace-pre-wrap font-mono text-red-800 max-h-[250px] overflow-y-auto">{BEFORE_TEXT}</pre>
-                    </div>
-                    <div className="text-center text-2xl">↓</div>
-                    <div className="bg-white rounded-xl border border-green-200 p-4">
-                      <div className="text-xs font-bold text-green-600 uppercase tracking-wider mb-2">After (정제)</div>
-                      <pre className="text-xs bg-green-50 p-3 rounded-lg border border-green-100 overflow-x-auto whitespace-pre-wrap font-mono text-green-800">{AFTER_TEXT}</pre>
-                    </div>
-                  </div>
-                ) : s.showBefore ? (
-                  <div className="bg-white rounded-xl border border-slate-200 p-5">
-                    <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">원본 문서 (노이즈 포함)</div>
-                    <pre className="text-xs bg-red-50 p-3 rounded-lg border border-red-100 overflow-x-auto whitespace-pre-wrap font-mono text-red-800">{BEFORE_TEXT}</pre>
-                    <div className="mt-3 flex flex-wrap gap-1">
-                      <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full">헤더/푸터</span>
-                      <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full">네비게이션</span>
-                      <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full">광고</span>
-                      <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full">전각문자</span>
-                      <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full">불규칙 공백</span>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="bg-white rounded-xl border border-slate-200 p-5">
-                    <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">전처리 파이프라인</div>
-                    <div className="space-y-3">
-                      {PIPELINE_STAGES.map((stage, i) => (
-                        <div key={i} className={`flex items-start gap-3 p-3 rounded-lg border transition-all duration-500 ${i === s.activeStage ? 'bg-blue-50 border-blue-300 scale-105 shadow-md' : 'bg-slate-50 border-slate-100 opacity-50'}`}>
-                          <span className="text-xl mt-0.5">{stage.icon}</span>
-                          <div>
-                            <div className="font-bold text-sm">{i + 1}. {stage.label}</div>
-                            <div className="text-xs text-slate-600 mt-0.5">{stage.desc}</div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                <div className="text-xs font-bold text-blue-600 uppercase tracking-wider mb-4">
-                  {s.showCode ? '코드 예시' : '상세 설명'}
-                </div>
-                {s.showCode ? (
-                  <pre className="text-xs bg-slate-50 p-4 rounded-lg border overflow-x-auto whitespace-pre-wrap font-mono text-slate-700">{
-                    s.activeStage === 0 ?
-`import re
-
-def remove_noise(text: str) -> str:
-    """헤더, 푸터, 광고 등 노이즈 제거"""
-    # 헤더/푸터 패턴 제거
-    text = re.sub(
-        r'={3,}.*?={3,}', '', text
-    )
-    # 네비게이션 제거
-    text = re.sub(
-        r'Navigation:.*?\\n', '', text
-    )
-    # 광고 제거
-    text = re.sub(
-        r'\\[광고\\].*?\\n', '', text
-    )
-    # Copyright 제거
-    text = re.sub(
-        r'Copyright.*?\\n', '', text
-    )
-    return text.strip()` :
-                    s.activeStage === 1 ?
-`import unicodedata
-
-def normalize_text(text: str) -> str:
-    """유니코드 정규화 + 공백 정리"""
-    # 유니코드 NFKC 정규화
-    # (전각 → 반각, 호환 문자 통일)
-    text = unicodedata.normalize('NFKC', text)
-
-    # 연속 공백을 하나로
-    text = re.sub(r'[ \\t]+', ' ', text)
-
-    # 연속 빈 줄을 하나로
-    text = re.sub(r'\\n{3,}', '\\n\\n', text)
-
-    return text.strip()
-
-# "오전　9시" → "오전 9시"
-# "한다．"   → "한다."` :
-                    s.activeStage === 2 ?
-`import hashlib
-
-def deduplicate(docs: list) -> list:
-    """해시 기반 중복 문서 제거"""
-    seen = set()
-    unique = []
-
-    for doc in docs:
-        # 문서 내용의 해시 생성
-        doc_hash = hashlib.md5(
-            doc.page_content.encode()
-        ).hexdigest()
-
-        if doc_hash not in seen:
-            seen.add(doc_hash)
-            unique.append(doc)
-
-    removed = len(docs) - len(unique)
-    print(f"중복 제거: {removed}건")
-    return unique
-
-# 100건 → 87건 (13건 중복 제거)` :
-`def full_pipeline(docs: list) -> list:
-    """전처리 전체 파이프라인"""
-    result = []
-    for doc in docs:
-        text = doc.page_content
-
-        # 1. 노이즈 제거
-        text = remove_noise(text)
-        # 2. 정규화
-        text = normalize_text(text)
-        # 3. 필터링 (최소 길이)
-        if len(text) < 50:
-            continue
-
-        doc.page_content = text
-        result.append(doc)
-
-    # 4. 중복 제거
-    result = deduplicate(result)
-    return result`
-                  }</pre>
-                ) : s.showBefore && s.showAfter ? (
-                  <div className="space-y-4">
-                    <div className="p-4 rounded-lg bg-blue-50 border border-blue-200">
-                      <div className="font-bold text-sm text-blue-800 mb-2">정제 결과 요약</div>
-                      <div className="space-y-2 text-xs text-blue-700">
-                        <div className="flex justify-between p-2 bg-white rounded border"><span>원본 길이</span><span className="font-bold">423자</span></div>
-                        <div className="flex justify-between p-2 bg-white rounded border"><span>정제 후 길이</span><span className="font-bold text-green-600">198자</span></div>
-                        <div className="flex justify-between p-2 bg-white rounded border"><span>노이즈 비율</span><span className="font-bold text-red-600">53%</span></div>
-                      </div>
-                    </div>
-                    <div className="p-4 rounded-lg bg-amber-50 border border-amber-200">
-                      <div className="font-bold text-sm text-amber-800 mb-2">주의사항</div>
-                      <div className="text-xs text-amber-700 space-y-1">
-                        <div>• 과도한 전처리로 중요 정보를 잃지 않도록 주의</div>
-                        <div>• 도메인별 특수 패턴 고려 필요</div>
-                        <div>• 전처리 전/후 샘플링 검증 필수</div>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="p-4 rounded-lg bg-blue-50 border border-blue-200">
-                      <div className="font-bold text-sm text-blue-800 mb-2">왜 전처리가 중요한가?</div>
-                      <div className="text-xs text-blue-700 space-y-1">
-                        <div>• <b>Garbage In, Garbage Out</b> — 더러운 데이터로는 좋은 검색 불가</div>
-                        <div>• 노이즈가 Embedding 품질을 심각하게 저하</div>
-                        <div>• 헤더/푸터가 반복되면 청크마다 동일 내용이 포함됨</div>
-                      </div>
-                    </div>
-                    <div className="p-4 rounded-lg bg-slate-50 border border-slate-200">
-                      <div className="font-bold text-sm text-slate-700 mb-2">실무 체크리스트</div>
-                      <div className="text-xs text-slate-600 space-y-1">
-                        <div>1. 원본 문서를 눈으로 확인했는가?</div>
-                        <div>2. 반복되는 패턴(헤더/푸터)을 식별했는가?</div>
-                        <div>3. 전처리 후 의미가 손실되지 않는가?</div>
-                        <div>4. 전처리 결과를 샘플링 검증했는가?</div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-rose-600 text-white hover:bg-rose-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              {['전처리', '노이즈 제거', '정규화', '중복 제거', 'NFKC'].map(kw => (
-                <span key={kw} className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full text-sm font-medium border border-blue-200">{kw}</span>
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['전처리', 'clean', 'NFKC', 'dedupe (hash)', 'OCR', 'tesseract', 'pipeline'].map((kw) => (
+                <span key={kw} className="bg-rose-50 text-rose-700 px-3 py-1 rounded-full text-xs font-medium border border-rose-200">
+                  {kw}
+                </span>
               ))}
             </div>
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button onClick={prev} disabled={step === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg>
-                </button>
-                <button onClick={toggle} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-blue-600 hover:bg-blue-700">
-                  {isPlaying ? (<><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>정지</>) : (<><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg>자동 실행</>)}
-                </button>
-                <button onClick={next} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
-                </button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {step + 1} / {STEPS.length}</div>
-            </div>
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./II-1-1.html" className="text-rose-700 hover:text-rose-900 font-medium">&larr; II-1-1. Document Loading</a>
+              <a href="./II-1-3.html" className="text-rose-700 hover:text-rose-900 font-medium">II-1-3. 메타데이터 보존과 활용 &rarr;</a>
+            </nav>
 
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./II-1-1.html" className="text-blue-600 hover:text-blue-800 font-medium">&larr; II-1-1. Document Loading</a>
-              <a href="./II-1-3.html" className="text-blue-600 hover:text-blue-800 font-medium">II-1-3. 메타데이터 보존과 활용 &rarr;</a>
-            </div>
           </div>
         </div>
       );
     }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
