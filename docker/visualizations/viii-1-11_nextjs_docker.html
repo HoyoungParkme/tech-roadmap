@@ -3,281 +3,888 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — Next.js Docker화</title>
+  <title>Docker 인터랙티브 학습 — VIII-1-11. Next.js Docker (SSR React 앱)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes buildProgress { from{width:0%;} to{width:100%;} }
-    @keyframes scaleIn { from{opacity:0;transform:scale(0.8);} to{opacity:1;transform:scale(1);} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-    .anim-build { animation: buildProgress 1.5s ease-out forwards; }
-    .anim-scale { animation: scaleIn 0.4s ease-out forwards; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    VIII-1-11. Next.js Docker — SSR React 앱을 standalone 출력으로 슬림하게 컨테이너화
+    학습 목표: next build → Dockerfile → standalone output → 멀티스테이지 → 정적 파일까지
+              5단계로 ~1.2GB 순진한 이미지를 ~150MB 슬림 이미지로 줄이는 전체 흐름을 본다.
+    핵심 비유: 캠핑 배낭 — 집 전체를 들고 가는 대신, 진짜 필요한 것만 standalone 배낭에 담는다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 빌드 흐름 + standalone 시각화) / 우(VSCode CodeViewer 5탭)
+    색상: docker sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 빌드 산출물 — Step 별로 어느 부분이 standalone 으로 추출되는지 표시
+    //   .next/standalone/  : 서버 코드 + 추려진 node_modules
+    //   .next/static/      : 클라이언트 정적 (JS/CSS chunk)
+    //   public/            : 공개 정적 파일 (이미지, favicon)
+    //   node_modules/      : 풀 의존성 (운영 이미지에 들어가면 안 됨)
+    //   src/               : 소스 코드 (운영 이미지에 들어가면 안 됨)
+    // ─────────────────────────────────────────────────────
+    const ARTIFACTS = [
+      { id: 'standalone', label: '.next/standalone/', icon: '🎒', desc: '서버 코드 + 추려진 deps', size: '90 MB',  ship: true  },
+      { id: 'static',     label: '.next/static/',     icon: '🎨', desc: '클라이언트 chunk (JS/CSS)', size: '50 MB', ship: true  },
+      { id: 'public',     label: 'public/',           icon: '🖼️', desc: '공개 정적 (favicon, 이미지)', size: '10 MB', ship: true  },
+      { id: 'nodemod',    label: 'node_modules/',     icon: '📚', desc: '풀 의존성 (1300개+)',       size: '700 MB', ship: false },
+      { id: 'src',        label: 'src/ + .next/cache/', icon: '📂', desc: '소스 + 빌드 캐시',         size: '350 MB', ship: false },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — LiveDataPane이 읽는 dataState
+    //   phase            : 'build' | 'dockerfile' | 'standalone' | 'multistage' | 'static'
+    //   buildDone        : next build 완료 여부 (.next/ 폴더 존재)
+    //   standaloneOn     : output: 'standalone' 활성 (배낭 시각화)
+    //   stagesOn         : 멀티스테이지에서 활성화된 stage id 배열 ['deps','builder','runner']
+    //   shippedArtifacts : 최종 이미지에 들어가는 산출물 id 배열
+    //   imageSize        : 현재 이미지 크기 (MB)
+    //   activeFile       : 우측 CodeViewer 강조용 (의미만)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: "STEP 1 · standalone 출력 모드란?",
-        desc: "일반 Next.js 빌드는 node_modules 전체(~1.2GB)가 필요하다. output: 'standalone'을 설정하면 실행에 필요한 파일만 골라서 ~150MB 이미지를 만든다. 캠핑에 필요한 것만 배낭에 담는 것과 같다.",
-        phase: "standalone",
+        title: 'Step 1. next build — 빌드 산출물부터 살펴본다',
+        desc: 'npm run build 한 줄이면 Next.js가 .next/ 폴더에 SSR 서버 번들·정적 chunk·라우팅 매니페스트를 모두 만든다. 문제는 이 빌드 결과를 그대로 컨테이너에 통째로 넣으면 node_modules(700MB) + src + .next/cache 까지 같이 따라와 1.2GB짜리 비대한 이미지가 된다는 점이다. "어떤 산출물만 진짜 운영에 필요한가" 를 먼저 구분하는 것이 컨테이너화의 출발점이다.',
+        phase: 'build',
+        buildDone: true,
+        standaloneOn: false,
+        stagesOn: [],
+        shippedArtifacts: ['standalone', 'static', 'public', 'nodemod', 'src'],
+        imageSize: 1200,
+        activeFile: 'build.sh',
+        code: {
+          lang: 'bash',
+          filename: 'build.sh',
+          lines: [
+            '# Step 1. Next.js 빌드 산출물 살펴보기',
+            '',
+            '# 1) 의존성 설치 — 1300+ 패키지가 node_modules/에 깔린다',
+            'npm ci',
+            '',
+            '# 2) 프로덕션 빌드 — .next/ 폴더가 생긴다',
+            'npm run build',
+            '',
+            '# ─── 빌드 결과 폴더 구조 ───',
+            'tree -L 2 -d',
+            '#  .',
+            '#  ├── .next/',
+            '#  │   ├── cache/        # 빌드 캐시 (운영 불필요)',
+            '#  │   ├── server/       # SSR 서버 번들',
+            '#  │   ├── static/       # 클라이언트 chunk (브라우저로 전송)',
+            '#  │   └── standalone/   # output: standalone 켜야 생성 (Step 3)',
+            '#  ├── node_modules/    # 1,317 패키지 (~700 MB)',
+            '#  ├── public/          # favicon, og-image 등 (~10 MB)',
+            '#  └── src/             # 소스 코드 (운영 불필요)',
+            '',
+            '# 3) 실행 — 이 상태에서 그대로 동작은 한다',
+            'npm run start',
+            '#  → http://localhost:3000 으로 SSR 응답',
+            '',
+            '# ─── 문제점 ───',
+            '#  • 컨테이너에 통째로 COPY . . 하면 1.2 GB',
+            '#  • node_modules / .next/cache / src 다 따라옴',
+            '#  • 이미지 push/pull 도 느리고, k8s 스케줄링도 느림',
+            '#  • 진짜 필요한 것은 .next/standalone + .next/static + public 셋뿐',
+            '',
+            '# 다음 단계 →  Dockerfile 로 한 번 그대로 옮겨보자 (Step 2)',
+          ],
+          highlight: [3, 4, 6, 7, 13, 14, 15, 16, 17, 23, 24, 28, 29, 30, 31],
+        },
       },
       {
-        title: "STEP 2 · 1단계: deps — 의존성 설치",
-        desc: "node:20-alpine 베이스에서 package.json과 package-lock.json만 복사하고 npm ci로 의존성을 설치한다. 의존성 파일이 바뀌지 않으면 이 레이어를 캐시에서 재사용한다.",
-        phase: "deps",
+        title: 'Step 2. Dockerfile — node:20-alpine 위에 그대로 올리기',
+        desc: 'FROM node:20-alpine 베이스를 쓰는 이유는 풀 node:20(~400MB)이 아닌 alpine(~80MB) 위에 얹어서 시작 크기를 줄이기 위해서다. 가장 직관적인 단일 스테이지 Dockerfile 하나를 먼저 본다. COPY . . 로 통째 옮기고 npm ci → npm run build → npm run start 까지 한 이미지에서 다 한다. 동작은 하지만 이미지가 1.2GB로 비대하다. 이 비효율을 다음 두 단계(standalone + 멀티스테이지)에서 해결한다.',
+        phase: 'dockerfile',
+        buildDone: true,
+        standaloneOn: false,
+        stagesOn: ['runner'],
+        shippedArtifacts: ['standalone', 'static', 'public', 'nodemod', 'src'],
+        imageSize: 1200,
+        activeFile: 'Dockerfile',
+        code: {
+          lang: 'dockerfile',
+          filename: 'Dockerfile',
+          lines: [
+            '# Step 2. 가장 단순한 단일 스테이지 — 동작은 하지만 1.2 GB',
+            '',
+            '# alpine 은 ~80 MB · 풀 node:20 은 ~400 MB → alpine 선택',
+            'FROM node:20-alpine',
+            '',
+            '# 작업 디렉토리',
+            'WORKDIR /app',
+            '',
+            '# 의존성 캐시 효율화 — package*.json 만 먼저 복사',
+            'COPY package.json package-lock.json ./',
+            '',
+            '# npm ci 는 lock 파일을 엄격히 따르고 node_modules 를 깨끗하게 만든다',
+            'RUN npm ci',
+            '',
+            '# 소스 전체 복사 — 여기서 1.2 GB 가 시작된다',
+            'COPY . .',
+            '',
+            '# Next.js 프로덕션 빌드',
+            'RUN npm run build',
+            '',
+            '# Next.js 기본 SSR 포트',
+            'EXPOSE 3000',
+            '',
+            '# 컨테이너 시작 — npm 으로 실행 (PID 1 이 npm)',
+            'CMD ["npm", "run", "start"]',
+            '',
+            '# ─── 빌드 & 실행 ───',
+            '#  docker build -t myapp:naive .',
+            '#  docker run -p 3000:3000 myapp:naive',
+            '',
+            '# ─── 한계 ───',
+            '#  ✗ 이미지 크기 ~1.2 GB',
+            '#  ✗ node_modules 1300+ 패키지 통째 포함',
+            '#  ✗ src/ + .next/cache 도 따라옴',
+            '#  ✗ npm 이 PID 1 이라 SIGTERM 전파가 깔끔하지 않음',
+            '',
+            '# 다음 → output: standalone 으로 진짜 필요한 것만 추리자 (Step 3)',
+          ],
+          highlight: [3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 24, 25],
+        },
       },
       {
-        title: "STEP 3 · 2단계: builder — 앱 빌드",
-        desc: "deps 스테이지의 node_modules를 복사하고 소스 코드를 추가한 뒤 npm run build를 실행한다. NEXT_PUBLIC_* 환경변수는 이 시점에 번들에 하드코딩된다.",
-        phase: "builder",
+        title: 'Step 3. next.config.js → output: "standalone" — 배낭 패킹',
+        desc: 'next.config.js 한 줄(output: "standalone")을 켜면 Next.js가 빌드 시 .next/standalone/ 폴더에 "이 앱을 돌리는 데 진짜 필요한 코드 + 추려진 의존성"만 골라 담는다. 1300개 node_modules에서 실행에 쓰이는 ~200개만 추려 ~90MB로 압축된다. server.js 진입점도 자동 생성된다. 캠핑 갈 때 집 전체를 트럭으로 옮기지 않고, 진짜 필요한 것만 배낭(standalone)에 담는 발상이다.',
+        phase: 'standalone',
+        buildDone: true,
+        standaloneOn: true,
+        stagesOn: ['runner'],
+        shippedArtifacts: ['standalone', 'static', 'public'],
+        imageSize: 280,
+        activeFile: 'next.config.js',
+        code: {
+          lang: 'javascript',
+          filename: 'next.config.js',
+          lines: [
+            '// Step 3. next.config.js — output: "standalone" 활성화',
+            '',
+            '/** @type {import("next").NextConfig} */',
+            'const nextConfig = {',
+            '  // ─── 컨테이너화의 핵심 한 줄 ───',
+            '  // .next/standalone/ 에 "필요한 것만" 추려 담아준다',
+            '  // - server.js 진입점 자동 생성',
+            '  // - node_modules 중 실제 import 되는 것만 trace',
+            '  // - 결과: 700 MB → ~90 MB',
+            '  output: "standalone",',
+            '',
+            '  // 이미지 도메인 (선택)',
+            '  images: {',
+            '    remotePatterns: [',
+            '      { protocol: "https", hostname: "images.example.com" },',
+            '    ],',
+            '  },',
+            '',
+            '  // 빌드 시점 환경 변수 노출 — NEXT_PUBLIC_* 는 자동으로 번들 박힘',
+            '  env: {',
+            '    APP_NAME: "myapp",',
+            '  },',
+            '};',
+            '',
+            'module.exports = nextConfig;',
+            '',
+            '// ─── 빌드 후 폴더 구조 ───',
+            '//  .next/',
+            '//   ├── standalone/        ← 새로 생긴다 (~90 MB)',
+            '//   │    ├── server.js     ← 자동 생성 진입점',
+            '//   │    ├── package.json  ← 추려진 deps 만 명시',
+            '//   │    ├── node_modules/ ← 추려진 ~200 개만',
+            '//   │    └── .next/        ← 서버 번들',
+            '//   └── static/            ← 별도 (클라이언트 chunk)',
+            '//',
+            '// public/ 폴더는 standalone 에 자동 포함되지 않는다 → Step 5',
+            '',
+            '// ─── 핵심 ───',
+            '//  • 한 줄로 700 MB 의존성 → 90 MB 로 추려짐',
+            '//  • 진입점이 npm run start 가 아닌 node server.js',
+            '//  • Dockerfile 은 이 standalone 폴더만 COPY 하면 된다 (Step 4)',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 39, 40, 41, 42],
+        },
       },
       {
-        title: "STEP 4 · 3단계: runner — 실행 이미지",
-        desc: ".next/standalone, .next/static, public 3가지를 복사한다. standalone이 생성하는 server.js로 실행한다. static과 public을 빠뜨리면 CSS/JS/이미지가 로드되지 않는다.",
-        phase: "runner",
+        title: 'Step 4. 멀티스테이지 — deps / builder / runner 3단 분리',
+        desc: 'standalone만 켜도 효과는 있지만, 진짜 슬림은 멀티스테이지 빌드와 함께 온다. deps 스테이지에서 의존성만 설치(레이어 캐시 극대화), builder 스테이지에서 next build, 마지막 runner 스테이지는 alpine 베이스에서 새로 시작해서 standalone + static + public 만 COPY --from 으로 가져온다. 빌드 도구·소스·node_modules 풀셋·캐시는 runner에 닿지 않는다. 결과: ~150MB 이미지에 비루트 사용자(node)로 실행.',
+        phase: 'multistage',
+        buildDone: true,
+        standaloneOn: true,
+        stagesOn: ['deps', 'builder', 'runner'],
+        shippedArtifacts: ['standalone', 'static', 'public'],
+        imageSize: 150,
+        activeFile: 'multistage.Dockerfile',
+        code: {
+          lang: 'dockerfile',
+          filename: 'multistage.Dockerfile',
+          lines: [
+            '# Step 4. 3-stage Dockerfile — deps / builder / runner',
+            '',
+            '# ━━━ Stage 1: deps — 의존성만 설치 (캐시 잘 먹게) ━━━',
+            'FROM node:20-alpine AS deps',
+            'WORKDIR /app',
+            '',
+            '# package*.json 만 먼저 복사 → lock 안 바뀌면 이 레이어 재사용',
+            'COPY package.json package-lock.json ./',
+            'RUN npm ci',
+            '',
+            '# ━━━ Stage 2: builder — next build 수행 ━━━',
+            'FROM node:20-alpine AS builder',
+            'WORKDIR /app',
+            '',
+            '# deps 스테이지의 node_modules 를 그대로 가져온다',
+            'COPY --from=deps /app/node_modules ./node_modules',
+            'COPY . .',
+            '',
+            '# 텔레메트리 끄기 (선택)',
+            'ENV NEXT_TELEMETRY_DISABLED=1',
+            '',
+            '# 빌드타임 변수 — NEXT_PUBLIC_* 는 이 시점에 번들에 박힌다',
+            'ARG NEXT_PUBLIC_API_URL',
+            'ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL',
+            '',
+            'RUN npm run build',
+            '#  → .next/standalone/ + .next/static/ 생성',
+            '',
+            '# ━━━ Stage 3: runner — 실행 전용 슬림 이미지 ━━━',
+            'FROM node:20-alpine AS runner',
+            'WORKDIR /app',
+            '',
+            'ENV NODE_ENV=production',
+            'ENV NEXT_TELEMETRY_DISABLED=1',
+            '',
+            '# 비루트 사용자 — alpine 의 기본 node 그룹 활용',
+            'RUN addgroup -S app && adduser -S app -G app',
+            '',
+            '# standalone 추출물만 가져온다 (~90 MB)',
+            'COPY --from=builder --chown=app:app /app/.next/standalone ./',
+            '',
+            '# 클라이언트 chunk + public 은 별도로 (Step 5)',
+            'COPY --from=builder --chown=app:app /app/.next/static ./.next/static',
+            'COPY --from=builder --chown=app:app /app/public ./public',
+            '',
+            'USER app',
+            'EXPOSE 3000',
+            'ENV PORT=3000 HOSTNAME=0.0.0.0',
+            '',
+            '# standalone 이 만들어준 server.js 진입점',
+            'CMD ["node", "server.js"]',
+            '',
+            '# ─── 빌드 ───',
+            '#  docker build -t myapp:slim \\',
+            '#    --build-arg NEXT_PUBLIC_API_URL=https://api.example.com .',
+            '#  → 이미지 크기: ~150 MB (87% ↓)',
+          ],
+          highlight: [3, 4, 8, 9, 11, 12, 15, 16, 17, 22, 23, 24, 26, 29, 30, 36, 37, 39, 40, 43, 44, 50, 51],
+        },
       },
       {
-        title: "STEP 5 · 환경변수 주입 전략",
-        desc: "NEXT_PUBLIC_*는 빌드타임에 --build-arg로 주입(번들에 하드코딩). DATABASE_URL 같은 서버사이드 변수는 docker run -e로 런타임에 주입(이미지 재사용 가능).",
-        phase: "env_vars",
-      },
-      {
-        title: "STEP 6 · 완성: 이미지 크기 비교",
-        desc: "일반 빌드 ~1.2GB에서 standalone 3-stage로 ~150MB까지 80% 이상 줄었다. deps/builder/runner 3단계 분리로 각 레이어를 독립적으로 캐시하여 재빌드도 빠르다.",
-        phase: "complete",
+        title: 'Step 5. 정적 파일 처리 — static + public 빠뜨리면 안 된다',
+        desc: 'standalone 폴더 안에는 .next/static과 public이 자동으로 들어가지 않는다. 그래서 runner 스테이지에서 COPY --from=builder /app/.next/static과 /app/public을 명시적으로 옮겨야 한다. 두 폴더를 빠뜨리면 페이지는 200으로 떠도 CSS·JS chunk 404, 이미지 깨짐, 폰트 누락이 발생한다. 정적 자산을 CDN(예: S3 + CloudFront)로 빼는 패턴도 흔하지만, 그 경우엔 assetPrefix 설정과 함께 묶어서 가야 한다.',
+        phase: 'static',
+        buildDone: true,
+        standaloneOn: true,
+        stagesOn: ['deps', 'builder', 'runner'],
+        shippedArtifacts: ['standalone', 'static', 'public'],
+        imageSize: 150,
+        activeFile: 'static.Dockerfile',
+        code: {
+          lang: 'dockerfile',
+          filename: 'static.Dockerfile',
+          lines: [
+            '# Step 5. 정적 파일 처리 — .next/static + public 명시적으로',
+            '',
+            '# ━━━ runner 스테이지 핵심 3 줄 ━━━',
+            '# 1) standalone 본체 — server.js + 추려진 deps',
+            'COPY --from=builder --chown=app:app /app/.next/standalone ./',
+            '',
+            '# 2) 클라이언트 chunk — JS/CSS hash 파일들',
+            '#    → /app/.next/static 위치를 정확히 맞춰야 server.js 가 찾는다',
+            'COPY --from=builder --chown=app:app /app/.next/static ./.next/static',
+            '',
+            '# 3) public — favicon, robots.txt, 이미지 등',
+            '#    → /app/public 위치 (standalone 에 자동 포함 안 됨)',
+            'COPY --from=builder --chown=app:app /app/public ./public',
+            '',
+            '# ─── 빠뜨렸을 때 증상 ───',
+            '#  ✗ static 누락  → /_next/static/chunks/app/page-xxx.js 404',
+            '#                  화면은 떠도 인터랙션·스타일이 박살',
+            '#  ✗ public 누락  → favicon.ico 404, og:image 깨짐',
+            '#                  /robots.txt /sitemap.xml 404',
+            '',
+            '# ─── 검증: 컨테이너 안 폴더 구조 ───',
+            '#  docker run --rm myapp:slim sh -c "ls /app && ls /app/.next"',
+            '#   /app',
+            '#   ├── server.js          ← standalone 진입점',
+            '#   ├── package.json',
+            '#   ├── node_modules/      ← 추려진 ~200 개',
+            '#   ├── .next/',
+            '#   │    ├── server/       ← SSR 번들 (standalone 내장)',
+            '#   │    └── static/       ← Step 5 에서 별도 COPY ← 중요',
+            '#   └── public/            ← Step 5 에서 별도 COPY ← 중요',
+            '',
+            '# ─── 더 나아간 패턴 (선택) ───',
+            '#  CDN 으로 정적 분리:',
+            '#    next.config.js 에 assetPrefix: "https://cdn.example.com" 추가',
+            '#    → .next/static 을 빌드 후 S3 + CloudFront 로 업로드',
+            '#    → 이미지에는 server.js 만 남고 더 슬림해짐',
+            '',
+            '# ─── 정리: 4 단계로 본 이미지 다이어트 ───',
+            '#   Step 2 단일 stage             : ~1200 MB',
+            '#   Step 3 standalone 추가         : ~ 280 MB',
+            '#   Step 4 멀티스테이지 + standalone: ~ 150 MB  ← 운영 권장',
+            '#   Step 5 + CDN 분리 (선택)        : ~ 100 MB',
+            '',
+            '# 다음 자료 →  VIII-1-12 정적 파일 서빙 (Nginx 프론트)',
+          ],
+          highlight: [3, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16, 17, 18, 19, 38, 39, 40, 41, 42],
+        },
       },
     ];
 
-    function StandaloneCompare() {
+    // ─────────────────────────────────────────────────────
+    // 좌측 상단: Next.js 빌드 흐름 (소스 → next build → .next/)
+    //   buildDone 이면 .next/ 박스가 sky 로 켜진다
+    //   standaloneOn 이면 .next/standalone/ 서브박스가 추가 강조
+    // ─────────────────────────────────────────────────────
+    function BuildFlowBox({ buildDone, standaloneOn }) {
       return (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 anim-fade">
-          <div className="rounded-xl border-2 border-red-300 bg-red-50 p-5">
-            <div className="text-center">
-              <div className="text-4xl mb-2">📦</div>
-              <h4 className="font-bold text-red-700">일반 빌드</h4>
-              <div className="text-3xl font-bold text-red-600 mt-2">~1.2GB</div>
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-3">
+          <div className="flex items-center gap-1.5 mb-2">
+            <span className="text-base">⚙️</span>
+            <span className="text-[11px] font-bold text-slate-700">Next.js 빌드 흐름</span>
+          </div>
+          <div className="grid grid-cols-3 gap-1.5 items-stretch">
+            {/* src */}
+            <div className="rounded border-2 border-slate-300 bg-slate-50 p-2 text-center">
+              <div className="text-base">📂</div>
+              <div className="text-[10px] font-bold text-slate-700">src/</div>
+              <div className="text-[8px] text-slate-500">React 소스</div>
             </div>
-            <div className="mt-4 space-y-2">
-              {[".next/ (빌드 결과)", "node_modules/ 전체", "소스 코드 전체"].map((item, i) => (
-                <div key={i} className="bg-red-100 text-red-700 px-3 py-2 rounded-lg text-sm anim-slide" style={{animationDelay:`${i*0.1}s`}}>
-                  {item}
-                </div>
-              ))}
+            {/* next build */}
+            <div className={`rounded border-2 p-2 text-center transition-all duration-500 ${
+              buildDone ? 'bg-sky-100 border-sky-500 shadow-sm' : 'bg-slate-50 border-dashed border-slate-200'
+            }`}>
+              <div className="text-base">🔨</div>
+              <div className={`text-[10px] font-bold ${buildDone ? 'text-sky-800' : 'text-slate-400'}`}>next build</div>
+              <div className="text-[8px] text-slate-500">SSR 번들 + static</div>
+            </div>
+            {/* .next/ */}
+            <div className={`rounded border-2 p-2 text-center transition-all duration-500 ${
+              buildDone ? 'bg-sky-50 border-sky-400 shadow-sm' : 'bg-slate-50 border-dashed border-slate-200'
+            }`}>
+              <div className="text-base">📦</div>
+              <div className={`text-[10px] font-bold ${buildDone ? 'text-sky-800' : 'text-slate-400'}`}>.next/</div>
+              <div className="text-[8px] text-slate-500">빌드 결과</div>
             </div>
           </div>
-          <div className="rounded-xl border-2 border-emerald-300 bg-emerald-50 p-5 shadow-lg">
-            <div className="text-center">
-              <div className="text-4xl mb-2">🎒</div>
-              <h4 className="font-bold text-emerald-700">standalone 빌드</h4>
-              <div className="text-3xl font-bold text-emerald-600 mt-2">~150MB</div>
+          <div className="text-center text-[10px] text-slate-400 my-1">↓</div>
+          {/* standalone 서브박스 */}
+          <div className={`rounded border-2 px-2 py-1.5 transition-all duration-500 ${
+            standaloneOn ? 'bg-emerald-50 border-emerald-400 shadow-sm' : 'bg-slate-50 border-dashed border-slate-200 opacity-60'
+          }`}>
+            <div className="flex items-center gap-1.5 text-[10px]">
+              <span>🎒</span>
+              <span className={`font-bold ${standaloneOn ? 'text-emerald-800' : 'text-slate-400'}`}>
+                .next/standalone/  (output: 'standalone')
+              </span>
+              {standaloneOn && (
+                <span className="ml-auto text-[8px] bg-emerald-600 text-white px-1 py-0.5 rounded font-mono font-bold">
+                  packed
+                </span>
+              )}
             </div>
-            <div className="mt-4 space-y-2">
-              {[".next/standalone/ (서버 코드만)", ".next/static/ (정적 에셋)", "public/ (공개 파일)"].map((item, i) => (
-                <div key={i} className="bg-emerald-100 text-emerald-700 px-3 py-2 rounded-lg text-sm anim-slide" style={{animationDelay:`${i*0.1}s`}}>
-                  {item}
-                </div>
-              ))}
+            <div className={`text-[9px] font-mono ${standaloneOn ? 'text-emerald-700' : 'text-slate-400'} mt-0.5`}>
+              {standaloneOn
+                ? 'server.js 자동 생성 + 추려진 ~200 deps (~90 MB)'
+                : '아직 비활성 (next.config.js 설정 필요)'}
             </div>
           </div>
         </div>
       );
     }
 
-    function ThreeStageView({ activeStage }) {
+    // ─────────────────────────────────────────────────────
+    // 좌측 중앙: 멀티스테이지 시각화 (deps → builder → runner)
+    //   stagesOn 에 들어 있는 stage 만 sky 로 활성
+    // ─────────────────────────────────────────────────────
+    function MultiStageBox({ stagesOn }) {
       const stages = [
-        { name: "deps", icon: "📋", label: "의존성 설치", color: "blue", items: ["COPY package.json", "RUN npm ci"] },
-        { name: "builder", icon: "🔨", label: "앱 빌드", color: "purple", items: ["COPY --from=deps node_modules", "COPY . .", "RUN npm run build"] },
-        { name: "runner", icon: "🚀", label: "실행 이미지", color: "emerald", items: ["COPY standalone/", "COPY static/", "COPY public/"] },
+        { id: 'deps',    icon: '📋', label: 'deps',    desc: 'npm ci' },
+        { id: 'builder', icon: '🔨', label: 'builder', desc: 'next build' },
+        { id: 'runner',  icon: '🚀', label: 'runner',  desc: 'node server.js' },
       ];
-
       return (
-        <div className="space-y-4 anim-fade">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🏗️</span>
+              <span className="text-[11px] font-bold text-slate-700">멀티스테이지 빌드</span>
+            </div>
+            <span className="text-[9px] font-mono text-slate-500">
+              {stagesOn.length} / 3 stage
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-1.5">
             {stages.map((s, i) => {
-              const isActive = s.name === activeStage || activeStage === "all";
-              const colors = {
-                blue: { border: "border-blue-400", bg: "bg-blue-50", text: "text-blue-700", itemBg: "bg-blue-100" },
-                purple: { border: "border-purple-400", bg: "bg-purple-50", text: "text-purple-700", itemBg: "bg-purple-100" },
-                emerald: { border: "border-emerald-400", bg: "bg-emerald-50", text: "text-emerald-700", itemBg: "bg-emerald-100" },
-              }[s.color];
-
+              const on = stagesOn.includes(s.id);
               return (
-                <div key={i} className={`rounded-xl border-2 p-4 transition-all duration-500 ${
-                  isActive ? `${colors.border} ${colors.bg} shadow-lg scale-[1.02]` : 'border-slate-200 bg-slate-50 opacity-40 scale-95'
-                }`}>
-                  <div className="text-center mb-3">
-                    <span className="text-3xl">{s.icon}</span>
-                    <div className={`font-bold text-sm mt-1 ${isActive ? colors.text : 'text-slate-400'}`}>
-                      {i + 1}단계: {s.label}
+                <div
+                  key={s.id}
+                  className={`rounded-lg border-2 p-2 text-center transition-all duration-500 ${
+                    on
+                      ? 'bg-sky-50 border-sky-400 shadow-sm'
+                      : 'bg-slate-50 border-dashed border-slate-200 opacity-50'
+                  }`}
+                >
+                  <div className="text-lg">{s.icon}</div>
+                  <div className={`text-[10px] font-bold ${on ? 'text-sky-800' : 'text-slate-400'}`}>
+                    {i + 1}. {s.label}
+                  </div>
+                  <div className={`text-[8px] font-mono ${on ? 'text-slate-600' : 'text-slate-400'}`}>
+                    {s.desc}
+                  </div>
+                  {on && (
+                    <div className="mt-1 bg-sky-600 text-white text-[8px] px-1 py-0.5 rounded font-mono font-bold">
+                      AS {s.label}
                     </div>
-                  </div>
-                  <div className="space-y-2">
-                    {s.items.map((item, j) => (
-                      <div key={j} className={`px-2 py-1.5 rounded text-xs font-mono ${isActive ? `${colors.itemBg} ${colors.text}` : 'bg-slate-100 text-slate-400'}`}>
-                        {item}
-                      </div>
-                    ))}
-                  </div>
+                  )}
                 </div>
               );
             })}
           </div>
-          {activeStage !== "all" && (
-            <div className="flex items-center justify-center gap-2">
-              {stages.map((s, i) => (
-                <React.Fragment key={i}>
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${
-                    s.name === activeStage ? 'bg-blue-500 text-white anim-pulse' : 'bg-slate-200 text-slate-400'
-                  }`}>{i + 1}</div>
-                  {i < stages.length - 1 && <div className="w-8 h-0.5 bg-slate-200"></div>}
-                </React.Fragment>
-              ))}
-            </div>
-          )}
+          <div className={`text-[9px] mt-1.5 ${stagesOn.length === 3 ? 'text-sky-700 font-semibold' : 'text-slate-400'}`}>
+            {stagesOn.length === 3
+              ? '✓ 빌드 도구·소스·풀 deps 는 runner 에 닿지 않는다'
+              : stagesOn.length === 1
+                ? '단일 stage — 모든 산출물이 한 이미지에 (Step 2)'
+                : '아직 미설정'}
+          </div>
         </div>
       );
     }
 
-    function EnvVarsView() {
-      const vars = [
-        { type: "빌드타임", prefix: "NEXT_PUBLIC_*", example: "NEXT_PUBLIC_API_URL", inject: "docker build --build-arg", icon: "🔨", color: "amber", note: "번들에 하드코딩 → 변경 시 재빌드 필요" },
-        { type: "서버사이드", prefix: "일반 변수", example: "DATABASE_URL", inject: "docker run -e", icon: "🔧", color: "blue", note: "런타임 주입 → 이미지 재사용 가능" },
-      ];
+    // ─────────────────────────────────────────────────────
+    // 좌측 하단: 최종 이미지 산출물 + 크기 변화
+    //   shippedArtifacts 에 포함된 항목만 emerald, 나머지는 회색
+    //   imageSize 를 큰 숫자로 표시 (1200 → 280 → 150 변화)
+    // ─────────────────────────────────────────────────────
+    function ImageContentsBox({ shippedArtifacts, imageSize }) {
+      const sizeColor =
+        imageSize <= 200 ? 'text-emerald-600' :
+        imageSize <= 400 ? 'text-sky-600' :
+        imageSize <= 700 ? 'text-amber-600' : 'text-rose-600';
       return (
-        <div className="space-y-4 anim-fade">
-          {vars.map((v, i) => (
-            <div key={i} className={`rounded-xl border-2 p-5 anim-slide ${
-              v.color === 'amber' ? 'border-amber-300 bg-amber-50' : 'border-blue-300 bg-blue-50'
-            }`} style={{animationDelay:`${i*0.2}s`}}>
-              <div className="flex items-center gap-3 mb-3">
-                <span className="text-3xl">{v.icon}</span>
-                <div>
-                  <h4 className={`font-bold ${v.color === 'amber' ? 'text-amber-800' : 'text-blue-800'}`}>{v.type} 변수</h4>
-                  <code className="text-xs text-slate-500">{v.example}</code>
-                </div>
-              </div>
-              <div className={`px-3 py-2 rounded-lg text-sm ${v.color === 'amber' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'}`}>
-                <div className="font-mono text-xs mb-1">{v.inject}</div>
-                <div className="font-medium">{v.note}</div>
-              </div>
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🐳</span>
+              <span className="text-[11px] font-bold text-slate-700">최종 이미지 내용물</span>
             </div>
-          ))}
-        </div>
-      );
-    }
+            <div className="flex items-baseline gap-1">
+              <span className={`text-xl font-bold font-mono ${sizeColor}`}>
+                {imageSize}
+              </span>
+              <span className="text-[10px] text-slate-500 font-mono">MB</span>
+            </div>
+          </div>
 
-    function CompleteView() {
-      return (
-        <div className="space-y-4 anim-fade">
-          <div className="bg-gradient-to-r from-emerald-50 to-blue-50 border-2 border-emerald-300 rounded-xl p-6">
-            <div className="text-center">
-              <div className="text-4xl mb-3">🎉</div>
-              <h3 className="text-xl font-bold text-emerald-800 mb-2">Next.js 3-Stage 이미지 완성!</h3>
-              <div className="flex flex-wrap justify-center gap-2 mt-4">
-                {["output: 'standalone'", "deps 스테이지", "builder 스테이지", "runner 스테이지", "~150MB 이미지", "비루트 사용자"].map((item, i) => (
-                  <span key={i} className="bg-emerald-200 text-emerald-800 px-3 py-1.5 rounded-full text-sm font-medium anim-slide" style={{animationDelay:`${i*0.1}s`}}>
-                    {item}
+          <div className="space-y-1">
+            {ARTIFACTS.map((a) => {
+              const shipped = shippedArtifacts.includes(a.id);
+              const required = a.ship; // 운영에 진짜 필요한가
+              const bad = shipped && !required; // 들어가면 안 되는데 들어감
+              return (
+                <div
+                  key={a.id}
+                  className={`flex items-center gap-2 rounded border-2 px-2 py-1 transition-all duration-500 ${
+                    shipped
+                      ? (bad
+                          ? 'bg-rose-50 border-rose-300'
+                          : 'bg-emerald-50 border-emerald-300')
+                      : 'bg-slate-50 border-dashed border-slate-200 opacity-50'
+                  }`}
+                >
+                  <span className="text-base">{a.icon}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className={`text-[10px] font-mono font-bold ${
+                      shipped ? (bad ? 'text-rose-800' : 'text-emerald-800') : 'text-slate-400'
+                    }`}>
+                      {a.label}
+                    </div>
+                    <div className={`text-[9px] ${shipped ? 'text-slate-600' : 'text-slate-400'} truncate`}>
+                      {a.desc}
+                    </div>
+                  </div>
+                  <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                    shipped
+                      ? (bad ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white')
+                      : 'bg-slate-200 text-slate-500'
+                  }`}>
+                    {a.size}
                   </span>
-                ))}
-              </div>
-            </div>
+                  <span className="text-[10px] w-3">
+                    {shipped ? (bad ? '✗' : '✓') : '·'}
+                  </span>
+                </div>
+              );
+            })}
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-center">
-              <div className="text-3xl mb-2">📦</div>
-              <div className="text-2xl font-bold text-red-600">~1.2GB</div>
-              <div className="text-xs text-red-500">일반 빌드</div>
+
+          {/* 다이어트 진행 바 */}
+          <div className="mt-2">
+            <div className="flex items-center justify-between text-[9px] text-slate-500 font-mono mb-0.5">
+              <span>이미지 다이어트</span>
+              <span>1200 MB → {imageSize} MB</span>
             </div>
-            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-center anim-pulse">
-              <div className="text-3xl mb-2">🚀</div>
-              <div className="text-2xl font-bold text-emerald-600">~150MB</div>
-              <div className="text-xs text-emerald-500">standalone 빌드 (87% 절감)</div>
+            <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ${
+                  imageSize <= 200 ? 'bg-emerald-500' :
+                  imageSize <= 400 ? 'bg-sky-500' :
+                  imageSize <= 700 ? 'bg-amber-500' : 'bg-rose-500'
+                }`}
+                style={{ width: `${Math.max(8, (imageSize / 1200) * 100)}%` }}
+              />
             </div>
           </div>
         </div>
       );
     }
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단: 빌드 흐름 (src → next build → .next + standalone)
+    //   중앙: 멀티스테이지 (deps / builder / runner)
+    //   하단: 최종 이미지 내용물 + 크기 변화
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📚 next build → standalone → 이미지</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-2">
+            <BuildFlowBox
+              buildDone={step.buildDone}
+              standaloneOn={step.standaloneOn}
+            />
+
+            {/* 화살표 */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.stagesOn.length > 0 ? 'text-sky-600 font-bold' : 'text-slate-300'
+              }`}>
+                ↓ Dockerfile 멀티스테이지로 분리
+              </div>
+            </div>
+
+            <MultiStageBox stagesOn={step.stagesOn} />
+
+            {/* 화살표 */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.shippedArtifacts.length > 0 ? 'text-sky-600 font-bold' : 'text-slate-300'
+              }`}>
+                ↓ runner 스테이지가 만드는 최종 이미지
+              </div>
+            </div>
+
+            <ImageContentsBox
+              shippedArtifacts={step.shippedArtifacts}
+              imageSize={step.imageSize}
+            />
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>active stage
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-emerald-500"></span>운영 필요
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-rose-500"></span>불필요(낭비)
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded border border-slate-300 bg-white"></span>제외됨
+            </span>
+            <span className="ml-auto font-mono">phase: {step.phase}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    //   파일명 탭, 윈도우 dot, 라인 번호, 강조 라인
+    //   상단에 5개 파일 탭 (build.sh / Dockerfile / next.config.js /
+    //                       multistage.Dockerfile / static.Dockerfile)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total, onJumpTo }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      const TABS = [
+        { idx: 0, name: 'build.sh' },
+        { idx: 1, name: 'Dockerfile' },
+        { idx: 2, name: 'next.config.js' },
+        { idx: 3, name: 'multistage.Dockerfile' },
+        { idx: 4, name: 'static.Dockerfile' },
+      ];
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4000);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
-
-      const renderVisual = () => {
-        switch(data.phase) {
-          case "standalone": return <StandaloneCompare />;
-          case "deps": return <ThreeStageView activeStage="deps" />;
-          case "builder": return <ThreeStageView activeStage="builder" />;
-          case "runner": return <ThreeStageView activeStage="runner" />;
-          case "env_vars": return <EnvVarsView />;
-          case "complete": return <CompleteView />;
-          default: return null;
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
         }
-      };
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일 탭 바 (5개 파일명) */}
+          <div className="bg-[#21252b] px-3 pt-2 flex items-center gap-1.5 border-b border-slate-700 overflow-x-auto">
+            <div className="flex gap-1.5 mr-2 flex-shrink-0">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            {TABS.map((t) => {
+              const active = t.idx === stepIdx;
+              return (
+                <button
+                  key={t.name}
+                  onClick={() => onJumpTo(t.idx)}
+                  className={`px-2.5 py-1 text-[11px] font-mono rounded-t whitespace-nowrap transition ${
+                    active
+                      ? 'bg-[#282c34] text-sky-300 border-t border-l border-r border-slate-700'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                  title={`Step ${t.idx + 1}`}
+                >
+                  {t.name}
+                </button>
+              );
+            })}
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase pr-2">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines · {code.filename}</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생(3000ms), 키보드 단축키
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      const handleJumpTo = (idx) => {
+        setStepIdx(idx);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum VIII-1-11</span>
+            </nav>
+
+            {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter VIII-1-11: Next.js 앱 Docker화</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VIII</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part VIII. 실무 패턴 &gt; Chapter 1. 프레임워크별 컨테이너화</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VIII-1-11. Next.js Docker — SSR React 앱 standalone 패킹</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">next build → output: 'standalone' → 3-stage Dockerfile → 정적 파일까지, 1.2 GB → 150 MB 다이어트</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">standalone 빌드와 3-stage Dockerfile로 최적화된 Next.js 이미지를 만드는 과정을 시뮬레이션합니다.</p>
             </header>
 
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "complete" ? "bg-emerald-600 border-emerald-700 text-white" :
-              data.phase === "env_vars" ? "bg-amber-600 border-amber-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer
+                code={step.code}
+                stepIdx={stepIdx}
+                total={STEPS.length}
+                onJumpTo={handleJumpTo}
+              />
             </div>
 
-            <div key={`visual-${step}`}>{renderVisual()}</div>
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: <strong>output: 'standalone'</strong>(추리기) + <strong>멀티스테이지</strong>(분리) + <strong>static/public 명시 COPY</strong>(누락 방지) — 이 셋이 Next.js 컨테이너화의 핵심 3 축이다. 다음(VIII-1-12)에서는 정적 자산을 Nginx로 빼는 패턴을 다룬다.
+              </div>
+            )}
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
-              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['Next.js', 'next build', "output: 'standalone'", 'node:20-alpine', 'multi-stage', 'deps/builder/runner', 'COPY --from', '.next/static', 'public/', 'server.js'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./viii-1-10_nodejs_docker.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; VIII-1-10 Node.js Docker</a>
+              <a href="./viii-1-12_static_serving.html" className="text-sky-700 hover:text-sky-900 font-medium">VIII-1-12 정적 파일 서빙 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

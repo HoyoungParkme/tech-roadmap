@@ -3,322 +3,892 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — ECR 사용</title>
+  <title>Docker 인터랙티브 학습 — VIII-1-14. ECR 활용</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes moveRight { 0%{transform:translateX(0);opacity:1;} 50%{transform:translateX(50px);opacity:0.5;} 100%{transform:translateX(100px);opacity:0;} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    VIII-1-14. ECR 활용 — AWS Elastic Container Registry
+    학습 목표: 로컬에서 만든 Docker 이미지를 AWS의 비공개 레지스트리(ECR)에 올리고
+              EC2/ECS에서 IAM 역할 기반으로 안전하게 가져와 실행하는 5단계 흐름을 본다.
+    핵심 비유: 사내 우편함 — Docker Hub(공개 게시판) 대신 회사 전용 사물함(ECR)
+              열쇠는 사원증(IAM)에 박아두면 비밀번호 없이도 동료가 찾아갈 수 있다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 로컬 → ECR → EC2 흐름) / 우(VSCode CodeViewer)
+    색상: docker sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // ECR 시뮬레이션 상수 — 단계별 시각화에 사용
+    //   accountId      : 데모용 12자리 AWS 계정 ID
+    //   region         : 시연 리전 (서울)
+    //   repoName       : 만들 리포지토리 이름
+    //   repoUri        : create 단계 이후 등장
+    // ─────────────────────────────────────────────────────
+    const ACCOUNT_ID = '123456789012';
+    const REGION = 'ap-northeast-2';
+    const REPO_NAME = 'demo-app';
+    const REPO_URI = `${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO_NAME}`;
+
+    // 단계별 데이터 — LiveDataPane이 읽는 dataState
+    //   phase/localActive/ecrActive/ec2Active : 단계 식별 + 박스 강조
+    //   repoExists/loggedIn/imagesInRepo      : ECR 상태
+    //   pulledOnEc2/iamAttached               : EC2 상태
+    //   lifecycleOn/expiredTags               : lifecycle 단계 전용
+    //   flowDir : 'push' | 'pull' | null — 가운데 화살표 방향
     const STEPS = [
       {
-        title: "STEP 1 · Docker Hub vs ECR — 왜 ECR인가",
-        desc: "Docker Hub는 기본 공개 저장소라 내부 이미지를 올리기에 부적합하다. ECR은 AWS 계정 안의 비공개 레지스트리로, EC2/ECS와 자연스럽게 연동되고 같은 리전 내 네트워크 비용이 무료다.",
-        phase: "compare",
+        title: 'Step 1. ECR 리포지토리 생성',
+        desc: 'AWS 콘솔이나 CLI로 비공개 ECR 리포지토리를 만든다. aws ecr create-repository 한 줄이면 된다. 응답에 들어 있는 repositoryUri (계정ID.dkr.ecr.리전.amazonaws.com/이름) 가 이후 모든 docker tag·push·pull 의 주소가 된다. 이미지 스캔(scanOnPush)과 태그 불변성(IMMUTABLE) 옵션을 같이 켜면 보안과 추적성이 단번에 좋아진다.',
+        phase: 'create',
+        localActive: false,
+        ecrActive: true,
+        ec2Active: false,
+        repoExists: true,
+        loggedIn: false,
+        imagesInRepo: [],
+        pulledOnEc2: null,
+        iamAttached: false,
+        lifecycleOn: false,
+        expiredTags: [],
+        flowDir: null,
+        code: {
+          lang: 'bash',
+          filename: 'create-repo.sh',
+          lines: [
+            '# Step 1. ECR 리포지토리 생성 — 한 번만 하면 끝',
+            '',
+            '# 1) 리포지토리 생성 (CLI)',
+            'aws ecr create-repository \\',
+            '  --repository-name demo-app \\',
+            '  --region ap-northeast-2 \\',
+            '  --image-scanning-configuration scanOnPush=true \\',
+            '  --image-tag-mutability IMMUTABLE',
+            '',
+            '# 2) 응답 (JSON 일부 발췌)',
+            '# {',
+            '#   "repository": {',
+            '#     "repositoryName": "demo-app",',
+            '#     "repositoryUri":',
+            '#       "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app",',
+            '#     "imageTagMutability": "IMMUTABLE",',
+            '#     "imageScanningConfiguration": { "scanOnPush": true }',
+            '#   }',
+            '# }',
+            '',
+            '# 3) 만든 리포 확인',
+            'aws ecr describe-repositories \\',
+            '  --repository-names demo-app \\',
+            '  --query "repositories[0].repositoryUri" \\',
+            '  --output text',
+            '#  → 123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app',
+            '',
+            '# ─── 옵션 핵심 ───',
+            '#  • scanOnPush=true : push 시 자동 취약점 스캔 (무료)',
+            '#  • IMMUTABLE       : 같은 태그 덮어쓰기 금지 → 운영 안전',
+            '#  • repositoryUri   : 이후 docker tag/push 의 목적지',
+            '',
+            '# 환경변수로 박아두면 다음 단계에서 편하다 (export ECR_URI=...)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 14, 15, 27, 28, 29, 33, 34],
+        },
       },
       {
-        title: "STEP 2 · ECR 리포지토리 생성",
-        desc: "aws ecr create-repository --repository-name demo-app 명령으로 프라이빗 리포지토리를 생성한다. 응답에서 repositoryUri 값을 메모해둔다. 이후 docker tag와 docker push에 사용한다.",
-        phase: "create_repo",
+        title: 'Step 2. aws ecr get-login-password → docker login',
+        desc: 'ECR은 12시간짜리 임시 토큰으로 로그인한다. aws ecr get-login-password 의 출력을 docker login 의 stdin 으로 파이프하면 평문 비밀번호가 셸 히스토리에 남지 않는다. 로컬 PC에서는 AWS CLI 자격증명(~/.aws/credentials), CI 에서는 OIDC, EC2 에서는 IAM 역할이 자격을 공급한다.',
+        phase: 'login',
+        localActive: true,
+        ecrActive: true,
+        ec2Active: false,
+        repoExists: true,
+        loggedIn: true,
+        imagesInRepo: [],
+        pulledOnEc2: null,
+        iamAttached: false,
+        lifecycleOn: false,
+        expiredTags: [],
+        flowDir: null,
+        code: {
+          lang: 'bash',
+          filename: 'login.sh',
+          lines: [
+            '# Step 2. ECR 로그인 — 12시간짜리 임시 토큰',
+            '',
+            '# 1) AWS CLI 자격증명 확인',
+            'aws sts get-caller-identity',
+            '#  → { "Account": "123456789012", "Arn": "...:user/dev" }',
+            '',
+            '# 2) 비밀번호 받아서 곧장 docker login 의 stdin 으로 흘려보낸다',
+            'aws ecr get-login-password --region ap-northeast-2 \\',
+            '  | docker login \\',
+            '      --username AWS \\',
+            '      --password-stdin \\',
+            '      123456789012.dkr.ecr.ap-northeast-2.amazonaws.com',
+            '#  → Login Succeeded',
+            '',
+            '# 3) 인증 정보는 ~/.docker/config.json 에 캐시됨',
+            '#  "auths": {',
+            '#    "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com": {',
+            '#       "auth": "QVdTOmV5SnFkR2tpT2lJ..."   ← base64 임시토큰',
+            '#  } }',
+            '',
+            '# ─── 자주 하는 실수 ───',
+            '#  ✗ 로그인 URL 에 /repo_name 붙이면 실패 → 호스트까지만',
+            '#  ✗ -p 로 직접 넘기면 셸 히스토리에 남음 → --password-stdin',
+            '',
+            '# 토큰은 12시간 후 만료 — CI/CD 는 매 잡마다 재호출',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 13, 21, 22, 23],
+        },
       },
       {
-        title: "STEP 3 · ECR 로그인 + 이미지 푸시",
-        desc: "aws ecr get-login-password로 임시 토큰(12시간 유효)을 받아 docker login에 전달한다. 로컬에서 빌드한 이미지에 ECR URI 태그를 추가하고 docker push로 업로드한다.",
-        phase: "push",
+        title: 'Step 3. docker tag + docker push — 이미지 업로드',
+        desc: '로컬에서 빌드한 이미지에 ECR URI 형식으로 별명(tag)을 붙이고 docker push 로 올린다. 같은 이미지에 두 개의 이름이 붙는 셈이라 디스크 추가 비용은 0 이다. 푸시되는 건 이미지 레이어인데, ECR은 이미 존재하는 레이어는 다시 받지 않으므로 두 번째 푸시부터는 변경분만 빠르게 올라간다.',
+        phase: 'push',
+        localActive: true,
+        ecrActive: true,
+        ec2Active: false,
+        repoExists: true,
+        loggedIn: true,
+        imagesInRepo: ['v1.0.0'],
+        pulledOnEc2: null,
+        iamAttached: false,
+        lifecycleOn: false,
+        expiredTags: [],
+        flowDir: 'push',
+        code: {
+          lang: 'bash',
+          filename: 'tag-push.sh',
+          lines: [
+            '# Step 3. docker tag + docker push — ECR 업로드',
+            '',
+            '# 0) 사전: 로컬에 이미지가 있어야 한다',
+            'docker build -t demo-app:v1.0.0 .',
+            'docker images demo-app',
+            '#  REPOSITORY  TAG      IMAGE ID       SIZE',
+            '#  demo-app    v1.0.0   1a2b3c4d5e6f   180MB',
+            '',
+            '# 1) ECR URI 형식으로 별명(tag) 붙이기',
+            '#    형식: <계정ID>.dkr.ecr.<리전>.amazonaws.com/<repo>:<tag>',
+            'docker tag demo-app:v1.0.0 \\',
+            '  123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app:v1.0.0',
+            '',
+            '# 디스크는 그대로 — 이름만 두 개를 가리킨다',
+            'docker images',
+            '#  demo-app                  v1.0.0  1a2b3c4d  180MB',
+            '#  123...dkr.ecr.../demo-app v1.0.0  1a2b3c4d  180MB',
+            '',
+            '# 2) push (Step 2 의 docker login 이 살아 있어야 함)',
+            'docker push \\',
+            '  123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app:v1.0.0',
+            '#  3f2e1d: Pushed',
+            '#  9a8b7c: Pushed',
+            '#  v1.0.0: digest: sha256:abc... size: 1572',
+            '',
+            '# 3) 확인',
+            'aws ecr list-images --repository-name demo-app',
+            '# { "imageIds": [ { "imageTag": "v1.0.0", ... } ] }',
+            '',
+            '# ─── 한 번 더 푸시 (v1.0.1) ───',
+            '#  이미 ECR 에 있는 레이어는 "Layer already exists" 스킵',
+            '#  → 두 번째부터 변경분만 올라가서 매우 빠름',
+            '',
+            '# ─── 태그 전략 (실무) ───',
+            '#  • git SHA : demo-app:c3a91f2 ← CI/CD 자동',
+            '#  • semver  : demo-app:v1.0.0 ← 사람이 보기 편함',
+            '#  • latest  : 운영에선 비추 (버전 추적 불가)',
+          ],
+          highlight: [3, 4, 11, 12, 19, 20, 21, 27, 28, 33, 34, 35],
+        },
       },
       {
-        title: "STEP 4 · EC2에서 이미지 풀 — IAM 역할",
-        desc: "EC2에 AmazonEC2ContainerRegistryReadOnly IAM 역할을 연결하면, 자격 증명 파일 없이 ECR에서 이미지를 풀할 수 있다. 최소 권한 원칙: 운영 서버는 ReadOnly, 빌드 서버는 PowerUser.",
-        phase: "pull",
+        title: 'Step 4. EC2/ECS에서 pull — IAM 역할로 비밀번호 없이',
+        desc: 'EC2 인스턴스에 IAM 역할(AmazonEC2ContainerRegistryReadOnly)을 붙이면 자격증명 파일을 서버에 두지 않고도 ECR에 인증된다. 인스턴스 메타데이터에서 임시 토큰을 받아 docker login 한 뒤 docker pull 로 받아간다. 운영=ReadOnly, 빌드/CI=PowerUser 로 권한을 분리하는 게 최소 권한 원칙.',
+        phase: 'pull',
+        localActive: false,
+        ecrActive: true,
+        ec2Active: true,
+        repoExists: true,
+        loggedIn: true,
+        imagesInRepo: ['v1.0.0'],
+        pulledOnEc2: 'v1.0.0',
+        iamAttached: true,
+        lifecycleOn: false,
+        expiredTags: [],
+        flowDir: 'pull',
+        code: {
+          lang: 'bash',
+          filename: 'iam-pull.sh',
+          lines: [
+            '# Step 4. EC2 에서 ECR pull — IAM 역할 기반',
+            '',
+            '# ─── (사전) IAM 역할 만들기 ───',
+            '#  IAM → 역할 만들기 → AWS 서비스 → EC2',
+            '#  정책: AmazonEC2ContainerRegistryReadOnly',
+            '#  역할 이름: ec2-ecr-readonly',
+            '#  EC2 → 보안 → IAM 역할 수정 → 위 역할 연결',
+            '',
+            '# ─── 이 아래는 EC2 ssh 접속해서 실행 ───',
+            '',
+            '# 1) IAM 역할이 잘 붙었는지 확인',
+            'aws sts get-caller-identity',
+            '#  → "Arn": ".../assumed-role/ec2-ecr-readonly/i-0abc..."',
+            '#       (IAM 사용자가 아니라 assumed-role 이면 OK)',
+            '',
+            '# 2) ECR 로그인 — Step 2 와 동일하지만 자격증명 파일 없음!',
+            'aws ecr get-login-password --region ap-northeast-2 \\',
+            '  | docker login \\',
+            '      --username AWS --password-stdin \\',
+            '      123456789012.dkr.ecr.ap-northeast-2.amazonaws.com',
+            '#  → Login Succeeded',
+            '',
+            '# 3) 이미지 pull',
+            'docker pull \\',
+            '  123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app:v1.0.0',
+            '#  3f2e1d: Pull complete',
+            '#  9a8b7c: Pull complete',
+            '#  Status: Downloaded newer image',
+            '',
+            '# 4) 실행',
+            'docker run -d --name app -p 80:8000 \\',
+            '  123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app:v1.0.0',
+            '',
+            '# ─── 최소 권한 원칙 ───',
+            '#  운영 EC2 / ECS : ReadOnly  (pull 만)',
+            '#  빌드 / CI      : PowerUser (push 가능)',
+            '#  개발자 PC      : SSO 임시 자격 (long-lived 키 금지)',
+            '',
+            '# ─── ECS / EKS 도 동일 ───',
+            '#  ECS Task : taskRoleArn 에 ECR 권한',
+            '#  EKS Pod  : IRSA 로 SA ↔ Role 매핑',
+          ],
+          highlight: [3, 4, 5, 6, 7, 11, 12, 13, 14, 16, 17, 18, 19, 20, 23, 24, 25, 31, 32, 33],
+        },
       },
       {
-        title: "STEP 5 · 이미지 수명 주기 정책",
-        desc: "이미지를 계속 푸시하면 ECR 저장 비용이 누적된다. 수명 주기 정책으로 '최근 10개 이미지만 유지'처럼 설정하면 오래된 이미지를 자동 삭제하여 비용을 절감한다.",
-        phase: "lifecycle",
-      },
-      {
-        title: "STEP 6 · ECR 전체 흐름 완성",
-        desc: "로컬에서 이미지 빌드 → ECR에 태그 + 푸시 → EC2에서 IAM 역할로 인증 후 풀 → 컨테이너 실행. 같은 AWS 리전 내에서 모든 전송이 무료이고 보안이 보장된다.",
-        phase: "complete",
+        title: 'Step 5. Lifecycle Policy — 오래된 이미지 자동 삭제',
+        desc: '이미지를 계속 푸시하면 ECR 저장 비용이 쌓인다(GB·월 단위 과금). lifecycle policy 를 걸어 두면 "최근 N개만 유지", "30일 지난 untagged 삭제" 같은 규칙으로 매일 자동 청소된다. JSON 한 장만 넣어두면 끝. 운영 이미지를 보호하려면 tagPrefixList 로 v 가 붙은 태그는 제외해도 좋다.',
+        phase: 'lifecycle',
+        localActive: false,
+        ecrActive: true,
+        ec2Active: false,
+        repoExists: true,
+        loggedIn: true,
+        imagesInRepo: ['v1.0.0', 'v1.0.1', 'v1.0.2', 'v1.0.3', 'v1.0.4', 'v1.0.5', 'v1.0.6', 'v1.0.7', 'v1.0.8', 'v1.0.9', 'v1.0.10', 'v1.0.11', 'v1.0.12'],
+        pulledOnEc2: 'v1.0.0',
+        iamAttached: true,
+        lifecycleOn: true,
+        expiredTags: ['v1.0.0', 'v1.0.1', 'v1.0.2'],
+        flowDir: null,
+        code: {
+          lang: 'json',
+          filename: 'lifecycle.json',
+          lines: [
+            '{',
+            '  "rules": [',
+            '    {',
+            '      "rulePriority": 1,',
+            '      "description": "최근 10개 이미지만 유지 — 그 이상은 자동 삭제",',
+            '      "selection": {',
+            '        "tagStatus": "any",',
+            '        "countType": "imageCountMoreThan",',
+            '        "countNumber": 10',
+            '      },',
+            '      "action": { "type": "expire" }',
+            '    },',
+            '    {',
+            '      "rulePriority": 2,',
+            '      "description": "태그 없는(untagged) 이미지는 7일 후 삭제",',
+            '      "selection": {',
+            '        "tagStatus": "untagged",',
+            '        "countType": "sinceImagePushed",',
+            '        "countUnit": "days",',
+            '        "countNumber": 7',
+            '      },',
+            '      "action": { "type": "expire" }',
+            '    }',
+            '  ]',
+            '}',
+            '',
+            '/*  ─── 적용 / 미리보기 ───',
+            '   aws ecr put-lifecycle-policy \\',
+            '     --repository-name demo-app \\',
+            '     --lifecycle-policy-text file://lifecycle.json',
+            '   # 미리보기(삭제 X): start-lifecycle-policy-preview',
+            '',
+            '   ─── 운영 이미지 보호 패턴 ───',
+            '   "selection": {',
+            '     "tagStatus":     "tagged",',
+            '     "tagPrefixList": ["dev-", "feat-"],',
+            '     "countType":     "imageCountMoreThan",',
+            '     "countNumber":   5',
+            '   }',
+            '   → v1.x.x 같은 운영 태그는 안 지워짐',
+            '',
+            '   ─── 비용 감각 ───',
+            '   ECR 스토리지: $0.10 / GB·월 (서울)',
+            '   180MB × 100 개 → 18GB → 월 $1.8 (누적)',
+            '*/',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 28, 29, 30, 31],
+        },
       },
     ];
 
-    function CompareView() {
-      const items = [
-        { field: "기본 공개 여부", hub: "공개 (Public)", ecr: "비공개 (Private)" },
-        { field: "인증 방식", hub: "사용자 계정", ecr: "AWS IAM" },
-        { field: "AWS 서비스 연동", hub: "별도 설정 필요", ecr: "자동 연동" },
-        { field: "이미지 스캔", hub: "유료", ecr: "기본 스캔 무료" },
-        { field: "네트워크 비용", hub: "전송 비용 발생", ecr: "같은 리전 무료" },
-      ];
+    // ─────────────────────────────────────────────────────
+    // 좌측 패널 — 로컬 PC 박스
+    //   localActive 면 sky 강조, 아니면 회색
+    //   loggedIn 일 때만 자물쇠가 풀린 모양
+    // ─────────────────────────────────────────────────────
+    function LocalBox({ active, loggedIn }) {
       return (
-        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden anim-fade">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-slate-100">
-                <th className="p-3 text-left text-slate-600">항목</th>
-                <th className="p-3 text-center text-slate-600">Docker Hub</th>
-                <th className="p-3 text-center text-blue-700 font-bold">AWS ECR</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((r, i) => (
-                <tr key={i} className="border-t border-slate-100 anim-slide" style={{animationDelay:`${i*0.1}s`}}>
-                  <td className="p-3 font-medium text-slate-700">{r.field}</td>
-                  <td className="p-3 text-center text-slate-500">{r.hub}</td>
-                  <td className="p-3 text-center text-blue-700 font-bold">{r.ecr}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-    }
-
-    function CreateRepoView() {
-      return (
-        <div className="space-y-4 anim-fade">
-          <div className="bg-gray-900 rounded-xl p-5 font-mono text-sm">
-            <div className="flex items-center gap-2 mb-3">
-              <div className="w-3 h-3 rounded-full bg-red-500"></div>
-              <div className="w-3 h-3 rounded-full bg-yellow-500"></div>
-              <div className="w-3 h-3 rounded-full bg-green-500"></div>
-              <span className="text-gray-400 text-xs ml-2">Terminal (로컬)</span>
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${
+          active ? 'bg-sky-50 border-sky-400 shadow-md' : 'bg-slate-50 border-slate-200'
+        }`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">💻</span>
+              <span className={`text-[11px] font-bold ${active ? 'text-sky-800' : 'text-slate-500'}`}>
+                로컬 PC / CI Runner
+              </span>
             </div>
-            <div className="text-green-300">$ aws ecr create-repository \</div>
-            <div className="text-green-300 ml-4">--repository-name demo-app \</div>
-            <div className="text-green-300 ml-4">--region ap-northeast-2</div>
+            <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${
+              loggedIn ? 'bg-emerald-600 text-white' : 'bg-slate-300 text-slate-600'
+            }`}>
+              {loggedIn ? 'logged in' : 'no auth'}
+            </span>
           </div>
-          <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-5">
-            <h4 className="font-bold text-blue-800 mb-3">응답 (JSON)</h4>
-            <div className="bg-white rounded-lg p-4 font-mono text-xs space-y-1">
-              <div className="text-slate-400">{"{"}</div>
-              <div className="ml-4"><span className="text-blue-600">"repositoryName"</span>: <span className="text-green-600">"demo-app"</span>,</div>
-              <div className="ml-4 bg-yellow-100 px-1 rounded"><span className="text-blue-600">"repositoryUri"</span>: <span className="text-green-600">"123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/demo-app"</span></div>
-              <div className="text-slate-400">{"}"}</div>
-            </div>
-            <p className="text-xs text-blue-600 mt-2 font-bold">repositoryUri를 메모! docker tag와 docker push에 사용합니다.</p>
+          <div className="bg-white rounded border border-slate-200 p-1.5 font-mono text-[9px] leading-snug text-slate-700 space-y-0.5">
+            <div><span className="text-sky-600">$</span> docker build -t demo-app:v1.0.0 .</div>
+            <div><span className="text-sky-600">$</span> docker tag demo-app:v1.0.0 ...</div>
+            <div><span className="text-sky-600">$</span> docker push ...</div>
+          </div>
+          <div className={`text-[9px] mt-1 ${active ? 'text-sky-700 font-semibold' : 'text-slate-400'}`}>
+            {loggedIn ? '✓ ECR 12시간 토큰 보유' : 'docker login 필요'}
           </div>
         </div>
       );
     }
 
-    function PushView() {
-      const commands = [
-        { cmd: "aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin <ECR_URI>", desc: "ECR 로그인 (12시간 유효 토큰)", icon: "🔑" },
-        { cmd: "docker build -t demo-app:latest .", desc: "로컬에서 이미지 빌드", icon: "🔨" },
-        { cmd: "docker tag demo-app:latest 123456789012.dkr.ecr.../demo-app:v1.0.0", desc: "ECR URI 형식으로 태그 추가", icon: "🏷️" },
-        { cmd: "docker push 123456789012.dkr.ecr.../demo-app:v1.0.0", desc: "ECR에 이미지 푸시", icon: "📤" },
-      ];
+    // ─────────────────────────────────────────────────────
+    // 가운데 — ECR 박스
+    //   repoExists 면 리포 이름 표시, 아니면 "(empty)"
+    //   imagesInRepo 의 태그를 카드로 나열, expiredTags 는 취소선
+    //   lifecycleOn 일 때 상단에 정책 활성 배지
+    // ─────────────────────────────────────────────────────
+    function EcrBox({ active, repoExists, imagesInRepo, expiredTags, lifecycleOn }) {
       return (
-        <div className="bg-gray-900 rounded-xl p-5 anim-fade">
-          <div className="flex items-center gap-2 mb-4">
-            <div className="w-3 h-3 rounded-full bg-red-500"></div>
-            <div className="w-3 h-3 rounded-full bg-yellow-500"></div>
-            <div className="w-3 h-3 rounded-full bg-green-500"></div>
-            <span className="text-gray-400 text-xs ml-2">Terminal (로컬)</span>
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${
+          active ? 'bg-sky-50 border-sky-400 shadow-md' : 'bg-slate-50 border-slate-200'
+        }`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">☁️</span>
+              <span className={`text-[11px] font-bold ${active ? 'text-sky-800' : 'text-slate-500'}`}>
+                AWS ECR (private)
+              </span>
+            </div>
+            {lifecycleOn && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded font-mono font-bold bg-amber-500 text-white animate-pulse">
+                lifecycle ON
+              </span>
+            )}
           </div>
-          <div className="space-y-4">
-            {commands.map((c, i) => (
-              <div key={i} className="anim-slide" style={{animationDelay:`${i*0.2}s`}}>
-                <div className="flex items-center gap-3">
-                  <span className="text-xl">{c.icon}</span>
-                  <code className="text-green-400 font-mono text-xs break-all">$ {c.cmd}</code>
-                </div>
-                <p className="text-gray-500 text-xs ml-10 mt-1">{c.desc}</p>
+
+          <div className="bg-white rounded border border-slate-200 p-1.5 font-mono text-[9px] leading-snug">
+            <div className="text-slate-500 mb-0.5">
+              <span className="text-slate-400">repositoryUri:</span>
+            </div>
+            <div className={`${repoExists ? 'text-sky-700' : 'text-slate-300'} break-all leading-tight`}>
+              {repoExists
+                ? `${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO_NAME}`
+                : '(아직 없음)'}
+            </div>
+          </div>
+
+          {/* 이미지 목록 */}
+          <div className="mt-2">
+            <div className="text-[9px] text-slate-500 mb-1 flex items-center justify-between">
+              <span>📦 images ({imagesInRepo.length})</span>
+              {expiredTags.length > 0 && (
+                <span className="text-[8px] text-rose-600 font-bold">
+                  -{expiredTags.length} expired
+                </span>
+              )}
+            </div>
+            {imagesInRepo.length === 0 ? (
+              <div className="text-[9px] text-slate-400 italic px-1">(empty)</div>
+            ) : (
+              <div className="grid grid-cols-3 gap-1">
+                {imagesInRepo.map((tag) => {
+                  const expired = expiredTags.includes(tag);
+                  return (
+                    <div
+                      key={tag}
+                      className={`text-[8px] font-mono rounded px-1 py-0.5 text-center border transition-all duration-500 ${
+                        expired
+                          ? 'bg-rose-50 border-rose-300 text-rose-500 line-through'
+                          : 'bg-sky-100 border-sky-300 text-sky-800'
+                      }`}
+                    >
+                      {tag}
+                    </div>
+                  );
+                })}
               </div>
-            ))}
+            )}
           </div>
         </div>
       );
     }
 
-    function PullView() {
+    // ─────────────────────────────────────────────────────
+    // 우측 — EC2 / ECS 박스
+    //   iamAttached 면 IAM 역할 배지, 아니면 "no role"
+    //   pulledOnEc2 가 있으면 컨테이너 실행 카드 표시
+    // ─────────────────────────────────────────────────────
+    function Ec2Box({ active, iamAttached, pulledOnEc2 }) {
       return (
-        <div className="space-y-4 anim-fade">
-          <div className="bg-white rounded-xl border-2 border-purple-200 p-5">
-            <h4 className="font-bold text-purple-800 mb-3">IAM 역할 설정 흐름</h4>
-            <div className="space-y-3">
-              {[
-                { step: "1", text: "IAM → 역할 만들기 → AWS 서비스 → EC2", icon: "👤" },
-                { step: "2", text: "정책 연결: AmazonEC2ContainerRegistryReadOnly", icon: "📋" },
-                { step: "3", text: "EC2 인스턴스 → 보안 → IAM 역할 수정 → 역할 연결", icon: "🔗" },
-              ].map((s, i) => (
-                <div key={i} className="flex items-center gap-3 p-3 bg-purple-50 rounded-lg anim-slide" style={{animationDelay:`${i*0.15}s`}}>
-                  <span className="w-8 h-8 bg-purple-200 rounded-full flex items-center justify-center text-purple-700 font-bold text-sm">{s.step}</span>
-                  <span className="text-xl">{s.icon}</span>
-                  <span className="text-sm">{s.text}</span>
-                </div>
-              ))}
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${
+          active ? 'bg-sky-50 border-sky-400 shadow-md' : 'bg-slate-50 border-slate-200'
+        }`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🖥️</span>
+              <span className={`text-[11px] font-bold ${active ? 'text-sky-800' : 'text-slate-500'}`}>
+                EC2 / ECS Task
+              </span>
+            </div>
+            <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono font-bold ${
+              iamAttached ? 'bg-violet-600 text-white' : 'bg-slate-300 text-slate-600'
+            }`}>
+              {iamAttached ? 'IAM role ✓' : 'no role'}
+            </span>
+          </div>
+
+          <div className="bg-white rounded border border-slate-200 p-1.5 font-mono text-[9px] leading-snug text-slate-700 space-y-0.5">
+            <div className={iamAttached ? 'text-violet-700' : 'text-slate-400'}>
+              <span className="text-sky-600">role:</span>{' '}
+              {iamAttached ? 'ec2-ecr-readonly' : '—'}
+            </div>
+            <div className={iamAttached ? 'text-violet-700' : 'text-slate-400'}>
+              <span className="text-sky-600">policy:</span>{' '}
+              {iamAttached ? 'AmazonEC2ContainerRegistryReadOnly' : '—'}
             </div>
           </div>
-          <div className="bg-gray-900 rounded-xl p-5 font-mono text-sm">
-            <div className="text-gray-400 mb-2"># EC2에서 (IAM 역할 덕분에 자격 증명 불필요)</div>
-            <div className="text-green-300">$ aws ecr get-login-password | docker login ...</div>
-            <div className="text-cyan-300 mt-1">Login Succeeded</div>
-            <div className="text-green-300 mt-2">$ docker pull 123456789012.dkr.ecr.../demo-app:latest</div>
-            <div className="text-white mt-1">latest: Pulling from demo-app ... Pull complete</div>
-          </div>
-          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
-            <p className="text-xs text-amber-700"><strong>최소 권한 원칙:</strong> 운영 서버 → ReadOnly, 빌드 서버(CI) → PowerUser(push 포함)</p>
-          </div>
-        </div>
-      );
-    }
 
-    function LifecycleView() {
-      return (
-        <div className="space-y-4 anim-fade">
-          <div className="bg-white rounded-xl border-2 border-blue-200 p-5">
-            <h4 className="font-bold text-blue-800 mb-3">수명 주기 정책 예시: 최근 10개만 유지</h4>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <div className="bg-gray-900 rounded-lg p-3 font-mono text-xs text-green-300">
-                  <div>{"{"}</div>
-                  <div className="ml-2">"rules": [{"{"}</div>
-                  <div className="ml-4">"description": "최근 10개만 유지",</div>
-                  <div className="ml-4">"selection": {"{"}</div>
-                  <div className="ml-6 text-yellow-300">"countNumber": 10</div>
-                  <div className="ml-4">{"}"},</div>
-                  <div className="ml-4">"action": {"{"} "type": "expire" {"}"}</div>
-                  <div className="ml-2">{"}"}]</div>
-                  <div>{"}"}</div>
+          {/* 풀 받은 이미지 / 컨테이너 */}
+          <div className="mt-2">
+            {pulledOnEc2 ? (
+              <div className="bg-emerald-50 border-2 border-emerald-300 rounded p-1.5">
+                <div className="flex items-center justify-between text-[9px]">
+                  <span className="font-bold text-emerald-800">🐳 container</span>
+                  <span className="text-[8px] bg-emerald-600 text-white px-1 rounded font-mono font-bold">
+                    Up ✓
+                  </span>
+                </div>
+                <div className="text-[8px] font-mono text-emerald-700 mt-0.5 leading-tight break-all">
+                  demo-app:{pulledOnEc2}
+                </div>
+                <div className="text-[8px] text-emerald-600 mt-0.5">
+                  :80 → :8000 listening
                 </div>
               </div>
-              <div className="space-y-2">
-                <div className="text-sm font-bold text-slate-700 mb-2">이미지 보관 상태:</div>
-                {["v1.0.0", "v1.0.1", "v1.0.2", "...", "v1.0.9 (최신)"].map((v, i) => (
-                  <div key={i} className={`flex items-center justify-between px-3 py-1.5 rounded-lg text-xs ${
-                    v === "v1.0.0" ? 'bg-red-100 text-red-600 line-through' : 'bg-green-100 text-green-700'
-                  } anim-slide`} style={{animationDelay:`${i*0.1}s`}}>
-                    <span>{v}</span>
-                    <span>{v === "v1.0.0" ? '자동 삭제' : '유지'}</span>
-                  </div>
-                ))}
+            ) : (
+              <div className="bg-slate-50 border border-dashed border-slate-300 rounded p-1.5 text-[9px] text-slate-400 text-center">
+                아직 pull 받지 않음
               </div>
-            </div>
+            )}
           </div>
         </div>
       );
     }
 
-    function CompleteView() {
-      const flow = [
-        { label: "로컬 빌드", icon: "💻", desc: "docker build" },
-        { label: "태그 추가", icon: "🏷️", desc: "docker tag" },
-        { label: "ECR 푸시", icon: "📤", desc: "docker push" },
-        { label: "EC2 풀", icon: "📥", desc: "docker pull" },
-        { label: "실행", icon: "🚀", desc: "docker run" },
-      ];
+    // ─────────────────────────────────────────────────────
+    // 가운데 화살표 — push / pull 방향 시각화
+    //   flowDir === 'push' : 로컬 → ECR (오른쪽)
+    //   flowDir === 'pull' : ECR → EC2 (오른쪽)
+    //   둘 다 좌우 배치라 ↘/↗ 보다 → 가 직관적
+    // ─────────────────────────────────────────────────────
+    function FlowArrow({ from, to, flowDir, label, sub }) {
+      const active = flowDir != null;
       return (
-        <div className="space-y-4 anim-fade">
-          <div className="bg-gradient-to-r from-emerald-50 to-blue-50 border-2 border-emerald-300 rounded-xl p-6">
-            <div className="text-center mb-4">
-              <div className="text-4xl mb-3">🎉</div>
-              <h3 className="text-xl font-bold text-emerald-800">ECR 전체 흐름 완성!</h3>
-            </div>
-            <div className="flex items-center justify-between">
-              {flow.map((f, i) => (
-                <React.Fragment key={i}>
-                  <div className="flex flex-col items-center anim-slide" style={{animationDelay:`${i*0.15}s`}}>
-                    <span className="text-2xl mb-1">{f.icon}</span>
-                    <span className="text-xs font-bold">{f.label}</span>
-                    <span className="text-xs text-slate-500">{f.desc}</span>
-                  </div>
-                  {i < flow.length - 1 && <div className="text-blue-400 font-bold">→</div>}
-                </React.Fragment>
-              ))}
-            </div>
+        <div className="flex flex-col items-center justify-center px-1">
+          <div className={`text-[10px] font-mono font-bold mb-0.5 ${active ? 'text-sky-700' : 'text-slate-300'}`}>
+            {label}
           </div>
-          <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-center">
-            <p className="text-sm text-blue-700">같은 AWS 리전 내 EC2 ↔ ECR 전송은 <strong>네트워크 비용 무료!</strong></p>
+          <div className={`text-2xl ${active ? 'text-sky-500' : 'text-slate-300'}`}>
+            →
+          </div>
+          <div className={`text-[8px] font-mono ${active ? 'text-sky-600' : 'text-slate-300'} mt-0.5`}>
+            {sub}
           </div>
         </div>
       );
     }
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단:  [로컬] → [ECR] → [EC2]  3박스 가로 배치
+    //   하단:  단계 요약 + 범례
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📚 로컬 → ECR → EC2 흐름</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          {/* 3 박스 + 화살표 — 작은 화면에서는 세로로 쌓이도록 wrap */}
+          <div className="grid grid-cols-[1fr_auto_1fr] gap-2 items-stretch">
+            <LocalBox active={step.localActive} loggedIn={step.loggedIn} />
+            <FlowArrow
+              flowDir={step.flowDir === 'push' ? 'push' : null}
+              label={step.flowDir === 'push' ? 'push' : ''}
+              sub={step.flowDir === 'push' ? 'docker push' : ''}
+            />
+            <EcrBox
+              active={step.ecrActive}
+              repoExists={step.repoExists}
+              imagesInRepo={step.imagesInRepo}
+              expiredTags={step.expiredTags}
+              lifecycleOn={step.lifecycleOn}
+            />
+          </div>
+
+          {/* ECR → EC2 화살표 + EC2 박스 */}
+          <div className="grid grid-cols-[1fr_auto_1fr] gap-2 items-stretch mt-2">
+            <div className="rounded-lg border-2 border-dashed border-slate-200 bg-slate-50/50 p-2 flex items-center justify-center text-[9px] text-slate-400 font-mono">
+              {step.phase === 'lifecycle'
+                ? '🧹 매일 00:00 UTC 자동 청소'
+                : step.phase === 'create'
+                  ? '🔧 IMMUTABLE + scanOnPush'
+                  : step.phase === 'login'
+                    ? '🔑 12시간 임시 토큰'
+                    : step.phase === 'push'
+                      ? '🏷️ tag → push 변경분만'
+                      : '🛡️ IAM 임시 자격증명'}
+            </div>
+            <FlowArrow
+              flowDir={step.flowDir === 'pull' ? 'pull' : null}
+              label={step.flowDir === 'pull' ? 'pull' : ''}
+              sub={step.flowDir === 'pull' ? 'docker pull' : ''}
+            />
+            <Ec2Box
+              active={step.ec2Active}
+              iamAttached={step.iamAttached}
+              pulledOnEc2={step.pulledOnEc2}
+            />
+          </div>
+
+          {/* 단계 요약 패널 */}
+          <div className="mt-3 bg-sky-50 border border-sky-200 rounded-lg p-2.5">
+            <div className="flex items-center gap-2 text-[10px] font-mono">
+              <span className="bg-sky-600 text-white px-1.5 py-0.5 rounded font-bold">
+                phase: {step.phase}
+              </span>
+              <span className="text-slate-600">
+                images in ECR: <strong className="text-sky-700">{step.imagesInRepo.length}</strong>
+              </span>
+              {step.expiredTags.length > 0 && (
+                <span className="text-rose-600">
+                  · expired: <strong>{step.expiredTags.length}</strong>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-2 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>active
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded border border-slate-300 bg-white"></span>idle
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-violet-500"></span>IAM
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-amber-500"></span>lifecycle
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-rose-500"></span>expired
+            </span>
+            <span className="ml-auto font-mono">region: {REGION}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    //   파일 탭(전체 5개), 윈도우 dot, 라인 번호, 강조 라인
+    //   현재 step 의 파일명을 active 탭으로 보여준다
+    // ─────────────────────────────────────────────────────
+    const FILE_TABS = [
+      'create-repo.sh',
+      'login.sh',
+      'tag-push.sh',
+      'iam-pull.sh',
+      'lifecycle.json',
+    ];
+
+    function CodeViewer({ code, stepIdx, total, onTab }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4000);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
-
-      const renderVisual = () => {
-        switch(data.phase) {
-          case "compare": return <CompareView />;
-          case "create_repo": return <CreateRepoView />;
-          case "push": return <PushView />;
-          case "pull": return <PullView />;
-          case "lifecycle": return <LifecycleView />;
-          case "complete": return <CompleteView />;
-          default: return null;
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
         }
-      };
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-3 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5 mr-2">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <div className="flex gap-0.5 overflow-x-auto flex-1">
+              {FILE_TABS.map((name, i) => {
+                const activeTab = i === stepIdx;
+                return (
+                  <button
+                    key={name}
+                    onClick={() => onTab && onTab(i)}
+                    className={`px-2 py-1 text-[10px] font-mono rounded-t transition whitespace-nowrap ${
+                      activeTab
+                        ? 'bg-[#282c34] text-sky-300 border-t border-l border-r border-slate-700'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    {name}
+                  </button>
+                );
+              })}
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono uppercase ml-2 flex-shrink-0">
+              {code.lang}
+            </span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines · {code.filename}</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생(3000ms), 키보드 단축키
+    //   탭 클릭 시 해당 step 으로 점프
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      const handleTab = (i) => {
+        setStepIdx(i);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum VIII-1-14</span>
+            </nav>
+
+            {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter VIII-1-14: ECR(Elastic Container Registry) 사용</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VIII</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part VIII. Docker on Cloud &gt; Chapter 1. AWS</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VIII-1-14. ECR 활용 — 사내 전용 이미지 레지스트리</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">로컬 빌드 → ECR push → EC2 pull(IAM) → lifecycle 자동 청소까지 5단계로 끝낸다</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">ECR 레포 생성 → 로그인 → 이미지 푸시 → EC2에서 풀 전체 흐름을 시뮬레이션합니다.</p>
             </header>
 
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "complete" ? "bg-emerald-600 border-emerald-700 text-white" :
-              data.phase === "pull" ? "bg-purple-600 border-purple-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer
+                code={step.code}
+                stepIdx={stepIdx}
+                total={STEPS.length}
+                onTab={handleTab}
+              />
             </div>
 
-            <div key={`visual-${step}`}>{renderVisual()}</div>
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: <strong>create → login → push → pull(IAM) → lifecycle</strong> — 이 5단계가 ECR 운용 전부다. 다음(VIII-1-15)에서는 ECS / Fargate 로 컨테이너를 진짜 띄워본다.
+              </div>
+            )}
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
-              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['ECR', 'create-repository', 'get-login-password', 'docker push', 'docker pull', 'IAM role', 'ReadOnly', 'lifecycle policy', 'IMMUTABLE', 'scanOnPush'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./viii-1-13_aws_ecs_basics.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; VIII-1-13 ECS 기본</a>
+              <a href="./viii-1-15_aws_fargate.html" className="text-sky-700 hover:text-sky-900 font-medium">VIII-1-15 Fargate &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

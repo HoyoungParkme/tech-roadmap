@@ -3,251 +3,721 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — system prune과 디스크 관리</title>
+  <title>Docker 인터랙티브 학습 — VIII-1-4. system prune 디스크 정리</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes shrink { from{transform:scaleY(1);} to{transform:scaleY(0);} }
-    @keyframes grow { from{width:0%;} to{width:100%;} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    VIII-1-4. system prune 디스크 정리 — 누적된 쓰레기 한 번에 비우기
+    학습 목표: docker system df 로 현황 파악 → container/image prune 으로 좁게 청소 →
+              system prune -a --volumes 로 전체 정리까지의 5단계 흐름을 시각화한다.
+    핵심 비유: 책상 정리 — df 는 자 측정, container/image prune 은 서랍별 청소,
+              system prune -a --volumes 는 책상 통째로 비우기.
+    패턴: fastapi v1 — 좌(LiveDataPane: 디스크 사용량 막대 + 정리 효과) / 우(VSCode CodeViewer)
+    색상: docker sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 디스크 사용량 카테고리 — Step 별로 sizeGB / reclaimGB 가 변한다
+    //   key       : 카테고리 식별자
+    //   icon/label: UI 표시
+    // ─────────────────────────────────────────────────────
+    const CATEGORIES = [
+      { key: 'images',     icon: '🖼️', label: 'Images',        desc: '이미지 (태그된 + dangling <none>)' },
+      { key: 'containers', icon: '📦', label: 'Containers',    desc: '컨테이너 layer (Up + Exited)' },
+      { key: 'volumes',    icon: '💾', label: 'Volumes',       desc: 'named volume + 사용 안 되는 볼륨' },
+      { key: 'cache',      icon: '🔨', label: 'Build Cache',   desc: 'BuildKit 캐시 (전부 회수 가능)' },
+    ];
+
+    // 디스크 총 용량(시각화 막대 max 값) — 5GB 기준 막대
+    const MAX_GB = 5.0;
+
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — LiveDataPane 이 읽는 dataState
+    //   phase     : 'problem' | 'df' | 'container-prune' | 'image-prune' | 'system-prune'
+    //   disk      : { images, containers, volumes, cache } — 각 GB 사용량
+    //   reclaim   : { images, containers, volumes, cache } — 그중 회수 가능한 용량 (GB)
+    //   reclaimed : 직전 단계 대비 이번 단계에서 회수된 용량 (GB) — 0 이면 표시 안 함
+    //   alert     : 'danger' | 'info' | 'success' | null — 좌측 상단 배너 색
+    //   alertText : 배너 텍스트
+    //   focus     : 강조할 카테고리 key 배열 (sky 테두리)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: "STEP 1 · 디스크가 부족하다!",
-        desc: "Docker를 계속 사용하다 보면 중지된 컨테이너, 댕글링 이미지, 미사용 볼륨, 빌드 캐시가 쌓인다. docker system df로 현황을 파악하는 것이 첫 번째 단계다.",
-        phase: "problem",
-        disk: { images: 2.45, containers: 0.15, volumes: 1.2, cache: 0.51, reclaimable: 3.28 },
+        title: 'Step 1. 디스크가 가득 찼다 — 멈춘 컨테이너와 dangling 이미지가 누적',
+        desc: '몇 주간 docker run / build / pull 을 반복하면 멈춘 컨테이너 layer, 태그가 사라진 dangling 이미지(<none>:<none>), 빌드 캐시가 조용히 쌓인다. df -h 로 보면 /var/lib/docker 만 4 GB+ 를 잡아먹고 있다. 정리하지 않으면 디스크 풀(no space left on device)로 새 빌드도 실패한다.',
+        phase: 'problem',
+        disk:    { images: 2.40, containers: 0.45, volumes: 1.20, cache: 0.65 },
+        reclaim: { images: 1.60, containers: 0.40, volumes: 0.30, cache: 0.65 },
+        reclaimed: 0,
+        alert: 'danger',
+        alertText: '⚠️ /var/lib/docker 4.70 GB — 디스크 가득 차기 직전',
+        focus: [],
+        code: {
+          lang: 'bash',
+          filename: 'df.sh',
+          lines: [
+            '# Step 1. 호스트 디스크 부족 — 원인은 대개 Docker',
+            '',
+            '# 1) 호스트 디스크 사용량 확인',
+            'df -h /',
+            '#  Filesystem      Size  Used Avail Use% Mounted on',
+            '#  /dev/nvme0n1p2   50G   46G  1.8G  96% /     ← 위험!',
+            '',
+            '# 2) 무엇이 그렇게 큰가? — Docker 폴더부터 의심',
+            'sudo du -sh /var/lib/docker',
+            '#  4.7G    /var/lib/docker',
+            '',
+            '# 3) 안에서 누가 범인인지 더 보기',
+            'sudo du -sh /var/lib/docker/*',
+            '#  2.4G    /var/lib/docker/overlay2     ← 이미지 layer',
+            '#  450M    /var/lib/docker/containers   ← 멈춘 컨테이너 로그',
+            '#  1.2G    /var/lib/docker/volumes      ← named volume',
+            '#  650M    /var/lib/docker/buildkit     ← 빌드 캐시',
+            '',
+            '# ─── 어떻게 이렇게 됐나? ───',
+            '#  • docker run 후 docker rm 안 함 → 멈춘 컨테이너 누적',
+            '#  • docker build 반복 → 이전 태그가 dangling <none> 으로 남음',
+            '#  • docker pull 새 버전 → 옛 버전은 안 지워짐',
+            '#  • BuildKit 캐시는 자동 정리 안 됨',
+            '',
+            '# ─── 해결 흐름 (다음 4 step) ───',
+            '#  Step 2  docker system df          ← 측정',
+            '#  Step 3  docker container prune    ← 멈춘 컨테이너 청소',
+            '#  Step 4  docker image prune -a     ← 미사용 이미지 청소',
+            '#  Step 5  docker system prune -a --volumes  ← 전체 청소',
+          ],
+          highlight: [4, 5, 6, 9, 10, 13, 14, 15, 16, 17, 24, 25, 26, 27],
+        },
       },
       {
-        title: "STEP 2 · docker system df — 현황 파악",
-        desc: "이미지 2.45GB 중 1.82GB 회수 가능, 컨테이너 156MB 중 134MB 회수 가능, 볼륨 1.2GB 중 800MB 회수 가능, 빌드 캐시 512MB 전부 회수 가능. RECLAIMABLE이 정리 가능한 용량이다.",
-        phase: "df",
-        disk: { images: 2.45, containers: 0.15, volumes: 1.2, cache: 0.51, reclaimable: 3.28 },
+        title: 'Step 2. docker system df — 사용량과 회수 가능량 측정',
+        desc: 'docker system df 는 4 카테고리(Images / Containers / Local Volumes / Build Cache)별로 SIZE 와 RECLAIMABLE 을 한 표로 보여준다. -v(verbose) 를 붙이면 어떤 이미지·컨테이너·볼륨이 정확히 얼마를 잡아먹는지 항목별로 나온다. "회수 가능"이라고 표시된 만큼이 안전하게 prune 으로 비울 수 있는 용량이다.',
+        phase: 'df',
+        disk:    { images: 2.40, containers: 0.45, volumes: 1.20, cache: 0.65 },
+        reclaim: { images: 1.60, containers: 0.40, volumes: 0.30, cache: 0.65 },
+        reclaimed: 0,
+        alert: 'info',
+        alertText: '🔎 측정만 한다 — 실제 삭제는 아직 없다',
+        focus: ['images', 'containers', 'volumes', 'cache'],
+        code: {
+          lang: 'bash',
+          filename: 'system-df.sh',
+          lines: [
+            '# Step 2. docker system df — 카테고리별 사용량 / 회수 가능량',
+            '',
+            '# 1) 요약 — 표 한 장으로 전체 보기',
+            'docker system df',
+            '#  TYPE            TOTAL  ACTIVE  SIZE     RECLAIMABLE',
+            '#  Images           42     5      2.40GB   1.60GB (66%)',
+            '#  Containers       18     2      450MB    400MB  (88%)',
+            '#  Local Volumes    9      3      1.20GB   300MB  (25%)',
+            '#  Build Cache      87     0      650MB    650MB  (100%)',
+            '',
+            '# 2) 상세 — 어떤 이미지가 큰지까지 출력',
+            'docker system df -v',
+            '#  Images space usage:',
+            '#  REPOSITORY    TAG       IMAGE ID      SIZE      SHARED SIZE  UNIQUE SIZE',
+            '#  myapp         v1        abc123        850MB     120MB        730MB',
+            '#  myapp         <none>    def456        820MB     120MB        700MB  ← dangling',
+            '#  postgres      14        ...           370MB     0B           370MB',
+            '#  ...',
+            '',
+            '# ─── 표 읽는 법 ───',
+            '#  • TOTAL       : 디스크에 존재하는 항목 수',
+            '#  • ACTIVE      : 지금 사용 중인 항목 수 (running container 가 잡고 있음)',
+            '#  • SIZE        : 카테고리 전체 디스크 사용량',
+            '#  • RECLAIMABLE : 그중 안전하게 정리 가능한 용량',
+            '#                  → "이만큼은 prune 으로 즉시 비울 수 있다"',
+            '',
+            '# ─── 다음 결정 ───',
+            '#  • Containers 88% 회수 가능 → Step 3 container prune',
+            '#  • Images     66% 회수 가능 → Step 4 image prune -a',
+            '#  • Build      100% 회수 가능 → 어차피 system prune 으로 같이 비움',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 26, 27, 28],
+        },
       },
       {
-        title: "STEP 3 · docker system prune — 기본 정리",
-        desc: "중지된 컨테이너 + 미사용 네트워크 + 댕글링 이미지 + 빌드 캐시를 한 번에 삭제한다. 실행 중인 컨테이너와 연결된 이미지, 그리고 볼륨은 건드리지 않는다. 안전한 기본 정리다.",
-        phase: "prune",
-        disk: { images: 0.63, containers: 0.02, volumes: 1.2, cache: 0.0, reclaimable: 0.4 },
+        title: 'Step 3. docker container prune — 멈춘 컨테이너만 좁게 정리',
+        desc: 'Exited / Created 상태로 남아있는 멈춘 컨테이너만 골라서 삭제한다. running 상태 컨테이너는 절대 건드리지 않으므로 운영 중에도 가장 안전한 명령이다. 컨테이너 layer 와 그 안의 로그 파일도 함께 삭제되어 즉시 디스크가 회수된다. -f 를 붙이면 확인 프롬프트 없이 바로 실행된다.',
+        phase: 'container-prune',
+        disk:    { images: 2.40, containers: 0.05, volumes: 1.20, cache: 0.65 },
+        reclaim: { images: 1.60, containers: 0.00, volumes: 0.30, cache: 0.65 },
+        reclaimed: 0.40,
+        alert: 'success',
+        alertText: '✓ 0.40 GB 회수 — 멈춘 컨테이너 16개 삭제',
+        focus: ['containers'],
+        code: {
+          lang: 'bash',
+          filename: 'container-prune.sh',
+          lines: [
+            '# Step 3. docker container prune — 멈춘 컨테이너만 일괄 삭제',
+            '',
+            '# 1) 어떤 컨테이너가 멈춰있는지 먼저 본다',
+            'docker ps -a --filter "status=exited" --filter "status=created"',
+            '#  CONTAINER ID  IMAGE        STATUS                     NAMES',
+            '#  abc123        myapp:v1     Exited (0) 3 weeks ago     test-1',
+            '#  def456        postgres:14  Exited (137) 2 days ago    db-old',
+            '#  ...  (총 16개)',
+            '',
+            '# 2) 멈춘 컨테이너 일괄 삭제',
+            'docker container prune',
+            '#  WARNING! This will remove all stopped containers.',
+            '#  Are you sure you want to continue? [y/N] y',
+            '#  Deleted Containers:',
+            '#  abc123...',
+            '#  def456...',
+            '#  ...',
+            '#  Total reclaimed space: 400MB',
+            '',
+            '# 3) 확인 없이 바로 (CI 스크립트 등에서)',
+            'docker container prune -f',
+            '',
+            '# 4) 24시간 이상 멈춰있던 것만 (운영 안전)',
+            'docker container prune --filter "until=24h" -f',
+            '',
+            '# ─── 안전 포인트 ───',
+            '#  • running 상태 컨테이너는 절대 안 지움',
+            '#  • 컨테이너 layer + json 로그도 함께 삭제',
+            '#  • named volume 은 그대로 보존됨 (Step 5 와 다름)',
+            '',
+            '# ─── 결과 ───',
+            '#  Containers 450MB → 50MB  (400MB 회수)',
+            '#  남은 50MB 는 running 2개의 layer',
+          ],
+          highlight: [3, 4, 10, 11, 17, 19, 20, 22, 23, 25, 26, 27, 28, 30, 31, 32],
+        },
       },
       {
-        title: "STEP 4 · docker system prune -a — 강력 정리",
-        desc: "-a를 추가하면 댕글링 이미지뿐 아니라 실행 중인 컨테이너에서 사용하지 않는 모든 이미지도 삭제된다. 다음에 필요할 때 다시 pull해야 한다. 신중하게 사용한다.",
-        phase: "prune_a",
-        disk: { images: 0.12, containers: 0.02, volumes: 1.2, cache: 0.0, reclaimable: 0.0 },
+        title: 'Step 4. docker image prune -a — 사용 안 되는 이미지 모두 정리',
+        desc: '-a 가 없으면 dangling(<none>:<none>) 이미지만, -a 를 붙이면 "지금 컨테이너에 의해 사용 중이지 않은 모든 이미지"가 삭제된다. 다음에 docker run 하면 다시 pull 받아야 하므로 인터넷이 빠르고 디스크가 부족할 때 효과적이다. --filter "until=72h" 로 최근 3일 안에 쓴 이미지는 보존하는 식의 부분 정리도 가능하다.',
+        phase: 'image-prune',
+        disk:    { images: 0.30, containers: 0.05, volumes: 1.20, cache: 0.65 },
+        reclaim: { images: 0.00, containers: 0.00, volumes: 0.30, cache: 0.65 },
+        reclaimed: 2.10,
+        alert: 'success',
+        alertText: '✓ 2.10 GB 회수 — 미사용 이미지 37개 삭제',
+        focus: ['images'],
+        code: {
+          lang: 'bash',
+          filename: 'image-prune.sh',
+          lines: [
+            '# Step 4. docker image prune — dangling / 미사용 이미지 정리',
+            '',
+            '# ─── 옵션 비교 ───',
+            '#  docker image prune       ← dangling(<none>:<none>) 만 삭제 (안전)',
+            '#  docker image prune -a    ← + 사용 안 되는 모든 이미지 삭제 (강력)',
+            '',
+            '# 1) 먼저 dangling 만 — build 후 태그 옮길 때 생긴 잔재',
+            'docker image prune',
+            '#  WARNING! This will remove all dangling images.',
+            '#  Deleted Images:',
+            '#  deleted: sha256:def456...',
+            '#  Total reclaimed space: 800MB',
+            '',
+            '# 2) 본격 정리 — 컨테이너가 안 쓰는 이미지 모두',
+            'docker image prune -a',
+            '#  WARNING! This will remove all images without at least',
+            '#  one container associated to them.',
+            '#  Are you sure you want to continue? [y/N] y',
+            '#  Deleted Images:',
+            '#  untagged: nginx:1.21',
+            '#  untagged: postgres:13',
+            '#  untagged: myapp:v0.9',
+            '#  ... (37개)',
+            '#  Total reclaimed space: 2.1GB',
+            '',
+            '# 3) 시간 필터 — 최근 72시간 이내 사용한 건 보존',
+            'docker image prune -a --filter "until=72h" -f',
+            '',
+            '# 4) 라벨 필터 — 특정 라벨 가진 이미지만',
+            'docker image prune -a --filter "label=stage=test" -f',
+            '',
+            '# ─── 주의 ───',
+            '#  • -a 를 붙이면 다음 run 때 pull 필요 (네트워크 비용)',
+            '#  • running 컨테이너가 쓰는 이미지는 절대 삭제 안 됨',
+            '#  • CI 빌드 캐시로 쓰던 이미지가 사라질 수 있음',
+            '',
+            '# ─── 결과 ───',
+            '#  Images 2.40GB → 300MB  (2.10GB 회수)',
+            '#  남은 300MB 는 running 2개와 자주 쓰는 base image',
+          ],
+          highlight: [3, 4, 5, 7, 8, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28, 30, 31, 33, 34, 35, 36],
+        },
       },
       {
-        title: "STEP 5 · 개별 prune vs 전체 prune",
-        desc: "container prune, image prune, volume prune, network prune, builder prune으로 특정 항목만 선택 정리할 수 있다. volume prune은 DB 데이터가 삭제될 수 있어 가장 주의가 필요하다.",
-        phase: "individual",
-        disk: { images: 0.12, containers: 0.02, volumes: 1.2, cache: 0.0, reclaimable: 0.0 },
-      },
-      {
-        title: "STEP 6 · 안전한 정리 플로차트",
-        desc: "디스크 부족 → system df로 확인 → 빌드 캐시 많으면 builder prune → 중지된 컨테이너 많으면 container prune → 댕글링 이미지 많으면 image prune → 볼륨은 ls로 확인 후 개별 rm.",
-        phase: "flowchart",
-        disk: { images: 0.12, containers: 0.02, volumes: 0.4, cache: 0.0, reclaimable: 0.0 },
+        title: 'Step 5. docker system prune -a --volumes — 전체 한 방 정리',
+        desc: 'system prune 한 줄로 멈춘 컨테이너 + 미사용 네트워크 + dangling 이미지 + 빌드 캐시까지 한 번에 비운다. -a 를 더하면 모든 미사용 이미지, --volumes 까지 더하면 어디서도 참조 안 되는 named volume 까지 삭제된다. DB 가 들어있는 볼륨이 같이 날아갈 수 있어서 운영에서는 신중히, 개인 개발 머신 정리에는 가장 빠르고 강력한 한 줄이다.',
+        phase: 'system-prune',
+        disk:    { images: 0.30, containers: 0.05, volumes: 0.20, cache: 0.00 },
+        reclaim: { images: 0.00, containers: 0.00, volumes: 0.00, cache: 0.00 },
+        reclaimed: 0.95,
+        alert: 'success',
+        alertText: '✓ 누적 3.45 GB 회수 — 전체 디스크 0.55 GB 까지 비움',
+        focus: ['images', 'containers', 'volumes', 'cache'],
+        code: {
+          lang: 'bash',
+          filename: 'system-prune.sh',
+          lines: [
+            '# Step 5. docker system prune — 한 줄로 전체 정리',
+            '',
+            '# ─── 옵션 누적 비교 ───',
+            '#  docker system prune                  ← 멈춘 컨테이너+미사용 네트워크',
+            '#                                         + dangling 이미지+빌드 캐시',
+            '#  docker system prune -a               ← + 사용 안 되는 모든 이미지',
+            '#  docker system prune -a --volumes     ← + 미사용 named volume까지',
+            '',
+            '# 1) 가장 강력한 한 줄',
+            'docker system prune -a --volumes',
+            '#  WARNING! This will remove:',
+            '#    - all stopped containers',
+            '#    - all networks not used by at least one container',
+            '#    - all anonymous volumes not used by at least one container',
+            '#    - all images without at least one container associated to them',
+            '#    - all build cache',
+            '#  Are you sure you want to continue? [y/N] y',
+            '#',
+            '#  Deleted Containers: ...',
+            '#  Deleted Networks: bridge_old, test_default',
+            '#  Deleted Volumes: tmp_data, build_cache',
+            '#  Deleted Images: ...',
+            '#  Deleted build cache objects: 87',
+            '#  Total reclaimed space: 3.45GB',
+            '',
+            '# 2) CI / 야간 배치에서 자주 쓰는 형태 (확인 생략)',
+            'docker system prune -a --volumes -f',
+            '',
+            '# 3) 24시간 이상 묵은 것만 — 어제 작업한 건 보존',
+            'docker system prune -a --filter "until=24h" -f',
+            '',
+            '# ─── 운영 환경 안전 수칙 ───',
+            '#  • --volumes 는 DB 데이터까지 날릴 수 있음 → 사전에 docker volume ls',
+            '#  • 운영서버에서는 -a 빼고 system prune 만 (이미지 재pull 부담)',
+            '#  • crontab 에 매일 새벽 한 번 묶으면 디스크 자동 관리',
+            '#    0 3 * * * docker system prune -f',
+            '',
+            '# ─── 5단계 누적 결과 ───',
+            '#  before  4.70 GB  (Step 1)',
+            '#  → df    측정만   (Step 2)',
+            '#  → ctn   4.30 GB  (Step 3, -0.40)',
+            '#  → img   2.20 GB  (Step 4, -2.10)',
+            '#  → sys   0.55 GB  (Step 5, -1.65)  ✓ 4.15 GB 회수',
+            '#',
+            '#  다음(VIII-1-5) : 운영 환경 디스크 모니터링 + 자동 정리 cron',
+          ],
+          highlight: [3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23, 25, 26, 28, 29, 31, 32, 33, 34, 35, 38, 39, 40, 41, 42, 43, 44],
+        },
       },
     ];
 
-    function DiskBar({ label, sizeGB, maxGB, color, reclaimPercent, phase }) {
-      const widthPercent = (sizeGB / maxGB) * 100;
-      const colorMap = {
-        blue: { bg: "bg-blue-500", light: "bg-blue-100", text: "text-blue-700", border: "border-blue-200" },
-        amber: { bg: "bg-amber-500", light: "bg-amber-100", text: "text-amber-700", border: "border-amber-200" },
-        green: { bg: "bg-green-500", light: "bg-green-100", text: "text-green-700", border: "border-green-200" },
-        purple: { bg: "bg-purple-500", light: "bg-purple-100", text: "text-purple-700", border: "border-purple-200" },
-      };
-      const c = colorMap[color];
+    // ─────────────────────────────────────────────────────
+    // 단일 카테고리 막대 — sizeGB 막대 위에 reclaim 영역을 amber 로 겹쳐 표시
+    //   focused: sky 강조 테두리
+    // ─────────────────────────────────────────────────────
+    function DiskBar({ cat, sizeGB, reclaimGB, focused }) {
+      const usedPct = (sizeGB / MAX_GB) * 100;
+      const reclaimPct = (reclaimGB / MAX_GB) * 100;
+      const reclaimRatio = sizeGB > 0 ? Math.round((reclaimGB / sizeGB) * 100) : 0;
       return (
-        <div className={`${c.light} border ${c.border} rounded-lg p-3 anim-fade`}>
-          <div className="flex justify-between items-center mb-2">
-            <span className={`font-bold text-sm ${c.text}`}>{label}</span>
-            <span className={`font-mono text-sm ${c.text}`}>{sizeGB.toFixed(2)} GB</span>
-          </div>
-          <div className="bg-white rounded-full h-4 overflow-hidden">
-            <div className={`${c.bg} h-full rounded-full transition-all duration-1000 ease-out`} style={{ width: `${Math.max(widthPercent, 2)}%` }}></div>
-          </div>
-          {reclaimPercent > 0 && (
-            <div className="text-xs text-slate-500 mt-1">회수 가능: {reclaimPercent}%</div>
-          )}
-        </div>
-      );
-    }
-
-    function PruneTable() {
-      const rows = [
-        { cmd: "container prune", target: "중지된 컨테이너", danger: "낮음", color: "green" },
-        { cmd: "image prune", target: "댕글링 이미지 (<none>)", danger: "낮음", color: "green" },
-        { cmd: "image prune -a", target: "미사용 모든 이미지", danger: "높음", color: "amber" },
-        { cmd: "volume prune", target: "미사용 볼륨 (데이터 포함!)", danger: "매우 높음", color: "red" },
-        { cmd: "network prune", target: "미사용 네트워크", danger: "낮음", color: "green" },
-        { cmd: "system prune", target: "컨테이너+네트워크+댕글링+캐시", danger: "중간", color: "amber" },
-        { cmd: "system prune -a", target: "+ 모든 미사용 이미지", danger: "높음", color: "amber" },
-        { cmd: "system prune -a --volumes", target: "+ 볼륨 포함", danger: "매우 높음", color: "red" },
-      ];
-      const dangerColor = { "낮음": "bg-green-100 text-green-700", "중간": "bg-amber-100 text-amber-700", "높음": "bg-orange-100 text-orange-700", "매우 높음": "bg-red-100 text-red-700" };
-      return (
-        <div className="bg-white rounded-xl border border-slate-200 p-4 overflow-x-auto anim-fade">
-          <h4 className="font-bold text-slate-700 mb-3">개별 prune 명령 비교</h4>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-slate-50">
-                <th className="text-left px-3 py-2 font-bold text-slate-600">명령</th>
-                <th className="text-left px-3 py-2 font-bold text-slate-600">삭제 대상</th>
-                <th className="text-left px-3 py-2 font-bold text-slate-600">주의 수준</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, i) => (
-                <tr key={i} className="border-t border-slate-100 anim-slide" style={{animationDelay:`${i*0.05}s`}}>
-                  <td className="px-3 py-2 font-mono text-blue-600 text-xs">{r.cmd}</td>
-                  <td className="px-3 py-2 text-slate-700">{r.target}</td>
-                  <td className="px-3 py-2"><span className={`px-2 py-0.5 rounded text-xs font-bold ${dangerColor[r.danger]}`}>{r.danger}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-    }
-
-    function FlowChart() {
-      const steps = [
-        { icon: "💾", label: "디스크 부족", sub: "docker system df -v", color: "red" },
-        { icon: "🔨", label: "빌드 캐시", sub: "builder prune", color: "purple" },
-        { icon: "📦", label: "중지된 컨테이너", sub: "container prune", color: "blue" },
-        { icon: "🖼️", label: "댕글링 이미지", sub: "image prune", color: "amber" },
-        { icon: "💿", label: "볼륨 (주의!)", sub: "volume ls → rm", color: "red" },
-      ];
-      return (
-        <div className="bg-gradient-to-r from-emerald-50 to-blue-50 border-2 border-emerald-300 rounded-xl p-6 anim-fade">
-          <h3 className="text-lg font-bold text-emerald-800 mb-4 text-center">안전한 디스크 정리 순서</h3>
-          <div className="flex flex-wrap items-center justify-center gap-2 md:gap-3">
-            {steps.map((s, i) => (
-              <React.Fragment key={i}>
-                <div className={`bg-white border-2 border-${s.color}-300 rounded-xl p-3 text-center min-w-[100px] anim-slide`} style={{animationDelay:`${i*0.15}s`}}>
-                  <div className="text-2xl mb-1">{s.icon}</div>
-                  <div className={`text-xs font-bold text-${s.color}-800`}>{s.label}</div>
-                  <div className="text-xs text-slate-500 mt-1 font-mono">{s.sub}</div>
+        <div
+          className={`rounded-lg border-2 p-2.5 transition-all duration-500 ${
+            focused ? 'bg-sky-50 border-sky-400 shadow-md' : 'bg-white border-slate-200'
+          }`}
+        >
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">{cat.icon}</span>
+              <span className={`text-[11px] font-bold ${focused ? 'text-sky-800' : 'text-slate-700'}`}>
+                {cat.label}
+              </span>
+            </div>
+            <div className="text-right">
+              <div className={`text-[11px] font-mono font-bold ${focused ? 'text-sky-700' : 'text-slate-700'}`}>
+                {sizeGB.toFixed(2)} GB
+              </div>
+              {reclaimGB > 0 && (
+                <div className="text-[9px] font-mono text-amber-600">
+                  회수 {reclaimGB.toFixed(2)} ({reclaimRatio}%)
                 </div>
-                {i < steps.length - 1 && <div className="text-slate-400 font-bold">→</div>}
-              </React.Fragment>
+              )}
+            </div>
+          </div>
+
+          {/* 막대 */}
+          <div className="relative h-4 bg-slate-100 rounded-full overflow-hidden">
+            {/* 전체 사용량 */}
+            <div
+              className={`absolute left-0 top-0 h-full transition-all duration-700 ease-out ${
+                focused ? 'bg-sky-500' : 'bg-slate-400'
+              }`}
+              style={{ width: `${Math.max(usedPct, sizeGB > 0 ? 1 : 0)}%` }}
+            />
+            {/* 회수 가능 영역 (사용량 막대 안에 amber 줄무늬) */}
+            {reclaimGB > 0 && (
+              <div
+                className="absolute right-0 top-0 h-full bg-amber-400 transition-all duration-700 ease-out"
+                style={{
+                  left: `${usedPct - reclaimPct}%`,
+                  width: `${reclaimPct}%`,
+                }}
+                title={`회수 가능: ${reclaimGB.toFixed(2)} GB`}
+              />
+            )}
+          </div>
+
+          <div className="text-[9px] text-slate-500 mt-1 leading-tight">{cat.desc}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 디스크 사용량 막대 4개 + 총합 + 직전 단계 회수 효과
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const total =
+        step.disk.images + step.disk.containers + step.disk.volumes + step.disk.cache;
+      const reclaimable =
+        step.reclaim.images +
+        step.reclaim.containers +
+        step.reclaim.volumes +
+        step.reclaim.cache;
+
+      const alertColor = {
+        danger: 'bg-rose-50 border-rose-300 text-rose-800',
+        info: 'bg-sky-50 border-sky-300 text-sky-800',
+        success: 'bg-emerald-50 border-emerald-300 text-emerald-800',
+      }[step.alert] || 'bg-slate-50 border-slate-200 text-slate-600';
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">💽 /var/lib/docker 디스크 사용량</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          {/* 상단 alert */}
+          <div className={`rounded-lg border-2 p-2 mb-3 text-[12px] font-semibold ${alertColor}`}>
+            {step.alertText}
+          </div>
+
+          {/* 총합 카드 */}
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            <div className="rounded-lg border-2 border-slate-300 bg-slate-50 p-2 text-center">
+              <div className="text-[9px] text-slate-500 font-bold uppercase">현재 사용</div>
+              <div className="text-lg font-mono font-bold text-slate-700">
+                {total.toFixed(2)}
+                <span className="text-[10px] ml-1 text-slate-500">GB</span>
+              </div>
+            </div>
+            <div className="rounded-lg border-2 border-amber-300 bg-amber-50 p-2 text-center">
+              <div className="text-[9px] text-amber-700 font-bold uppercase">회수 가능</div>
+              <div className="text-lg font-mono font-bold text-amber-700">
+                {reclaimable.toFixed(2)}
+                <span className="text-[10px] ml-1">GB</span>
+              </div>
+            </div>
+            <div
+              className={`rounded-lg border-2 p-2 text-center transition-all duration-500 ${
+                step.reclaimed > 0
+                  ? 'border-emerald-400 bg-emerald-50'
+                  : 'border-slate-200 bg-slate-50 opacity-60'
+              }`}
+            >
+              <div
+                className={`text-[9px] font-bold uppercase ${
+                  step.reclaimed > 0 ? 'text-emerald-700' : 'text-slate-400'
+                }`}
+              >
+                이번 단계 회수
+              </div>
+              <div
+                className={`text-lg font-mono font-bold ${
+                  step.reclaimed > 0 ? 'text-emerald-700' : 'text-slate-400'
+                }`}
+              >
+                {step.reclaimed > 0 ? `−${step.reclaimed.toFixed(2)}` : '0.00'}
+                <span className="text-[10px] ml-1">GB</span>
+              </div>
+            </div>
+          </div>
+
+          {/* 카테고리별 막대 */}
+          <div className="space-y-2">
+            {CATEGORIES.map((cat) => (
+              <DiskBar
+                key={cat.key}
+                cat={cat}
+                sizeGB={step.disk[cat.key]}
+                reclaimGB={step.reclaim[cat.key]}
+                focused={step.focus.includes(cat.key)}
+              />
             ))}
           </div>
-          <div className="mt-4 bg-red-50 border border-red-200 rounded-lg p-3 text-center">
-            <span className="text-red-600 text-sm font-bold">⚠ volume prune은 DB 데이터가 삭제될 수 있다. 반드시 volume ls로 확인 후 개별 rm!</span>
+
+          {/* 단계별 누적 정리 효과 — 작은 진행 막대 */}
+          <div className="mt-3 pt-3 border-t border-slate-100">
+            <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
+              <span className="font-semibold">5단계 누적 회수</span>
+              <span className="font-mono">{(4.70 - total).toFixed(2)} / 4.15 GB</span>
+            </div>
+            <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-sky-400 to-emerald-500 transition-all duration-700"
+                style={{ width: `${Math.min(((4.70 - total) / 4.15) * 100, 100)}%` }}
+              />
+            </div>
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>focused
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-slate-400"></span>used
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-amber-400"></span>reclaimable
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-emerald-500"></span>reclaimed
+            </span>
+            <span className="ml-auto font-mono">phase: {step.phase}</span>
           </div>
         </div>
       );
     }
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    //   파일명 탭, 윈도우 dot, 라인 번호, sky 강조 라인
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4500);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
-
-      const totalUsed = data.disk.images + data.disk.containers + data.disk.volumes + data.disk.cache;
-      const maxGB = 4.5;
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생(3000ms), 키보드 ←/→
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum VIII-1-4</span>
+            </nav>
+
+            {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter VIII-1-4: system prune과 디스크 관리</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VIII</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part VIII. 운영 &gt; Chapter 1. 디스크 관리</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VIII-1-4. system prune — 디스크 정리 한 방</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">df 측정 → container/image prune 좁게 → system prune -a --volumes 전체 정리까지 5단계</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">Docker가 차지하는 디스크 공간을 파악하고 안전하게 정리하는 과정을 시뮬레이션합니다.</p>
             </header>
 
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "flowchart" ? "bg-emerald-600 border-emerald-700 text-white" :
-              data.phase === "problem" ? "bg-red-600 border-red-700 text-white" :
-              data.phase === "prune_a" ? "bg-orange-600 border-orange-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            {/* 디스크 사용량 시각화 */}
-            <div key={`disk-${step}`} className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
-              <div className="flex justify-between items-center mb-4">
-                <h4 className="font-bold text-slate-700">Docker 디스크 사용량</h4>
-                <span className="font-mono text-sm text-slate-500">총 {totalUsed.toFixed(2)} GB</span>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <DiskBar label="이미지 (Images)" sizeGB={data.disk.images} maxGB={maxGB} color="blue" reclaimPercent={data.phase === "df" ? 74 : 0} />
-                <DiskBar label="컨테이너 (Containers)" sizeGB={data.disk.containers} maxGB={maxGB} color="green" reclaimPercent={data.phase === "df" ? 86 : 0} />
-                <DiskBar label="볼륨 (Volumes)" sizeGB={data.disk.volumes} maxGB={maxGB} color="amber" reclaimPercent={data.phase === "df" ? 66 : 0} />
-                <DiskBar label="빌드 캐시 (Build Cache)" sizeGB={data.disk.cache} maxGB={maxGB} color="purple" reclaimPercent={data.phase === "df" ? 100 : 0} />
-              </div>
-            </div>
-
-            {/* 정리 효과 표시 */}
-            {(data.phase === "prune" || data.phase === "prune_a") && (
-              <div className={`border-2 rounded-xl p-4 text-center anim-fade ${
-                data.phase === "prune_a" ? "bg-orange-50 border-orange-300" : "bg-emerald-50 border-emerald-300"
-              }`}>
-                <span className={`font-bold text-lg ${data.phase === "prune_a" ? "text-orange-700" : "text-emerald-700"}`}>
-                  {data.phase === "prune" ? "✅ system prune 완료 — 볼륨은 유지됨" : "⚠ system prune -a 완료 — 미사용 이미지까지 삭제됨"}
-                </span>
-                <p className={`text-sm mt-1 ${data.phase === "prune_a" ? "text-orange-600" : "text-emerald-600"}`}>
-                  {data.phase === "prune" ? "회수된 공간: 약 2.5GB" : "회수된 공간: 약 3.0GB (이미지 재다운로드 필요)"}
-                </p>
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: <strong>df</strong>(측정) → <strong>container prune</strong>(안전) → <strong>image prune -a</strong>(강력) → <strong>system prune -a --volumes</strong>(전체) — 운영서버에서는 <strong>--volumes</strong>를 신중히, 개인 머신은 한 줄로 끝낸다. 다음(VIII-1-5)에서는 자동 정리 cron / 디스크 모니터링을 다룬다.
               </div>
             )}
 
-            {/* 개별 prune 테이블 */}
-            {data.phase === "individual" && <PruneTable />}
-
-            {/* 플로차트 */}
-            {data.phase === "flowchart" && <FlowChart />}
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
-              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['system df', 'container prune', 'image prune -a', 'system prune', '--volumes', 'dangling', 'reclaimable', 'BuildKit cache', 'until filter'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./viii-1-3_logs_inspect.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; VIII-1-3 logs / inspect</a>
+              <a href="./viii-1-5_disk_monitoring.html" className="text-sky-700 hover:text-sky-900 font-medium">VIII-1-5 디스크 모니터링 &rarr;</a>
+            </nav>
+
           </div>
         </div>
       );

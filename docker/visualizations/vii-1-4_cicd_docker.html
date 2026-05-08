@@ -3,324 +3,798 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — CI/CD 자동화</title>
+  <title>Docker 인터랙티브 학습 — VII-1-4. CI/CD with Docker</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes slideDown { from{opacity:0;transform:translateY(-20px);} to{opacity:1;transform:translateY(0);} }
-    @keyframes spin { from{transform:rotate(0deg);} to{transform:rotate(360deg);} }
-    @keyframes checkmark { from{opacity:0;transform:scale(0);} to{opacity:1;transform:scale(1);} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-    .anim-down { animation: slideDown 0.5s ease-out forwards; }
-    .anim-spin { animation: spin 1s linear infinite; }
-    .anim-check { animation: checkmark 0.3s ease-out forwards; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    VII-1-4. CI/CD with Docker — GitHub Actions로 빌드/푸시 자동화
+    학습 목표: 사람 손으로 docker build/push 하던 흐름을 GitHub Actions + build-push-action +
+              metadata-action 으로 자동화하고, PR마다 빌드 → 테스트 → registry 흐름까지 5단계로 본다.
+    핵심 비유: 컨베이어 벨트 — git push 하는 순간 벨트가 돌아 빌드/태깅/푸시까지 알아서 굴러간다
+    패턴: fastapi v1 — 좌(LiveDataPane: git push → CI 파이프라인 → registry → 배포) / 우(VSCode CodeViewer)
+    색상: docker sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    const PIPELINE_STAGES = [
-      { id: "push", label: "코드 Push", icon: "📤", desc: "main 브랜치에 merge" },
-      { id: "test", label: "테스트", icon: "🧪", desc: "pytest / npm test" },
-      { id: "build", label: "이미지 빌드", icon: "🔨", desc: "BuildKit + 캐시" },
-      { id: "scan", label: "취약점 스캔", icon: "🔍", desc: "trivy CRITICAL/HIGH" },
-      { id: "push_registry", label: "Push", icon: "⬆️", desc: "GHCR/ECR에 저장" },
+    // ─────────────────────────────────────────────────────
+    // CI 파이프라인 단계 — 좌측 컨베이어 벨트의 칸들
+    //   build  : Dockerfile → 이미지
+    //   test   : 컨테이너 띄워 smoke test
+    //   tag    : metadata-action 이 sha/branch/semver 부여
+    //   push   : registry 로 업로드
+    // ─────────────────────────────────────────────────────
+    const PIPELINE = [
+      { id: 'checkout', label: 'checkout', icon: '📥', desc: '소스 받기' },
+      { id: 'build',    label: 'build',    icon: '🔨', desc: '이미지 빌드' },
+      { id: 'test',     label: 'test',     icon: '🧪', desc: '테스트 실행' },
+      { id: 'tag',      label: 'tag',      icon: '🏷️', desc: '태그 부여' },
+      { id: 'push',     label: 'push',     icon: '⬆️', desc: 'registry 푸시' },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — LiveDataPane 이 읽는 dataState
+    //   phase            : 'manual' | 'on-push' | 'build-push' | 'tags' | 'pr-pipeline'
+    //   trigger          : 'human' | 'git-push' | 'pr-open' | null
+    //   activeStages     : 활성/통과한 PIPELINE 단계 id 배열
+    //   tags             : registry 에 올라간 이미지 태그 목록
+    //   registryActive   : registry 박스 강조 여부
+    //   prMode           : true 면 PR 컨텍스트 (push 차단)
+    //   manualPain       : Step 1 — 수동 빌드 위험성 강조
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: "STEP 1 · 왜 CI/CD 자동화가 필요한가",
-        desc: "수동 빌드는 세 가지 문제가 있다. 1) 태그를 잘못 붙이거나 push를 빠뜨리는 실수. 2) '내 노트북에서 빌드한 이미지'는 환경마다 다를 수 있음. 3) 배포가 특정 사람에게 의존.",
-        phase: "why",
-        activeStage: -1,
+        title: 'Step 1. 수동 build/push — 사람 실수의 단골 자리',
+        desc: '터미널에서 docker build 후 docker push 하는 흐름은 단순해 보이지만, 태그 오타·빌드 누락·push 빠뜨림·로컬 환경 의존이 매번 발생한다. "내 노트북에선 됐는데"가 여기서 시작된다. 게다가 배포가 한 사람의 손에 묶여서 그가 자리를 비우면 멈춘다. 자동화 없이는 재현이 안 된다.',
+        phase: 'manual',
+        trigger: 'human',
+        activeStages: [],
+        tags: [],
+        registryActive: false,
+        prMode: false,
+        manualPain: true,
+        code: {
+          lang: 'bash',
+          filename: 'manual-bad.sh',
+          lines: [
+            '# Step 1. 수동 빌드/푸시 — 자동화 전 흔한 풍경',
+            '',
+            '# 1) 매번 손으로 빌드',
+            'docker build -t myapp:latest .',
+            '',
+            '# 2) 태그를 손으로 붙임 (여기서 오타·버전 혼선 단골 발생)',
+            'docker tag myapp:latest ghcr.io/acme/myapp:1.2.0',
+            '',
+            '# 3) 레지스트리 로그인도 매번 (또는 평소엔 생략하다 잊어버림)',
+            'echo $GHCR_TOKEN | docker login ghcr.io -u $USER --password-stdin',
+            '',
+            '# 4) push 도 손으로 — 잊으면 새 이미지가 안 올라감',
+            'docker push ghcr.io/acme/myapp:1.2.0',
+            '',
+            '# ─── 문제점 ───',
+            '#  • 태그 오타 (1.2.0 vs 1.20) — registry 가 그대로 받아버림',
+            '#  • 로컬 캐시·네트워크에 따라 결과가 미묘하게 다름 ("내 노트북에선 됐는데")',
+            '#  • 배포 권한이 특정 인원 한 명에게 묶임 → 휴가/퇴사 시 멈춤',
+            '#  • 어떤 커밋이 이미지로 올라갔는지 추적이 안 됨',
+            '#  • 테스트를 깜빡하고 push 해버려도 막을 장치가 없음',
+            '',
+            '# 한 줄 요약: "사람의 의지" 가 빌드/푸시의 유일한 안전장치다.',
+            '#            git push 만 하면 나머지가 자동으로 돌아가야 한다.',
+          ],
+          highlight: [3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 19, 20, 21],
+        },
       },
       {
-        title: "STEP 2 · GitHub Actions 파이프라인 흐름",
-        desc: "코드 push → 테스트 → 이미지 빌드 → 취약점 스캔 → 레지스트리 push. 앞 단계가 실패하면 뒤 단계는 실행되지 않는다. 취약한 이미지가 레지스트리에 올라가지 못하게 막는다.",
-        phase: "pipeline",
-        activeStage: -1,
+        title: 'Step 2. GitHub Actions on push — git push 가 곧 트리거',
+        desc: '워크플로우 파일을 .github/workflows/ 에 두면 GitHub 가 git push 를 감지해 자동으로 러너를 띄운다. on.push.branches 로 어느 브랜치에서 동작할지, on.tags 로 태그 이벤트도 받을지 정한다. checkout-action 이 소스를 내려받는 첫 단계까지가 "트리거 + 워크스페이스 준비" 다. 사람의 손이 빠지는 첫 지점이다.',
+        phase: 'on-push',
+        trigger: 'git-push',
+        activeStages: ['checkout'],
+        tags: [],
+        registryActive: false,
+        prMode: false,
+        manualPain: false,
+        code: {
+          lang: 'yaml',
+          filename: 'gh-actions.yml',
+          lines: [
+            '# Step 2. .github/workflows/docker.yml — 트리거 정의',
+            '',
+            'name: docker-image',
+            '',
+            'on:',
+            '  push:',
+            '    branches: [main]            # main 푸시 → 정식 배포 이미지',
+            '    tags:     ["v*.*.*"]        # v1.2.0 같은 semver 태그',
+            '  pull_request:',
+            '    branches: [main]            # PR 도 트리거 (Step 5 에서 활용)',
+            '',
+            'jobs:',
+            '  build:',
+            '    runs-on: ubuntu-latest',
+            '    steps:',
+            '      - name: checkout',
+            '        uses: actions/checkout@v4',
+            '',
+            '      - name: 환경 정보 출력',
+            '        run: |',
+            '          echo "ref     = ${{ github.ref }}"',
+            '          echo "sha     = ${{ github.sha }}"',
+            '          echo "event   = ${{ github.event_name }}"',
+            '',
+            '# ─── 핵심 ───',
+            '#  • on.push.branches  → 어떤 브랜치 푸시에 반응할지',
+            '#  • on.push.tags      → 릴리즈 태그도 같은 워크플로우에서 처리',
+            '#  • actions/checkout  → 러너에 소스 코드 내려받기',
+            '#  • github.* 컨텍스트 → 어떤 커밋/이벤트인지 모든 정보 제공',
+            '',
+            '# 아직 build/push 는 없다. 다음 단계에서 build-push-action 을 붙인다.',
+          ],
+          highlight: [3, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17],
+        },
       },
       {
-        title: "STEP 3 · 코드 Push → 테스트 실행",
-        desc: "main 브랜치에 코드가 push되면 워크플로우가 자동 트리거된다. 먼저 pytest/npm test로 코드 품질을 검증한다. 테스트가 실패하면 빌드 자체가 진행되지 않는다.",
-        phase: "test",
-        activeStage: 1,
+        title: 'Step 3. docker/build-push-action — 빌드 + push 한 방에',
+        desc: 'docker/build-push-action 은 BuildKit 으로 이미지를 만들고 그대로 registry 에 올려준다. setup-buildx-action 으로 빌더를 활성화하고, login-action 으로 GHCR 에 로그인한 뒤 build-push-action 한 단계로 빌드와 푸시가 동시에 끝난다. 여기서 캐시(cache-from/to: gha)도 같이 켜면 빌드 시간이 분 단위에서 초 단위로 떨어진다.',
+        phase: 'build-push',
+        trigger: 'git-push',
+        activeStages: ['checkout', 'build', 'test', 'push'],
+        tags: ['ghcr.io/acme/myapp:latest'],
+        registryActive: true,
+        prMode: false,
+        manualPain: false,
+        code: {
+          lang: 'yaml',
+          filename: 'build-push.yml',
+          lines: [
+            '# Step 3. build-push-action — 빌드와 푸시를 한 액션이 처리',
+            '',
+            'jobs:',
+            '  build:',
+            '    runs-on: ubuntu-latest',
+            '    permissions:',
+            '      contents: read',
+            '      packages: write           # GHCR 푸시에 필수',
+            '',
+            '    steps:',
+            '      - uses: actions/checkout@v4',
+            '',
+            '      - name: BuildKit 빌더 활성화',
+            '        uses: docker/setup-buildx-action@v3',
+            '',
+            '      - name: GHCR 로그인',
+            '        uses: docker/login-action@v3',
+            '        with:',
+            '          registry: ghcr.io',
+            '          username: ${{ github.actor }}',
+            '          password: ${{ secrets.GITHUB_TOKEN }}',
+            '',
+            '      - name: 빌드 + 푸시',
+            '        uses: docker/build-push-action@v5',
+            '        with:',
+            '          context: .',
+            '          push: true               # ← 여기 한 줄로 push까지',
+            '          tags: ghcr.io/acme/myapp:latest',
+            '          cache-from: type=gha',
+            '          cache-to:   type=gha,mode=max',
+            '',
+            '# ─── 한 액션이 해주는 일 ───',
+            '#  • Dockerfile 로 BuildKit 멀티스테이지 빌드',
+            '#  • registry 인증 정보 기억 (login-action 결과 재사용)',
+            '#  • push: true 면 빌드 직후 그대로 업로드',
+            '#  • GHA 캐시(type=gha) 로 레이어 재사용 → 빌드 5분 → 30초',
+          ],
+          highlight: [3, 4, 5, 6, 7, 12, 13, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29],
+        },
       },
       {
-        title: "STEP 4 · BuildKit으로 이미지 빌드 + 캐시",
-        desc: "docker/build-push-action이 BuildKit으로 빌드한다. cache-from: type=gha로 이전 빌드 캐시를 불러오고, cache-to: type=gha로 새 캐시를 저장한다. pip install, npm ci 레이어가 캐시되면 빌드 시간이 수 분에서 수십 초로 단축된다.",
-        phase: "build",
-        activeStage: 2,
+        title: 'Step 4. tag 생성 — sha + branch + semver 자동 부여',
+        desc: 'docker/metadata-action 이 git 컨텍스트(브랜치, 태그, sha)를 보고 어떤 이미지 태그를 붙일지 알아서 만들어준다. main 푸시면 latest + sha-abc1234, v1.2.0 태그 푸시면 1.2.0 + 1.2 + 1 + latest 까지 한 번에. build-push-action 이 그 출력을 그대로 받아 같은 이미지에 여러 태그로 push 한다. 태그 오타가 사람 손에서 떠난다.',
+        phase: 'tags',
+        trigger: 'git-push',
+        activeStages: ['checkout', 'build', 'test', 'tag', 'push'],
+        tags: [
+          'ghcr.io/acme/myapp:latest',
+          'ghcr.io/acme/myapp:main',
+          'ghcr.io/acme/myapp:sha-abc1234',
+          'ghcr.io/acme/myapp:1.2.0',
+          'ghcr.io/acme/myapp:1.2',
+        ],
+        registryActive: true,
+        prMode: false,
+        manualPain: false,
+        code: {
+          lang: 'yaml',
+          filename: 'tags.yml',
+          lines: [
+            '# Step 4. metadata-action — 태그를 git 컨텍스트로 자동 생성',
+            '',
+            '      - name: 태그/라벨 자동 생성',
+            '        id: meta',
+            '        uses: docker/metadata-action@v5',
+            '        with:',
+            '          images: ghcr.io/acme/myapp',
+            '          tags: |',
+            '            type=ref,event=branch          # main, develop ...',
+            '            type=ref,event=pr              # pr-123',
+            '            type=sha,prefix=sha-           # sha-abc1234',
+            '            type=semver,pattern={{version}}     # 1.2.0',
+            '            type=semver,pattern={{major}}.{{minor}}  # 1.2',
+            '            type=semver,pattern={{major}}        # 1',
+            '            type=raw,value=latest,enable={{is_default_branch}}',
+            '',
+            '      - name: 빌드 + 푸시 (자동 태그 사용)',
+            '        uses: docker/build-push-action@v5',
+            '        with:',
+            '          context: .',
+            '          push: true',
+            '          tags: ${{ steps.meta.outputs.tags }}     # 여러 태그 동시 push',
+            '          labels: ${{ steps.meta.outputs.labels }} # OCI 라벨도 자동',
+            '          cache-from: type=gha',
+            '          cache-to:   type=gha,mode=max',
+            '',
+            '# ─── 자동 부여되는 태그 예시 ───',
+            '#  main 브랜치 푸시:',
+            '#    → main, sha-abc1234, latest',
+            '#  v1.2.0 태그 푸시:',
+            '#    → 1.2.0, 1.2, 1, latest, sha-abc1234',
+            '#  PR #42 오픈:',
+            '#    → pr-42, sha-abc1234   (push 는 Step 5 정책으로 결정)',
+            '',
+            '# 사람은 git tag v1.2.0 한 줄만 적는다. 나머지는 액션이 만든다.',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23],
+        },
       },
       {
-        title: "STEP 5 · 취약점 스캔 → 레지스트리 Push",
-        desc: "trivy가 빌드된 이미지의 CRITICAL/HIGH 취약점을 검사한다. 취약점이 있으면 워크플로우가 실패하고 push가 중단된다. 통과하면 GHCR/ECR에 이미지가 push된다. PR에서는 빌드만 하고 push는 하지 않는다.",
-        phase: "scan_push",
-        activeStage: 4,
-      },
-      {
-        title: "STEP 6 · 핵심 GitHub Actions 구성 요소",
-        desc: "setup-buildx-action(BuildKit 활성화), login-action(레지스트리 인증), metadata-action(태그 자동 생성), build-push-action(빌드+push). GITHUB_TOKEN은 GitHub이 자동 제공하는 토큰이다.",
-        phase: "actions",
-        activeStage: -1,
+        title: 'Step 5. PR 파이프라인 — 매 PR마다 빌드 → 테스트 → registry',
+        desc: 'PR이 열리면 같은 워크플로우가 돌면서 이미지를 빌드하고 컨테이너 띄워 테스트까지 한다. 단, push: ${{ github.event_name != \'pull_request\' }} 로 PR 이미지는 registry 에 올리지 않거나 별도 dev registry 로만 보낸다. 검토 전 코드의 :latest 가 운영에 닿지 않게 막는 핵심 안전장치다. main 머지 직후에야 정식 태그가 registry 에 박힌다.',
+        phase: 'pr-pipeline',
+        trigger: 'pr-open',
+        activeStages: ['checkout', 'build', 'test'],
+        tags: [
+          'ghcr.io/acme/myapp:latest',
+          'ghcr.io/acme/myapp:main',
+          'ghcr.io/acme/myapp:sha-abc1234',
+          'ghcr.io/acme/myapp:1.2.0',
+          'ghcr.io/acme/myapp:1.2',
+        ],
+        registryActive: false,
+        prMode: true,
+        manualPain: false,
+        code: {
+          lang: 'yaml',
+          filename: 'pr-pipeline.yml',
+          lines: [
+            '# Step 5. PR 파이프라인 — 빌드/테스트는 항상, push 는 main 일 때만',
+            '',
+            'on:',
+            '  push:',
+            '    branches: [main]',
+            '    tags:     ["v*.*.*"]',
+            '  pull_request:',
+            '    branches: [main]',
+            '',
+            'jobs:',
+            '  build-test-push:',
+            '    runs-on: ubuntu-latest',
+            '    permissions:',
+            '      contents: read',
+            '      packages: write',
+            '    steps:',
+            '      - uses: actions/checkout@v4',
+            '      - uses: docker/setup-buildx-action@v3',
+            '',
+            '      - name: GHCR 로그인 (PR 도 캐시 push 위해 로그인)',
+            '        uses: docker/login-action@v3',
+            '        with:',
+            '          registry: ghcr.io',
+            '          username: ${{ github.actor }}',
+            '          password: ${{ secrets.GITHUB_TOKEN }}',
+            '',
+            '      - name: 메타데이터(태그) 생성',
+            '        id: meta',
+            '        uses: docker/metadata-action@v5',
+            '        with:',
+            '          images: ghcr.io/acme/myapp',
+            '          tags: |',
+            '            type=ref,event=branch',
+            '            type=ref,event=pr',
+            '            type=sha,prefix=sha-',
+            '            type=semver,pattern={{version}}',
+            '',
+            '      - name: 빌드 (PR/푸시 공통)',
+            '        uses: docker/build-push-action@v5',
+            '        with:',
+            '          context: .',
+            '          load: ${{ github.event_name == \'pull_request\' }}',
+            '          push: ${{ github.event_name != \'pull_request\' }}',
+            '          tags:   ${{ steps.meta.outputs.tags }}',
+            '          labels: ${{ steps.meta.outputs.labels }}',
+            '          cache-from: type=gha',
+            '          cache-to:   type=gha,mode=max',
+            '',
+            '      - name: 컨테이너 smoke test (PR 포함 항상)',
+            '        run: |',
+            '          docker run -d --name app -p 8000:8000 \\',
+            '            ghcr.io/acme/myapp:sha-${GITHUB_SHA::7}',
+            '          sleep 5',
+            '          curl -fsS http://localhost:8000/health',
+            '',
+            '# ─── 정책 한 줄 요약 ───',
+            '#  PR :  build ✓  test ✓  push ✗   (검토 전 운영 registry 오염 방지)',
+            '#  main: build ✓  test ✓  push ✓   (정식 태그가 registry 에 박힘)',
+            '#  tag : 위와 동일 + semver 태그가 함께 push',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 41, 42, 43, 44, 45, 46, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60],
+        },
       },
     ];
 
-    function PipelineStage({ stage, index, isActive, isPassed, isFailed }) {
-      return (
-        <div className={`flex flex-col items-center transition-all duration-500 ${
-          isActive ? "scale-110" : isPassed ? "scale-100" : "scale-90 opacity-50"
-        }`}>
-          <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all duration-500 ${
-            isFailed ? "border-red-400 bg-red-100" :
-            isActive ? "border-blue-400 bg-blue-100 anim-pulse" :
-            isPassed ? "border-green-400 bg-green-100" :
-            "border-slate-300 bg-slate-100"
-          }`}>
-            {isPassed && !isActive ? <span className="anim-check text-green-600 font-bold">V</span> : stage.icon}
+    // ─────────────────────────────────────────────────────
+    // 좌측 상단: 트리거 박스 — 사람 / git push / PR
+    //   manualPain → 사람 아이콘 + 빨간 경고
+    //   trigger 'git-push' → push 이벤트 sky 강조
+    //   trigger 'pr-open'  → PR 이벤트 amber 강조
+    // ─────────────────────────────────────────────────────
+    function TriggerBox({ trigger, manualPain }) {
+      if (manualPain) {
+        return (
+          <div className="rounded-lg border-2 border-rose-300 bg-rose-50 p-3">
+            <div className="flex items-center gap-1.5 mb-1.5">
+              <span className="text-base">🧑‍💻</span>
+              <span className="text-[11px] font-bold text-rose-800">사람이 매번 손으로</span>
+            </div>
+            <div className="bg-white rounded border border-rose-200 p-1.5 font-mono text-[9px] leading-snug text-slate-600 space-y-0.5">
+              <div><span className="text-rose-600">$</span> docker build -t myapp:latest .</div>
+              <div><span className="text-rose-600">$</span> docker tag ... 1.2.0</div>
+              <div><span className="text-rose-600">$</span> docker login ghcr.io</div>
+              <div><span className="text-rose-600">$</span> docker push ...</div>
+            </div>
+            <div className="text-[9px] mt-1 text-rose-700 font-semibold">
+              ✗ 태그 오타 · push 누락 · 권한 한 명에게 묶임
+            </div>
           </div>
-          <div className={`text-xs font-medium mt-1 ${
-            isActive ? "text-blue-700" : isPassed ? "text-green-700" : "text-slate-400"
-          }`}>{stage.label}</div>
-          <div className="text-xs text-slate-400 mt-0.5">{stage.desc}</div>
-        </div>
-      );
-    }
-
-    function PipelineArrow({ isPassed }) {
+        );
+      }
+      const isPush = trigger === 'git-push';
+      const isPR   = trigger === 'pr-open';
       return (
-        <div className={`flex items-center justify-center px-1 mt-[-20px] ${isPassed ? "text-green-400" : "text-slate-300"}`}>
-          <span className="text-lg">→</span>
+        <div className="grid grid-cols-2 gap-2">
+          <div className={`rounded-lg border-2 p-2 transition-all duration-500 text-center ${
+            isPush ? 'bg-sky-100 border-sky-500 shadow-md' : 'bg-slate-50 border-slate-200 opacity-60'
+          }`}>
+            <div className="text-base">📤</div>
+            <div className={`text-[11px] font-bold ${isPush ? 'text-sky-800' : 'text-slate-400'}`}>git push</div>
+            <div className="text-[9px] text-slate-500 mt-0.5 font-mono">on: push (main / tags)</div>
+          </div>
+          <div className={`rounded-lg border-2 p-2 transition-all duration-500 text-center ${
+            isPR ? 'bg-amber-100 border-amber-500 shadow-md' : 'bg-slate-50 border-slate-200 opacity-60'
+          }`}>
+            <div className="text-base">🔀</div>
+            <div className={`text-[11px] font-bold ${isPR ? 'text-amber-800' : 'text-slate-400'}`}>pull request</div>
+            <div className="text-[9px] text-slate-500 mt-0.5 font-mono">on: pull_request</div>
+          </div>
         </div>
       );
     }
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // ─────────────────────────────────────────────────────
+    // 좌측 중앙: CI 파이프라인 — 가로 컨베이어 벨트
+    //   activeStages 에 들어 있는 id 까지 sky 점등
+    //   마지막 활성 칸은 pulse, 이전은 통과(check)
+    // ─────────────────────────────────────────────────────
+    function PipelineBox({ activeStages }) {
+      const lastActive = activeStages[activeStages.length - 1];
+      return (
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🤖</span>
+              <span className="text-[11px] font-bold text-slate-700">GitHub Actions Runner</span>
+            </div>
+            {activeStages.length > 0 && (
+              <span className="text-[9px] bg-sky-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">
+                running
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1">
+            {PIPELINE.map((stage, i) => {
+              const passed   = activeStages.includes(stage.id);
+              const isLast   = stage.id === lastActive;
+              return (
+                <React.Fragment key={stage.id}>
+                  <div className={`flex-1 rounded-md border-2 p-1.5 text-center transition-all duration-500 ${
+                    passed
+                      ? (isLast ? 'bg-sky-100 border-sky-500 shadow' : 'bg-emerald-50 border-emerald-300')
+                      : 'bg-slate-50 border-dashed border-slate-200 opacity-50'
+                  }`}>
+                    <div className="text-base leading-none">{stage.icon}</div>
+                    <div className={`text-[9px] font-bold mt-0.5 ${
+                      passed ? (isLast ? 'text-sky-800' : 'text-emerald-700') : 'text-slate-400'
+                    }`}>{stage.label}</div>
+                    <div className={`text-[8px] ${passed ? 'text-slate-600' : 'text-slate-400'} leading-tight`}>
+                      {stage.desc}
+                    </div>
+                    {passed && !isLast && (
+                      <div className="text-[8px] text-emerald-600 font-bold mt-0.5">✓</div>
+                    )}
+                    {isLast && passed && (
+                      <div className="mt-0.5 bg-sky-600 text-white text-[8px] px-1 py-0.5 rounded font-mono font-bold">
+                        active
+                      </div>
+                    )}
+                  </div>
+                  {i < PIPELINE.length - 1 && (
+                    <span className={`text-xs ${
+                      activeStages.includes(stage.id) ? 'text-sky-500' : 'text-slate-300'
+                    }`}>→</span>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 하단: registry 박스 — 푸시된 이미지 태그 목록
+    //   prMode → push 차단 표시 (회색 + 자물쇠)
+    //   registryActive → sky 강조
+    // ─────────────────────────────────────────────────────
+    function RegistryBox({ tags, registryActive, prMode }) {
+      const hasTags = tags && tags.length > 0;
+      return (
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${
+          registryActive
+            ? 'bg-sky-50 border-sky-400 shadow-md'
+            : prMode
+              ? 'bg-amber-50 border-amber-300'
+              : 'bg-slate-50 border-slate-200 opacity-70'
+        }`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">📦</span>
+              <span className={`text-[11px] font-bold ${
+                registryActive ? 'text-sky-800' : prMode ? 'text-amber-800' : 'text-slate-500'
+              }`}>
+                ghcr.io/acme/myapp
+              </span>
+            </div>
+            {registryActive && (
+              <span className="text-[9px] bg-sky-600 text-white px-1.5 py-0.5 rounded font-mono font-bold animate-pulse">
+                pushed ✓
+              </span>
+            )}
+            {prMode && (
+              <span className="text-[9px] bg-amber-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">
+                push 차단 🔒
+              </span>
+            )}
+          </div>
+          <div className="bg-white rounded border border-slate-200 p-1.5 font-mono text-[9px] leading-snug space-y-0.5 min-h-[80px]">
+            {!hasTags && (
+              <div className="text-slate-400 italic">아직 푸시된 이미지 없음</div>
+            )}
+            {hasTags && tags.map((t, i) => (
+              <div key={i} className="flex items-center gap-1">
+                <span className={prMode ? 'text-slate-400 line-through' : 'text-sky-700 font-semibold'}>
+                  {t}
+                </span>
+                {!prMode && (
+                  <span className="ml-auto text-[8px] text-emerald-600 font-bold">✓</span>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className={`text-[9px] mt-1 ${
+            registryActive ? 'text-sky-700 font-semibold' :
+            prMode ? 'text-amber-700 font-semibold' :
+            'text-slate-400'
+          }`}>
+            {registryActive && '✓ main / tag 푸시 → 정식 이미지가 등록됨'}
+            {prMode && '✗ PR 컨텍스트 — 빌드/테스트만, push 는 main 머지 후'}
+            {!registryActive && !prMode && '대기 중'}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단: 트리거 (사람/push/PR)
+    //   중앙: CI 파이프라인 (5칸 컨베이어)
+    //   하단: registry 와 푸시된 태그 목록
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📚 git push → CI → registry → 배포</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-2">
+            <TriggerBox trigger={step.trigger} manualPain={step.manualPain} />
+
+            {/* 화살표: 트리거 → 파이프라인 */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.activeStages.length > 0 ? 'text-sky-600 font-bold' : 'text-slate-300'
+              }`}>
+                ↓ workflow trigger
+              </div>
+            </div>
+
+            <PipelineBox activeStages={step.activeStages} />
+
+            {/* 화살표: 파이프라인 → registry */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.registryActive ? 'text-sky-600 font-bold' :
+                step.prMode ? 'text-amber-600 font-bold' :
+                'text-slate-300'
+              }`}>
+                {step.prMode ? '↓ push 차단 (PR 컨텍스트)' : '↓ docker push'}
+              </div>
+            </div>
+
+            <RegistryBox
+              tags={step.tags}
+              registryActive={step.registryActive}
+              prMode={step.prMode}
+            />
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>active
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-emerald-500"></span>passed
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-amber-500"></span>PR mode
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-rose-500"></span>manual risk
+            </span>
+            <span className="ml-auto font-mono">phase: {step.phase}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    //   파일명 탭, 윈도우 dot, 라인 번호, 강조 라인
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4500);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
 
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생(3000ms), 키보드 단축키
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum VII-1-4</span>
+            </nav>
+
+            {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter VII-1-4: CI/CD에서 Docker 빌드 자동화</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VII</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part VII. Docker 운영 &gt; Chapter 1. Registry · CI/CD</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VII-1-4. CI/CD with Docker — GitHub Actions로 빌드/푸시 자동화</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">손으로 docker build/push → GitHub Actions + build-push-action + metadata-action 으로 컨베이어처럼 자동화</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">GitHub Actions 파이프라인 흐름(push → build → test → deploy)을 시뮬레이션합니다.</p>
             </header>
 
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "actions" ? "bg-emerald-600 border-emerald-700 text-white" :
-              data.phase === "why" ? "bg-orange-600 border-orange-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            {/* 파이프라인 시각화 */}
-            {data.phase !== "why" && data.phase !== "actions" && (
-              <div key={`pipeline-${step}`} className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 anim-fade">
-                <div className="flex items-start justify-center gap-1 flex-wrap">
-                  {PIPELINE_STAGES.map((stage, i) => (
-                    <React.Fragment key={stage.id}>
-                      <PipelineStage stage={stage} index={i}
-                        isActive={data.activeStage === i}
-                        isPassed={data.activeStage > i}
-                        isFailed={false} />
-                      {i < PIPELINE_STAGES.length - 1 && (
-                        <PipelineArrow isPassed={data.activeStage > i} />
-                      )}
-                    </React.Fragment>
-                  ))}
-                </div>
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: 트리거(<strong>on.push / pull_request</strong>) → 빌드(<strong>build-push-action</strong>) → 태그(<strong>metadata-action</strong>) → 푸시 정책(<strong>push: PR이면 false</strong>) — 이 4 가지가 CI/CD with Docker 의 뼈대다. 다음 자료(VII-1-5)에서는 배포(deploy) 흐름까지 이어진다.
               </div>
             )}
 
-            {/* 왜 필요한가 */}
-            {data.phase === "why" && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 anim-fade">
-                {[
-                  { icon: "🐛", title: "실수 가능성", desc: "태그를 잘못 붙이거나 push를 빠뜨림", color: "red" },
-                  { icon: "🔄", title: "재현성 부족", desc: "내 노트북 빌드 이미지는 환경마다 다름", color: "orange" },
-                  { icon: "👤", title: "병목 발생", desc: "배포가 특정 사람에게 의존됨", color: "yellow" },
-                ].map((item, i) => (
-                  <div key={i} className={`rounded-xl border-2 border-${item.color}-300 bg-${item.color}-50 p-4 text-center anim-slide`} style={{animationDelay: `${i * 0.15}s`}}>
-                    <div className="text-3xl mb-2">{item.icon}</div>
-                    <div className={`font-bold text-${item.color}-700 text-sm`}>{item.title}</div>
-                    <div className={`text-xs text-${item.color}-600 mt-1`}>{item.desc}</div>
-                  </div>
-                ))}
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
-            )}
-
-            {/* 추가 시각화 */}
-            <div key={`detail-${step}`} className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 anim-fade">
-              {/* 테스트 단계 */}
-              {data.phase === "test" && (
-                <div className="space-y-3">
-                  <div className="text-sm font-medium text-slate-600 mb-2">워크플로우 트리거 조건</div>
-                  <div className="bg-slate-800 rounded-lg p-4 font-mono text-xs">
-                    <div className="text-yellow-300">on:</div>
-                    <div className="text-blue-300 ml-2">push:</div>
-                    <div className="text-green-400 ml-4">branches: [main]      # main push 시 실행</div>
-                    <div className="text-blue-300 ml-2">pull_request:</div>
-                    <div className="text-green-400 ml-4">branches: [main]      # main PR 시 실행 (빌드만, push 안 함)</div>
-                  </div>
-                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-center">
-                    <span className="text-blue-700 font-medium">PR에서는 빌드만 하고 push는 하지 않는다 — 검토 전 코드의 이미지가 올라가면 안 된다</span>
-                  </div>
-                </div>
-              )}
-
-              {/* 빌드 + 캐시 */}
-              {data.phase === "build" && (
-                <div className="space-y-4">
-                  <div className="text-sm font-medium text-slate-600 mb-2">BuildKit 캐시 동작</div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                      <div className="font-bold text-red-700 text-sm mb-2">캐시 없이 빌드</div>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 bg-red-200 rounded-full h-4 overflow-hidden">
-                          <div className="bg-red-500 h-full rounded-full" style={{width: "100%"}} />
-                        </div>
-                        <span className="text-xs text-red-600 font-medium">5분 30초</span>
-                      </div>
-                      <div className="text-xs text-red-500 mt-1">모든 레이어를 처음부터 빌드</div>
-                    </div>
-                    <div className="bg-green-50 border border-green-200 rounded-lg p-3">
-                      <div className="font-bold text-green-700 text-sm mb-2">GHA 캐시 사용</div>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 bg-green-200 rounded-full h-4 overflow-hidden">
-                          <div className="bg-green-500 h-full rounded-full" style={{width: "25%"}} />
-                        </div>
-                        <span className="text-xs text-green-600 font-medium">45초</span>
-                      </div>
-                      <div className="text-xs text-green-500 mt-1">변경된 레이어만 다시 빌드</div>
-                    </div>
-                  </div>
-                  <div className="bg-slate-800 rounded-lg p-4 font-mono text-xs">
-                    <div className="text-green-400">cache-from: type=gha         # 이전 캐시 불러옴</div>
-                    <div className="text-green-400">cache-to: type=gha,mode=max  # 새 캐시 저장</div>
-                    <div className="text-slate-500 mt-1"># 캐시 용량 제한: 리포지토리당 10GB</div>
-                  </div>
-                </div>
-              )}
-
-              {/* 스캔 + push */}
-              {data.phase === "scan_push" && (
-                <div className="space-y-4">
-                  <div className="bg-slate-800 rounded-lg p-4 font-mono text-xs">
-                    <div className="text-slate-500"># trivy 스캔을 CI에 추가</div>
-                    <div className="text-yellow-300">- name: trivy 이미지 스캔</div>
-                    <div className="text-blue-300 ml-2">uses: aquasecurity/trivy-action@master</div>
-                    <div className="text-blue-300 ml-2">with:</div>
-                    <div className="text-green-400 ml-4">format: table</div>
-                    <div className="text-red-400 ml-4">exit-code: 1              # CRITICAL 시 워크플로우 실패</div>
-                    <div className="text-green-400 ml-4">severity: CRITICAL,HIGH</div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-center">
-                      <div className="text-2xl mb-1">V</div>
-                      <div className="text-xs text-green-700 font-medium">스캔 통과 → Push 실행</div>
-                    </div>
-                    <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-center">
-                      <div className="text-2xl mb-1">X</div>
-                      <div className="text-xs text-red-700 font-medium">CRITICAL 발견 → Push 차단</div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* 파이프라인 전체 */}
-              {data.phase === "pipeline" && (
-                <div className="space-y-3">
-                  {[
-                    { stage: "테스트", desc: "pytest / npm test 실행", fail: "실패 시 → 빌드 진행 안 함", icon: "🧪" },
-                    { stage: "빌드", desc: "BuildKit + GHA 캐시", fail: "실패 시 → 스캔 진행 안 함", icon: "🔨" },
-                    { stage: "스캔", desc: "trivy CRITICAL/HIGH 검사", fail: "CRITICAL 발견 시 → push 중단", icon: "🔍" },
-                    { stage: "Push", desc: "GHCR/ECR에 이미지 업로드", fail: "main merge 시에만 실행", icon: "⬆️" },
-                  ].map((item, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-slate-200 anim-down" style={{animationDelay: `${i * 0.15}s`}}>
-                      <div className="text-2xl">{item.icon}</div>
-                      <div className="flex-1">
-                        <div className="font-bold text-slate-800 text-sm">{item.stage}</div>
-                        <div className="text-xs text-slate-500">{item.desc}</div>
-                      </div>
-                      <div className="text-xs text-red-500 bg-red-50 px-2 py-1 rounded">{item.fail}</div>
-                      {i < 3 && <span className="text-slate-300">↓</span>}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Actions 구성 요소 */}
-              {data.phase === "actions" && (
-                <div className="space-y-3">
-                  {[
-                    { action: "actions/checkout@v4", desc: "저장소 코드를 워크플로우 실행 환경에 내려받음", icon: "📥" },
-                    { action: "docker/setup-buildx-action@v3", desc: "BuildKit 기반 buildx 빌더 활성화", icon: "⚙️" },
-                    { action: "docker/login-action@v3", desc: "레지스트리 로그인 (GITHUB_TOKEN 자동 제공)", icon: "🔑" },
-                    { action: "docker/metadata-action@v5", desc: "브랜치/태그/SHA에 맞는 이미지 태그 자동 생성", icon: "🏷️" },
-                    { action: "docker/build-push-action@v5", desc: "빌드 + push를 한 번에 처리, BuildKit 캐시 연동", icon: "🚀" },
-                  ].map((item, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 bg-emerald-50 border border-emerald-200 rounded-lg anim-slide" style={{animationDelay: `${i * 0.1}s`}}>
-                      <div className="text-xl">{item.icon}</div>
-                      <div className="flex-1">
-                        <div className="font-mono text-xs text-emerald-800 font-medium">{item.action}</div>
-                        <div className="text-xs text-emerald-600">{item.desc}</div>
-                      </div>
-                    </div>
-                  ))}
-                  <div className="bg-emerald-100 border border-emerald-300 rounded-lg p-3 text-xs text-center">
-                    <span className="text-emerald-800 font-medium">secrets.GITHUB_TOKEN은 별도 발급 없이 GitHub이 자동 제공. permissions.packages: write 필수.</span>
-                  </div>
-                </div>
-              )}
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
 
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
-              </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
-              </div>
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
             </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['GitHub Actions', 'build-push-action', 'metadata-action', 'setup-buildx', 'login-action', 'on: push', 'pull_request', 'GHCR', 'semver tag', 'cache: gha'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./vii-1-3_security.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; VII-1-3 컨테이너 보안</a>
+              <a href="./vii-1-5_deployment.html" className="text-sky-700 hover:text-sky-900 font-medium">VII-1-5 배포 전략 &rarr;</a>
+            </nav>
 
           </div>
         </div>

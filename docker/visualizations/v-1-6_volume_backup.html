@@ -3,75 +3,590 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — 볼륨 백업과 복원</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <title>Docker 인터랙티브 학습 — V-1-6. Volume 백업 / 복구</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>💾</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes flowDown { from{opacity:0;transform:translateY(-15px);} to{opacity:1;transform:translateY(0);} }
-    @keyframes compress { 0%{transform:scaleY(1);} 50%{transform:scaleY(0.7);} 100%{transform:scaleY(1);} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-    .anim-flow { animation: flowDown 0.5s ease-out forwards; }
-    .anim-compress { animation: compress 1s ease-in-out; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    V-1-6. Volume 백업 / 복구 — tar로 영속 데이터를 보호한다
+    학습 목표: docker volume이 삭제·서버 손상으로 사라지기 전에 tar archive로 백업하고,
+              외부 스토리지(S3)로 옮긴 뒤, 필요할 때 다시 복구하는 5단계 절차를 본다.
+    핵심 비유: 금고(volume) → 진공 포장(tar) → 외부 창고(S3) → 다시 풀어 금고에 적재
+    패턴: fastapi v1 — 좌(LiveDataPane: volume → tar → backup file → restore 흐름) / 우(VSCode CodeViewer)
+    탭: data-loss.sh, backup.sh, s3-upload.sh, restore.sh, cron.sh
+    색상: sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계
+    //   phase           : 'loss' | 'backup' | 'offsite' | 'restore' | 'automate'
+    //   volume          : { state, label, files: [{name, lit}], danger }
+    //   tarFile         : { exists, size, sha, building, extracting }
+    //   offsite         : { uploaded, provider, key, count }
+    //   newVolume       : { exists, restored }
+    //   cron            : { active, schedule }
+    //   conclusion      : 마지막 단계 결과 박스 표시
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: "STEP 1 · 볼륨 백업이 필요한 이유",
-        desc: "컨테이너가 삭제되어도 볼륨은 남는다. 하지만 호스트 서버가 망가지거나, 실수로 docker volume rm 또는 docker compose down -v를 치면 볼륨도 사라진다. 재생성 불가능한 데이터는 별도로 백업해야 한다.",
-        phase: "why",
+        title: 'Step 1. Volume 손실 시나리오 — 영속 데이터도 사라질 수 있다',
+        desc: '컨테이너가 사라져도 volume은 남는다. 그러나 volume rm, compose down -v, 디스크 손상, 서버 폐기 — 어떤 이유로든 volume 자체가 날아가면 PostgreSQL의 사용자/주문 데이터처럼 재생성 불가능한 정보가 영원히 사라진다. "volume을 만들었으니 안전" 은 충분하지 않다. 백업 전략이 따로 있어야 한다.',
+        phase: 'loss',
+        volume: {
+          state: 'at-risk',
+          label: 'pgdata',
+          files: [
+            { name: 'base/16384/users.dat', lit: true },
+            { name: 'base/16384/orders.dat', lit: true },
+            { name: 'pg_wal/00000001...', lit: true },
+            { name: 'postgresql.conf', lit: true },
+          ],
+          danger: true,
+        },
+        tarFile: { exists: false },
+        offsite: { uploaded: false, count: 0 },
+        newVolume: { exists: false, restored: false },
+        cron: { active: false },
+        conclusion: false,
+        code: {
+          lang: 'bash',
+          filename: 'data-loss.sh',
+          lines: [
+            '# Step 1. volume 도 사라질 수 있다 — 손실 시나리오 4가지',
+            '',
+            '# 현재 상태: PostgreSQL 컨테이너 + pgdata volume',
+            'docker volume ls',
+            '#  DRIVER    VOLUME NAME',
+            '#  local     pgdata     ← users / orders 테이블',
+            '',
+            '# ─── 시나리오 1. 명시적 삭제 ───',
+            'docker volume rm pgdata',
+            '#  → 즉시 영구 삭제. 휴지통 없음.',
+            '',
+            '# ─── 시나리오 2. compose down -v ───',
+            'docker compose down -v',
+            '#  → 컨테이너만 내리려다 volume 까지 함께 제거 (운영 최다 실수)',
+            '',
+            '# ─── 시나리오 3. 디스크 손상 ───',
+            '#  /var/lib/docker/volumes 가 들어 있는 디스크 장애.',
+            '',
+            '# ─── 시나리오 4. 인스턴스 폐기 ───',
+            '#  EBS 분리 안 된 채 EC2 종료 → 데이터 증발.',
+            '',
+            '# ─── 결론 ───',
+            '#  volume 은 1차 방어선일 뿐, 물리 손실까지 막진 않는다.',
+            '#  → 정기 백업 + offsite 보관이 필수.',
+            '',
+            '# 백업 없이 사라지면 끝나는 데이터',
+            '#   • 사용자 / 비밀번호 해시',
+            '#   • 결제 / 주문 내역',
+            '#   • 업로드 파일 메타데이터',
+            '#   • 모델 학습 결과 / 임베딩',
+          ],
+          highlight: [3, 8, 9, 12, 13, 22, 23, 24],
+        },
       },
       {
-        title: "STEP 2 · tar 백업: 임시 컨테이너 생성",
-        desc: "alpine 경량 이미지로 임시 컨테이너를 띄운다. --rm 옵션으로 작업 완료 후 자동 삭제되게 한다. 이 컨테이너에 볼륨과 호스트 디렉토리를 동시에 마운트한다.",
-        phase: "temp_container",
+        title: 'Step 2. tar archive 로 백업 — 임시 컨테이너로 묶기',
+        desc: 'volume 자체에는 tar 명령이 없다. 대신 alpine 같은 경량 이미지로 1회용 컨테이너(--rm)를 띄워 volume 과 호스트 디렉토리를 동시에 마운트한다. 컨테이너 안에서 /data(volume) 를 tar czf 로 압축해 /backup(호스트) 에 backup.tar.gz 로 떨어뜨린다. 작업이 끝나면 컨테이너는 자동 삭제, 호스트에는 압축 파일만 남는다.',
+        phase: 'backup',
+        volume: {
+          state: 'reading',
+          label: 'pgdata',
+          files: [
+            { name: 'base/16384/users.dat', lit: true },
+            { name: 'base/16384/orders.dat', lit: true },
+            { name: 'pg_wal/00000001...', lit: true },
+            { name: 'postgresql.conf', lit: true },
+          ],
+          danger: false,
+        },
+        tarFile: { exists: true, size: '142 MB', sha: 'a1b2c3...', building: true },
+        offsite: { uploaded: false, count: 0 },
+        newVolume: { exists: false, restored: false },
+        cron: { active: false },
+        conclusion: false,
+        code: {
+          lang: 'bash',
+          filename: 'backup.sh',
+          lines: [
+            '# Step 2. volume → tar.gz 압축 백업',
+            '',
+            '# 1) DB 컨테이너 정지 (I/O quiesce — 일관성 보장)',
+            'docker compose stop db',
+            '',
+            '# 2) 임시 컨테이너로 tar 백업',
+            'docker run --rm \\',
+            '  -v pgdata:/data:ro \\',
+            '  -v "$(pwd)":/backup \\',
+            '  alpine:3.19 \\',
+            '  tar czf /backup/pgdata-$(date +%Y%m%d-%H%M).tar.gz \\',
+            '       -C /data .',
+            '',
+            '# ─── 옵션 해부 ───',
+            '#  --rm                : 작업 끝나면 컨테이너 자동 제거',
+            '#  -v pgdata:/data:ro  : 백업 대상 volume — read-only',
+            '#  -v $(pwd):/backup   : 호스트 결과 저장 디렉토리',
+            '#  alpine:3.19         : 5 MB 경량 이미지 (tar 내장)',
+            '#  tar czf  ...        : Create + gZip + File',
+            '#  -C /data .          : /data 로 cd 한 뒤 . 전부',
+            '',
+            '# 3) 결과 확인',
+            'ls -lh pgdata-*.tar.gz',
+            '#  -rw-r--r-- 1 root 142M pgdata-20260507-0200.tar.gz',
+            '',
+            '# 4) 무결성 체크섬',
+            'sha256sum pgdata-20260507-0200.tar.gz \\',
+            '  > pgdata-20260507-0200.tar.gz.sha256',
+            '',
+            '# 5) DB 재시작',
+            'docker compose start db',
+            '',
+            '# ─── 핵심 ───',
+            '#  • alpine 은 tar 용 껍데기 — 작업 후 사라짐',
+            '#  • 호스트에는 tar.gz 단 한 개만 남음 → 이동 자유',
+            '#  • read-only 마운트로 백업 중 실수 쓰기 차단',
+          ],
+          highlight: [3, 4, 9, 10, 11, 12, 13, 14, 15, 27, 28, 31, 32, 33],
+        },
       },
       {
-        title: "STEP 3 · tar 백업: 볼륨 데이터 압축",
-        desc: "-v <볼륨>:/data로 볼륨을 마운트하고, -v $(pwd):/backup으로 호스트 현재 디렉토리를 마운트한다. tar czf로 /data 내용을 압축해 /backup/backup.tar.gz로 저장한다. 호스트에 파일이 생긴다.",
-        phase: "backup",
+        title: 'Step 3. 외부 스토리지로 — S3 로 백업 파일 옮기기',
+        desc: '백업 파일이 같은 서버 디스크에 있으면 그 서버가 망가질 때 같이 사라진다. 이를 막는 원칙이 3-2-1 규칙: 사본 3개 / 매체 2종 / offsite 1곳. AWS S3, GCS, Azure Blob 처럼 다른 리전/계정의 스토리지에 보관해 서버·데이터센터 단위 장애에도 살아남게 한다. aws s3 cp 한 줄로 끝난다.',
+        phase: 'offsite',
+        volume: {
+          state: 'idle',
+          label: 'pgdata',
+          files: [
+            { name: 'base/16384/users.dat', lit: false },
+            { name: 'base/16384/orders.dat', lit: false },
+            { name: 'pg_wal/00000001...', lit: false },
+            { name: 'postgresql.conf', lit: false },
+          ],
+          danger: false,
+        },
+        tarFile: { exists: true, size: '142 MB', sha: 'a1b2c3...' },
+        offsite: { uploaded: true, provider: 'S3', key: 's3://my-backups/pgdata/2026-05-07/pgdata-0200.tar.gz', count: 30 },
+        newVolume: { exists: false, restored: false },
+        cron: { active: false },
+        conclusion: false,
+        code: {
+          lang: 'bash',
+          filename: 's3-upload.sh',
+          lines: [
+            '# Step 3. 백업 파일을 외부 스토리지로 — 3-2-1 규칙',
+            '',
+            '# ─── 3-2-1 규칙 ───',
+            '#  3 사본 / 2 매체 / 1 offsite (다른 리전·계정)',
+            '',
+            '# 1) AWS S3 업로드',
+            'BACKUP_FILE=pgdata-20260507-0200.tar.gz',
+            'aws s3 cp "$BACKUP_FILE" \\',
+            '  "s3://my-backups/pgdata/2026-05-07/$BACKUP_FILE" \\',
+            '  --storage-class STANDARD_IA',
+            '#  → STANDARD_IA: 자주 안 읽는 백업용 저렴 클래스',
+            '',
+            '# 체크섬도 함께 업로드',
+            'aws s3 cp "${BACKUP_FILE}.sha256" \\',
+            '  "s3://my-backups/pgdata/2026-05-07/${BACKUP_FILE}.sha256"',
+            '',
+            '# 2) Lifecycle: 30일 후 Glacier, 365일 후 삭제 (별도 1회 설정)',
+            '',
+            '# 3) 멀티 클라우드 대안',
+            '#    gsutil cp  "$BACKUP_FILE" gs://my-backups/...',
+            '#    azcopy copy "$BACKUP_FILE" "https://acct.blob..."',
+            '#    rclone copy "$BACKUP_FILE" gdrive:backups/',
+            '',
+            '# 4) 로컬 7일치만 유지',
+            'find . -name "pgdata-*.tar.gz" -mtime +7 -delete',
+            '',
+            '# 5) 업로드 검증 — ETag 와 sha256 비교',
+            'aws s3api head-object \\',
+            '  --bucket my-backups \\',
+            '  --key "pgdata/2026-05-07/$BACKUP_FILE" \\',
+            '  --query ETag',
+            '',
+            '# ─── 왜 외부에 두는가 ───',
+            '#  • 호스트·서버 통째 분실 대응',
+            '#  • 랜섬웨어 — S3 버전 잠금으로 복구',
+            '#  • 리전 단위 장애 (불, 정전, 케이블 단절)',
+            '#  • 규제 — 일부 산업은 offsite 가 법적 요구',
+          ],
+          highlight: [8, 9, 10, 11, 12, 15, 16, 17, 27, 28, 31, 32, 33, 34, 35],
+        },
       },
       {
-        title: "STEP 4 · tar 복원: 압축 해제",
-        desc: "복원은 반대 순서다. 새 볼륨을 만들고, 다시 임시 컨테이너를 띄워 tar xzf로 압축을 풀어 볼륨에 쓴다. czf(Create Zipped File)와 xzf(eXtract Zipped File)만 기억하면 된다.",
-        phase: "restore",
+        title: 'Step 4. 복구 — tar 를 풀어 새 volume 에 적재',
+        desc: '복구는 백업의 거울이다. 새 volume 을 만들고, 다시 임시 컨테이너로 호스트의 tar.gz 와 새 volume 을 동시에 마운트한 뒤 tar xzf 로 압축을 풀어 volume 안에 그대로 쓴다. czf(create) 의 짝은 xzf(extract). 마지막에 PostgreSQL 컨테이너를 새 volume 으로 다시 띄우면 사용자/주문 데이터가 그대로 살아 돌아온다. 백업은 복구 테스트가 성공해야 의미가 있다.',
+        phase: 'restore',
+        volume: {
+          state: 'idle',
+          label: 'pgdata (lost)',
+          files: [],
+          danger: false,
+        },
+        tarFile: { exists: true, size: '142 MB', sha: 'a1b2c3...', extracting: true },
+        offsite: { uploaded: true, provider: 'S3', key: 's3://my-backups/pgdata/2026-05-07/pgdata-0200.tar.gz', count: 30 },
+        newVolume: {
+          exists: true,
+          restored: true,
+          label: 'pgdata_restored',
+          files: [
+            { name: 'base/16384/users.dat', lit: true },
+            { name: 'base/16384/orders.dat', lit: true },
+            { name: 'pg_wal/00000001...', lit: true },
+            { name: 'postgresql.conf', lit: true },
+          ],
+        },
+        cron: { active: false },
+        conclusion: false,
+        code: {
+          lang: 'bash',
+          filename: 'restore.sh',
+          lines: [
+            '# Step 4. tar.gz → 새 volume 복구 (DR 시나리오)',
+            '',
+            '# 상황: pgdata 가 사라졌고, S3 에 백업이 있다.',
+            '',
+            '# 1) S3 에서 백업 다운로드',
+            'BACKUP_FILE=pgdata-20260507-0200.tar.gz',
+            'aws s3 cp \\',
+            '  "s3://my-backups/pgdata/2026-05-07/$BACKUP_FILE" \\',
+            '  "./$BACKUP_FILE"',
+            '',
+            '# 2) 무결성 검증',
+            'aws s3 cp \\',
+            '  "s3://my-backups/pgdata/2026-05-07/${BACKUP_FILE}.sha256" .',
+            'sha256sum -c "${BACKUP_FILE}.sha256"',
+            '#  → pgdata-20260507-0200.tar.gz: OK',
+            '',
+            '# 3) 새 volume 생성',
+            'docker volume create pgdata_restored',
+            '',
+            '# 4) tar 압축 해제 (백업의 거울)',
+            'docker run --rm \\',
+            '  -v pgdata_restored:/data \\',
+            '  -v "$(pwd)":/backup \\',
+            '  alpine:3.19 \\',
+            '  tar xzf /backup/$BACKUP_FILE -C /data',
+            '',
+            '# ─── 옵션 ───',
+            '#  -v pgdata_restored:/data : 쓰기 대상 (rw)',
+            '#  tar xzf                  : eXtract + gZip + File',
+            '#  -C /data                 : /data 안으로 풀기',
+            '',
+            '# 5) Postgres 를 복원된 volume 으로 재시작',
+            'docker run -d --name db \\',
+            '  -v pgdata_restored:/var/lib/postgresql/data \\',
+            '  -e POSTGRES_PASSWORD=secret \\',
+            '  postgres:16',
+            '',
+            '# 6) 복원 검증',
+            'docker exec db psql -U postgres -d demo \\',
+            '  -c "SELECT count(*) FROM users;"',
+            '#  → 12483 (백업 시점과 동일 → 성공)',
+            '',
+            '# ─── 백업/복구 짝 ───',
+            '#  czf ↔ xzf      (Create ↔ eXtract)',
+            '#  /data → /backup ↔ /backup → /data',
+            '#',
+            '# ─── 골든 룰 ───',
+            '#  "복원 테스트가 성공한 적 없는 백업은 백업이 아니다."',
+            '#  → 분기 1회 이상 실제 복원 리허설.',
+          ],
+          highlight: [4, 5, 6, 7, 8, 17, 20, 21, 22, 23, 24, 25, 33, 34, 35, 36, 37, 38, 41, 42, 43],
+        },
       },
       {
-        title: "STEP 5 · pg_dump / pg_restore",
-        desc: "PostgreSQL 데이터는 pg_dump가 더 안정적이다. tar는 파일을 그대로 복사하므로 PostgreSQL 버전이 다르면 호환성 문제가 생길 수 있다. pg_dump는 SQL 형태로 내보내기 때문에 버전이 달라도 복원이 가능하다.",
-        phase: "pgdump",
-      },
-      {
-        title: "STEP 6 · 백업 전략 정리",
-        desc: "tar 백업은 모든 볼륨에 적용 가능한 범용 패턴이다. PostgreSQL은 pg_dump가 권장된다. 프로덕션에서는 cron으로 자동 백업하고, S3/GCS에 보관하며, 복원 테스트를 주기적으로 수행한다.",
-        phase: "summary",
+        title: 'Step 5. 자동화 — cron + S3 sync 로 매일 새벽 백업',
+        desc: '사람이 매일 백업을 직접 칠 수는 없다. cron 으로 새벽 2시에 backup.sh 를 돌리고, 끝나면 자동으로 S3 에 sync, 7일 지난 로컬 파일은 삭제, 결과는 로그로 남긴다. systemd timer / GitHub Actions / Kubernetes CronJob 으로도 동일 원리다. "정기 + 외부 + 검증" 세 박자가 갖춰지면 비로소 백업 시스템이 완성된다.',
+        phase: 'automate',
+        volume: {
+          state: 'protected',
+          label: 'pgdata',
+          files: [
+            { name: 'base/16384/users.dat', lit: true },
+            { name: 'base/16384/orders.dat', lit: true },
+            { name: 'pg_wal/00000001...', lit: true },
+            { name: 'postgresql.conf', lit: true },
+          ],
+          danger: false,
+        },
+        tarFile: { exists: true, size: '142 MB', sha: 'a1b2c3...' },
+        offsite: { uploaded: true, provider: 'S3', key: 's3://my-backups/pgdata/...', count: 30 },
+        newVolume: { exists: true, restored: true, label: 'pgdata_restored' },
+        cron: { active: true, schedule: '0 2 * * * (매일 02:00)' },
+        conclusion: true,
+        code: {
+          lang: 'bash',
+          filename: 'cron.sh',
+          lines: [
+            '# Step 5. cron + S3 sync — 매일 자동 백업 파이프라인',
+            '',
+            '# /etc/cron.d/pgdata-backup  (root, 매일 02:00)',
+            '#  0 2 * * *  /opt/scripts/backup-pipeline.sh',
+            '',
+            '# /opt/scripts/backup-pipeline.sh',
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            '',
+            'TS=$(date +%Y%m%d-%H%M)',
+            'BACKUP_DIR=/var/backups/pgdata',
+            'BACKUP_FILE="pgdata-${TS}.tar.gz"',
+            'S3_PREFIX="s3://my-backups/pgdata/$(date +%Y-%m-%d)"',
+            'LOG=/var/log/pgdata-backup.log',
+            '',
+            'mkdir -p "$BACKUP_DIR" && cd "$BACKUP_DIR"',
+            '',
+            '# 1) tar 백업',
+            'docker run --rm \\',
+            '  -v pgdata:/data:ro \\',
+            '  -v "$BACKUP_DIR":/backup \\',
+            '  alpine:3.19 \\',
+            '  tar czf "/backup/$BACKUP_FILE" -C /data . \\',
+            '  >> "$LOG" 2>&1',
+            '',
+            '# 2) 체크섬',
+            'sha256sum "$BACKUP_FILE" > "${BACKUP_FILE}.sha256"',
+            '',
+            '# 3) S3 업로드 (sync — 누락분만)',
+            'aws s3 sync "$BACKUP_DIR" "$S3_PREFIX" \\',
+            '  --exclude "*" --include "pgdata-${TS}*" \\',
+            '  --storage-class STANDARD_IA >> "$LOG" 2>&1',
+            '',
+            '# 4) 로컬 7일치만 유지 (S3 에 보관)',
+            'find "$BACKUP_DIR" -name "pgdata-*.tar.gz*" -mtime +7 -delete',
+            '',
+            '# 5) Slack 알림',
+            'curl -s -X POST "$SLACK_WEBHOOK" \\',
+            '  -H "Content-Type: application/json" \\',
+            '  -d "{\"text\":\"✅ pgdata backup OK · $BACKUP_FILE\"}"',
+            '',
+            '# ─── 프로덕션 체크리스트 ───',
+            '#  [x] 정기 스케줄 — cron / systemd timer / k8s CronJob',
+            '#  [x] 외부 보관   — S3 / GCS / Azure (3-2-1)',
+            '#  [x] 무결성 검증 — sha256',
+            '#  [x] 보존 정책   — 로컬 7d / S3 30d / Glacier 1y',
+            '#  [x] 알림        — 실패 시 Slack / PagerDuty',
+            '#  [x] 복원 리허설 — 분기 1회 실제 복원',
+            '#',
+            '# ─── 다음 단계 ───',
+            '#  V-1-7  Bind mount vs Volume',
+            '#  V-1-8  Compose services.db.volumes',
+          ],
+          highlight: [2, 3, 4, 5, 18, 19, 20, 21, 22, 23, 24, 28, 30, 31, 32, 33, 34, 37, 40, 41, 42, 43, 46, 47, 48, 49, 50, 51, 52],
+        },
       },
     ];
 
-    /* ── 명령어 분석 컴포넌트 ── */
-    function CommandBreakdown({ parts, title }) {
+    // ─────────────────────────────────────────────────────
+    // 좌측 1단: Volume 박스 (원본 — loss / read / protected / lost)
+    // ─────────────────────────────────────────────────────
+    const VOL_STYLE = {
+      danger:    { border: 'border-red-400 bg-red-50 shadow-md',           badge: 'bg-red-600',     label: 'AT RISK',    pulse: true,  note: '⚠ rm / down -v / 디스크 손상에 노출', noteClass: 'text-red-700 font-semibold' },
+      reading:   { border: 'border-sky-400 bg-sky-50 shadow-md',           badge: 'bg-sky-600',     label: 'read · ro',  pulse: false, note: '→ alpine 컨테이너가 /data 로 read 중', noteClass: 'text-sky-700 font-semibold' },
+      protected: { border: 'border-emerald-400 bg-emerald-50 shadow-md',   badge: 'bg-emerald-600', label: 'protected ✓',pulse: false, note: '✓ 매일 자동 백업 + S3 보관', noteClass: 'text-emerald-700 font-semibold' },
+      lost:      { border: 'border-dashed border-slate-300 bg-slate-50 opacity-60', badge: 'bg-slate-500', label: 'lost', pulse: false, note: '볼륨 손실 — restore 대기', noteClass: 'text-slate-500' },
+      idle:      { border: 'border-slate-200 bg-slate-50',                 badge: '',               label: '',           pulse: false, note: '대기 상태', noteClass: 'text-slate-500' },
+    };
+    function VolumeBox({ vol }) {
+      const lost = vol.label && vol.label.includes('lost');
+      const key = vol.danger ? 'danger' : vol.state === 'reading' ? 'reading' : vol.state === 'protected' ? 'protected' : lost ? 'lost' : 'idle';
+      const s = VOL_STYLE[key];
       return (
-        <div className="bg-slate-900 rounded-xl p-4">
-          <div className="text-slate-400 text-xs mb-3">{title}</div>
-          <div className="font-mono text-sm space-y-1">
-            {parts.map((part, i) => (
-              <div key={i} className="flex items-start gap-3 anim-slide" style={{ animationDelay: `${i * 0.1}s` }}>
-                <code className={`px-2 py-0.5 rounded whitespace-nowrap ${part.highlight ? "bg-yellow-900/50 text-yellow-300" : "text-slate-300"}`}>
-                  {part.code}
-                </code>
-                <span className="text-slate-500 text-xs mt-0.5">{part.desc}</span>
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${s.border}`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">{lost ? '💥' : '💾'}</span>
+              <span className="text-[11px] font-bold text-slate-700">Docker Volume · {vol.label}</span>
+            </div>
+            {s.label && (
+              <span className={`text-[9px] ${s.badge} text-white px-1.5 py-0.5 rounded font-mono font-bold ${s.pulse ? 'animate-pulse' : ''}`}>
+                {s.label}
+              </span>
+            )}
+          </div>
+          {vol.files.length > 0 ? (
+            <div className="bg-white rounded border border-slate-200 p-1.5 space-y-0.5">
+              {vol.files.map((f) => (
+                <div key={f.name} className={`text-[9px] font-mono px-1 py-0.5 rounded ${f.lit ? 'bg-sky-100 text-sky-800' : 'text-slate-400'}`}>
+                  {f.name}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="bg-white rounded border border-dashed border-slate-300 p-2 text-center">
+              <div className="text-[10px] text-slate-400 italic">volume 데이터 없음 (삭제됨)</div>
+            </div>
+          )}
+          <div className={`text-[9px] mt-1 ${s.noteClass}`}>{s.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 2단: tar archive 박스 (중간 산출물)
+    // ─────────────────────────────────────────────────────
+    function TarBox({ tar, building, extracting }) {
+      const exists = tar && tar.exists;
+      const border = !exists ? 'bg-slate-50 border-dashed border-slate-300 opacity-50'
+        : building ? 'bg-amber-50 border-amber-400 shadow-md'
+        : extracting ? 'bg-violet-50 border-violet-400 shadow-md'
+        : 'bg-sky-50 border-sky-400';
+      const badge = building ? { cls: 'bg-amber-500 animate-pulse', text: 'tar czf' }
+        : extracting ? { cls: 'bg-violet-600 animate-pulse', text: 'tar xzf' }
+        : exists ? { cls: 'bg-sky-600', text: 'stored' } : null;
+      const note = building ? '→ /backup 호스트 디렉토리에 쓰는 중...'
+        : extracting ? '→ /data 새 볼륨으로 풀어 쓰는 중...'
+        : '→ 호스트 디스크에 보관됨';
+      return (
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${border}`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">📦</span>
+              <span className={`text-[11px] font-bold ${exists ? 'text-slate-700' : 'text-slate-400'}`}>
+                tar archive · backup.tar.gz
+              </span>
+            </div>
+            {badge && (
+              <span className={`text-[9px] ${badge.cls} text-white px-1.5 py-0.5 rounded font-mono font-bold`}>{badge.text}</span>
+            )}
+          </div>
+          {exists ? (
+            <div className="bg-white rounded border border-slate-200 p-1.5 space-y-1">
+              <div className="flex items-center gap-1.5 text-[9px] font-mono text-slate-700">
+                <span className="text-slate-400">file</span>
+                <span className="text-sky-700 font-bold">pgdata-20260507-0200.tar.gz</span>
+              </div>
+              <div className="flex items-center gap-3 text-[9px] font-mono">
+                <span><span className="text-slate-400">size</span> <span className="text-slate-700 font-bold">{tar.size}</span></span>
+                <span><span className="text-slate-400">sha256</span> <span className="text-slate-700 font-bold">{tar.sha}</span></span>
+              </div>
+              <div className="text-[9px] text-slate-500 font-mono">{note}</div>
+            </div>
+          ) : (
+            <div className="bg-white rounded border border-dashed border-slate-300 p-2 text-center">
+              <div className="text-[10px] text-slate-400 italic">아직 백업 파일 없음</div>
+              <div className="text-[9px] text-slate-400 font-mono mt-0.5">tar 명령 대기</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 3단: S3 / 외부 스토리지 박스
+    // ─────────────────────────────────────────────────────
+    function OffsiteBox({ offsite }) {
+      const uploaded = offsite && offsite.uploaded;
+      return (
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${
+          uploaded ? 'bg-sky-50 border-sky-400 shadow-md' : 'bg-slate-50 border-dashed border-slate-300 opacity-50'
+        }`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">☁️</span>
+              <span className={`text-[11px] font-bold ${uploaded ? 'text-slate-700' : 'text-slate-400'}`}>
+                Offsite · {offsite && offsite.provider ? offsite.provider : 'S3 / GCS / Azure'}
+              </span>
+            </div>
+            {uploaded && (
+              <span className="text-[9px] bg-sky-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">
+                3-2-1 ✓
+              </span>
+            )}
+          </div>
+          {uploaded ? (
+            <div className="bg-white rounded border border-sky-200 p-1.5 space-y-1">
+              <div className="text-[9px] font-mono text-sky-700 break-all">
+                {offsite.key}
+              </div>
+              <div className="flex items-center gap-3 text-[9px] font-mono">
+                <span className="bg-sky-100 text-sky-800 px-1.5 py-0.5 rounded">STANDARD_IA</span>
+                <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">retention 30d</span>
+                <span className="text-slate-500">{offsite.count} versions</span>
+              </div>
+              <div className="text-[9px] text-slate-500 font-mono">
+                → 다른 리전 / 계정에 보관 — 서버·DC 단위 장애에도 살아남음
+              </div>
+            </div>
+          ) : (
+            <div className="bg-white rounded border border-dashed border-slate-300 p-2 text-center">
+              <div className="text-[10px] text-slate-400 italic">아직 업로드되지 않음</div>
+              <div className="text-[9px] text-slate-400 font-mono mt-0.5">aws s3 cp 대기</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 4단: 새 volume (복구 결과)
+    // ─────────────────────────────────────────────────────
+    function NewVolumeBox({ nv }) {
+      const restored = nv && nv.exists && nv.restored;
+      return (
+        <div className={`rounded-lg border-2 p-3 transition-all duration-500 ${restored ? 'bg-emerald-50 border-emerald-400 shadow-md' : 'bg-slate-50 border-dashed border-slate-300 opacity-50'}`}>
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🔁</span>
+              <span className={`text-[11px] font-bold ${restored ? 'text-emerald-800' : 'text-slate-400'}`}>
+                Restored Volume · {nv && nv.label ? nv.label : 'pgdata_restored'}
+              </span>
+            </div>
+            {restored && (<span className="text-[9px] bg-emerald-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">recovered ✓</span>)}
+          </div>
+          {restored && nv.files ? (
+            <div className="bg-white rounded border border-emerald-200 p-1.5 space-y-0.5">
+              {nv.files.map((f) => (
+                <div key={f.name} className="text-[9px] font-mono px-1 py-0.5 rounded bg-emerald-100 text-emerald-800">{f.name}</div>
+              ))}
+              <div className="text-[9px] text-emerald-700 font-mono mt-1">→ SELECT count(*) FROM users; → 12483 ✓</div>
+            </div>
+          ) : (
+            <div className="bg-white rounded border border-dashed border-slate-300 p-2 text-center">
+              <div className="text-[10px] text-slate-400 italic">복구 대기</div>
+              <div className="text-[9px] text-slate-400 font-mono mt-0.5">tar xzf 후 마운트</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 결과 박스 (Step 5에서만 등장)
+    // ─────────────────────────────────────────────────────
+    function ConclusionBox({ cron }) {
+      const items = [
+        { icon: '⏰', label: 'cron 매일 02:00', detail: cron && cron.schedule ? cron.schedule : '0 2 * * *' },
+        { icon: '☁️', label: 'S3 자동 동기화', detail: 'STANDARD_IA · 30d' },
+        { icon: '🔐', label: 'sha256 무결성', detail: '다운로드 후 검증' },
+        { icon: '🧪', label: '복원 리허설', detail: '분기 1회 실전 테스트' },
+      ];
+      return (
+        <div className="rounded-lg border-2 border-emerald-400 bg-gradient-to-br from-emerald-50 to-sky-50 p-3">
+          <div className="flex items-center gap-1.5 mb-2">
+            <span className="text-base">🎯</span>
+            <span className="text-[11px] font-bold text-emerald-800">백업 시스템의 4축</span>
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {items.map((it) => (
+              <div key={it.label} className="bg-white rounded border border-emerald-200 p-1.5">
+                <div className="flex items-center gap-1">
+                  <span className="text-sm">{it.icon}</span>
+                  <span className="text-[10px] font-bold text-emerald-900">{it.label}</span>
+                </div>
+                <div className="text-[9px] text-emerald-700 font-mono mt-0.5 ml-5">{it.detail}</div>
               </div>
             ))}
           </div>
@@ -79,262 +594,298 @@
       );
     }
 
-    /* ── 메인 앱 ── */
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — volume → tar → backup 파일 → 복구 흐름
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      const phase = step.phase;
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">💾 Volume → tar → Offsite → Restore</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live · phase: {phase}</span>
+          </div>
+
+          <div className="space-y-2">
+            <VolumeBox vol={step.volume} />
+
+            {/* 화살표: tar czf */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.tarFile && step.tarFile.exists ? 'text-sky-600 font-bold' : 'text-slate-300'
+              }`}>
+                ↓ docker run --rm -v pgdata:/data:ro · tar czf
+              </div>
+            </div>
+
+            <TarBox
+              tar={step.tarFile}
+              building={step.tarFile && step.tarFile.building}
+              extracting={step.tarFile && step.tarFile.extracting}
+            />
+
+            {/* 화살표: aws s3 cp */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.offsite && step.offsite.uploaded ? 'text-sky-600 font-bold' : 'text-slate-300'
+              }`}>
+                ↓ aws s3 cp · 3-2-1 규칙
+              </div>
+            </div>
+
+            <OffsiteBox offsite={step.offsite} />
+
+            {/* 화살표: tar xzf (복구) */}
+            <div className="text-center">
+              <div className={`inline-block text-xs font-mono ${
+                step.newVolume && step.newVolume.restored ? 'text-emerald-600 font-bold' : 'text-slate-300'
+              }`}>
+                ↓ aws s3 cp · tar xzf · docker volume create
+              </div>
+            </div>
+
+            <NewVolumeBox nv={step.newVolume} />
+
+            {step.conclusion && <ConclusionBox cron={step.cron} />}
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-red-500"></span>at risk
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>active
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-emerald-500"></span>protected / restored
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded border border-slate-300 bg-white"></span>idle
+            </span>
+            <span className="ml-auto font-mono">step {step.phase}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4000);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생, 키보드 단축키
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-1-6</span>
+            </nav>
 
             {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter V-1-6: 볼륨 백업과 복원</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 영속 데이터 &gt; Chapter 1. Volume</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">V-1-6. Volume 백업 / 복구 — tar로 영속 데이터 보호</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">손실 시나리오 → tar 백업 → S3 외부 보관 → 복구 → cron 자동화 5단계</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">docker run --rm으로 임시 컨테이너를 띄워 볼륨을 백업하고 복원하는 절차를 시뮬레이션합니다.</p>
             </header>
 
-            {/* 현재 단계 설명 */}
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "why" ? "bg-red-600 border-red-700 text-white" :
-              data.phase === "summary" ? "bg-emerald-600 border-emerald-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            {/* 시각화 영역 */}
-            {data.phase === "why" && (
-              <div key="why" className="anim-fade space-y-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-white border-2 border-slate-200 rounded-xl p-4">
-                    <div className="text-center mb-3">
-                      <div className="text-3xl">💾</div>
-                      <div className="font-bold text-slate-700">볼륨 (pgdata)</div>
-                      <div className="text-xs text-slate-500">PostgreSQL 데이터 저장</div>
-                    </div>
-                    <div className="space-y-1 text-xs">
-                      {["users 테이블", "orders 테이블", "설정 데이터"].map((item, i) => (
-                        <div key={i} className="bg-blue-50 border border-blue-200 rounded px-2 py-1">{item}</div>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-sm font-bold text-red-600 mb-2">데이터가 사라지는 상황:</div>
-                    {[
-                      { cmd: "docker volume rm pgdata", risk: "볼륨 직접 삭제" },
-                      { cmd: "docker compose down -v", risk: "-v 옵션으로 볼륨까지 삭제" },
-                      { cmd: "서버 장애 / 디스크 손상", risk: "하드웨어 문제" },
-                    ].map((item, i) => (
-                      <div key={i} className="bg-red-50 border border-red-200 rounded-lg p-3 anim-slide" style={{ animationDelay: `${i * 0.1}s` }}>
-                        <code className="text-xs text-red-700 font-mono">{item.cmd}</code>
-                        <div className="text-xs text-red-500 mt-1">{item.risk}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: <strong>volume rm 한 번이면 데이터는 사라진다</strong>. 매일 cron 으로 <strong>tar 백업 + S3 업로드</strong>, 분기마다 <strong>실제 복원 리허설</strong>까지 갖춰야 진짜 백업 시스템이다. 다음(V-1-7)에서는 bind mount 와 volume 의 선택 기준을 다룬다.
               </div>
             )}
 
-            {data.phase === "temp_container" && (
-              <div key="temp" className="anim-fade">
-                <div className="bg-white border-2 border-blue-200 rounded-xl p-6">
-                  <div className="text-center text-sm font-bold text-slate-600 mb-4">임시 컨테이너 구조</div>
-                  <div className="flex flex-col md:flex-row items-center justify-center gap-4">
-                    {/* 볼륨 */}
-                    <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-4 text-center">
-                      <div className="text-2xl">💾</div>
-                      <div className="font-bold text-blue-800 text-sm">pgdata 볼륨</div>
-                      <div className="text-xs text-blue-500">백업 대상 데이터</div>
-                    </div>
-
-                    <div className="text-blue-400 text-lg font-bold">→ /data</div>
-
-                    {/* 컨테이너 */}
-                    <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 text-center anim-pulse">
-                      <div className="text-2xl">📦</div>
-                      <div className="font-bold text-amber-800 text-sm">alpine 컨테이너</div>
-                      <div className="text-xs text-amber-500">--rm (자동 삭제)</div>
-                      <div className="text-xs text-amber-600 mt-1 font-mono">tar czf ...</div>
-                    </div>
-
-                    <div className="text-emerald-400 text-lg font-bold">/backup →</div>
-
-                    {/* 호스트 */}
-                    <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-4 text-center">
-                      <div className="text-2xl">🖥️</div>
-                      <div className="font-bold text-emerald-800 text-sm">호스트 $(pwd)</div>
-                      <div className="text-xs text-emerald-500">backup.tar.gz 저장</div>
-                    </div>
-                  </div>
-                </div>
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
-            )}
-
-            {data.phase === "backup" && (
-              <div key="backup" className="space-y-4 anim-fade">
-                <CommandBreakdown
-                  title="볼륨 백업 명령 분석"
-                  parts={[
-                    { code: "docker run --rm", desc: "임시 컨테이너 실행 (종료 시 자동 삭제)", highlight: true },
-                    { code: "  -v pgdata:/data", desc: "백업할 볼륨을 /data에 마운트 (읽기 대상)", highlight: true },
-                    { code: "  -v $(pwd):/backup", desc: "호스트 현재 디렉토리를 /backup에 마운트 (저장 위치)", highlight: true },
-                    { code: "  alpine", desc: "경량 리눅스 이미지 (tar 내장)", highlight: false },
-                    { code: "  tar czf /backup/backup.tar.gz -C /data .", desc: "Create Zipped File — /data를 압축해 저장", highlight: true },
-                  ]}
-                />
-                <div className="bg-white border-2 border-blue-200 rounded-xl p-4">
-                  <div className="text-center text-sm font-bold text-slate-600 mb-3">데이터 흐름</div>
-                  <div className="flex items-center justify-center gap-3 flex-wrap">
-                    <span className="bg-blue-100 text-blue-700 px-3 py-2 rounded-lg text-sm font-medium">💾 pgdata 볼륨</span>
-                    <span className="text-blue-400 font-bold">→ /data →</span>
-                    <span className="bg-amber-100 text-amber-700 px-3 py-2 rounded-lg text-sm font-medium anim-compress">tar czf (압축)</span>
-                    <span className="text-emerald-400 font-bold">→ /backup →</span>
-                    <span className="bg-emerald-100 text-emerald-700 px-3 py-2 rounded-lg text-sm font-medium">🖥️ backup.tar.gz</span>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {data.phase === "restore" && (
-              <div key="restore" className="space-y-4 anim-fade">
-                <CommandBreakdown
-                  title="볼륨 복원 명령 분석"
-                  parts={[
-                    { code: "docker run --rm", desc: "임시 컨테이너 실행", highlight: false },
-                    { code: "  -v new_pgdata:/data", desc: "복원 대상 볼륨을 /data에 마운트 (쓰기 대상)", highlight: true },
-                    { code: "  -v $(pwd):/backup", desc: "백업 파일이 있는 디렉토리를 /backup에 마운트", highlight: false },
-                    { code: "  alpine", desc: "경량 리눅스 이미지", highlight: false },
-                    { code: "  tar xzf /backup/backup.tar.gz -C /data", desc: "eXtract Zipped File — 압축 해제해 볼륨에 쓰기", highlight: true },
-                  ]}
-                />
-                <div className="bg-white border-2 border-emerald-200 rounded-xl p-4">
-                  <div className="text-center text-sm font-bold text-slate-600 mb-3">복원 데이터 흐름 (반대 방향)</div>
-                  <div className="flex items-center justify-center gap-3 flex-wrap">
-                    <span className="bg-emerald-100 text-emerald-700 px-3 py-2 rounded-lg text-sm font-medium">🖥️ backup.tar.gz</span>
-                    <span className="text-emerald-400 font-bold">→ /backup →</span>
-                    <span className="bg-amber-100 text-amber-700 px-3 py-2 rounded-lg text-sm font-medium">tar xzf (해제)</span>
-                    <span className="text-blue-400 font-bold">→ /data →</span>
-                    <span className="bg-blue-100 text-blue-700 px-3 py-2 rounded-lg text-sm font-medium">💾 new_pgdata</span>
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-center">
-                    <div className="font-mono font-bold text-blue-700">czf</div>
-                    <div className="text-xs text-blue-600 mt-1">Create Zipped File (백업)</div>
-                  </div>
-                  <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
-                    <div className="font-mono font-bold text-emerald-700">xzf</div>
-                    <div className="text-xs text-emerald-600 mt-1">eXtract Zipped File (복원)</div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {data.phase === "pgdump" && (
-              <div key="pgdump" className="space-y-4 anim-fade">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-white border-2 border-blue-300 rounded-xl p-4">
-                    <div className="font-bold text-blue-800 mb-2">백업 (pg_dump)</div>
-                    <div className="bg-slate-900 rounded-lg p-3 font-mono text-xs text-slate-300">
-                      <div className="text-slate-500"># SQL 형태로 추출</div>
-                      <div className="text-blue-300">docker compose exec db \</div>
-                      <div className="text-blue-300 pl-2">pg_dump -U app demo {'>'} backup.sql</div>
-                    </div>
-                    <div className="text-xs text-blue-600 mt-2">SQL 형태 → 버전이 달라도 복원 가능</div>
-                  </div>
-                  <div className="bg-white border-2 border-emerald-300 rounded-xl p-4">
-                    <div className="font-bold text-emerald-800 mb-2">복원 (psql)</div>
-                    <div className="bg-slate-900 rounded-lg p-3 font-mono text-xs text-slate-300">
-                      <div className="text-slate-500"># SQL 파일을 DB에 적용</div>
-                      <div className="text-emerald-300">docker compose exec -T db \</div>
-                      <div className="text-emerald-300 pl-2">psql -U app demo {'<'} backup.sql</div>
-                    </div>
-                    <div className="text-xs text-emerald-600 mt-2">-T: 파이프 사용 시 TTY 비활성화 필수</div>
-                  </div>
-                </div>
-                <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
-                  <div className="text-sm font-bold text-amber-800 mb-2">tar vs pg_dump 비교</div>
-                  <div className="grid grid-cols-2 gap-3 text-xs">
-                    <div>
-                      <div className="font-bold text-slate-600">tar 백업</div>
-                      <ul className="text-slate-500 mt-1 space-y-0.5">
-                        <li>- 모든 볼륨에 적용 가능 (범용)</li>
-                        <li>- 파일 그대로 복사</li>
-                        <li>- DB 버전 호환성 문제 가능</li>
-                      </ul>
-                    </div>
-                    <div>
-                      <div className="font-bold text-slate-600">pg_dump</div>
-                      <ul className="text-slate-500 mt-1 space-y-0.5">
-                        <li>- PostgreSQL 전용</li>
-                        <li>- SQL 형태로 추출</li>
-                        <li>- 버전 간 이식성 높음 (권장)</li>
-                      </ul>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {data.phase === "summary" && (
-              <div key="summary" className="bg-gradient-to-r from-emerald-50 to-blue-50 border-2 border-emerald-300 rounded-xl p-6 anim-fade">
-                <div className="text-center">
-                  <div className="text-4xl mb-3">🛡️</div>
-                  <h3 className="text-xl font-bold text-emerald-800 mb-4">볼륨 백업 전략 요약</h3>
-                  <div className="flex flex-wrap justify-center gap-2 mb-4">
-                    {[
-                      "tar: 범용 볼륨 백업",
-                      "pg_dump: PostgreSQL 권장",
-                      "cron: 자동 백업 스케줄",
-                      "S3/GCS: 외부 보관",
-                      "복원 테스트: 주기적 검증",
-                    ].map((item, i) => (
-                      <span key={i} className="bg-emerald-200 text-emerald-800 px-3 py-1.5 rounded-full text-sm font-medium anim-slide" style={{animationDelay:`${i*0.1}s`}}>
-                        {item}
-                      </span>
-                    ))}
-                  </div>
-                  <p className="text-emerald-700 text-sm">백업은 복원이 성공해야 의미가 있다. 복원 테스트 없이 백업만 하는 것은 불완전하다.</p>
-                </div>
-              </div>
-            )}
-
-            {/* 프로그레스 + 컨트롤 */}
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
-              </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
-              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['volume', 'tar czf', 'tar xzf', 'docker run --rm', 'alpine', 'aws s3 cp', '3-2-1 rule', 'sha256', 'cron', 'STANDARD_IA', 'restore drill'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./v-1-5_volume_inspect.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; V-1-5 Volume inspect</a>
+              <a href="./v-1-7_bind_mount_vs_volume.html" className="text-sky-700 hover:text-sky-900 font-medium">V-1-7 Bind mount vs Volume &rarr;</a>
+            </nav>
 
           </div>
         </div>

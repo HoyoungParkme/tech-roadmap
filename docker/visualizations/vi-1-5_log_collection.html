@@ -3,273 +3,891 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — 로그 수집과 docker logs</title>
+  <title>Docker 인터랙티브 학습 — VI-1-5. 로그 수집 (json-file / fluentd / syslog)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes flowDown { from{opacity:0;transform:translateY(-10px);} to{opacity:1;transform:translateY(0);} }
-    @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-    .anim-flow { animation: flowDown 0.4s ease-out forwards; }
-    .anim-blink { animation: blink 1s ease-in-out infinite; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    VI-1-5. 로그 수집 — json-file / fluentd / syslog driver
+    학습 목표: 컨테이너가 stdout/stderr 로 찍은 한 줄이 어떤 경로로 흘러서
+              어디에 저장되고, 어떤 도구로 읽히는지 5단계로 본다.
+              json-file(기본) → docker logs → fluentd/syslog 로 외부 전송 → ELK / Loki 에서 검색.
+    핵심 비유: 우체국 — 앱은 편지(stdout), driver 는 배달부, 도착지는 디스크/원격 시스템
+    패턴: fastapi v1 — 좌(LiveDataPane: 컨테이너 → driver → 외부 시스템) / 우(VSCode CodeViewer)
+    색상: docker sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 발생하는 로그 줄 — 좌측 LogStream 박스가 읽음
+    //   level : info / warn / error 색상에 사용
+    // ─────────────────────────────────────────────────────
     const LOG_LINES = [
-      { time: "12:00:01", level: "INFO", msg: "서버 시작됨 — port 8000", color: "text-green-400" },
-      { time: "12:00:05", level: "INFO", msg: "GET /items 200 OK (12ms)", color: "text-blue-400" },
-      { time: "12:00:08", level: "WARN", msg: "DB 연결 풀 70% 사용중", color: "text-yellow-400" },
-      { time: "12:00:12", level: "ERROR", msg: "POST /items 500 — psycopg.OperationalError", color: "text-red-400" },
-      { time: "12:00:15", level: "INFO", msg: "GET /health 200 OK (2ms)", color: "text-blue-400" },
-      { time: "12:00:18", level: "DEBUG", msg: "쿼리 실행: SELECT * FROM items LIMIT 50", color: "text-slate-400" },
+      { time: '12:00:01', level: 'INFO',  msg: 'Uvicorn running on http://0.0.0.0:8000' },
+      { time: '12:00:05', level: 'INFO',  msg: 'GET  /items 200 OK   12ms' },
+      { time: '12:00:08', level: 'WARN',  msg: 'DB pool 70% in use'          },
+      { time: '12:00:12', level: 'ERROR', msg: 'POST /items 500 OperationalError' },
+      { time: '12:00:15', level: 'INFO',  msg: 'GET  /health 200 OK    2ms' },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 사용 가능한 드라이버 — DriverSwitch 박스가 사용
+    //   active 한 드라이버가 sky 강조됨
+    // ─────────────────────────────────────────────────────
+    const DRIVERS = [
+      { id: 'json-file', label: 'json-file', desc: '기본 / 호스트 디스크',       icon: '📄' },
+      { id: 'fluentd',   label: 'fluentd',   desc: '중앙 수집기로 forward',     icon: '📡' },
+      { id: 'syslog',    label: 'syslog',    desc: 'OS / 원격 syslog 서버',     icon: '📮' },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — LiveDataPane 이 읽는 dataState
+    //   phase           : 'stdout' | 'json-file' | 'docker-logs' | 'forward' | 'central'
+    //   activeDriver    : 'json-file' | 'fluentd' | 'syslog' | null  — DriverSwitch 강조
+    //   showLogStream   : 컨테이너 → stdout 로그 줄 시각화 여부
+    //   showJsonFile    : /var/lib/docker/containers/.../*.log 파일 박스 노출
+    //   showDockerLogs  : 호스트 터미널에서 docker logs 결과 박스 노출
+    //   showForward     : 외부로 화살표 + 원격 시스템 박스 노출
+    //   externalSystem  : 'fluentd-aggregator' | 'syslog-server' | 'elk' | 'loki' | null
+    //   highlightStorage: 'host' | 'remote' — 어느 저장소를 강조할지
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: "STEP 1 · stdout/stderr가 로그의 핵심",
-        desc: "컨테이너는 프로세스가 종료되면 내부 상태를 잃는다. 앱이 stdout/stderr로 출력한 내용만 Docker가 캡처한다. 파일에 로그를 쓰면 docker logs로 볼 수 없고, 컨테이너가 죽으면 사라진다.",
-        phase: "stdout",
-        showLogs: false, showDriver: false, showLimit: false,
+        title: 'Step 1. 컨테이너는 stdout / stderr 로만 말한다',
+        desc: '컨테이너 안의 앱은 print() 든 logging 이든 결국 stdout(또는 stderr) 한 통로로 출력해야 Docker 가 그걸 잡는다. 파일에 쓰면 컨테이너가 죽을 때 같이 사라지고 docker logs 로도 안 보인다. 모든 컨테이너 로그 흐름의 출발점은 stdout 한 통이다.',
+        phase: 'stdout',
+        activeDriver: null,
+        showLogStream: true,
+        showJsonFile: false,
+        showDockerLogs: false,
+        showForward: false,
+        externalSystem: null,
+        highlightStorage: null,
+        code: {
+          lang: 'bash',
+          filename: 'stdout.sh',
+          lines: [
+            '# Step 1. 컨테이너 로그의 출발점 — stdout / stderr',
+            '',
+            '# ─── 좋은 예 — stdout 으로 직접 출력 ───',
+            'docker run --rm python:3.12-slim \\',
+            '  python -c "print(\'hello from stdout\')"',
+            '#  → hello from stdout                (Docker 가 캡처함)',
+            '',
+            '# ─── FastAPI 도 동일 — uvicorn 은 stdout 으로 찍는다 ───',
+            'docker run -d --name api -p 8000:8000 myapp:1.0',
+            'curl http://localhost:8000/items',
+            '#  → INFO: GET /items 200 OK',
+            '',
+            '# ─── 나쁜 예 — 파일에 쓰면 docker logs 로 안 보임 ───',
+            'docker run -d --name bad myapp:1.0 \\',
+            '  python -c "open(\'/tmp/app.log\',\'w\').write(\'lost\')"',
+            'docker logs bad',
+            '#  → (빈 출력)        ← 파일 안에만 있고 컨테이너 삭제 시 증발',
+            '',
+            '# ─── 12-factor app 원칙 ───',
+            '#  Treat logs as event streams.',
+            '#  앱은 파일/DB 에 쓰지 않고 stdout 한 통로로 흘려보낸다.',
+            '#  수집·라우팅·저장은 인프라(=Docker, driver, 수집기)의 몫.',
+            '',
+            '# ─── stderr 도 같이 잡힌다 ───',
+            'docker run --rm alpine sh -c "echo OK; echo BAD >&2"',
+            '#  → OK',
+            '#  → BAD             (stderr 도 docker logs 에 합쳐서 보임)',
+            '',
+            '# 정리:',
+            '#  • 앱 → stdout/stderr → Docker 엔진이 캡처',
+            '#  • 그 다음을 결정하는 게 "log driver"',
+            '#  • 기본 driver = json-file (Step 2 에서 본다)',
+          ],
+          highlight: [3, 4, 5, 8, 9, 10, 23, 24, 25, 26],
+        },
       },
       {
-        title: "STEP 2 · docker logs 명령 실습",
-        desc: "docker logs -f myapp으로 실시간 스트리밍. --tail 50으로 마지막 50줄. --since 10m으로 최근 10분. docker compose logs -f api db로 여러 서비스를 한 화면에서 본다.",
-        phase: "commands",
-        showLogs: true, showDriver: false, showLimit: false,
+        title: 'Step 2. json-file driver — 호스트 디스크에 JSON 한 줄씩',
+        desc: 'Docker 의 기본 log driver 는 json-file 이다. stdout 한 줄이 호스트의 /var/lib/docker/containers/<id>/<id>-json.log 파일에 JSON 한 줄로 적힌다. 이 파일이 있어야 docker logs 가 동작한다. 별도 수집기 없이 가장 단순하지만, 기본값은 용량 제한이 없어서 디스크가 가득 찰 위험이 있다.',
+        phase: 'json-file',
+        activeDriver: 'json-file',
+        showLogStream: true,
+        showJsonFile: true,
+        showDockerLogs: false,
+        showForward: false,
+        externalSystem: null,
+        highlightStorage: 'host',
+        code: {
+          lang: 'json',
+          filename: 'json-file.json',
+          lines: [
+            '// Step 2. json-file driver 가 실제로 디스크에 쓰는 형태',
+            '// 경로: /var/lib/docker/containers/<container-id>/<container-id>-json.log',
+            '// 한 줄당 한 JSON 객체 (newline-delimited JSON)',
+            '',
+            '{"log":"INFO: Uvicorn running on http://0.0.0.0:8000\\n","stream":"stdout","time":"2026-05-07T12:00:01.123Z"}',
+            '{"log":"INFO: GET /items 200 OK 12ms\\n",          "stream":"stdout","time":"2026-05-07T12:00:05.441Z"}',
+            '{"log":"WARN: DB pool 70% in use\\n",              "stream":"stdout","time":"2026-05-07T12:00:08.882Z"}',
+            '{"log":"ERROR: POST /items 500 OperationalError\\n","stream":"stderr","time":"2026-05-07T12:00:12.110Z"}',
+            '{"log":"INFO: GET /health 200 OK 2ms\\n",          "stream":"stdout","time":"2026-05-07T12:00:15.005Z"}',
+            '',
+            '/* ─── 필드 구조 ───',
+            '   log    : 실제 출력된 한 줄 (개행 포함)',
+            '   stream : "stdout" | "stderr"',
+            '   time   : RFC3339 UTC 타임스탬프',
+            ' */',
+            '',
+            '/* ─── 기본값의 함정 ───',
+            '   • max-size 가 없으면 한 파일이 GB 단위로 커진다',
+            '   • 활발히 찍는 서비스가 호스트 디스크를 가득 채울 수 있다',
+            '   • 운영에서는 반드시 옵션 지정',
+            ' */',
+            '',
+            '/* ─── 안전한 daemon.json (호스트 전체 기본값) ─── */',
+            '{',
+            '  "log-driver": "json-file",',
+            '  "log-opts": { "max-size": "10m", "max-file": "3", "compress": "true" }',
+            '}',
+            '',
+            '/* 또는 컨테이너별: docker run --log-driver json-file --log-opt max-size=10m ... */',
+            '/* 결과: 최대 10MB × 3 파일 = 30MB 에서 자동 로테이션 */',
+          ],
+          highlight: [5, 6, 7, 8, 9, 23, 24, 25, 26, 27, 29, 30],
+        },
       },
       {
-        title: "STEP 3 · json-file 로그 드라이버",
-        desc: "Docker 기본 로그 드라이버는 json-file이다. 로그를 호스트 디스크(/var/lib/docker/containers/)에 JSON 형식으로 저장한다. docker logs 명령이 동작하는 드라이버다.",
-        phase: "driver",
-        showLogs: true, showDriver: true, showLimit: false,
+        title: 'Step 3. docker logs — json-file 을 사람이 읽기 좋게 보여주는 명령',
+        desc: 'docker logs 는 별도 magic 이 아니라 Step 2 의 json-file 을 읽어서 stream/time 을 떼고 log 필드만 화면에 다시 합쳐주는 단순한 reader 다. -f(follow), --tail, --since, --until, -t(timestamp) 옵션으로 실시간 추적·필터·조회가 모두 한 명령에서 가능하다. driver 가 json-file 이거나 journald 일 때만 쓸 수 있다는 점이 중요하다.',
+        phase: 'docker-logs',
+        activeDriver: 'json-file',
+        showLogStream: true,
+        showJsonFile: true,
+        showDockerLogs: true,
+        showForward: false,
+        externalSystem: null,
+        highlightStorage: 'host',
+        code: {
+          lang: 'bash',
+          filename: 'docker-logs.sh',
+          lines: [
+            '# Step 3. docker logs — json-file 을 읽어서 보여주는 reader',
+            '',
+            '# ─── 기본: 모든 로그 한 번에 출력 ───',
+            'docker logs api',
+            '#  INFO: Uvicorn running on http://0.0.0.0:8000',
+            '#  INFO: GET /items 200 OK 12ms',
+            '#  WARN: DB pool 70% in use',
+            '#  ERROR: POST /items 500 OperationalError',
+            '#  INFO: GET /health 200 OK 2ms',
+            '',
+            '# ─── 실시간 스트리밍 (tail -f 처럼) ───',
+            'docker logs -f api',
+            '',
+            '# ─── 마지막 N 줄만 ───',
+            'docker logs --tail 50 api',
+            '',
+            '# ─── 시간 필터 (10분 전부터, 어제 13:00 까지) ───',
+            'docker logs --since 10m api',
+            'docker logs --since 2026-05-07T13:00:00 api',
+            'docker logs --until 1h api',
+            '',
+            '# ─── 타임스탬프 같이 ───',
+            'docker logs -t api',
+            '#  2026-05-07T12:00:05.441Z INFO: GET /items 200 OK 12ms',
+            '',
+            '# ─── stdout / stderr 분리 ───',
+            'docker logs api 1>app.out 2>app.err   # 호스트 파일로 분리',
+            '',
+            '# ─── compose: 여러 서비스 한 화면 (서비스명 prefix) ───',
+            'docker compose logs -f api db cache',
+            '#  api-1   | INFO: GET /items 200 OK',
+            '#  db-1    | LOG:  database system is ready',
+            '#  cache-1 | Ready to accept connections',
+            '',
+            '# ─── grep 과 조합 (운영에서 가장 많이 씀) ───',
+            'docker logs api 2>&1 | grep -i error',
+            'docker logs --since 1h api | grep "500 "',
+            '',
+            '# ─── 주의: driver 가 fluentd/syslog 면 docker logs 안 됨 ───',
+            'docker logs api',
+            '#  Error: configured logging driver does not support reading',
+            '',
+            '# 정리:',
+            '#  • docker logs == json-file 파일 reader',
+            '#  • -f / --tail / --since 만 외워도 90% 끝',
+            '#  • driver 가 외부 전송형(fluentd 등)이면 docker logs 못 씀',
+          ],
+          highlight: [3, 4, 11, 12, 14, 15, 17, 18, 19, 20, 28, 29, 34, 35, 36, 39, 40, 41],
+        },
       },
       {
-        title: "STEP 4 · 로그 용량 제한 (max-size / max-file)",
-        desc: "json-file은 기본적으로 용량 제한이 없다! 활발히 로그를 찍는 서비스가 디스크를 가득 채울 수 있다. max-size: 10m, max-file: 3으로 최대 30MB만 유지하도록 제한한다.",
-        phase: "limit",
-        showLogs: true, showDriver: true, showLimit: true,
+        title: 'Step 4. fluentd / syslog driver — 호스트가 아닌 외부로 흘려보낸다',
+        desc: '서버 한 대에선 json-file 로 충분하지만 컨테이너가 수십~수백 개가 되면 호스트마다 SSH 로 접속해 docker logs 를 찍는 건 불가능하다. 이때 log-driver 를 fluentd 나 syslog 로 바꾸면, stdout 한 줄이 호스트 디스크를 거치지 않고 곧장 원격 수집기로 전송된다. 그 대가로 docker logs 명령은 더 이상 동작하지 않는다 — 로그는 이제 수집기 쪽에서 봐야 한다.',
+        phase: 'forward',
+        activeDriver: 'fluentd',
+        showLogStream: true,
+        showJsonFile: false,
+        showDockerLogs: false,
+        showForward: true,
+        externalSystem: 'fluentd-aggregator',
+        highlightStorage: 'remote',
+        code: {
+          lang: 'yaml',
+          filename: 'fluentd.yml',
+          lines: [
+            '# Step 4. log-driver 를 fluentd / syslog 로 바꿔서 외부로 전송',
+            '',
+            '# ─── 4-1. compose 에서 fluentd driver 지정 ───',
+            'services:',
+            '  api:',
+            '    image: myapp:1.0',
+            '    logging:',
+            '      driver: fluentd',
+            '      options:',
+            '        fluentd-address: "fluentd-aggregator:24224"',
+            '        tag: "docker.api.{{.Name}}"',
+            '        fluentd-async: "true"        # 수집기 다운 시 컨테이너 블락 방지',
+            '        fluentd-retry-wait: "1s"',
+            '        fluentd-max-retries: "30"',
+            '',
+            '  db:',
+            '    image: postgres:14',
+            '    logging:',
+            '      driver: fluentd',
+            '      options:',
+            '        fluentd-address: "fluentd-aggregator:24224"',
+            '        tag: "docker.db.{{.Name}}"',
+            '',
+            '# ─── 4-2. fluentd 수집기쪽 설정 (별도 노드에서 실행) ───',
+            '# fluent.conf',
+            '#   <source>',
+            '#     @type forward       # 24224/tcp 로 들어오는 도커 로그를 받는다',
+            '#     port 24224',
+            '#   </source>',
+            '#   <match docker.**>',
+            '#     @type elasticsearch',
+            '#     host es.internal',
+            '#     port 9200',
+            '#     logstash_format true',
+            '#   </match>',
+            '',
+            '# ─── 4-3. syslog driver 도 같은 패턴 ───',
+            '# services:',
+            '#   api:',
+            '#     image: myapp:1.0',
+            '#     logging:',
+            '#       driver: syslog',
+            '#       options:',
+            '#         syslog-address: "tcp://logs.internal:514"',
+            '#         tag: "myapp/{{.Name}}"',
+            '#         syslog-format: "rfc5424"',
+            '',
+            '# ─── 4-4. 잃는 것과 얻는 것 ───',
+            '# 잃는 것: docker logs 가 안 됨 — 이제 호스트에는 파일이 없다',
+            '# 얻는 것:',
+            '#   • 호스트 디스크 안 씀 (max-size 걱정 X)',
+            '#   • 수집기 한 곳에서 모든 컨테이너 로그를 한 번에 검색',
+            '#   • 컨테이너가 죽어도 로그는 이미 원격에 있다',
+            '',
+            '# ─── 4-5. 안전판: 보조 driver 없음 ───',
+            '# 수집기가 다운되면 로그가 잠깐 끊긴다.',
+            '# fluentd-async: true + 짧은 retry-wait 로 컨테이너 자체가 멈추지 않게 한다.',
+            '# 영구 보존 책임은 수집기 쪽에 있다.',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 38, 39, 40, 41, 42, 43, 44, 45, 46],
+        },
       },
       {
-        title: "STEP 5 · 중앙 수집: fluentd / Loki",
-        desc: "서버가 여러 대가 되면 docker logs만으로는 부족하다. fluentd→Elasticsearch→Kibana(EFK) 또는 Promtail→Loki→Grafana 스택으로 모든 컨테이너 로그를 한 대시보드에서 검색할 수 있다.",
-        phase: "central",
-        showLogs: true, showDriver: true, showLimit: false,
-      },
-      {
-        title: "STEP 6 · 로그 레벨 전략",
-        desc: "개발: LOG_LEVEL=debug (상세 로그). 프로덕션: LOG_LEVEL=warning (필수만). 프로덕션에서 DEBUG를 켜두면 성능 저하와 디스크 낭비가 동시에 발생한다.",
-        phase: "level",
-        showLogs: true, showDriver: false, showLimit: false,
+        title: 'Step 5. ELK / Loki 연동 — 다 모인 다음에 사람이 검색한다',
+        desc: '4단계까지 오면 모든 컨테이너 로그가 한 곳(fluentd 수집기)으로 들어온다. 이제 그 다음 stage 로 보내서 저장·인덱싱·검색·시각화를 분리한다. 전통적 EFK(Elasticsearch + Fluentd + Kibana) 또는 가벼운 PLG(Promtail + Loki + Grafana) 두 스택이 사실상 표준이다. 이 단계까지 와야 운영팀은 SSH 없이 브라우저 한 탭에서 "어제 23시 api-3 의 5xx 만" 같은 질문을 풀 수 있다.',
+        phase: 'central',
+        activeDriver: 'fluentd',
+        showLogStream: true,
+        showJsonFile: false,
+        showDockerLogs: false,
+        showForward: true,
+        externalSystem: 'elk',
+        highlightStorage: 'remote',
+        code: {
+          lang: 'markdown',
+          filename: 'elk-loki.md',
+          lines: [
+            '# Step 5. 중앙 수집 스택 — EFK vs PLG',
+            '',
+            '## 두 가지 사실상 표준',
+            '',
+            '### A. EFK — Elasticsearch + Fluentd + Kibana',
+            '',
+            '```',
+            '컨테이너들 ──► fluentd driver ──► Fluentd Aggregator',
+            '                                       │',
+            '                                       ▼',
+            '                                Elasticsearch (인덱싱·저장)',
+            '                                       │',
+            '                                       ▼',
+            '                                   Kibana (검색·대시보드)',
+            '```',
+            '',
+            '- 장점: 풀텍스트 검색, 풍부한 시각화, 커뮤니티 큼',
+            '- 단점: ES 가 메모리·디스크 많이 먹음, 운영 난이도 높음',
+            '- 어울리는 곳: 보안/감사 로그까지 풀텍스트로 뒤져야 하는 환경',
+            '',
+            '### B. PLG — Promtail + Loki + Grafana',
+            '',
+            '```',
+            '컨테이너들 ──► Promtail (sidecar/agent) ──► Loki',
+            '                                            │',
+            '                                            ▼',
+            '                                        Grafana (검색·대시보드)',
+            '```',
+            '',
+            '- 장점: 메타데이터만 인덱싱 → 가볍고 저렴',
+            '- 단점: 풀텍스트 검색은 ES 보다 약함 (LogQL 로 grep 스타일)',
+            '- 어울리는 곳: Prometheus 메트릭 + 로그를 한 Grafana 에서 보는 팀',
+            '',
+            '## docker compose 한 장 예시 (Loki 스택)',
+            '',
+            '```yaml',
+            'services:',
+            '  api:',
+            '    image: myapp:1.0',
+            '    logging:',
+            '      driver: loki                        # plugin 설치 필요',
+            '      options:',
+            '        loki-url: "http://loki:3100/loki/api/v1/push"',
+            '        loki-batch-size: "400"',
+            '        labels: "service=api,env=prod"',
+            '',
+            '  loki:',
+            '    image: grafana/loki:2.9.0',
+            '    ports: ["3100:3100"]',
+            '',
+            '  grafana:',
+            '    image: grafana/grafana:10.2.0',
+            '    ports: ["3000:3000"]',
+            '    depends_on: [loki]',
+            '```',
+            '',
+            '## 선택 기준 — 한 줄 요약',
+            '',
+            '| 기준              | 추천             |',
+            '|-------------------|------------------|',
+            '| 풀텍스트 검색 강함  | EFK (Elasticsearch) |',
+            '| 운영 가볍고 저렴    | PLG (Loki)       |',
+            '| Prometheus 와 통합  | PLG (Grafana 한 화면) |',
+            '| 보안/감사 요건     | EFK (보존·검색 강함) |',
+            '',
+            '## 정리 — 5 단계 한 장 정리',
+            '',
+            '1. 앱은 stdout/stderr 로만 찍는다',
+            '2. 기본 json-file driver 가 호스트 디스크에 JSON 한 줄씩',
+            '3. docker logs 는 그 파일 reader 다',
+            '4. driver 를 fluentd/syslog 로 바꾸면 호스트 안 거치고 외부로',
+            '5. ES + Kibana 또는 Loki + Grafana 로 한 곳에서 검색·시각화',
+          ],
+          highlight: [5, 7, 8, 9, 10, 11, 12, 13, 14, 22, 23, 24, 25, 26, 27, 28, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55],
+        },
       },
     ];
 
-    function LogTerminal({ lines, filter }) {
-      const filtered = filter ? lines.filter(l => l.level !== "DEBUG") : lines;
+    // ─────────────────────────────────────────────────────
+    // 좌측 상단: 컨테이너 + stdout/stderr 로그 줄 시각화
+    //   showLogStream === true 일 때 5줄이 흘러나옴
+    //   level 별 색상: INFO(slate), WARN(amber), ERROR(rose)
+    // ─────────────────────────────────────────────────────
+    function ContainerBox({ showLogStream }) {
       return (
-        <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs overflow-x-auto">
-          <div className="text-slate-500 mb-2">$ docker logs -f api</div>
-          {filtered.map((line, i) => (
-            <div key={i} className={`${line.color} anim-flow`} style={{ animationDelay: `${i * 0.15}s` }}>
-              <span className="text-slate-600">[{line.time}]</span> <span className="font-bold">{line.level.padEnd(5)}</span> {line.msg}
+        <div className="rounded-lg border-2 border-sky-300 bg-sky-50 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🐳</span>
+              <span className="text-[11px] font-bold text-sky-800">Container — myapp:1.0</span>
             </div>
-          ))}
-          <div className="text-slate-600 mt-1 anim-blink">_</div>
+            <span className="text-[9px] bg-sky-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">
+              stdout / stderr
+            </span>
+          </div>
+          <div className="bg-slate-900 rounded border border-slate-700 p-2 font-mono text-[10px] leading-tight min-h-[5.5rem]">
+            {showLogStream ? (
+              LOG_LINES.map((l, i) => {
+                const color =
+                  l.level === 'ERROR' ? 'text-rose-400' :
+                  l.level === 'WARN'  ? 'text-amber-300' : 'text-slate-200';
+                return (
+                  <div key={i} className={color}>
+                    <span className="text-slate-500">[{l.time}]</span>{' '}
+                    <span className="font-bold">{l.level.padEnd(5)}</span>{' '}
+                    {l.msg}
+                  </div>
+                );
+              })
+            ) : (
+              <div className="text-slate-500 italic">앱이 아직 출력 전 …</div>
+            )}
+            <div className="text-slate-500 mt-0.5 animate-pulse">▌</div>
+          </div>
+          <div className="text-[9px] mt-1 text-sky-700">
+            앱 → stdout / stderr 한 통로 (12-factor)
+          </div>
         </div>
       );
     }
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // ─────────────────────────────────────────────────────
+    // 좌측 중앙: 3개 driver 스위치
+    //   activeDriver 와 일치하는 칸만 sky 강조
+    // ─────────────────────────────────────────────────────
+    function DriverSwitch({ activeDriver }) {
+      return (
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-2.5">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-[10px] font-bold text-slate-700">log-driver</span>
+            <span className="text-[9px] text-slate-400 font-mono">
+              {activeDriver ? `→ ${activeDriver}` : '(미선택)'}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-1.5">
+            {DRIVERS.map((d) => {
+              const on = activeDriver === d.id;
+              return (
+                <div
+                  key={d.id}
+                  className={`rounded border-2 p-1.5 text-center transition-all duration-500 ${
+                    on
+                      ? 'bg-sky-100 border-sky-500 shadow-sm'
+                      : 'bg-slate-50 border-slate-200 opacity-60'
+                  }`}
+                >
+                  <div className="text-base">{d.icon}</div>
+                  <div className={`text-[10px] font-bold font-mono ${on ? 'text-sky-700' : 'text-slate-500'}`}>
+                    {d.label}
+                  </div>
+                  <div className="text-[8px] text-slate-500 leading-tight">{d.desc}</div>
+                  {on && (
+                    <div className="mt-0.5 bg-sky-600 text-white text-[8px] px-1 py-0.5 rounded font-mono font-bold">
+                      active
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 하단 — 두 갈래 도착지
+    //   왼쪽: 호스트 디스크 (json-file)
+    //   오른쪽: 외부 시스템 (fluentd/syslog → ELK/Loki)
+    //   highlightStorage: 'host' | 'remote' 로 강조
+    // ─────────────────────────────────────────────────────
+    function StoragePane({
+      showJsonFile,
+      showDockerLogs,
+      showForward,
+      externalSystem,
+      highlightStorage,
+    }) {
+      const hostHi = highlightStorage === 'host';
+      const remoteHi = highlightStorage === 'remote';
+      return (
+        <div className="grid grid-cols-2 gap-2">
+          {/* 왼쪽: 호스트 디스크 */}
+          <div
+            className={`rounded-lg border-2 p-2 transition-all duration-500 ${
+              hostHi
+                ? 'bg-sky-50 border-sky-400 shadow-md'
+                : showJsonFile
+                ? 'bg-slate-50 border-slate-300'
+                : 'bg-slate-50 border-dashed border-slate-200 opacity-50'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 mb-1">
+              <span className="text-sm">💽</span>
+              <span className={`text-[10px] font-bold ${hostHi ? 'text-sky-800' : 'text-slate-500'}`}>
+                호스트 디스크
+              </span>
+            </div>
+            <div className="text-[8px] font-mono text-slate-500 leading-tight break-all">
+              /var/lib/docker/<br />containers/&lt;id&gt;/<br />&lt;id&gt;-json.log
+            </div>
+            {showJsonFile && (
+              <div className="mt-1 bg-white border border-slate-200 rounded p-1 font-mono text-[8px] leading-tight text-slate-600">
+                <div>{'{"log":"INFO ...","stream":"stdout"}'}</div>
+                <div>{'{"log":"WARN ...","stream":"stdout"}'}</div>
+                <div>{'{"log":"ERROR ...","stream":"stderr"}'}</div>
+              </div>
+            )}
+            {showDockerLogs && (
+              <div className="mt-1 bg-slate-900 rounded p-1 font-mono text-[8px] leading-tight">
+                <div className="text-emerald-400">$ docker logs api</div>
+                <div className="text-slate-200">INFO  GET /items 200</div>
+                <div className="text-rose-300">ERROR POST /items 500</div>
+              </div>
+            )}
+            <div className="text-[8px] mt-1 text-slate-500">
+              {hostHi ? '✓ json-file 활성' : '— driver 가 외부면 비워둠'}
+            </div>
+          </div>
+
+          {/* 오른쪽: 외부 시스템 */}
+          <div
+            className={`rounded-lg border-2 p-2 transition-all duration-500 ${
+              remoteHi
+                ? 'bg-sky-50 border-sky-400 shadow-md'
+                : showForward
+                ? 'bg-slate-50 border-slate-300'
+                : 'bg-slate-50 border-dashed border-slate-200 opacity-50'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 mb-1">
+              <span className="text-sm">📡</span>
+              <span className={`text-[10px] font-bold ${remoteHi ? 'text-sky-800' : 'text-slate-500'}`}>
+                외부 시스템
+              </span>
+            </div>
+            {showForward ? (
+              <div className="space-y-1">
+                {/* 1단계: 수집기 */}
+                <div className="bg-white border border-sky-200 rounded p-1 text-center">
+                  <div className="text-[10px]">📡</div>
+                  <div className="text-[9px] font-bold text-sky-700 font-mono">
+                    {externalSystem === 'syslog-server' ? 'syslog server' : 'Fluentd Aggregator'}
+                  </div>
+                  <div className="text-[8px] text-slate-500">tcp:24224 / 514</div>
+                </div>
+                <div className="text-center text-sky-500 text-xs leading-none">▼</div>
+                {/* 2단계: 저장 + 시각화 */}
+                {externalSystem === 'elk' ? (
+                  <>
+                    <div className="bg-white border border-amber-300 rounded p-1 text-center">
+                      <div className="text-[10px]">🗄️</div>
+                      <div className="text-[9px] font-bold text-amber-700 font-mono">Elasticsearch</div>
+                      <div className="text-[8px] text-slate-500">인덱싱 · 저장</div>
+                    </div>
+                    <div className="text-center text-sky-500 text-xs leading-none">▼</div>
+                    <div className="bg-white border border-emerald-300 rounded p-1 text-center">
+                      <div className="text-[10px]">📊</div>
+                      <div className="text-[9px] font-bold text-emerald-700 font-mono">Kibana</div>
+                      <div className="text-[8px] text-slate-500">검색 · 대시보드</div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="bg-white border border-slate-200 rounded p-1 text-center">
+                    <div className="text-[10px]">▾</div>
+                    <div className="text-[9px] font-bold text-slate-600 font-mono">ES / Loki / …</div>
+                    <div className="text-[8px] text-slate-500">다음 stage 로 라우팅</div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="text-[9px] text-slate-400 italic mt-2">
+                driver 가 json-file 이면 비워둠 (호스트만 사용)
+              </div>
+            )}
+            <div className="text-[8px] mt-1 text-slate-500">
+              {remoteHi ? '✓ 원격 수집 중' : '— 아직 외부 전송 안 함'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단: 컨테이너 + stdout 로그 줄
+    //   중앙: 3개 driver 스위치 (active 만 강조)
+    //   하단: 호스트 디스크 vs 외부 시스템 두 박스
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📚 컨테이너 → log driver → 도착지</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-2">
+            <ContainerBox showLogStream={step.showLogStream} />
+
+            {/* 화살표: driver 로 */}
+            <div className="text-center">
+              <div
+                className={`inline-block text-xs font-mono ${
+                  step.activeDriver ? 'text-sky-600 font-bold' : 'text-slate-300'
+                }`}
+              >
+                ↓ Docker 엔진이 캡처 → log-driver 로 전달
+              </div>
+            </div>
+
+            <DriverSwitch activeDriver={step.activeDriver} />
+
+            {/* 화살표: 도착지로 */}
+            <div className="text-center">
+              <div
+                className={`inline-block text-xs font-mono ${
+                  step.highlightStorage ? 'text-sky-600 font-bold' : 'text-slate-300'
+                }`}
+              >
+                ↓ driver 가 정한 도착지로
+              </div>
+            </div>
+
+            <StoragePane
+              showJsonFile={step.showJsonFile}
+              showDockerLogs={step.showDockerLogs}
+              showForward={step.showForward}
+              externalSystem={step.externalSystem}
+              highlightStorage={step.highlightStorage}
+            />
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>active
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded border border-slate-300 bg-white"></span>idle
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-amber-400"></span>WARN
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-rose-400"></span>ERROR
+            </span>
+            <span className="ml-auto font-mono">phase: {step.phase}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    //   파일명 탭, 윈도우 dot, 라인 번호, 강조 라인
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4500);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
 
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생(3000ms), 키보드 단축키
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum VI-1-5</span>
+            </nav>
+
+            {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter VI-1-5: 로그 수집과 docker logs</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VI</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part VI. Docker 운영 &gt; Chapter 1. 모니터링 / 로그</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VI-1-5. 로그 수집 — json-file / fluentd / syslog</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">stdout 한 줄이 어떤 driver 를 타고 어디로 가서 어떻게 검색되는지 5단계로</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">컨테이너 로그 흐름(stdout → docker logs → 파일 → 중앙 수집)을 시뮬레이션합니다.</p>
             </header>
 
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "central" ? "bg-indigo-600 border-indigo-700 text-white" :
-              data.phase === "limit" ? "bg-red-600 border-red-700 text-white" :
-              data.phase === "level" ? "bg-emerald-600 border-emerald-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            {/* 로그 흐름 시각화 */}
-            <div key={`vis-${step}`} className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 anim-fade">
-
-              {/* stdout 흐름도 */}
-              {data.phase === "stdout" && (
-                <div className="flex items-center justify-center gap-3 flex-wrap">
-                  {[
-                    { icon: "⚡", label: "앱 (FastAPI)", desc: "print() / logging" },
-                    { icon: "→", label: "", desc: "" },
-                    { icon: "📺", label: "stdout/stderr", desc: "표준 출력" },
-                    { icon: "→", label: "", desc: "" },
-                    { icon: "🐳", label: "Docker 엔진", desc: "캡처 & 저장" },
-                    { icon: "→", label: "", desc: "" },
-                    { icon: "📋", label: "docker logs", desc: "명령으로 조회" },
-                  ].map((item, i) => (
-                    item.label === "" ? (
-                      <div key={i} className="text-2xl text-blue-400 anim-slide" style={{animationDelay: `${i * 0.1}s`}}>→</div>
-                    ) : (
-                      <div key={i} className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-center anim-slide" style={{animationDelay: `${i * 0.1}s`}}>
-                        <div className="text-2xl">{item.icon}</div>
-                        <div className="font-bold text-blue-800 text-xs mt-1">{item.label}</div>
-                        <div className="text-xs text-slate-500">{item.desc}</div>
-                      </div>
-                    )
-                  ))}
-                </div>
-              )}
-
-              {/* 로그 터미널 */}
-              {data.showLogs && (
-                <LogTerminal lines={LOG_LINES} filter={data.phase === "level"} />
-              )}
-
-              {/* 로그 드라이버 비교 */}
-              {data.showDriver && (
-                <div className="mt-4 grid grid-cols-2 md:grid-cols-3 gap-3">
-                  {[
-                    { name: "json-file", desc: "호스트 디스크 (기본값)", support: "docker logs 가능", active: true },
-                    { name: "syslog", desc: "OS syslog 데몬", support: "docker logs 불가", active: false },
-                    { name: "fluentd", desc: "중앙 수집기", support: "docker logs 불가", active: data.phase === "central" },
-                    { name: "loki", desc: "Grafana Loki", support: "docker logs 불가", active: data.phase === "central" },
-                    { name: "journald", desc: "systemd journal", support: "docker logs 가능", active: false },
-                    { name: "none", desc: "로그 비활성화", support: "출력 없음", active: false },
-                  ].map((d, i) => (
-                    <div key={i} className={`rounded-lg border p-2.5 text-center text-xs transition-all duration-300 ${
-                      d.active ? "border-blue-300 bg-blue-50 shadow-sm" : "border-slate-200 bg-slate-50"
-                    }`}>
-                      <div className={`font-bold ${d.active ? "text-blue-700" : "text-slate-600"}`}>{d.name}</div>
-                      <div className="text-slate-500 mt-0.5">{d.desc}</div>
-                      <div className={`mt-1 ${d.support.includes("가능") ? "text-green-600" : "text-red-500"}`}>{d.support}</div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* 용량 제한 시각화 */}
-              {data.showLimit && (
-                <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-                    <div className="font-bold text-red-700 text-sm mb-2">제한 없음 (기본값)</div>
-                    <div className="flex gap-1">
-                      {[...Array(10)].map((_, i) => (
-                        <div key={i} className="flex-1 h-6 bg-red-300 rounded-sm" />
-                      ))}
-                    </div>
-                    <div className="text-xs text-red-600 mt-2">로그 무한 증가 → 디스크 풀 장애!</div>
-                  </div>
-                  <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                    <div className="font-bold text-green-700 text-sm mb-2">max-size: 10m, max-file: 3</div>
-                    <div className="flex gap-1">
-                      {[...Array(3)].map((_, i) => (
-                        <div key={i} className="flex-1 h-6 bg-green-400 rounded-sm" />
-                      ))}
-                      {[...Array(7)].map((_, i) => (
-                        <div key={i} className="flex-1 h-6 bg-slate-200 rounded-sm" />
-                      ))}
-                    </div>
-                    <div className="text-xs text-green-600 mt-2">최대 30MB만 유지 (로테이션)</div>
-                  </div>
-                </div>
-              )}
-
-              {/* 중앙 수집 아키텍처 */}
-              {data.phase === "central" && (
-                <div className="mt-4 bg-indigo-50 border border-indigo-200 rounded-lg p-4">
-                  <div className="text-center font-bold text-indigo-700 text-sm mb-3">중앙 로그 수집 아키텍처</div>
-                  <div className="flex items-center justify-center gap-2 flex-wrap text-xs">
-                    {[
-                      { label: "컨테이너들", icon: "🐳" },
-                      { label: "→", icon: "" },
-                      { label: "Fluentd / Promtail", icon: "📡" },
-                      { label: "→", icon: "" },
-                      { label: "ES / Loki", icon: "🗄️" },
-                      { label: "→", icon: "" },
-                      { label: "Kibana / Grafana", icon: "📊" },
-                    ].map((item, i) => (
-                      item.icon === "" ? (
-                        <span key={i} className="text-indigo-400 text-lg">→</span>
-                      ) : (
-                        <div key={i} className="bg-white border border-indigo-200 rounded px-3 py-2 text-center anim-slide" style={{animationDelay: `${i * 0.1}s`}}>
-                          <div className="text-lg">{item.icon}</div>
-                          <div className="text-indigo-700 font-medium">{item.label}</div>
-                        </div>
-                      )
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* 로그 레벨 비교 */}
-              {data.phase === "level" && (
-                <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-                    <div className="font-bold text-amber-700 text-sm">🔧 개발: LOG_LEVEL=debug</div>
-                    <div className="text-xs text-amber-600 mt-1">모든 로그 출력 (DEBUG 포함 6줄)</div>
-                  </div>
-                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
-                    <div className="font-bold text-emerald-700 text-sm">🏭 프로덕션: LOG_LEVEL=warning</div>
-                    <div className="text-xs text-emerald-600 mt-1">WARN+ERROR만 출력 (불필요한 로그 제거)</div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: <strong>stdout</strong> → <strong>log-driver</strong>(json-file/fluentd/syslog) → <strong>도착지</strong>(호스트 파일 / 원격 수집기) → <strong>EFK / PLG</strong> 로 검색·시각화. 다음(VI-1-6)에서는 같은 흐름의 메트릭 버전을 본다.
               </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['stdout', 'stderr', 'log-driver', 'json-file', 'docker logs', 'fluentd', 'syslog', 'EFK', 'Loki', 'Grafana'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./vi-1-4_resource_limits.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; VI-1-4 리소스 제한</a>
+              <a href="./vi-1-6_metrics_prometheus.html" className="text-sky-700 hover:text-sky-900 font-medium">VI-1-6 메트릭 / Prometheus &rarr;</a>
+            </nav>
 
           </div>
         </div>

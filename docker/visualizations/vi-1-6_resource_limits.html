@@ -3,286 +3,887 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Docker 인터랙티브 학습 — 리소스 제한</title>
+  <title>Docker 인터랙티브 학습 — VI-1-6. 자원 제한 (cpus / memory / OOMKilled)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    @keyframes fadeIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
-    @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.05);} }
-    @keyframes slideRight { from{opacity:0;transform:translateX(-30px);} to{opacity:1;transform:translateX(0);} }
-    @keyframes shake { 0%,100%{transform:translateX(0);} 25%{transform:translateX(-4px);} 75%{transform:translateX(4px);} }
-    @keyframes growBar { from{width:0;} to{width:100%;} }
-    @keyframes explode { 0%{transform:scale(1);opacity:1;} 50%{transform:scale(1.3);} 100%{transform:scale(0.8);opacity:0.5;} }
-    .anim-fade { animation: fadeIn 0.5s ease-out forwards; }
-    .anim-pulse { animation: pulse 1.5s ease-in-out infinite; }
-    .anim-slide { animation: slideRight 0.5s ease-out forwards; }
-    .anim-shake { animation: shake 0.4s ease-in-out; }
-    .anim-explode { animation: explode 0.6s ease-in-out forwards; }
-  </style>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
-<body class="bg-slate-50">
+<body>
   <div id="root"></div>
+
+  <!--
+    VI-1-6. 자원 제한 — cpus / memory / OOMKilled
+    학습 목표: 컨테이너에 자원 한도를 걸지 않으면 한 컨테이너가 호스트 자원을 다 먹는다는
+              사실을 보고, --cpus / --memory 로 제한을 걸고, 메모리 초과 시 OOMKilled
+              로 강제 종료되는 흐름을, cgroups v2 와 docker stats 모니터링과 함께 5단계로 본다.
+    핵심 비유: 셰어하우스 — 룸메이트(컨테이너) 한 명이 냉장고(메모리)를 다 채워두면
+              나머지가 굶는다. 칸막이(cgroups)로 각자의 몫을 정해줘야 한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 호스트 게이지 + 컨테이너 막대 + OOM 알람) /
+                       우(VSCode CodeViewer)
+    색상: docker sky
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 호스트 자원 — 데모용 고정 사양
+    //   CPU 4 코어, RAM 8 GiB
+    //   각 단계에서 컨테이너가 호스트의 어느 정도 비율을 잡아먹는지 보여준다
+    // ─────────────────────────────────────────────────────
+    const HOST = {
+      cpuCores: 4,
+      memMiB: 8192,
+    };
+
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 — LiveDataPane 이 읽는 dataState
+    //   phase             : 'no-limit' | 'with-limits' | 'oom' | 'cgroups' | 'stats'
+    //   containers        : [{ id, label, cpuPct, cpuLimit, memMiB, memLimit, status }]
+    //                       cpuPct    : 호스트 전체 대비 CPU 사용률 (0~100)
+    //                       cpuLimit  : --cpus 값 (코어 단위, null = 무제한)
+    //                       memMiB    : 현재 메모리 사용량
+    //                       memLimit  : --memory 값 (MiB 단위, null = 무제한)
+    //                       status    : 'running' | 'oomkilled' | 'starving'
+    //   alarmText         : 우상단 빨간 알람 텍스트 (null = 정상)
+    //   cgroupsHighlight  : Step 4 에서 cgroups v2 박스 강조 여부
+    //   statsLive         : Step 5 에서 docker stats live row 표시 여부
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: "STEP 1 · 제한 없는 컨테이너의 위험",
-        desc: "컨테이너는 기본적으로 호스트의 CPU와 메모리를 무제한으로 사용한다. 한 컨테이너가 메모리를 다 써버리면 같은 서버의 다른 컨테이너가 줄줄이 강제 종료된다.",
-        phase: "no_limit",
+        title: 'Step 1. 제한 없음 — 한 컨테이너가 호스트 자원 다 먹음',
+        desc: '컨테이너는 기본적으로 cpus / memory 한도가 없다. 메모리 누수가 생긴 api 컨테이너 한 개가 호스트 RAM 8GiB 중 7.5GiB 를 잡아먹어, 같은 호스트의 db · nginx 가 메모리 부족(starving)으로 응답을 못 한다. 한 명이 냉장고를 다 채우면 나머지가 굶는 셰어하우스 상황이다.',
+        phase: 'no-limit',
+        containers: [
+          { id: 'api',   label: 'api',   cpuPct: 92, cpuLimit: null, memMiB: 7600, memLimit: null, status: 'running' },
+          { id: 'db',    label: 'db',    cpuPct: 5,  cpuLimit: null, memMiB: 380,  memLimit: null, status: 'starving' },
+          { id: 'nginx', label: 'nginx', cpuPct: 1,  cpuLimit: null, memMiB: 60,   memLimit: null, status: 'starving' },
+        ],
+        alarmText: '⚠ api 가 호스트 RAM 의 93% 점유 — db / nginx 굶어죽기 직전',
+        cgroupsHighlight: false,
+        statsLive: false,
+        code: {
+          lang: 'bash',
+          filename: 'no-limit.sh',
+          lines: [
+            '# Step 1. 제한 없이 컨테이너 띄우기 — 한 명이 다 먹는다',
+            '',
+            '# 1) api / db / nginx 그냥 띄우기 — 자원 옵션 0 개',
+            'docker run -d --name api   myapp:1.0',
+            'docker run -d --name db    postgres:14',
+            'docker run -d --name nginx nginx:1.27',
+            '',
+            '# 2) api 에서 메모리 누수 발생 (내부 캐시 무한 성장 가정)',
+            '',
+            '# 3) docker stats — api 만 미친 듯이 RAM 잡아먹는다',
+            'docker stats --no-stream',
+            '#  CONTAINER   CPU %    MEM USAGE / LIMIT      MEM %',
+            '#  api          92.3%   7.42GiB / 7.77GiB      95.4%   ← 거의 다 먹음',
+            '#  db            5.1%   380MiB  / 7.77GiB       4.7%',
+            '#  nginx         0.4%   60MiB   / 7.77GiB       0.7%',
+            '#                                ▲',
+            '#               LIMIT 이 호스트 전체 RAM = 제한 없음',
+            '',
+            '# 4) 결과: db / nginx 응답 지연 → 502 / timeout',
+            'curl http://localhost:5432   # connection refused',
+            'curl http://localhost:80     # 504 Gateway Timeout',
+            '',
+            '# 5) 호스트 OS 자체의 OOM Killer 가 무작위 프로세스 처치',
+            'dmesg | tail',
+            '#  Out of memory: Killed process 1234 (postgres) ...',
+            '',
+            '# ─── 문제점 ───',
+            '#  • 한 컨테이너가 호스트 자원 100% 점유 (noisy neighbor)',
+            '#  • 다른 컨테이너 / 호스트 OS 까지 줄줄이 죽음',
+            '#  • 운영 환경에서는 절대 금지',
+          ],
+          highlight: [3, 4, 5, 10, 12, 13, 14, 15, 16, 19, 20, 24, 25, 26],
+        },
       },
       {
-        title: "STEP 2 · 메모리 제한 설정",
-        desc: "limits.memory: 512m은 '이 이상 절대 못 쓴다'는 하드 상한. reservations.memory: 256m은 '최소 이만큼은 보장해달라'는 소프트 하한. 두 가지를 함께 설정하면 최소 보장 + 최대 제한이 적용된다.",
-        phase: "memory",
+        title: 'Step 2. --cpus / --memory 지정 — 칸막이 치기',
+        desc: '--cpus 1.0 으로 CPU 코어 1 개 분량까지, --memory 512m 으로 RAM 512 MiB 까지만 쓰도록 한도를 걸면, api 가 누수를 일으켜도 자기 칸막이 안에서만 발버둥친다. db · nginx 에는 충분한 RAM 이 보장되어 호스트가 안정된다. cpus 와 memory 두 옵션이 컨테이너 격리의 핵심이다.',
+        phase: 'with-limits',
+        containers: [
+          { id: 'api',   label: 'api',   cpuPct: 24, cpuLimit: 1.0, memMiB: 480,  memLimit: 512,  status: 'running' },
+          { id: 'db',    label: 'db',    cpuPct: 18, cpuLimit: 2.0, memMiB: 720,  memLimit: 1024, status: 'running' },
+          { id: 'nginx', label: 'nginx', cpuPct: 4,  cpuLimit: 0.5, memMiB: 80,   memLimit: 256,  status: 'running' },
+        ],
+        alarmText: null,
+        cgroupsHighlight: false,
+        statsLive: false,
+        code: {
+          lang: 'bash',
+          filename: 'with-limits.sh',
+          lines: [
+            '# Step 2. --cpus / --memory 로 칸막이 치기',
+            '',
+            '# 1) api : CPU 1 코어 + RAM 512 MiB',
+            'docker run -d --name api \\',
+            '  --cpus="1.0" \\                # CPU 1 코어 분량 (호스트의 25%)',
+            '  --memory="512m" \\             # 하드 상한 — 넘으면 OOMKilled',
+            '  --memory-reservation="256m" \\ # 소프트 하한 — 최소 보장',
+            '  myapp:1.0',
+            '',
+            '# 2) db : CPU 2 코어 + RAM 1 GiB',
+            'docker run -d --name db \\',
+            '  --cpus="2.0" --memory="1g" \\',
+            '  postgres:14',
+            '',
+            '# 3) nginx : CPU 0.5 코어 + RAM 256 MiB',
+            'docker run -d --name nginx \\',
+            '  --cpus="0.5" --memory="256m" \\',
+            '  nginx:1.27',
+            '',
+            '# 4) 단위',
+            '#   --cpus    : 1.0 (1코어), 0.5 (반코어), 2.0 (2코어)',
+            '#   --memory  : 512m, 1g, 2g  (b/k/m/g 접미사)',
+            '',
+            '# 5) 확인',
+            'docker inspect api --format \\',
+            '  "{{.HostConfig.NanoCpus}} / {{.HostConfig.Memory}}"',
+            '#  → 1000000000 / 536870912',
+            '#    1e9 nanocpus = 1.0 코어, 512*1024*1024 = 512 MiB',
+            '',
+            '# ─── 핵심 ───',
+            '#  • --cpus  : CPU 시간 share (1.0 = 1 코어분)',
+            '#  • --memory: RAM 하드 상한 (초과 = OOMKilled)',
+            '#  • --memory-reservation : 최소 보장 (스케줄링 힌트)',
+            '#  • 운영의 모든 컨테이너에 반드시 둘 다 지정',
+          ],
+          highlight: [3, 4, 5, 6, 7, 10, 11, 12, 15, 16, 17],
+        },
       },
       {
-        title: "STEP 3 · CPU 제한 설정",
-        desc: "limits.cpus: '1.0'은 CPU 코어 1개 분량까지 사용 가능. 2코어 서버에서 cpus: 0.5는 전체 CPU 용량의 25%까지 쓸 수 있다. CPU 값은 반드시 따옴표로 감싼다.",
-        phase: "cpu",
+        title: 'Step 3. 메모리 초과 → OOMKilled (Exit 137)',
+        desc: 'api 의 한도를 512 MiB 로 걸어둔 상태에서 메모리 누수가 한도를 넘어가면, 리눅스 커널의 OOM Killer 가 컨테이너 안 프로세스를 SIGKILL 로 즉시 종료한다. docker inspect 의 OOMKilled: true, ExitCode: 137 (= 128 + 9 SIGKILL) 이 명확한 증거다. 호스트는 멀쩡하고 다른 컨테이너도 안전하다 — 칸막이의 역할.',
+        phase: 'oom',
+        containers: [
+          { id: 'api',   label: 'api',   cpuPct: 0,  cpuLimit: 1.0, memMiB: 512,  memLimit: 512,  status: 'oomkilled' },
+          { id: 'db',    label: 'db',    cpuPct: 18, cpuLimit: 2.0, memMiB: 720,  memLimit: 1024, status: 'running' },
+          { id: 'nginx', label: 'nginx', cpuPct: 4,  cpuLimit: 0.5, memMiB: 80,   memLimit: 256,  status: 'running' },
+        ],
+        alarmText: '🚨 api 컨테이너 OOMKilled (Exit 137 = SIGKILL)',
+        cgroupsHighlight: false,
+        statsLive: false,
+        code: {
+          lang: 'bash',
+          filename: 'oom.sh',
+          lines: [
+            '# Step 3. 메모리 한도 초과 → OOMKilled',
+            '',
+            '# 1) 한도(512m) 를 넘는 메모리를 잡아먹는 컨테이너',
+            'docker run -d \\',
+            '  --name leaker \\',
+            '  --memory="512m" \\',
+            '  python:3.12 \\',
+            '  python -c "x=[]\\nwhile True: x.append(\\" \\"*1024*1024)"',
+            '',
+            '# 2) 잠시 기다리면 사망',
+            'sleep 5',
+            'docker ps -a --filter name=leaker',
+            '#  CONTAINER   IMAGE        STATUS                       NAMES',
+            '#  abc123      python:3.12  Exited (137) 2 seconds ago   leaker',
+            '#                                  ▲',
+            '#              Exit 137 = 128 + 9 (SIGKILL — OOM Killer)',
+            '',
+            '# 3) 결정적 증거: docker inspect',
+            'docker inspect leaker --format "{{.State.OOMKilled}}"   # → true',
+            'docker inspect leaker --format "{{.State.ExitCode}}"    # → 137',
+            'docker inspect leaker --format "{{.State.Error}}"       # → ""',
+            '',
+            '# 4) 호스트 dmesg — cgroup OOM 이벤트',
+            'dmesg | grep -i "killed process"',
+            '#  Memory cgroup out of memory:',
+            '#    Killed process 4321 (python) total-vm:614400kB ...',
+            '#  ▲ "cgroup" 키워드 = 호스트 전체 OOM 아님 (격리 작동)',
+            '',
+            '# 5) 자동 재시작 정책과 함께 쓰면 자가복구',
+            'docker run -d \\',
+            '  --name api \\',
+            '  --memory="512m" \\',
+            '  --restart=on-failure:5 \\   # 5 회까지 자동 재시작',
+            '  myapp:1.0',
+            '',
+            '# ─── 핵심 ───',
+            '#  • OOMKilled=true 면 한도 초과 — 상향 또는 누수 수정',
+            '#  • Exit 137 만으로 OOM 단정 금지 (다른 SIGKILL 일 수도)',
+            '#  • 다른 컨테이너 / 호스트 영향 없음 — 격리 작동',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 18, 19, 20, 21, 24, 25, 26, 27],
+        },
       },
       {
-        title: "STEP 4 · OOM Killer 시뮬레이션",
-        desc: "메모리가 limits를 초과하면 리눅스 커널 OOM Killer가 컨테이너를 강제 종료한다. docker inspect에서 OOMKilled: true, 종료 코드 137(128+9=SIGKILL)로 확인할 수 있다.",
-        phase: "oom",
+        title: 'Step 4. cgroups v2 — 칸막이의 정체',
+        desc: '컨테이너 자원 제한은 마법이 아니라 리눅스 커널의 cgroups (control groups) v2 가 처리한다. docker run --cpus / --memory 옵션은 결국 /sys/fs/cgroup/ 아래에 cpu.max · memory.max 파일을 써넣는 것이다. cat 으로 읽어보면 우리가 지정한 값이 그대로 보인다. Docker 는 cgroups 위의 얇은 래퍼일 뿐.',
+        phase: 'cgroups',
+        containers: [
+          { id: 'api',   label: 'api',   cpuPct: 24, cpuLimit: 1.0, memMiB: 480,  memLimit: 512,  status: 'running' },
+          { id: 'db',    label: 'db',    cpuPct: 18, cpuLimit: 2.0, memMiB: 720,  memLimit: 1024, status: 'running' },
+          { id: 'nginx', label: 'nginx', cpuPct: 4,  cpuLimit: 0.5, memMiB: 80,   memLimit: 256,  status: 'running' },
+        ],
+        alarmText: null,
+        cgroupsHighlight: true,
+        statsLive: false,
+        code: {
+          lang: 'markdown',
+          filename: 'cgroups.md',
+          lines: [
+            '# Step 4. cgroups v2 — Docker 자원 제한의 실체',
+            '',
+            '## 한 줄 요약',
+            'docker --cpus / --memory = 커널 cgroups v2 설정의 wrapper.',
+            'cgroups = 프로세스 그룹마다 CPU·메모리·IO·PID 한도 거는 커널 기능.',
+            '',
+            '## 컨테이너의 cgroup 경로',
+            '```bash',
+            'docker inspect api --format "{{.Id}}"   # → 9f2c...',
+            'ls /sys/fs/cgroup/system.slice/docker-9f2c....scope/',
+            '#  cpu.max  memory.max  memory.current  pids.max  io.max',
+            '```',
+            '',
+            '## CPU 한도 — cpu.max / 메모리 한도 — memory.max',
+            '```bash',
+            'cat .../cpu.max          # → 100000 100000 (quota period μs)',
+            '# 100000 / 100000 = 1.0 코어  ← --cpus="1.0" 의 정체',
+            'cat .../memory.max       # → 536870912 (= 512 MiB)',
+            'cat .../memory.current   # → 503316480 (현재 사용량)',
+            '```',
+            '',
+            '## OOM 이벤트 — memory.events',
+            '```bash',
+            'cat .../memory.events',
+            '#  max       3   ← 한도 도달 횟수',
+            '#  oom       1   ← OOM 발동 횟수',
+            '#  oom_kill  1   ← 실제 SIGKILL 발생 횟수',
+            '```',
+            '',
+            '## 핵심 매핑',
+            '| Docker 옵션          | cgroups v2 파일 | 의미              |',
+            '|----------------------|-----------------|-------------------|',
+            '| --cpus="1.0"         | cpu.max         | quota/period 비율 |',
+            '| --memory="512m"      | memory.max      | RAM 하드 상한     |',
+            '| --memory-reservation | memory.low      | 소프트 하한       |',
+            '| --pids-limit         | pids.max        | 프로세스 수 한도  |',
+            '',
+            '## 정리',
+            '- Docker = cgroups + namespace 위의 얇은 인터페이스',
+            '- 같은 메커니즘을 systemd · podman · k8s 도 그대로 사용',
+            '- 격리 = cgroups (자원) + namespace (가시성)',
+          ],
+          highlight: [3, 4, 5, 14, 15, 16, 17, 18, 19, 23, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35, 36],
+        },
       },
       {
-        title: "STEP 5 · docker stats로 모니터링",
-        desc: "docker stats 명령으로 실시간 CPU/메모리 사용량을 확인한다. MEM USAGE/LIMIT에서 LIMIT이 설정값과 같으면 제한이 적용된 것. 큰 숫자(호스트 전체 메모리)가 나오면 제한이 없는 것이다.",
-        phase: "stats",
-      },
-      {
-        title: "STEP 6 · Compose deploy.resources 설정",
-        desc: "Compose에서는 deploy.resources.limits와 reservations 블록으로 선언한다. 이 값은 Kubernetes의 requests/limits와 직접 매핑되므로 K8s 전환 시 그대로 옮겨 쓸 수 있다.",
-        phase: "compose",
+        title: 'Step 5. docker stats 로 모니터링',
+        desc: 'docker stats 는 cgroups 의 현재 사용량(memory.current, cpu.stat)을 실시간으로 읽어 보여주는 사실상의 표준 모니터링 명령이다. MEM USAGE / LIMIT 의 LIMIT 이 우리가 지정한 값(예: 512MiB)과 같으면 한도가 제대로 걸려 있다는 뜻이고, 호스트 전체 RAM 이 보이면 미설정 상태다. CPU % 가 한도 % 에 자주 닿으면 throttling 발생 신호.',
+        phase: 'stats',
+        containers: [
+          { id: 'api',   label: 'api',   cpuPct: 24, cpuLimit: 1.0, memMiB: 480,  memLimit: 512,  status: 'running' },
+          { id: 'db',    label: 'db',    cpuPct: 18, cpuLimit: 2.0, memMiB: 720,  memLimit: 1024, status: 'running' },
+          { id: 'nginx', label: 'nginx', cpuPct: 4,  cpuLimit: 0.5, memMiB: 80,   memLimit: 256,  status: 'running' },
+        ],
+        alarmText: null,
+        cgroupsHighlight: false,
+        statsLive: true,
+        code: {
+          lang: 'bash',
+          filename: 'stats.sh',
+          lines: [
+            '# Step 5. docker stats 로 자원 사용량 모니터링',
+            '',
+            '# 1) 실시간 갱신 (Ctrl+C 로 종료)',
+            'docker stats',
+            '',
+            '# 2) 한 번만 찍고 빠지기 (스크립트용)',
+            'docker stats --no-stream',
+            '#  NAME    CPU %   MEM USAGE / LIMIT    MEM %   NET I/O',
+            '#  api     24.1%   480MiB / 512MiB      93.7%   1.2MB / 800kB',
+            '#  db      18.0%   720MiB / 1GiB        70.3%   3.1MB / 4.5MB',
+            '#  nginx    4.2%   80MiB  / 256MiB      31.2%   500kB / 200kB',
+            '#                   ▲              ▲',
+            '#            현재 사용량      지정한 한도',
+            '',
+            '# 3) 포맷 커스터마이즈 — JSON',
+            'docker stats --no-stream --format "{{json .}}" | jq .',
+            '#  { "Name":"api", "CPUPerc":"24.10%",',
+            '#    "MemUsage":"480MiB / 512MiB", "MemPerc":"93.74%" }',
+            '',
+            '# 4) 한도 적용 여부 확인',
+            '#   LIMIT == 지정값(512MiB) → OK',
+            '#   LIMIT == 호스트 전체 RAM(7.77GiB) → 미설정',
+            '',
+            '# 5) Prometheus / Grafana 연동은 cAdvisor 가 정석',
+            'docker run -d --name cadvisor \\',
+            '  -v /:/rootfs:ro -v /var/run:/var/run:ro \\',
+            '  -v /sys:/sys:ro -v /var/lib/docker/:/var/lib/docker:ro \\',
+            '  -p 8080:8080 gcr.io/cadvisor/cadvisor:v0.49.1',
+            '',
+            '# 6) docker events 로 OOM 이벤트 실시간 알림',
+            'docker events --filter event=oom',
+            '',
+            '# ─── 운영 체크리스트 ───',
+            '#  □ 모든 컨테이너에 --cpus / --memory 지정',
+            '#  □ MEM % 지속 90%+ → 한도 상향 또는 replica 추가',
+            '#  □ CPU % 가 한도에 자주 닿음 → throttling 발생',
+            '#  □ docker events 로 OOM 알림 → Slack / PagerDuty 연동',
+          ],
+          highlight: [3, 4, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 25, 26, 27, 28, 29, 31, 32, 34, 35, 36, 37, 38],
+        },
       },
     ];
 
-    function MemoryBar({ label, used, limit, isOOM, color }) {
-      const pct = limit > 0 ? Math.min((used / limit) * 100, 100) : (used / 8192) * 100;
-      const overLimit = used > limit && limit > 0;
+    // 좌측 상단: 호스트 자원 게이지 — 합산 사용률 (90%+ 빨강)
+    function HostGauge({ containers }) {
+      const cpuTotal = containers.reduce((s, c) => s + c.cpuPct, 0);
+      const memTotal = containers.reduce((s, c) => s + c.memMiB, 0);
+      const memPct = (memTotal / HOST.memMiB) * 100;
+
+      const cpuDanger = cpuTotal > 90;
+      const memDanger = memPct > 90;
+
       return (
-        <div className="mb-3">
-          <div className="flex justify-between text-xs mb-1">
-            <span className="font-medium text-slate-700">{label}</span>
-            <span className={overLimit ? "text-red-600 font-bold" : "text-slate-500"}>
-              {used}MB {limit > 0 ? `/ ${limit}MB` : "/ 제한 없음"}
-            </span>
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🖥️</span>
+              <span className="text-[11px] font-bold text-slate-700">
+                호스트: CPU {HOST.cpuCores}코어 · RAM {(HOST.memMiB/1024).toFixed(0)}GiB
+              </span>
+            </div>
+            <span className="text-[9px] text-slate-400 font-mono">aggregate</span>
           </div>
-          <div className="h-6 bg-slate-200 rounded-full overflow-hidden relative">
-            <div className={`h-full rounded-full transition-all duration-1000 ${
-              isOOM ? "bg-red-500 anim-shake" :
-              overLimit ? "bg-red-400" :
-              pct > 70 ? "bg-yellow-400" : `bg-${color}-400`
-            }`} style={{ width: `${Math.min(pct, 100)}%` }} />
-            {limit > 0 && (
-              <div className="absolute top-0 h-full border-r-2 border-red-600" style={{ left: "100%" }}>
-                <span className="absolute -top-5 -right-4 text-xs text-red-600 font-bold">LIMIT</span>
-              </div>
-            )}
+
+          {/* CPU 게이지 */}
+          <div className="mb-2">
+            <div className="flex justify-between text-[10px] mb-0.5">
+              <span className="font-semibold text-slate-600">CPU 사용률</span>
+              <span className={`font-mono font-bold ${cpuDanger ? 'text-rose-600' : 'text-slate-600'}`}>
+                {cpuTotal.toFixed(0)}%
+              </span>
+            </div>
+            <div className="h-3 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ${
+                  cpuDanger ? 'bg-rose-500' : cpuTotal > 70 ? 'bg-amber-400' : 'bg-sky-500'
+                }`}
+                style={{ width: `${Math.min(cpuTotal, 100)}%` }}
+              />
+            </div>
           </div>
-          {isOOM && <div className="text-xs text-red-600 font-bold mt-1 anim-shake">OOM Killed! (Exit Code: 137)</div>}
+
+          {/* Memory 게이지 */}
+          <div>
+            <div className="flex justify-between text-[10px] mb-0.5">
+              <span className="font-semibold text-slate-600">Memory 사용량</span>
+              <span className={`font-mono font-bold ${memDanger ? 'text-rose-600' : 'text-slate-600'}`}>
+                {(memTotal/1024).toFixed(2)} / {(HOST.memMiB/1024).toFixed(0)} GiB
+              </span>
+            </div>
+            <div className="h-3 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+              <div
+                className={`h-full rounded-full transition-all duration-700 ${
+                  memDanger ? 'bg-rose-500' : memPct > 70 ? 'bg-amber-400' : 'bg-sky-500'
+                }`}
+                style={{ width: `${Math.min(memPct, 100)}%` }}
+              />
+            </div>
+          </div>
+
+          {memDanger && (
+            <div className="mt-2 text-[9px] text-rose-700 font-semibold">
+              ⚠ 호스트 RAM 의 90% 초과 — 다른 프로세스가 굶거나 호스트 OOM 위험
+            </div>
+          )}
         </div>
       );
     }
 
-    function App() {
-      const [step, setStep] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const timerRef = useRef(null);
-      const data = STEPS[step];
+    // 좌측 중앙: 컨테이너별 CPU/Memory 막대 — limit 라인 + status 색상
+    function ContainerBars({ containers }) {
+      return (
+        <div className="rounded-lg border-2 border-slate-200 bg-white p-3 space-y-2.5">
+          <div className="flex items-center gap-1.5 mb-1">
+            <span className="text-base">🐳</span>
+            <span className="text-[11px] font-bold text-slate-700">컨테이너별 사용량</span>
+          </div>
+
+          {containers.map((c) => {
+            const oom = c.status === 'oomkilled';
+            const starve = c.status === 'starving';
+
+            // CPU 막대 — cpuLimit 은 코어 단위 (호스트 4코어 기준 비율)
+            const cpuLimitPctOfHost = c.cpuLimit ? (c.cpuLimit / HOST.cpuCores) * 100 : 100;
+            // CPU 막대 길이는 호스트 전체 대비
+            const cpuBarPct = Math.min(c.cpuPct, 100);
+
+            // Memory 막대 — memLimit 이 있으면 limit 대비, 없으면 호스트 전체 대비
+            const memBarPct = c.memLimit
+              ? Math.min((c.memMiB / c.memLimit) * 100, 100)
+              : Math.min((c.memMiB / HOST.memMiB) * 100, 100);
+            const memOverLimit = c.memLimit && c.memMiB >= c.memLimit;
+
+            const labelColor = oom
+              ? 'text-rose-700'
+              : starve
+              ? 'text-amber-700'
+              : 'text-sky-800';
+
+            return (
+              <div
+                key={c.id}
+                className={`rounded border p-2 transition-all duration-500 ${
+                  oom
+                    ? 'bg-rose-50 border-rose-400 animate-pulse'
+                    : starve
+                    ? 'bg-amber-50 border-amber-300'
+                    : 'bg-sky-50 border-sky-300'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className={`text-[11px] font-bold font-mono ${labelColor}`}>{c.label}</span>
+                  <span className="text-[9px] text-slate-500 font-mono">
+                    {oom ? (
+                      <span className="bg-rose-600 text-white px-1.5 py-0.5 rounded font-bold">
+                        OOMKilled · Exit 137
+                      </span>
+                    ) : starve ? (
+                      <span className="bg-amber-500 text-white px-1.5 py-0.5 rounded font-bold">
+                        starving
+                      </span>
+                    ) : (
+                      <span className="bg-emerald-500 text-white px-1.5 py-0.5 rounded font-bold">
+                        running
+                      </span>
+                    )}
+                  </span>
+                </div>
+
+                {/* CPU 막대 */}
+                <div className="mb-1">
+                  <div className="flex justify-between text-[9px] text-slate-600 mb-0.5">
+                    <span>CPU</span>
+                    <span className="font-mono">
+                      {c.cpuPct.toFixed(0)}% / {c.cpuLimit ? `${c.cpuLimit} core (${cpuLimitPctOfHost.toFixed(0)}%)` : '제한 없음'}
+                    </span>
+                  </div>
+                  <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+                    <div
+                      className={`h-full transition-all duration-700 ${
+                        oom ? 'bg-rose-400' : 'bg-sky-500'
+                      }`}
+                      style={{ width: `${cpuBarPct}%` }}
+                    />
+                    {c.cpuLimit && (
+                      <div
+                        className="absolute top-0 h-full border-r-2 border-rose-500"
+                        style={{ left: `${cpuLimitPctOfHost}%` }}
+                        title="--cpus limit"
+                      />
+                    )}
+                  </div>
+                </div>
+
+                {/* Memory 막대 */}
+                <div>
+                  <div className="flex justify-between text-[9px] text-slate-600 mb-0.5">
+                    <span>RAM</span>
+                    <span className={`font-mono ${memOverLimit ? 'text-rose-600 font-bold' : ''}`}>
+                      {c.memMiB} MiB / {c.memLimit ? `${c.memLimit} MiB` : '제한 없음'}
+                    </span>
+                  </div>
+                  <div className="relative h-2 bg-slate-100 rounded-full overflow-hidden border border-slate-200">
+                    <div
+                      className={`h-full transition-all duration-700 ${
+                        oom
+                          ? 'bg-rose-500'
+                          : memOverLimit
+                          ? 'bg-rose-400'
+                          : memBarPct > 80
+                          ? 'bg-amber-400'
+                          : 'bg-sky-500'
+                      }`}
+                      style={{ width: `${memBarPct}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 하단: cgroups v2 박스 (Step 4 강조)
+    //   /sys/fs/cgroup/.../cpu.max · memory.max 파일 표시
+    // ─────────────────────────────────────────────────────
+    function CgroupsBox({ highlight }) {
+      return (
+        <div
+          className={`rounded-lg border-2 p-2.5 transition-all duration-500 ${
+            highlight ? 'bg-sky-50 border-sky-400 shadow-md' : 'bg-slate-50 border-slate-200 opacity-70'
+          }`}
+        >
+          <div className="flex items-center gap-1.5 mb-1">
+            <span className="text-base">⚙️</span>
+            <span className={`text-[11px] font-bold ${highlight ? 'text-sky-800' : 'text-slate-500'}`}>
+              cgroups v2 — 커널 자원 제한 메커니즘
+            </span>
+            {highlight && (
+              <span className="ml-auto text-[8px] bg-sky-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">
+                kernel
+              </span>
+            )}
+          </div>
+          <div className="bg-white rounded border border-slate-200 p-1.5 font-mono text-[9px] leading-snug text-slate-700 space-y-0.5">
+            <div className="text-slate-500"># /sys/fs/cgroup/system.slice/docker-...scope/</div>
+            <div>
+              <span className="text-sky-600 font-bold">cpu.max</span>
+              <span className="text-slate-400">      → </span>
+              <span className="text-slate-700">100000 100000</span>
+              <span className="text-slate-400"> (= 1.0 코어)</span>
+            </div>
+            <div>
+              <span className="text-sky-600 font-bold">memory.max</span>
+              <span className="text-slate-400">   → </span>
+              <span className="text-slate-700">536870912</span>
+              <span className="text-slate-400"> (= 512 MiB)</span>
+            </div>
+            <div>
+              <span className="text-sky-600 font-bold">memory.current</span>
+              <span className="text-slate-400"> → </span>
+              <span className="text-slate-700">503316480</span>
+              <span className="text-slate-400"> (현재 사용)</span>
+            </div>
+            <div>
+              <span className="text-sky-600 font-bold">memory.events</span>
+              <span className="text-slate-400">  → </span>
+              <span className="text-slate-700">oom_kill 1</span>
+              <span className="text-slate-400"> (OOM 발생 횟수)</span>
+            </div>
+          </div>
+          <div className={`text-[9px] mt-1 ${highlight ? 'text-sky-700 font-semibold' : 'text-slate-400'}`}>
+            {highlight ? '✓ docker --cpus / --memory 옵션 = 위 파일에 값을 써넣는 것' : 'Docker 는 cgroups 위의 얇은 래퍼'}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 맨 하단: docker stats live row (Step 5 강조)
+    // ─────────────────────────────────────────────────────
+    function StatsLiveBox({ live, containers }) {
+      if (!live) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-400 bg-[#0f172a] p-2.5 shadow-md">
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <span className="text-base">📊</span>
+            <span className="text-[11px] font-bold text-sky-300 font-mono">$ docker stats --no-stream</span>
+            <span className="ml-auto w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          </div>
+          <div className="font-mono text-[9px] leading-snug">
+            <div className="text-slate-400 border-b border-slate-700 pb-0.5 mb-0.5">
+              NAME      CPU %   MEM USAGE / LIMIT      MEM %
+            </div>
+            {containers.map((c) => {
+              const memPct = c.memLimit ? ((c.memMiB / c.memLimit) * 100).toFixed(1) : 'n/a';
+              return (
+                <div key={c.id} className="text-sky-300">
+                  {c.label.padEnd(9)} {String(c.cpuPct.toFixed(1) + '%').padEnd(7)}
+                  {' '}{String(c.memMiB + 'MiB').padEnd(7)} / {c.memLimit ? c.memLimit + 'MiB' : '7.77GiB'}
+                  {'   '}{memPct}%
+                </div>
+              );
+            })}
+          </div>
+          <div className="text-[8px] text-slate-500 mt-1 font-mono">
+            cgroups 의 memory.current / cpu.stat 을 읽어 표시
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단: 호스트 게이지 (CPU / Memory 합산)
+    //   알람: alarmText 가 있으면 빨간 배너
+    //   중앙: 컨테이너별 막대
+    //   하단: cgroups 박스
+    //   맨 하단: stats live row (Step 5 만)
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">📊 호스트 자원 + 컨테이너 사용량</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-2.5">
+            <HostGauge containers={step.containers} />
+
+            {/* OOMKill / 위험 알람 배너 */}
+            {step.alarmText && (
+              <div
+                className={`rounded-lg border-2 px-3 py-2 text-[11px] font-semibold leading-snug ${
+                  step.phase === 'oom'
+                    ? 'bg-rose-50 border-rose-400 text-rose-800 animate-pulse'
+                    : 'bg-rose-50 border-rose-300 text-rose-700'
+                }`}
+              >
+                {step.alarmText}
+              </div>
+            )}
+
+            <ContainerBars containers={step.containers} />
+
+            <CgroupsBox highlight={step.cgroupsHighlight} />
+
+            <StatsLiveBox live={step.statsLive} containers={step.containers} />
+          </div>
+
+          {/* 범례 */}
+          <div className="flex flex-wrap gap-2 text-[9px] mt-3 pt-2 border-t border-slate-100 text-slate-500">
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-sky-500"></span>running
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-amber-400"></span>starving
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded bg-rose-500"></span>oomkilled
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block w-3 border-r-2 border-rose-500 h-2"></span>--limit
+            </span>
+            <span className="ml-auto font-mono">phase: {step.phase}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js 토큰화
+    //   파일명 탭, 윈도우 dot, 라인 번호, 강조 라인
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
 
       useEffect(() => {
-        if (isPlaying && step < STEPS.length - 1) {
-          timerRef.current = setTimeout(() => setStep(s => s + 1), 4500);
-        } else if (step >= STEPS.length - 1) setIsPlaying(false);
-        return () => clearTimeout(timerRef.current);
-      }, [isPlaying, step]);
-
-      const go = (d) => { setStep(s => Math.max(0, Math.min(STEPS.length - 1, s + d))); setIsPlaying(false); };
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-8">
-          <div className="max-w-5xl mx-auto space-y-6">
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
 
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-sky-500/15 border-l-2 border-sky-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인 — 상태 관리, 자동재생(3000ms), 키보드 단축키
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum VI-1-6</span>
+            </nav>
+
+            {/* 헤더 */}
             <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
               <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-blue-600 text-white flex items-center justify-center rounded-full font-bold text-xl">D</div>
-                <h1 className="text-xl font-bold text-slate-800">Chapter VI-1-6: 리소스 제한 (CPU / 메모리 limit)</h1>
+                <div className="w-9 h-9 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VI</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part VI. Docker 운영 &gt; Chapter 1. 자원 / 보안</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VI-1-6. 자원 제한 — cpus / memory / OOMKilled</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">제한 없으면 한 컨테이너가 호스트 다 먹는다 → --cpus / --memory 로 칸막이 → cgroups + docker stats 로 검증</p>
+                </div>
               </div>
-              <p className="text-slate-500 text-sm">제한 없음 vs 제한 있음을 비교하고, OOM Killer 동작을 시뮬레이션합니다.</p>
             </header>
 
-            <div key={step} className={`p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center anim-fade ${
-              data.phase === "oom" ? "bg-red-600 border-red-700 text-white" :
-              data.phase === "compose" ? "bg-emerald-600 border-emerald-700 text-white" :
-              data.phase === "no_limit" ? "bg-orange-600 border-orange-700 text-white" :
-              "bg-blue-600 border-blue-700 text-white"
-            }`}>
-              <h3 className="text-xs font-bold opacity-70 mb-1 uppercase tracking-wider">{data.title}</h3>
-              <p className="text-lg font-medium leading-relaxed">{data.desc}</p>
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
-            <div key={`vis-${step}`} className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 anim-fade">
-
-              {/* 제한 없음 시각화 */}
-              {data.phase === "no_limit" && (
-                <div className="space-y-4">
-                  <div className="text-sm font-medium text-slate-600 mb-2">호스트 메모리: 8GB (세 컨테이너 공유)</div>
-                  <MemoryBar label="api (메모리 누수 발생)" used={6000} limit={0} color="blue" />
-                  <MemoryBar label="db" used={1500} limit={0} color="purple" />
-                  <MemoryBar label="nginx" used={500} limit={0} color="green" />
-                  <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-center">
-                    <span className="text-red-600 font-bold">api가 메모리를 독점 → db, nginx가 메모리 부족으로 죽음</span>
-                  </div>
-                </div>
-              )}
-
-              {/* 메모리 제한 */}
-              {data.phase === "memory" && (
-                <div className="space-y-4">
-                  <div className="text-sm font-medium text-slate-600 mb-2">메모리 제한 적용 후</div>
-                  <MemoryBar label="api (limits: 512MB, reservations: 256MB)" used={380} limit={512} color="blue" />
-                  <MemoryBar label="db (limits: 1GB, reservations: 512MB)" used={640} limit={1024} color="purple" />
-                  <MemoryBar label="nginx (limits: 512MB)" used={45} limit={512} color="green" />
-                  <div className="grid grid-cols-2 gap-4 mt-4">
-                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-center">
-                      <div className="font-bold text-blue-700 text-sm">limits (하드 상한)</div>
-                      <div className="text-xs text-blue-600 mt-1">절대 초과 불가. 초과 시 OOM Kill</div>
-                    </div>
-                    <div className="bg-teal-50 border border-teal-200 rounded-lg p-3 text-center">
-                      <div className="font-bold text-teal-700 text-sm">reservations (소프트 하한)</div>
-                      <div className="text-xs text-teal-600 mt-1">최소 보장량. 스케줄링 기준</div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* CPU 제한 */}
-              {data.phase === "cpu" && (
-                <div className="space-y-4">
-                  <div className="text-sm font-medium text-slate-600 mb-2">CPU 제한 (2코어 서버 기준)</div>
-                  {[
-                    { label: "api (cpus: 1.0)", pct: 50, desc: "코어 1개분 = 전체의 50%" },
-                    { label: "db (cpus: 2.0)", pct: 100, desc: "코어 2개분 = 전체의 100%" },
-                    { label: "nginx (cpus: 0.25)", pct: 12.5, desc: "코어 0.25개분 = 전체의 12.5%" },
-                  ].map((item, i) => (
-                    <div key={i} className="mb-3">
-                      <div className="flex justify-between text-xs mb-1">
-                        <span className="font-medium text-slate-700">{item.label}</span>
-                        <span className="text-slate-500">{item.desc}</span>
-                      </div>
-                      <div className="h-6 bg-slate-200 rounded-full overflow-hidden">
-                        <div className="h-full bg-blue-400 rounded-full transition-all duration-1000"
-                          style={{ width: `${item.pct}%` }} />
-                      </div>
-                    </div>
-                  ))}
-                  <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-center text-xs">
-                    <span className="text-yellow-700 font-medium">YAML에서 cpus 값은 반드시 따옴표로 감싼다: cpus: "1.0"</span>
-                  </div>
-                </div>
-              )}
-
-              {/* OOM Killer */}
-              {data.phase === "oom" && (
-                <div className="space-y-4">
-                  <div className="text-sm font-medium text-slate-600 mb-2">OOM Killer 동작 시뮬레이션</div>
-                  <MemoryBar label="api (limits: 512MB → 사용량 증가중...)" used={520} limit={512} isOOM={true} color="blue" />
-
-                  <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs space-y-1">
-                    <div className="text-slate-500">$ docker inspect api --format '{`{{.State.OOMKilled}}`}'</div>
-                    <div className="text-red-400 font-bold">true</div>
-                    <div className="text-slate-500 mt-2">$ docker inspect api --format '{`{{.State.ExitCode}}`}'</div>
-                    <div className="text-red-400 font-bold">137</div>
-                    <div className="text-slate-500 mt-2 text-slate-600"># 137 = 128 + 9 (SIGKILL)</div>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-3 mt-2">
-                    {[
-                      { label: "한도가 너무 낮음", action: "docker stats로 실제 사용량 확인 후 1.5~2배로 설정" },
-                      { label: "메모리 누수", action: "시간 경과에 따른 메모리 증가 패턴 확인" },
-                      { label: "트래픽 폭증", action: "한도 상향 또는 replica 수 증가" },
-                    ].map((item, i) => (
-                      <div key={i} className="bg-red-50 border border-red-200 rounded-lg p-2 text-xs">
-                        <div className="font-bold text-red-700">{item.label}</div>
-                        <div className="text-red-600 mt-1">{item.action}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* docker stats */}
-              {data.phase === "stats" && (
-                <div className="space-y-4">
-                  <div className="bg-slate-900 rounded-lg p-4 font-mono text-xs overflow-x-auto">
-                    <div className="text-slate-500 mb-2">$ docker stats --no-stream</div>
-                    <div className="text-slate-400">{"CONTAINER   NAME    CPU %   MEM USAGE / LIMIT     MEM %"}</div>
-                    <div className="text-blue-400">{"a1b2c3d4    api     12.3%   210MiB / 512MiB       41.0%"}</div>
-                    <div className="text-purple-400">{"b2c3d4e5    db       2.1%   384MiB / 1GiB         37.5%"}</div>
-                    <div className="text-green-400">{"c3d4e5f6    nginx    0.1%   8.5MiB / 512MiB        1.7%"}</div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-xs">
-                      <div className="font-bold text-green-700">LIMIT이 설정값과 같으면</div>
-                      <div className="text-green-600 mt-1">제한이 올바르게 적용된 것 (예: 512MiB)</div>
-                    </div>
-                    <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-xs">
-                      <div className="font-bold text-yellow-700">LIMIT이 호스트 전체 메모리면</div>
-                      <div className="text-yellow-600 mt-1">제한 미설정 (예: 7.77GiB)</div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Compose 설정 */}
-              {data.phase === "compose" && (
-                <div className="space-y-4">
-                  <div className="bg-slate-800 rounded-lg p-4 text-sm font-mono overflow-x-auto">
-                    <div className="text-yellow-300">services:</div>
-                    <div className="text-blue-300 ml-2">api:</div>
-                    <div className="text-slate-400 ml-4">image: myapp:latest</div>
-                    <div className="text-green-400 ml-4">deploy:</div>
-                    <div className="text-green-400 ml-6">resources:</div>
-                    <div className="text-green-300 ml-8">limits:</div>
-                    <div className="text-emerald-400 ml-10">cpus: "1.0"</div>
-                    <div className="text-emerald-400 ml-10">memory: 512m</div>
-                    <div className="text-blue-300 ml-8">reservations:</div>
-                    <div className="text-blue-400 ml-10">cpus: "0.25"</div>
-                    <div className="text-blue-400 ml-10">memory: 256m</div>
-                  </div>
-                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
-                    <div className="text-emerald-700 font-medium text-sm">Compose reservations = K8s requests</div>
-                    <div className="text-emerald-700 font-medium text-sm">Compose limits = K8s limits</div>
-                    <div className="text-xs text-emerald-600 mt-1">K8s 전환 시 값을 그대로 옮겨 쓸 수 있다</div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex gap-1.5 mb-4">
-                {STEPS.map((_, i) => (
-                  <button key={i} onClick={() => { setStep(i); setIsPlaying(false); }}
-                    className={`flex-1 h-2 rounded-full transition-all duration-300 ${i <= step ? 'bg-blue-500' : 'bg-slate-200'} ${i === step ? 'scale-y-150' : ''}`} />
-                ))}
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-sky-50 border-2 border-sky-300 rounded-xl p-3 text-sm text-sky-900">
+                💡 정리: <strong>--cpus</strong>(CPU 코어 분량) + <strong>--memory</strong>(RAM 하드 상한) 두 옵션이 핵심. 배경엔 <strong>cgroups v2</strong>, 검증은 <strong>docker stats</strong> + <strong>docker inspect OOMKilled</strong>. 운영의 모든 컨테이너에 반드시 지정한다.
               </div>
-              <div className="flex items-center justify-center gap-3">
-                <button onClick={() => go(-1)} disabled={step === 0}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">← 이전</button>
-                <button onClick={() => { if (step >= STEPS.length - 1) { setStep(0); } setIsPlaying(p => !p); }}
-                  className={`px-5 py-2 rounded-lg text-sm font-medium transition shadow-sm ${isPlaying ? 'bg-red-100 text-red-600' : 'bg-blue-600 text-white hover:bg-blue-700'}`}>
-                  {isPlaying ? '⏸ 정지' : '▶ 자동 실행'}
-                </button>
-                <button onClick={() => go(1)} disabled={step === STEPS.length - 1}
-                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-sm font-medium transition">다음 →</button>
-                <span className="text-xs text-slate-400 ml-2">Step {step + 1} / {STEPS.length}</span>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
               </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
             </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['--cpus', '--memory', 'OOMKilled', 'Exit 137', 'SIGKILL', 'cgroups v2', 'memory.max', 'cpu.max', 'docker stats', 'noisy neighbor'].map((kw) => (
+                <span key={kw} className="bg-sky-50 text-sky-700 px-3 py-1 rounded-full text-xs font-medium border border-sky-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./vi-1-5_security_basics.html" className="text-sky-700 hover:text-sky-900 font-medium">&larr; VI-1-5 보안 기초</a>
+              <a href="./vi-1-7_logging_monitoring.html" className="text-sky-700 hover:text-sky-900 font-medium">VI-1-7 로깅/모니터링 &rarr;</a>
+            </nav>
 
           </div>
         </div>
