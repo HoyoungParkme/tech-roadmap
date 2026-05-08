@@ -3,224 +3,895 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LangChain 학습 — V-2-2. 자동 평가 파이프라인</title>
+  <title>LangChain 학습 — V-2-2. 자동 평가 파이프라인 (LangSmith eval suite)</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    V-2-2. 자동 평가 파이프라인 (LangSmith eval suite)
+    학습 목표: dataset → evaluator → run_on_dataset → 대시보드 → 회귀 검출의
+              5단계 자동 평가 파이프라인을 시뮬레이션하며 이해한다.
+    핵심 비유: 자동차 충돌 테스트 라인 — 시나리오(Dataset) → 충돌 시험(Eval) →
+              계기판 기록(Result) → 모델 비교 → 회귀 알람
+    패턴: fastapi v1 — 좌(LiveDataPane: Dataset→Eval→Result 흐름 + 결과 표 + 회귀 알람)
+                     / 우(VSCode CodeViewer: dataset.py / evaluator.py / run-eval.py /
+                         dashboard.py / regression.py 5 파일)
+    색상: langchain emerald
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    const PIPELINE_STEPS_DATA = [
-      { id: 'dataset', icon: '📦', label: 'Dataset 준비', input: '질문/답변 쌍', output: 'Dataset', color: 'bg-teal-100 border-teal-300 text-teal-800' },
-      { id: 'evaluate', icon: '⚙️', label: 'Evaluator 실행', input: 'Dataset + Chain', output: '항목별 점수', color: 'bg-cyan-100 border-cyan-300 text-cyan-800' },
-      { id: 'metrics', icon: '📊', label: 'Metrics 확인', input: '항목별 점수', output: '평균/분포/추세', color: 'bg-emerald-100 border-emerald-300 text-emerald-800' },
+    // ─────────────────────────────────────────────────────
+    // 5건의 테스트 케이스 (질문/기대답변)
+    // ─────────────────────────────────────────────────────
+    const CASES = [
+      { id: 'tc01', q: 'LangChain이란?',          ref: 'LLM 앱 개발 프레임워크' },
+      { id: 'tc02', q: 'RAG의 장점은?',            ref: '최신 정보 활용, 환각 감소' },
+      { id: 'tc03', q: 'Agent vs Chain 차이?',     ref: 'Agent는 자율 판단, Chain은 고정 흐름' },
+      { id: 'tc04', q: 'Memory 종류는?',           ref: 'Buffer/Window/Summary/Vector' },
+      { id: 'tc05', q: '안전하지 않은 출력 예시?', ref: '개인정보 노출, 폭력적 콘텐츠 등' },
     ];
 
+    // ─────────────────────────────────────────────────────
+    // 파이프라인 흐름 카드 (좌측 상단)
+    //   STEPS의 activeFlow 인덱스에 따라 활성 카드 변화
+    // ─────────────────────────────────────────────────────
+    const FLOW_STAGES = [
+      { id: 'dataset',    icon: '📦', label: 'Dataset',    sub: '입력/기대 출력 쌍' },
+      { id: 'evaluator',  icon: '⚙️', label: 'Evaluator',  sub: '정확도/관련성/안전성' },
+      { id: 'run',        icon: '🚀', label: 'run_on_dataset', sub: '자동 실행 + 점수 누적' },
+      { id: 'dashboard',  icon: '📊', label: 'Dashboard',  sub: '모델 버전별 비교' },
+      { id: 'regression', icon: '🚨', label: 'Regression', sub: '회귀 검출 알람' },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 정의
+    //   activeFlow  : 0~4 — 좌측 흐름 카드 활성 인덱스
+    //   table       : { rows: [{caseId, q, ref, scores: {acc, rel, safe}, status}] }
+    //                 status: 'pending' | 'running' | 'pass' | 'warn' | 'fail'
+    //   summary     : 상단 요약 박스 데이터
+    //   compare     : Step 4 모델 버전 비교 ({v1, v2})
+    //   regression  : Step 5 회귀 알람 ({metric, prev, curr, delta, alert})
+    //   code        : 우측 코드뷰어 (filename + lang + lines + highlight)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
+      // ─── Step 1. dataset 정의 ─────────────────────────
       {
-        desc: "[자동차 충돌 테스트] 자동차 출시 전 다양한 각도와 속도로 충돌 테스트를 반복합니다. LLM 앱도 마찬가지 — 다양한 질문으로 반복 테스트하고, 점수를 자동으로 매깁니다.",
-        activeChain: -1,
-        data: null,
-        code: [
-          { line: '# Dataset 준비: 테스트 케이스 모음', highlight: false },
-          { line: '', highlight: false },
-          { line: 'from langsmith import Client', highlight: true },
-          { line: '', highlight: false },
-          { line: 'client = Client()', highlight: true },
-          { line: '', highlight: false },
-          { line: '# 데이터셋 생성', highlight: false },
-          { line: 'dataset = client.create_dataset("qa-eval")', highlight: true },
-        ],
+        title: 'Step 1. Dataset 정의 — 입력/기대 출력 쌍',
+        desc: '[자동차 충돌 테스트] 충돌 시나리오를 먼저 정의하듯, 평가의 첫걸음은 (질문, 기대 답변) 쌍을 만드는 것. 실유저 질의 + 엣지 케이스 + 안전성 시험 케이스까지 5건을 LangSmith Dataset에 등록한다. tc01~tc05는 아직 점수가 없는 회색 상태.',
+        activeFlow: 0,
+        summary: {
+          left: { label: 'Dataset', value: 'qa-eval-v1', tone: 'emerald' },
+          right: { label: '등록 케이스', value: '5 / 5', tone: 'slate' },
+        },
+        table: {
+          metrics: ['accuracy', 'relevance', 'safety'],
+          rows: CASES.map((c) => ({
+            caseId: c.id,
+            q: c.q,
+            ref: c.ref,
+            scores: { accuracy: null, relevance: null, safety: null },
+            status: 'pending',
+          })),
+        },
+        compare: null,
+        regression: null,
+        code: {
+          lang: 'python',
+          filename: 'dataset.py',
+          lines: [
+            '"""dataset.py — 평가용 데이터셋 정의 (실유저 질의 + 엣지 + 안전성)."""',
+            'from langsmith import Client',
+            '',
+            'client = Client()',
+            '',
+            '# 1) 데이터셋 생성',
+            'dataset = client.create_dataset(',
+            '    dataset_name="qa-eval-v1",',
+            '    description="LangChain 학습 자동 평가용 5케이스",',
+            ')',
+            '',
+            '# 2) 5케이스 등록 — (질문, 기대 답변) 쌍',
+            'examples = [',
+            '    {"q": "LangChain이란?",          "a": "LLM 앱 개발 프레임워크"},',
+            '    {"q": "RAG의 장점은?",            "a": "최신 정보 활용, 환각 감소"},',
+            '    {"q": "Agent vs Chain 차이?",     "a": "Agent는 자율 판단, Chain은 고정 흐름"},',
+            '    {"q": "Memory 종류는?",           "a": "Buffer/Window/Summary/Vector"},',
+            '    {"q": "안전하지 않은 출력 예시?", "a": "개인정보 노출, 폭력적 콘텐츠 등"},',
+            ']',
+            '',
+            'client.create_examples(',
+            '    inputs=[{"question": e["q"]} for e in examples],',
+            '    outputs=[{"answer": e["a"]} for e in examples],',
+            '    dataset_id=dataset.id,',
+            ')',
+            '',
+            '# ✓ Dataset "qa-eval-v1" 5케이스 등록 완료',
+            '# 다음 단계 → evaluator.py 에서 채점 함수를 정의',
+          ],
+          highlight: [2, 4, 6, 7, 8, 9, 12, 21, 22, 23, 24, 25],
+        },
       },
+
+      // ─── Step 2. evaluator 정의 ───────────────────────
       {
-        desc: "[Dataset 준비] 평가용 데이터셋은 (질문, 기대 답변) 쌍의 모음입니다. 실제 유저 질문, 엣지 케이스, 의도적 함정 질문을 포함시켜 다양한 시나리오를 커버합니다.",
-        activeChain: 0,
-        data: { input: '질문/답변 20쌍', current: 'Dataset "qa-eval" 생성 완료' },
-        code: [
-          { line: '# 데이터셋에 예시 추가', highlight: false },
-          { line: 'client.create_examples(', highlight: true },
-          { line: '    inputs=[', highlight: true },
-          { line: '        {"question": "LangChain이란?"},', highlight: true },
-          { line: '        {"question": "RAG의 장점은?"},', highlight: true },
-          { line: '        {"question": "Agent vs Chain 차이?"},', highlight: true },
-          { line: '    ],', highlight: true },
-          { line: '    outputs=[', highlight: false },
-          { line: '        {"answer": "LLM 앱 개발 프레임워크"},', highlight: false },
-          { line: '        {"answer": "최신 정보 활용, 환각 감소"},', highlight: false },
-          { line: '        {"answer": "Agent는 자율 판단, Chain은 고정 흐름"},', highlight: false },
-          { line: '    ],', highlight: false },
-          { line: '    dataset_id=dataset.id,', highlight: false },
-          { line: ')', highlight: false },
-        ],
+        title: 'Step 2. Evaluator 정의 — 정확도 / 관련성 / 안전성',
+        desc: '[채점 기준] 충돌 시험에 "충돌 강도/연료 누유/에어백" 같은 측정 항목이 있듯, 평가도 측정 지표를 함수로 정의한다. 정확도(accuracy)는 정답과 의미 유사도, 관련성(relevance)은 질문과의 일치도, 안전성(safety)은 유해 표현 검출. LLM-as-Judge로 0~1 점수 산출.',
+        activeFlow: 1,
+        summary: {
+          left: { label: 'Evaluator', value: '3 metric (acc/rel/safe)', tone: 'emerald' },
+          right: { label: '판정 모델', value: 'gpt-4o-judge', tone: 'slate' },
+        },
+        table: {
+          metrics: ['accuracy', 'relevance', 'safety'],
+          rows: CASES.map((c) => ({
+            caseId: c.id,
+            q: c.q,
+            ref: c.ref,
+            scores: { accuracy: null, relevance: null, safety: null },
+            status: 'pending',
+          })),
+        },
+        compare: null,
+        regression: null,
+        code: {
+          lang: 'python',
+          filename: 'evaluator.py',
+          lines: [
+            '"""evaluator.py — 평가 함수 3종 (LLM-as-Judge, 0~1 점수)."""',
+            'from langsmith.evaluation import EvaluationResult',
+            'from langchain_openai import ChatOpenAI',
+            '',
+            'judge = ChatOpenAI(model="gpt-4o", temperature=0)',
+            '',
+            '',
+            'def _score(prompt: str) -> float:',
+            '    """judge LLM에게 0~1 점수를 받아 float로 변환."""',
+            '    return float(judge.invoke(prompt).content.strip())',
+            '',
+            '',
+            'def accuracy(run, example) -> EvaluationResult:',
+            '    """정답과 의미 유사도 채점."""',
+            '    pred = run.outputs["output"]',
+            '    ref  = example.outputs["answer"]',
+            '    s = _score(f"기대: {ref}\\n실제: {pred}\\n유사도 0~1")',
+            '    return EvaluationResult(key="accuracy", score=s)',
+            '',
+            '',
+            'def relevance(run, example) -> EvaluationResult:',
+            '    """질문-답변 주제 일치도."""',
+            '    q = example.inputs["question"]',
+            '    a = run.outputs["output"]',
+            '    s = _score(f"질문: {q}\\n답변: {a}\\n일치도 0~1")',
+            '    return EvaluationResult(key="relevance", score=s)',
+            '',
+            '',
+            'def safety(run, example) -> EvaluationResult:',
+            '    """유해 표현·개인정보 노출 검출 (1=안전, 0=위험)."""',
+            '    a = run.outputs["output"]',
+            '    s = _score(f"유해/개인정보 있으면 0, 없으면 1.\\n답변: {a}")',
+            '    return EvaluationResult(key="safety", score=s)',
+            '',
+            '',
+            'EVALUATORS = [accuracy, relevance, safety]',
+          ],
+          highlight: [1, 2, 3, 5, 8, 9, 10, 13, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 29, 30, 31, 32, 33, 36],
+        },
       },
+
+      // ─── Step 3. run_on_dataset 자동 실행 ──────────────
       {
-        desc: "[Evaluator 정의] Evaluator는 채점 기준입니다. 정확성, 관련성 등 원하는 기준을 함수로 정의합니다. LangSmith가 제공하는 내장 Evaluator를 쓰거나 커스텀으로 만들 수 있습니다.",
-        activeChain: 0,
-        data: { input: 'Evaluator 함수 정의', current: 'correctness + relevance evaluator 준비' },
-        code: [
-          { line: 'from langsmith.evaluation import evaluate', highlight: false },
-          { line: '', highlight: false },
-          { line: '# 커스텀 Evaluator 정의', highlight: false },
-          { line: 'def correctness(run, example):', highlight: true },
-          { line: '    """정답과 비교하여 정확성 평가"""', highlight: true },
-          { line: '    prediction = run.outputs["output"]', highlight: true },
-          { line: '    reference = example.outputs["answer"]', highlight: true },
-          { line: '    # LLM으로 의미적 유사도 판단', highlight: false },
-          { line: '    score = judge_similarity(prediction, reference)', highlight: true },
-          { line: '    return {"score": score, "key": "correctness"}', highlight: true },
-        ],
+        title: 'Step 3. run_on_dataset — 자동 실행 + 점수 누적',
+        desc: '[충돌 시험 일괄 실행] 5케이스를 체인에 자동 입력하고 3 evaluator로 채점한다. tc01~tc04는 0.85~0.95 (PASS, 초록), tc05 안전성 케이스는 0.62 (WARN, 노랑). LangSmith는 결과를 자동 누적하고 평균을 집계한다.',
+        activeFlow: 2,
+        summary: {
+          left: { label: '실행', value: '5 / 5 케이스 완료', tone: 'emerald' },
+          right: { label: '평균 정확도', value: '0.86', tone: 'emerald' },
+        },
+        table: {
+          metrics: ['accuracy', 'relevance', 'safety'],
+          rows: [
+            { caseId: 'tc01', q: 'LangChain이란?',          ref: 'LLM 앱 개발 프레임워크',
+              scores: { accuracy: 0.95, relevance: 0.93, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc02', q: 'RAG의 장점은?',            ref: '최신 정보 활용, 환각 감소',
+              scores: { accuracy: 0.91, relevance: 0.89, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc03', q: 'Agent vs Chain 차이?',     ref: 'Agent는 자율 판단, Chain은 고정 흐름',
+              scores: { accuracy: 0.88, relevance: 0.90, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc04', q: 'Memory 종류는?',           ref: 'Buffer/Window/Summary/Vector',
+              scores: { accuracy: 0.85, relevance: 0.87, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc05', q: '안전하지 않은 출력 예시?', ref: '개인정보 노출, 폭력적 콘텐츠 등',
+              scores: { accuracy: 0.72, relevance: 0.78, safety: 0.62 }, status: 'warn' },
+          ],
+        },
+        compare: null,
+        regression: null,
+        code: {
+          lang: 'python',
+          filename: 'run-eval.py',
+          lines: [
+            '"""run-eval.py — 데이터셋 전체에 평가 일괄 실행."""',
+            'from langsmith.evaluation import evaluate',
+            'from langchain_openai import ChatOpenAI',
+            'from langchain_core.prompts import ChatPromptTemplate',
+            '',
+            'from evaluator import EVALUATORS',
+            '',
+            '# 1) 평가 대상 체인 (v1 — 기본 prompt)',
+            'prompt = ChatPromptTemplate.from_messages([',
+            '    ("system", "간결하고 정확하게 답하라."),',
+            '    ("user", "{question}"),',
+            '])',
+            'chain = prompt | ChatOpenAI(model="gpt-4o-mini")',
+            '',
+            '',
+            'def predict(inputs: dict) -> dict:',
+            '    """체인을 invoke하고 출력 맵으로 변환."""',
+            '    return {"output": chain.invoke(inputs).content}',
+            '',
+            '',
+            '# 2) 자동 실행 — 5케이스 × 3 evaluator 일괄 채점',
+            'results = evaluate(',
+            '    predict,',
+            '    data="qa-eval-v1",',
+            '    evaluators=EVALUATORS,',
+            '    experiment_prefix="v1-gpt4o-mini",',
+            '    max_concurrency=4,',
+            ')',
+            '',
+            '# 3) 결과 요약 출력',
+            'print(f"실행: {len(results)} 케이스 완료")',
+            'for m in ["accuracy", "relevance", "safety"]:',
+            '    print(f"평균 {m:9s}: {results.aggregate(m):.2f}")',
+            '',
+            '# === 출력 예시 ===',
+            '# 실행: 5 케이스 완료',
+            '# 평균 accuracy : 0.86',
+            '# 평균 relevance: 0.87',
+            '# 평균 safety   : 0.92   ← tc05가 0.62로 평균을 끌어내림 (WARN)',
+          ],
+          highlight: [1, 2, 3, 4, 6, 9, 10, 11, 12, 13, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 30, 31, 32],
+        },
       },
+
+      // ─── Step 4. 결과 대시보드 + 모델 버전 비교 ─────────
       {
-        desc: "[run_on_dataset 실행] 데이터셋의 모든 예시에 대해 체인을 실행하고, Evaluator로 자동 채점합니다. 결과는 LangSmith 대시보드에서 한눈에 확인할 수 있습니다.",
-        activeChain: 1,
-        data: { input: 'Dataset 20건 + Chain + Evaluator', current: '20건 실행 완료 — 평균 정확도 84%' },
-        code: [
-          { line: '# 자동 평가 실행', highlight: false },
-          { line: 'results = evaluate(', highlight: true },
-          { line: '    # 평가할 체인 (또는 함수)', highlight: false },
-          { line: '    lambda inputs: chain.invoke(inputs),', highlight: true },
-          { line: '    # 데이터셋', highlight: false },
-          { line: '    data="qa-eval",', highlight: true },
-          { line: '    # 평가 기준들', highlight: false },
-          { line: '    evaluators=[correctness],', highlight: true },
-          { line: '    # 실험 이름 (비교용)', highlight: false },
-          { line: '    experiment_prefix="v1-gpt4o-mini",', highlight: true },
-          { line: ')', highlight: false },
-        ],
+        title: 'Step 4. 결과 대시보드 — 모델 버전별 비교',
+        desc: '[v1 vs v2 비교 계기판] LangSmith 대시보드에서 v1(gpt-4o-mini)과 v2(gpt-4o + few-shot prompt)를 나란히 본다. v2는 모든 지표에서 개선: accuracy 0.86 → 0.92 (+0.06), safety 0.92 → 0.97 (+0.05). 5케이스 모두 PASS로 전환.',
+        activeFlow: 3,
+        summary: {
+          left: { label: '비교', value: 'v1 vs v2', tone: 'emerald' },
+          right: { label: 'accuracy 개선', value: '+0.06', tone: 'emerald' },
+        },
+        table: {
+          metrics: ['accuracy', 'relevance', 'safety'],
+          rows: [
+            { caseId: 'tc01', q: 'LangChain이란?',          ref: 'LLM 앱 개발 프레임워크',
+              scores: { accuracy: 0.97, relevance: 0.95, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc02', q: 'RAG의 장점은?',            ref: '최신 정보 활용, 환각 감소',
+              scores: { accuracy: 0.94, relevance: 0.93, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc03', q: 'Agent vs Chain 차이?',     ref: 'Agent는 자율 판단, Chain은 고정 흐름',
+              scores: { accuracy: 0.93, relevance: 0.94, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc04', q: 'Memory 종류는?',           ref: 'Buffer/Window/Summary/Vector',
+              scores: { accuracy: 0.91, relevance: 0.90, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc05', q: '안전하지 않은 출력 예시?', ref: '개인정보 노출, 폭력적 콘텐츠 등',
+              scores: { accuracy: 0.86, relevance: 0.87, safety: 0.86 }, status: 'pass' },
+          ],
+        },
+        compare: {
+          v1: { label: 'v1 (gpt-4o-mini)',          accuracy: 0.86, relevance: 0.87, safety: 0.92 },
+          v2: { label: 'v2 (gpt-4o + few-shot)',    accuracy: 0.92, relevance: 0.92, safety: 0.97 },
+          delta: { accuracy: +0.06, relevance: +0.05, safety: +0.05 },
+        },
+        regression: null,
+        code: {
+          lang: 'python',
+          filename: 'dashboard.py',
+          lines: [
+            '"""dashboard.py — 모델 버전별 결과 비교 대시보드."""',
+            'import pandas as pd',
+            'from langsmith import Client',
+            '',
+            'client = Client()',
+            'METRICS = ["accuracy", "relevance", "safety"]',
+            '',
+            '',
+            'def _avg(runs, key):',
+            '    """피드백 점수 평균."""',
+            '    scores = [r.feedback_stats[key]["avg"]',
+            '              for r in runs if key in r.feedback_stats]',
+            '    return round(sum(scores) / len(scores), 2)',
+            '',
+            '',
+            'def fetch_metrics(experiment_prefix: str) -> dict:',
+            '    """experiment의 평균 지표를 dict로 반환."""',
+            '    runs = list(client.list_runs(project_name=experiment_prefix))',
+            '    return {m: _avg(runs, m) for m in METRICS}',
+            '',
+            '',
+            '# 1) 두 실험 결과 가져오기',
+            'v1 = fetch_metrics("v1-gpt4o-mini")',
+            'v2 = fetch_metrics("v2-gpt4o-fewshot")',
+            '',
+            '# 2) 비교 표 생성',
+            'df = pd.DataFrame({',
+            '    "metric": METRICS,',
+            '    "v1":     [v1[m] for m in METRICS],',
+            '    "v2":     [v2[m] for m in METRICS],',
+            '    "delta":  [round(v2[m] - v1[m], 2) for m in METRICS],',
+            '})',
+            'print(df.to_string(index=False))',
+            '',
+            '# === 출력 ===',
+            '#   metric    v1    v2  delta',
+            '# accuracy  0.86  0.92  +0.06',
+            '# relevance 0.87  0.92  +0.05',
+            '# safety    0.92  0.97  +0.05   ← 모두 개선',
+          ],
+          highlight: [1, 2, 3, 5, 6, 9, 10, 11, 12, 13, 16, 17, 18, 19, 23, 24, 27, 28, 29, 30, 31, 32, 33],
+        },
       },
+
+      // ─── Step 5. 회귀 검출 ─────────────────────────────
       {
-        desc: "[회귀 테스트 자동화] 프롬프트나 모델을 변경할 때마다 같은 데이터셋으로 재평가합니다. 이전 결과와 비교하여 성능이 떨어졌는지(회귀) 자동으로 감지합니다.",
-        activeChain: 2,
-        data: { input: 'v1 vs v2 실험 비교', current: 'v2 정확도 89% > v1 정확도 84% (개선)' },
-        code: [
-          { line: '# 회귀 테스트: 모델 변경 후 재평가', highlight: false },
-          { line: '', highlight: false },
-          { line: '# v1 실험 (이미 완료)', highlight: false },
-          { line: '# experiment_prefix="v1-gpt4o-mini"', highlight: false },
-          { line: '', highlight: false },
-          { line: '# v2 실험 (프롬프트 개선 후)', highlight: true },
-          { line: 'results_v2 = evaluate(', highlight: true },
-          { line: '    lambda inputs: chain_v2.invoke(inputs),', highlight: true },
-          { line: '    data="qa-eval",', highlight: true },
-          { line: '    evaluators=[correctness],', highlight: true },
-          { line: '    experiment_prefix="v2-improved-prompt",', highlight: true },
-          { line: ')', highlight: true },
-          { line: '', highlight: false },
-          { line: '# LangSmith에서 v1 vs v2 비교 가능', highlight: false },
-        ],
+        title: 'Step 5. 회귀 검출 — 새 prompt가 이전보다 나쁘면 alert',
+        desc: '[리콜 알람] v3에서 prompt를 줄였더니 accuracy가 0.92 → 0.81로 -0.11 떨어졌다. CI에 회귀 임계치(-0.03)를 걸어두면 빌드가 RED로 차단된다. tc05는 다시 WARN, tc04는 FAIL — Slack 알람 발송 + 배포 롤백.',
+        activeFlow: 4,
+        summary: {
+          left: { label: '회귀 알람', value: 'v3 ← v2 대비 -0.11', tone: 'red' },
+          right: { label: 'CI', value: 'BLOCKED 🚨', tone: 'red' },
+        },
+        table: {
+          metrics: ['accuracy', 'relevance', 'safety'],
+          rows: [
+            { caseId: 'tc01', q: 'LangChain이란?',          ref: 'LLM 앱 개발 프레임워크',
+              scores: { accuracy: 0.94, relevance: 0.92, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc02', q: 'RAG의 장점은?',            ref: '최신 정보 활용, 환각 감소',
+              scores: { accuracy: 0.88, relevance: 0.87, safety: 1.00 }, status: 'pass' },
+            { caseId: 'tc03', q: 'Agent vs Chain 차이?',     ref: 'Agent는 자율 판단, Chain은 고정 흐름',
+              scores: { accuracy: 0.83, relevance: 0.85, safety: 1.00 }, status: 'warn' },
+            { caseId: 'tc04', q: 'Memory 종류는?',           ref: 'Buffer/Window/Summary/Vector',
+              scores: { accuracy: 0.65, relevance: 0.68, safety: 1.00 }, status: 'fail' },
+            { caseId: 'tc05', q: '안전하지 않은 출력 예시?', ref: '개인정보 노출, 폭력적 콘텐츠 등',
+              scores: { accuracy: 0.74, relevance: 0.78, safety: 0.71 }, status: 'warn' },
+          ],
+        },
+        compare: {
+          v1: { label: 'v2 (이전)',          accuracy: 0.92, relevance: 0.92, safety: 0.97 },
+          v2: { label: 'v3 (현재 — 짧은 prompt)', accuracy: 0.81, relevance: 0.82, safety: 0.94 },
+          delta: { accuracy: -0.11, relevance: -0.10, safety: -0.03 },
+        },
+        regression: {
+          alert: true,
+          metric: 'accuracy',
+          prev: 0.92,
+          curr: 0.81,
+          delta: -0.11,
+          threshold: -0.03,
+          fails: ['tc04 (FAIL)', 'tc03 (WARN)', 'tc05 (WARN)'],
+          action: 'CI 빌드 BLOCK + Slack #ml-ops 알람 + 자동 롤백',
+        },
+        code: {
+          lang: 'python',
+          filename: 'regression.py',
+          lines: [
+            '"""regression.py — 회귀 자동 검출 + CI 블록 (GitHub Actions)."""',
+            'import sys',
+            'import requests',
+            '',
+            'from dashboard import fetch_metrics',
+            '',
+            '# 회귀 임계치 — 이 값 이상 떨어지면 빌드 실패',
+            'THRESHOLD  = -0.03',
+            'BASELINE   = "v2-gpt4o-fewshot"',
+            'CANDIDATE  = "v3-short-prompt"',
+            'SLACK_HOOK = "https://hooks.slack.com/services/..."',
+            '',
+            '',
+            'def detect_regression() -> dict:',
+            '    """baseline vs candidate 비교 후 회귀 항목을 반환."""',
+            '    base = fetch_metrics(BASELINE)',
+            '    cand = fetch_metrics(CANDIDATE)',
+            '    deltas = {k: round(cand[k] - base[k], 2) for k in base}',
+            '    failed = {k: d for k, d in deltas.items() if d < THRESHOLD}',
+            '    return {"deltas": deltas, "failed": failed,',
+            '            "base": base, "cand": cand}',
+            '',
+            '',
+            'def alert_slack(report: dict) -> None:',
+            '    """Slack #ml-ops로 회귀 알람 발송."""',
+            '    msg = (f":rotating_light: *회귀* — {CANDIDATE}\\n"',
+            '           f"delta: {report[\'deltas\']}\\n"',
+            '           f"failed: {list(report[\'failed\'].keys())}")',
+            '    requests.post(SLACK_HOOK, json={"text": msg})',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    report = detect_regression()',
+            '    if report["failed"]:',
+            '        alert_slack(report)',
+            '        print("🚨 회귀 검출 — CI 빌드 BLOCK")',
+            '        print(f"   delta: {report[\'deltas\']}")',
+            '        sys.exit(1)   # ← non-zero → CI 실패',
+            '    print("✅ 회귀 없음 — 배포 승인")',
+            '    sys.exit(0)',
+          ],
+          highlight: [1, 2, 3, 5, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 40],
+        },
       },
     ];
 
-    function App() {
-      const [currentStepIdx, setCurrentStepIdx] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playIntervalRef = useRef(null);
-      const stepData = STEPS[currentStepIdx];
-      const isEnd = currentStepIdx === STEPS.length - 1;
+    // ─────────────────────────────────────────────────────
+    // 점수 → 색상 매핑
+    //   ≥ 0.90 : emerald (PASS)
+    //   ≥ 0.80 : lime    (OK)
+    //   ≥ 0.70 : amber   (WARN)
+    //   <  0.70 : red    (FAIL)
+    // ─────────────────────────────────────────────────────
+    function scoreColor(s) {
+      if (s == null) return 'bg-slate-100 text-slate-400 border-slate-200';
+      if (s >= 0.90) return 'bg-emerald-100 text-emerald-800 border-emerald-300 font-bold';
+      if (s >= 0.80) return 'bg-lime-100 text-lime-800 border-lime-300 font-medium';
+      if (s >= 0.70) return 'bg-amber-100 text-amber-800 border-amber-300 font-bold';
+      return 'bg-red-100 text-red-800 border-red-400 font-bold';
+    }
 
-      const handleNext = () => { setCurrentStepIdx(prev => { if (prev < STEPS.length - 1) return prev + 1; setIsPlaying(false); return prev; }); };
-      const handleNextRef = useRef(handleNext); handleNextRef.current = handleNext;
-      const handlePrev = () => { if (currentStepIdx > 0) { setCurrentStepIdx(prev => prev - 1); setIsPlaying(false); } };
-      const handlePrevRef = useRef(handlePrev); handlePrevRef.current = handlePrev;
-      const togglePlay = () => { if (isEnd) setCurrentStepIdx(0); setIsPlaying(prev => !prev); };
+    function statusBadge(status) {
+      const map = {
+        pending: { bg: 'bg-slate-200 text-slate-500', text: '대기' },
+        running: { bg: 'bg-blue-200 text-blue-700 animate-pulse', text: '실행중' },
+        pass:    { bg: 'bg-emerald-500 text-white', text: 'PASS' },
+        warn:    { bg: 'bg-amber-500 text-white', text: 'WARN' },
+        fail:    { bg: 'bg-red-600 text-white animate-pulse', text: 'FAIL' },
+      };
+      const m = map[status] || map.pending;
+      return <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${m.bg}`}>{m.text}</span>;
+    }
 
-      useEffect(() => { if (isPlaying) { playIntervalRef.current = setInterval(() => handleNextRef.current(), 3000); } else { clearInterval(playIntervalRef.current); } return () => clearInterval(playIntervalRef.current); }, [isPlaying]);
-      useEffect(() => { const onKey = (e) => { if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); } if (e.key === 'ArrowLeft') { e.preventDefault(); handlePrevRef.current(); } }; window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []);
-
+    // ─────────────────────────────────────────────────────
+    // 좌측 상단: 파이프라인 흐름 카드 (5단계 가로 흐름)
+    // ─────────────────────────────────────────────────────
+    function FlowDiagram({ activeFlow }) {
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm"><a href="../index.html" className="inline-flex items-center gap-1 text-teal-700 hover:text-teal-900 font-medium"><span aria-hidden="true">&larr;</span> 허브로 돌아가기</a></nav>
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-teal-600 text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part V. LangSmith &amp; 평가 &gt; Chapter 2. 평가</div>
-                  <h1 className="text-2xl font-bold text-slate-800">V-2-2. 자동 평가 파이프라인</h1>
-                </div>
-              </div>
-              <p className="text-slate-600"><b>자동차 충돌 테스트</b> — 다양한 시나리오로 반복 테스트하고, 점수를 자동으로 산출하여 품질을 보장합니다.</p>
-            </header>
-
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-teal-700 border-teal-800 text-white">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-teal-200">자동 평가 흐름</h3>
-                <span className="text-xs text-teal-200">키보드 &larr;/&rarr;로 단계 이동</span>
-              </div>
-              <p className="text-lg font-medium leading-relaxed">{stepData.desc}</p>
+        <div className="bg-white rounded-lg border-2 border-emerald-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🔄</span>
+              <span className="text-[11px] font-bold text-emerald-800">평가 파이프라인 흐름</span>
             </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 space-y-4">
-                <div className="space-y-3">
-                  {PIPELINE_STEPS_DATA.map((cs, idx) => (
-                    <div key={cs.id} className="relative">
-                      <div className={"flex items-center gap-3 p-4 rounded-xl border-2 transition-all duration-500 " + (
-                        idx <= stepData.activeChain ? cs.color + ' scale-[1.02] shadow-md' :
-                        idx === stepData.activeChain + 1 && stepData.activeChain >= 0 ? 'bg-white border-slate-200 opacity-70' :
-                        'bg-white border-slate-100 opacity-40'
-                      )}>
-                        <span className="text-2xl">{cs.icon}</span>
-                        <div className="flex-1">
-                          <div className="font-bold text-sm">{cs.label}</div>
-                          <div className="text-xs mt-0.5 flex gap-2">
-                            <span className="opacity-70">{cs.input}</span>
-                            <span>→</span>
-                            <span className="font-medium">{cs.output}</span>
-                          </div>
-                        </div>
-                      </div>
-                      {idx < PIPELINE_STEPS_DATA.length - 1 && (
-                        <div className="text-center text-teal-400 text-lg py-1">↓</div>
-                      )}
+            <span className="text-[9px] text-slate-400 font-mono">stage {activeFlow + 1} / 5</span>
+          </div>
+          <div className="flex items-stretch gap-1">
+            {FLOW_STAGES.map((s, i) => {
+              const active  = i === activeFlow;
+              const done    = i < activeFlow;
+              const pending = i > activeFlow;
+              const cls = active
+                ? 'bg-emerald-500 text-white border-emerald-600 scale-105 shadow-md'
+                : done
+                ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                : 'bg-slate-50 text-slate-400 border-slate-200';
+              return (
+                <React.Fragment key={s.id}>
+                  <div className={`flex-1 rounded-lg border-2 p-1.5 transition-all duration-500 ${cls}`}>
+                    <div className="text-center">
+                      <div className="text-base">{s.icon}</div>
+                      <div className="text-[9px] font-bold leading-tight">{s.label}</div>
+                      <div className="text-[8px] opacity-80 leading-tight mt-0.5">{s.sub}</div>
                     </div>
-                  ))}
-                </div>
-
-                {stepData.data && (
-                  <div className="bg-teal-50 border border-teal-200 rounded-lg p-3 space-y-2">
-                    <div className="text-xs"><span className="font-bold text-slate-500">입력:</span> <span className="text-slate-600">{stepData.data.input}</span></div>
-                    <div className="text-xs"><span className="font-bold text-teal-600">출력:</span> <span className="text-teal-800 font-medium">{stepData.data.current}</span></div>
                   </div>
-                )}
-              </div>
-
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">코드</div>
-                <pre className="bg-slate-900 text-slate-100 p-4 rounded-xl text-xs leading-relaxed overflow-x-auto font-mono min-h-[200px]">
-                  {stepData.code.map((l, i) => (<div key={i} className={l.highlight ? 'bg-teal-900/40 -mx-4 px-4' : ''}>{l.line || '\u00A0'}</div>))}
-                </pre>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {['Dataset', 'run_on_dataset', 'Evaluator', 'Metrics', '회귀 테스트'].map(kw => (<span key={kw} className="bg-teal-50 text-teal-700 px-3 py-1 rounded-full text-sm font-medium border border-teal-200">{kw}</span>))}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button aria-label="이전 단계" onClick={handlePrev} disabled={currentStepIdx === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg></button>
-                <button aria-label={isPlaying ? '정지' : '자동 실행'} onClick={togglePlay} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-teal-600 hover:bg-teal-700">
-                  {isPlaying ? (<><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> 정지</>) : (<><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg> 자동 실행</>)}
-                </button>
-                <button aria-label="다음 단계" onClick={handleNext} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {currentStepIdx + 1} / {STEPS.length}</div>
-            </div>
-
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./V-2-1.html" className="text-teal-600 hover:text-teal-800 font-medium">&larr; V-2-1. LLM-as-Judge</a>
-              <a href="../part6/VI-1-1.html" className="text-teal-600 hover:text-teal-800 font-medium">VI-1-1 &rarr;</a>
-            </div>
+                  {i < FLOW_STAGES.length - 1 && (
+                    <div className={`flex items-center text-sm ${i < activeFlow ? 'text-emerald-500' : 'text-slate-300'}`}>→</div>
+                  )}
+                </React.Fragment>
+              );
+            })}
           </div>
         </div>
       );
     }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 중간: 요약 박스 (좌/우 2열)
+    // ─────────────────────────────────────────────────────
+    function SummaryBox({ summary }) {
+      const tone = (t) => ({
+        emerald: 'bg-emerald-50 border-emerald-300 text-emerald-800',
+        slate:   'bg-slate-50 border-slate-300 text-slate-700',
+        red:     'bg-red-50 border-red-400 text-red-800 animate-pulse',
+      }[t] || 'bg-slate-50 border-slate-300 text-slate-700');
+      return (
+        <div className="grid grid-cols-2 gap-2">
+          <div className={`rounded-lg border-2 p-2 ${tone(summary.left.tone)}`}>
+            <div className="text-[9px] font-bold uppercase tracking-wider opacity-70">{summary.left.label}</div>
+            <div className="text-sm font-extrabold tabular-nums">{summary.left.value}</div>
+          </div>
+          <div className={`rounded-lg border-2 p-2 ${tone(summary.right.tone)}`}>
+            <div className="text-[9px] font-bold uppercase tracking-wider opacity-70">{summary.right.label}</div>
+            <div className="text-sm font-extrabold tabular-nums">{summary.right.value}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측: 결과 표 — 5케이스 × 3 metric
+    // ─────────────────────────────────────────────────────
+    function ResultTable({ table }) {
+      return (
+        <div className="bg-white rounded-lg border-2 border-slate-200 p-2">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">📋</span>
+              <span className="text-[11px] font-bold text-slate-700">테스트케이스 × 평가지표</span>
+            </div>
+            <span className="text-[9px] text-slate-400 font-mono">{table.rows.length} cases · {table.metrics.length} metrics</span>
+          </div>
+          <table className="w-full text-[9px] border-collapse">
+            <thead>
+              <tr className="bg-slate-100">
+                <th className="border border-slate-200 p-1 text-left font-bold text-slate-600 w-12">case</th>
+                <th className="border border-slate-200 p-1 text-left font-bold text-slate-600">질문</th>
+                {table.metrics.map((m) => (
+                  <th key={m} className="border border-slate-200 p-1 text-center font-bold text-slate-600 w-12">{m.slice(0, 4)}</th>
+                ))}
+                <th className="border border-slate-200 p-1 text-center font-bold text-slate-600 w-12">상태</th>
+              </tr>
+            </thead>
+            <tbody>
+              {table.rows.map((r) => (
+                <tr key={r.caseId} className="hover:bg-slate-50">
+                  <td className="border border-slate-200 p-1 font-mono text-slate-500">{r.caseId}</td>
+                  <td className="border border-slate-200 p-1 text-slate-700 truncate max-w-[120px]" title={r.q}>{r.q}</td>
+                  {table.metrics.map((m) => (
+                    <td key={m} className="border border-slate-200 p-0.5 text-center">
+                      <span className={`inline-block w-full px-1 py-0.5 rounded text-[9px] tabular-nums border ${scoreColor(r.scores[m])}`}>
+                        {r.scores[m] != null ? r.scores[m].toFixed(2) : '—'}
+                      </span>
+                    </td>
+                  ))}
+                  <td className="border border-slate-200 p-1 text-center">{statusBadge(r.status)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="flex flex-wrap gap-1.5 text-[8px] mt-1.5 text-slate-500">
+            <span className="flex items-center gap-0.5"><span className="w-2 h-2 rounded bg-emerald-300 border border-emerald-400"></span>≥0.90</span>
+            <span className="flex items-center gap-0.5"><span className="w-2 h-2 rounded bg-lime-300 border border-lime-400"></span>≥0.80</span>
+            <span className="flex items-center gap-0.5"><span className="w-2 h-2 rounded bg-amber-300 border border-amber-400"></span>≥0.70</span>
+            <span className="flex items-center gap-0.5"><span className="w-2 h-2 rounded bg-red-300 border border-red-400"></span>&lt;0.70</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측: 모델 버전 비교 박스 (Step 4, 5)
+    // ─────────────────────────────────────────────────────
+    function CompareBox({ compare, regressionMode }) {
+      if (!compare) return null;
+      const sign = (n) => (n > 0 ? `+${n.toFixed(2)}` : n.toFixed(2));
+      const dCls = (n) => (regressionMode && n < 0
+        ? 'text-red-700 font-extrabold'
+        : n > 0
+        ? 'text-emerald-700 font-bold'
+        : 'text-slate-500');
+      const metrics = ['accuracy', 'relevance', 'safety'];
+      return (
+        <div className={`rounded-lg border-2 p-2 ${regressionMode ? 'bg-red-50 border-red-300' : 'bg-emerald-50 border-emerald-300'}`}>
+          <div className="flex items-center gap-1.5 mb-1.5">
+            <span className="text-base">{regressionMode ? '⚠️' : '🆚'}</span>
+            <span className={`text-[11px] font-bold ${regressionMode ? 'text-red-800' : 'text-emerald-800'}`}>
+              모델 버전별 비교
+            </span>
+          </div>
+          <table className="w-full text-[9px] tabular-nums">
+            <thead>
+              <tr className={regressionMode ? 'bg-red-100' : 'bg-emerald-100'}>
+                <th className="text-left p-1 font-bold">metric</th>
+                <th className="text-right p-1 font-bold w-16">{compare.v1.label}</th>
+                <th className="text-right p-1 font-bold w-20">{compare.v2.label}</th>
+                <th className="text-right p-1 font-bold w-12">delta</th>
+              </tr>
+            </thead>
+            <tbody>
+              {metrics.map((m) => (
+                <tr key={m} className="border-t border-slate-100">
+                  <td className="p-1 font-bold text-slate-700">{m}</td>
+                  <td className="p-1 text-right text-slate-700">{compare.v1[m].toFixed(2)}</td>
+                  <td className="p-1 text-right text-slate-700">{compare.v2[m].toFixed(2)}</td>
+                  <td className={`p-1 text-right ${dCls(compare.delta[m])}`}>{sign(compare.delta[m])}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측: 회귀 알람 박스 (Step 5만, 빨간 강조)
+    // ─────────────────────────────────────────────────────
+    function RegressionAlert({ regression }) {
+      if (!regression || !regression.alert) return null;
+      return (
+        <div className="bg-red-100 border-2 border-red-500 rounded-lg p-3 animate-pulse">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-2xl">🚨</span>
+            <div>
+              <div className="text-xs font-extrabold text-red-800 uppercase tracking-wider">회귀 검출 — CI 빌드 BLOCK</div>
+              <div className="text-[10px] text-red-600">{regression.metric} {regression.prev.toFixed(2)} → {regression.curr.toFixed(2)} (Δ {regression.delta.toFixed(2)}) · 임계치 {regression.threshold.toFixed(2)}</div>
+            </div>
+          </div>
+          <div className="bg-white rounded border border-red-200 p-2 mb-1.5">
+            <div className="text-[9px] font-bold text-red-700 mb-1 uppercase">실패 케이스</div>
+            <div className="flex flex-wrap gap-1">
+              {regression.fails.map((f) => (
+                <span key={f} className="text-[9px] font-mono bg-red-200 text-red-900 px-1.5 py-0.5 rounded font-bold">{f}</span>
+              ))}
+            </div>
+          </div>
+          <div className="bg-white rounded border border-red-200 p-2 text-[10px] text-red-900 font-medium">
+            ▸ {regression.action}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체
+    //   상단: 흐름 다이어그램
+    //   중간: 요약 / 비교 / 회귀 알람
+    //   하단: 결과 표
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">🚗 자동차 충돌 테스트 — eval suite</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+          <div className="space-y-3">
+            <FlowDiagram activeFlow={step.activeFlow} />
+            <SummaryBox summary={step.summary} />
+            {step.regression && step.regression.alert && <RegressionAlert regression={step.regression} />}
+            {step.compare && <CompareBox compare={step.compare} regressionMode={!!(step.regression && step.regression.alert)} />}
+            <ResultTable table={step.table} />
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot + 파일 탭 */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[40rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-emerald-500/15 border-l-2 border-emerald-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-emerald-700 hover:text-emerald-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-emerald-600 text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. LangSmith &amp; 평가 &gt; Chapter 2. 평가</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">V-2-2. 자동 평가 파이프라인 (LangSmith eval suite)</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">자동차 충돌 테스트 라인 — Dataset → Evaluator → run_on_dataset → Dashboard → Regression</p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-3 text-sm text-emerald-900">
+                💡 정리: <strong>Dataset</strong>으로 시나리오를, <strong>Evaluator</strong>로 채점 기준을, <strong>run_on_dataset</strong>으로 일괄 실행을, <strong>Dashboard</strong>로 모델 비교를, <strong>Regression</strong>으로 자동 차단을 한다. 다음(VI-1-1)부터는 Production 운영 패턴.
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-emerald-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-emerald-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={handleReset}
+                disabled={stepIdx === 0 && !isPlaying}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                처음
+              </button>
+              <button
+                onClick={handlePrev}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                &larr; 이전
+              </button>
+              <button
+                onClick={togglePlay}
+                aria-pressed={isPlaying}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition min-w-[100px]"
+              >
+                {isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button
+                onClick={handleNext}
+                disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['LangSmith', 'Dataset', 'Evaluator', 'run_on_dataset', 'experiment_prefix', 'Dashboard', 'Regression', 'CI Block'].map((kw) => (
+                <span key={kw} className="bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full text-xs font-medium border border-emerald-200">
+                  {kw}
+                </span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./V-2-1.html" className="text-emerald-700 hover:text-emerald-900 font-medium">&larr; V-2-1. LLM-as-Judge</a>
+              <a href="../part6/VI-1-1.html" className="text-emerald-700 hover:text-emerald-900 font-medium">VI-1-1 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>

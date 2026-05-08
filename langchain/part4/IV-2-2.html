@@ -9,291 +9,863 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <style>
+    /* 노드 일시정지 감속 애니메이션 — Step 2,3에서 active 노드를 천천히 떨림 */
+    @keyframes slow-pulse {
+      0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.5); }
+      50%      { transform: scale(1.04); box-shadow: 0 0 0 10px rgba(245, 158, 11, 0); }
+    }
+    .pause-blink { animation: slow-pulse 1.6s ease-in-out infinite; }
+
+    /* 흐름 표시용 점 이동 — agent → tools 화살표 위 */
+    @keyframes flow-dot {
+      0%   { top: 0%;   opacity: 0; }
+      10%  { opacity: 1; }
+      90%  { opacity: 1; }
+      100% { top: 100%; opacity: 0; }
+    }
+    .flow-dot { animation: flow-dot 1.4s linear infinite; }
+
+    /* Reject 분기에서 빨간 X 등장 */
+    @keyframes pop-in {
+      0%   { transform: scale(0);   opacity: 0; }
+      60%  { transform: scale(1.2); opacity: 1; }
+      100% { transform: scale(1);   opacity: 1; }
+    }
+    .pop-in { animation: pop-in 0.6s ease-out both; }
+
+    /* Approve 시 초록 체크 등장 */
+    @keyframes check-in {
+      0%   { stroke-dashoffset: 30; opacity: 0; }
+      100% { stroke-dashoffset: 0;  opacity: 1; }
+    }
+    .check-in path { stroke-dasharray: 30; animation: check-in 0.6s ease-out forwards; }
+  </style>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    IV-2-2. Human-in-the-Loop — LangGraph interrupt_before + 사람 승인 후 진행
+    학습 목표: Agent가 위험 액션(DELETE, 결제)을 자동 실행하기 전에
+              그래프를 일시정지하고, 사람이 state를 검토·수정·재개·거부할 수 있는
+              5단계 흐름을 익힌다.
+    핵심 비유: 공장 자동 라인의 품질 검사원 — 위험 단계 직전에 사람이 OK/NG를 누른다
+    패턴   : fastapi v1 — 좌(LiveDataPane: Graph 다이어그램 + Pause + Human 박스) /
+             우(VSCode CodeViewer + 5 파일명 탭)
+    색상   : langchain emerald
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 단계별 데이터 정의
+    //   nodes        : 그래프 노드 상태 [START, agent, tools, END]
+    //                  각 노드는 phase: 'idle'|'running'|'done'|'paused'|'skipped'|'rejected'
+    //   pauseAt      : 'tools' 같은 노드 id (해당 노드 직전에 일시정지 표시)
+    //   humanBox     : 사람 박스 표시 데이터 (kind / payload / decision)
+    //   stateSnapshot: 현재 graph state — messages 배열
+    //   threadId     : checkpoint thread id
+    // ─────────────────────────────────────────────────────
     const STEPS = [
+      // ───────────────────────────── Step 1 ─────────────────────────────
       {
-        desc: "[공장 자동 라인의 위험] Agent가 모든 것을 자동으로 실행하면 위험합니다. 이메일 발송, 결제, 데이터 삭제 같은 작업을 LLM이 마음대로 실행하면 큰 문제가 됩니다.",
-        visual: 'danger',
-        code: [
-          { line: '# 자동 실행의 위험', highlight: false },
-          { line: '', highlight: false },
-          { line: '# Agent가 스스로 판단하면...', highlight: false },
-          { line: '# "이 메일을 삭제하겠습니다" → 실행!', highlight: true },
-          { line: '# "결제를 진행하겠습니다" → 실행!', highlight: true },
-          { line: '# "파일을 삭제하겠습니다" → 실행!', highlight: true },
-          { line: '', highlight: false },
-          { line: '# 사람의 확인 없이 위험한 작업 수행', highlight: false },
-          { line: '# → Human-in-the-Loop 필요!', highlight: false },
+        title: 'Step 1. Agent 자율 실행 — 위험 액션도 자동',
+        desc: 'interrupt_before 없이 Agent를 그냥 돌리면 LLM이 판단한 모든 도구를 자동 실행한다. "이메일 삭제", "결제 진행", "DROP TABLE" 같은 비가역 액션도 사람 확인 없이 곧장 실행 — 한 번 사고나면 복구가 어렵다. 이걸 막으려고 Human-in-the-Loop가 필요하다.',
+        nodes: [
+          { id: 'START',  label: 'START',  phase: 'done',    color: 'slate' },
+          { id: 'agent',  label: 'agent',  phase: 'done',    color: 'emerald' },
+          { id: 'tools',  label: 'tools',  phase: 'running', color: 'red' },
+          { id: 'END',    label: 'END',    phase: 'idle',    color: 'slate' },
         ],
+        pauseAt: null,
+        humanBox: {
+          kind: 'absent',
+          warning: '사람 미개입 — Agent가 단독 실행',
+        },
+        stateSnapshot: {
+          threadId: '—',
+          messages: [
+            { role: 'user',     text: '이 사용자 계정을 삭제해줘' },
+            { role: 'ai',       text: 'delete_user(id="u_42") 호출하겠습니다', toolCall: { name: 'delete_user', args: { id: 'u_42' } } },
+            { role: 'tool',     text: '✗ 실행됨 — 복구 불가', danger: true },
+          ],
+        },
+        code: {
+          lang: 'python',
+          filename: 'auto-risky.py',
+          lines: [
+            '# Step 1. interrupt 없이 컴파일 — 위험 액션도 자동 실행',
+            'from langgraph.graph import StateGraph, END',
+            'from langgraph.prebuilt import ToolNode',
+            'from langchain_openai import ChatOpenAI',
+            '',
+            '@tool',
+            'def delete_user(id: str) -> str:',
+            '    """사용자 계정을 영구 삭제 (복구 불가)."""',
+            '    db.execute("DELETE FROM users WHERE id = ?", id)',
+            '    return f"deleted {id}"',
+            '',
+            '@tool',
+            'def charge_card(amount: int) -> str:',
+            '    """결제를 즉시 진행."""',
+            '    return stripe.Charge.create(amount=amount)',
+            '',
+            'tools = [delete_user, charge_card]',
+            'llm = ChatOpenAI(model="gpt-4o-mini").bind_tools(tools)',
+            '',
+            'graph = StateGraph(MessagesState)',
+            'graph.add_node("agent", lambda s: {"messages": [llm.invoke(s["messages"])]})',
+            'graph.add_node("tools", ToolNode(tools))',
+            'graph.add_edge("agent", "tools")',
+            'graph.add_edge("tools", "agent")',
+            'graph.set_entry_point("agent")',
+            '',
+            '# ⚠ interrupt_before 없음 → 위험 액션 그대로 실행',
+            'app = graph.compile()',
+            '',
+            'app.invoke({"messages": [("user", "u_42 계정 삭제해줘")]})',
+            '#  → LLM 이 delete_user 호출 결정',
+            '#  → ToolNode 가 즉시 DELETE 실행 😱',
+            '#  → 사용자가 "잠깐!" 외칠 새 없이 비가역 처리됨',
+            '',
+            '# 위험한 이유:',
+            '#  • LLM 의 판단이 100% 옳지 않음 (hallucination)',
+            '#  • prompt injection 으로 악성 호출 유도 가능',
+            '#  • DELETE / 결제 / 외부 메일은 비가역',
+            '',
+            '# 다음: interrupt_before 로 위험 노드 직전 정지',
+          ],
+          highlight: [1, 5, 6, 7, 8, 9, 11, 12, 13, 14, 26, 27, 29, 30, 31, 32],
+        },
       },
+      // ───────────────────────────── Step 2 ─────────────────────────────
       {
-        desc: "[품질 검사원] interrupt_before는 특정 노드 실행 전에 그래프를 멈추는 설정입니다. 공장 품질 검사원이 '이 단계 전에 검사합니다'라고 멈추는 것과 같습니다.",
-        visual: 'interrupt',
-        code: [
-          { line: '# interrupt_before: 특정 노드 전에 중단', highlight: false },
-          { line: '', highlight: false },
-          { line: 'from langgraph.checkpoint.memory import (', highlight: false },
-          { line: '    MemorySaver', highlight: false },
-          { line: ')', highlight: false },
-          { line: '', highlight: false },
-          { line: 'checkpointer = MemorySaver()', highlight: true },
-          { line: '', highlight: false },
-          { line: 'app = graph.compile(', highlight: true },
-          { line: '    checkpointer=checkpointer,', highlight: true },
-          { line: '    interrupt_before=["tools"]  # 도구 실행 전 중단', highlight: true },
-          { line: ')', highlight: true },
+        title: 'Step 2. interrupt_before — 특정 노드 직전 일시정지',
+        desc: 'compile 시점에 interrupt_before=["tools"]를 추가하면, agent 노드가 도구 호출을 결정한 뒤 tools 노드 직전에 그래프가 멈춘다. checkpointer(MemorySaver / SqliteSaver / PostgresSaver)가 현재 state를 thread_id 키로 저장 — 며칠 뒤에도 정확히 그 지점부터 재개 가능.',
+        nodes: [
+          { id: 'START',  label: 'START',  phase: 'done',    color: 'slate' },
+          { id: 'agent',  label: 'agent',  phase: 'done',    color: 'emerald' },
+          { id: 'tools',  label: 'tools',  phase: 'paused',  color: 'amber' },
+          { id: 'END',    label: 'END',    phase: 'idle',    color: 'slate' },
         ],
+        pauseAt: 'tools',
+        humanBox: {
+          kind: 'waiting',
+          message: '사람이 도구 호출 내용을 확인할 때까지 무기한 대기',
+        },
+        stateSnapshot: {
+          threadId: 'thr-7f3a',
+          messages: [
+            { role: 'user', text: 'u_42 계정 삭제해줘' },
+            { role: 'ai',   text: '도구 호출을 결정함', toolCall: { name: 'delete_user', args: { id: 'u_42' } } },
+          ],
+          checkpoint: '✓ saved (thr-7f3a · ts=2026-05-07T10:21Z)',
+        },
+        code: {
+          lang: 'python',
+          filename: 'interrupt-before.py',
+          lines: [
+            '# Step 2. interrupt_before 로 tools 노드 직전 일시정지',
+            'from langgraph.graph import StateGraph, END',
+            'from langgraph.checkpoint.memory import MemorySaver',
+            'from langgraph.prebuilt import ToolNode',
+            '',
+            '# 1) checkpointer — 일시정지 시 state 보존 저장소',
+            '#    개발: MemorySaver / 운영: SqliteSaver · PostgresSaver',
+            'checkpointer = MemorySaver()',
+            '',
+            '# 2) 그래프 구성 (Step 1 과 동일)',
+            'graph = StateGraph(MessagesState)',
+            'graph.add_node("agent", agent_node)',
+            'graph.add_node("tools", ToolNode(tools))',
+            'graph.add_edge("agent", "tools")',
+            'graph.add_edge("tools", "agent")',
+            'graph.set_entry_point("agent")',
+            '',
+            '# 3) ⭐ interrupt_before — tools 노드 직전 자동 정지',
+            'app = graph.compile(',
+            '    checkpointer=checkpointer,',
+            '    interrupt_before=["tools"],   # ← 핵심',
+            '    # interrupt_after=[...] 도 가능',
+            ')',
+            '',
+            '# 4) 호출 — thread_id 로 checkpoint 식별',
+            'config = {"configurable": {"thread_id": "thr-7f3a"}}',
+            'app.invoke(',
+            '    {"messages": [("user", "u_42 계정 삭제해줘")]},',
+            '    config,',
+            ')',
+            '#  → agent 실행 → 도구 호출 결정',
+            '#  → tools 직전 ⏸ 정지 (checkpoint 자동 저장)',
+            '#  → 함수 return (블로킹 X)',
+            '',
+            '# 비유: 공장 자동 라인 품질 검사 게이트',
+            '# checkpointer 보관: messages, 다음 노드, channel, ts',
+            '',
+            '# 다음: get_state 로 사람이 멈춘 state 검토',
+          ],
+          highlight: [1, 2, 5, 6, 7, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28, 29, 30],
+        },
       },
+      // ───────────────────────────── Step 3 ─────────────────────────────
       {
-        desc: "[실행 → 중단] invoke를 호출하면 agent 노드까지 실행되고, tools 노드 직전에 멈춥니다. 이 시점에 사람이 어떤 도구를 호출하려는지 확인할 수 있습니다.",
-        visual: 'pause',
-        code: [
-          { line: '# 실행 → tools 노드 전에 중단', highlight: false },
-          { line: '', highlight: false },
-          { line: 'config = {"configurable": {"thread_id": "1"}}', highlight: true },
-          { line: '', highlight: false },
-          { line: 'result = app.invoke(', highlight: true },
-          { line: '    {"messages": [("user", "이메일 삭제해줘")]},', highlight: true },
-          { line: '    config', highlight: true },
-          { line: ')', highlight: true },
-          { line: '', highlight: false },
-          { line: '# → agent 실행 후, tools 실행 전 중단', highlight: false },
-          { line: '# → 사람이 확인할 시간!', highlight: false },
+        title: 'Step 3. 사람이 state 검토 — 어떤 도구를 부르려는지 본다',
+        desc: '멈춰있는 동안 app.get_state(config)로 현재 state를 꺼내 본다. 마지막 AIMessage의 tool_calls를 확인하면 LLM이 부르려던 도구 이름·인자가 그대로 보인다. "delete_user(id=u_42)" — 정말 이 사용자를 지워도 되는지 사람이 눈으로 검증한다.',
+        nodes: [
+          { id: 'START',  label: 'START',  phase: 'done',    color: 'slate' },
+          { id: 'agent',  label: 'agent',  phase: 'done',    color: 'emerald' },
+          { id: 'tools',  label: 'tools',  phase: 'paused',  color: 'amber' },
+          { id: 'END',    label: 'END',    phase: 'idle',    color: 'slate' },
         ],
+        pauseAt: 'tools',
+        humanBox: {
+          kind: 'inspecting',
+          inspect: {
+            toolName: 'delete_user',
+            args: { id: 'u_42' },
+            risk: 'HIGH · 비가역',
+          },
+        },
+        stateSnapshot: {
+          threadId: 'thr-7f3a',
+          messages: [
+            { role: 'user', text: 'u_42 계정 삭제해줘' },
+            { role: 'ai',   text: '도구 호출을 결정함', toolCall: { name: 'delete_user', args: { id: 'u_42' } } },
+          ],
+          checkpoint: '✓ saved (thr-7f3a · ts=2026-05-07T10:21Z)',
+          inspecting: true,
+        },
+        code: {
+          lang: 'python',
+          filename: 'inspect-state.py',
+          lines: [
+            '# Step 3. 멈춘 state 를 사람이 꺼내서 검토',
+            'config = {"configurable": {"thread_id": "thr-7f3a"}}',
+            '',
+            '# 1) 현재 graph state 조회 — checkpoint 복원',
+            'snapshot = app.get_state(config)',
+            '',
+            'print(snapshot.next)',
+            '#  → ("tools",)   ← 다음에 실행될 노드',
+            '',
+            'print(snapshot.values["messages"])',
+            '#  [HumanMessage("u_42 계정 삭제해줘"),',
+            '#   AIMessage(tool_calls=[',
+            '#       {"name": "delete_user",',
+            '#        "args": {"id": "u_42"},',
+            '#        "id": "call_abc"}])]',
+            '',
+            '# 2) 마지막 AIMessage 의 tool_calls 사람에게 표시',
+            'pending = snapshot.values["messages"][-1]',
+            'for tc in pending.tool_calls:',
+            '    print(f"⚠ 도구: {tc[\'name\']}")',
+            '    print(f"  인자: {tc[\'args\']}")',
+            '#  ⚠ 도구: delete_user',
+            '#    인자: {\'id\': \'u_42\'}',
+            '',
+            '# 3) 사람의 검증 체크리스트',
+            '#  [ ] 호출 도구가 의도한 작업과 일치?',
+            '#  [ ] 인자(id, amount)가 합당?',
+            '#  [ ] 비가역(DELETE/결제/메일) 더블 체크',
+            '#  [ ] prompt injection 의심 입력 없는가?',
+            '',
+            '# 운영: Slack / Email / 관리자 UI 로 푸시',
+            '# 이 시점엔 부수 효과 0 — 안전!',
+            '',
+            '# 다음: update_state 로 인자 수정 또는 그대로 재개',
+          ],
+          highlight: [3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 22, 23],
+        },
       },
+      // ───────────────────────────── Step 4 ─────────────────────────────
       {
-        desc: "[사람 승인] 중단된 상태에서 사람이 도구 호출 내용을 확인합니다. '이메일 삭제'를 정말 실행할지 판단합니다. 승인하면 계속, 거부하면 취소합니다.",
-        visual: 'approve',
-        code: [
-          { line: '# 사람이 확인', highlight: false },
-          { line: '', highlight: false },
-          { line: '# 현재 상태 확인', highlight: false },
-          { line: 'state = app.get_state(config)', highlight: true },
-          { line: 'pending = state.values["messages"][-1]', highlight: true },
-          { line: '', highlight: false },
-          { line: '# 도구 호출 내용 출력', highlight: false },
-          { line: 'print(pending.tool_calls)', highlight: true },
-          { line: '# [{"name": "delete_email", "args": {...}}]', highlight: false },
-          { line: '', highlight: false },
-          { line: '# 사람: "이 작업을 승인할까요?" → Yes/No', highlight: false },
+        title: 'Step 4. 승인 후 재개 — invoke(None) 또는 update_state로 인자 수정',
+        desc: '검토가 끝나고 OK면 app.invoke(None, config) — None을 넣으면 "추가 입력 없이 멈춘 곳부터 재개"라는 뜻이다. 인자가 살짝 다르면 app.update_state(config, ...)로 messages를 패치한 뒤 재개. checkpoint가 있어 정확히 tools 노드부터 이어진다.',
+        nodes: [
+          { id: 'START',  label: 'START',  phase: 'done',    color: 'slate' },
+          { id: 'agent',  label: 'agent',  phase: 'done',    color: 'emerald' },
+          { id: 'tools',  label: 'tools',  phase: 'running', color: 'emerald' },
+          { id: 'END',    label: 'END',    phase: 'idle',    color: 'slate' },
         ],
+        pauseAt: null,
+        humanBox: {
+          kind: 'approved',
+          decision: 'APPROVE',
+          patched: { id: 'u_42 (확인됨)' },
+        },
+        stateSnapshot: {
+          threadId: 'thr-7f3a',
+          messages: [
+            { role: 'user', text: 'u_42 계정 삭제해줘' },
+            { role: 'ai',   text: '도구 호출을 결정함', toolCall: { name: 'delete_user', args: { id: 'u_42' } } },
+            { role: 'tool', text: '✓ deleted u_42', success: true },
+          ],
+          checkpoint: '✓ resumed (thr-7f3a)',
+        },
+        code: {
+          lang: 'python',
+          filename: 'update-state.py',
+          lines: [
+            '# Step 4. 사람이 승인 — 멈춘 지점부터 재개',
+            'config = {"configurable": {"thread_id": "thr-7f3a"}}',
+            '',
+            '# ── Case A. 그대로 승인 — invoke(None) 으로 재개 ──',
+            '# None = "새 입력 없이 멈춘 state 그대로 이어서 진행"',
+            'result = app.invoke(None, config)',
+            '#  → tools 실행 (delete_user → 진짜 DELETE)',
+            '#  → agent (도구 결과 보고 후속 판단)',
+            '#  → END 까지 진행',
+            '',
+            'print(result["messages"][-1].content)',
+            '#  → "u_42 계정을 영구 삭제했습니다."',
+            '',
+            '# ── Case B. 인자 수정 후 재개 — update_state ──',
+            '# 예: "id 가 u_42 가 아니라 u_43" 발견',
+            'from langchain_core.messages import AIMessage',
+            '',
+            'patched = AIMessage(',
+            '    content="",',
+            '    tool_calls=[{',
+            '        "name": "delete_user",',
+            '        "args": {"id": "u_43"},   # ← 인자 교정',
+            '        "id":   "call_abc",',
+            '    }],',
+            ')',
+            '',
+            'app.update_state(',
+            '    config,',
+            '    {"messages": [patched]},      # 마지막 메시지 교체',
+            '    as_node="agent",              # agent 가 만든 것처럼 기록',
+            ')',
+            '',
+            '# 그 후 평소처럼 None 으로 재개',
+            'result = app.invoke(None, config)',
+            '#  → 이제 u_43 으로 실행됨',
+            '',
+            '# 핵심: checkpointer 덕분에 reload-and-resume',
+            '#       며칠 뒤 사람이 OK 눌러도 동일 동작',
+            '',
+            '# 다음: 거부 시나리오 — 종료 또는 다른 분기',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 33, 34],
+        },
       },
+      // ───────────────────────────── Step 5 ─────────────────────────────
       {
-        desc: "[재개] 사람이 승인하면 None을 전달하여 중단된 지점부터 이어서 실행합니다. checkpoint 덕분에 상태가 보존되어 정확히 멈춘 곳에서 다시 시작합니다.",
-        visual: 'resume',
-        code: [
-          { line: '# 승인 → 재개 (resume)', highlight: false },
-          { line: '', highlight: false },
-          { line: '# 승인: 중단된 지점부터 계속 실행', highlight: false },
-          { line: 'result = app.invoke(None, config)', highlight: true },
-          { line: '# → tools 노드 실행 → agent → END', highlight: false },
-          { line: '', highlight: false },
-          { line: '# 거부: 상태 수정 후 다른 경로로', highlight: false },
-          { line: 'app.update_state(', highlight: true },
-          { line: '    config,', highlight: true },
-          { line: '    {"messages": [("user", "취소해줘")]}', highlight: true },
-          { line: ')', highlight: true },
+        title: 'Step 5. Reject — 종료 또는 안전한 분기로 라우팅',
+        desc: '검토 결과 "이 작업 안 함" 결론이 나면 두 가지 선택지가 있다. (1) 그냥 호출을 멈추고 thread를 버린다. (2) update_state로 도구 호출을 빈 ToolMessage로 대체해 agent에게 "사용자가 거부함" 신호를 보내고 다른 분기(예: 안내 응답)로 진행한다. 비가역 액션은 결코 실행되지 않는다.',
+        nodes: [
+          { id: 'START',  label: 'START',    phase: 'done',     color: 'slate' },
+          { id: 'agent',  label: 'agent',    phase: 'running',  color: 'emerald' },
+          { id: 'tools',  label: 'tools',    phase: 'rejected', color: 'red' },
+          { id: 'END',    label: 'END',      phase: 'done',     color: 'slate' },
         ],
+        pauseAt: null,
+        humanBox: {
+          kind: 'rejected',
+          decision: 'REJECT',
+          reason: '사용자가 본인 확인을 못 함 — 위험하므로 거부',
+        },
+        stateSnapshot: {
+          threadId: 'thr-7f3a',
+          messages: [
+            { role: 'user',  text: 'u_42 계정 삭제해줘' },
+            { role: 'ai',    text: '도구 호출을 결정함', toolCall: { name: 'delete_user', args: { id: 'u_42' } } },
+            { role: 'tool',  text: '✗ rejected by human — not executed', rejected: true },
+            { role: 'ai',    text: '본인 확인이 필요합니다. 고객센터로 연락 부탁드립니다.', safe: true },
+          ],
+          checkpoint: '✓ ended safely (thr-7f3a)',
+        },
+        code: {
+          lang: 'python',
+          filename: 'reject.py',
+          lines: [
+            '# Step 5. 사람이 거부 — 비가역 액션 차단',
+            'config = {"configurable": {"thread_id": "thr-7f3a"}}',
+            '',
+            '# ── 옵션 1. 그냥 종료 ──',
+            '# invoke 를 더 호출하지 않으면 끝',
+            '# checkpoint 는 남지만 도구는 영원히 실행 안 됨',
+            '',
+            '# ── 옵션 2. agent 에 "거부됨" 알리고 안전 분기 ──',
+            'from langchain_core.messages import ToolMessage',
+            '',
+            '# 1) 도구 결과 자리에 "거부" ToolMessage 주입',
+            'snapshot = app.get_state(config)',
+            'pending  = snapshot.values["messages"][-1]',
+            'tool_id  = pending.tool_calls[0]["id"]',
+            '',
+            'rejected_msg = ToolMessage(',
+            '    content="rejected by human — not executed",',
+            '    tool_call_id=tool_id,',
+            ')',
+            '',
+            'app.update_state(',
+            '    config,',
+            '    {"messages": [rejected_msg]},',
+            '    as_node="tools",   # tools 가 응답한 것처럼 기록',
+            ')',
+            '',
+            '# 2) 재개 — agent 가 거부 메시지를 보고 후속 판단',
+            'result = app.invoke(None, config)',
+            'print(result["messages"][-1].content)',
+            '#  → "본인 확인이 필요합니다. 고객센터로 연락 바랍니다."',
+            '',
+            '# ── 정리: Human-in-the-Loop 5단계 ──',
+            '#  1) 자율 실행 (위험)',
+            '#  2) interrupt_before 로 위험 노드 직전 정지',
+            '#  3) get_state 로 사람이 검토',
+            '#  4) invoke(None) / update_state 로 승인 재개',
+            '#  5) ToolMessage 거부 또는 종료',
+            '#',
+            '# 적합: DELETE/DROP/결제/메일, 규제 산업, 사내 승인',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24, 25, 27, 28, 29, 30],
+        },
       },
     ];
 
-    function App() {
-      const [currentStepIdx, setCurrentStepIdx] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playIntervalRef = useRef(null);
-      const stepData = STEPS[currentStepIdx];
-      const isEnd = currentStepIdx === STEPS.length - 1;
-
-      const handleNext = () => { setCurrentStepIdx(prev => { if (prev < STEPS.length - 1) return prev + 1; setIsPlaying(false); return prev; }); };
-      const handleNextRef = useRef(handleNext); handleNextRef.current = handleNext;
-      const handlePrev = () => { if (currentStepIdx > 0) { setCurrentStepIdx(prev => prev - 1); setIsPlaying(false); } };
-      const handlePrevRef = useRef(handlePrev); handlePrevRef.current = handlePrev;
-      const togglePlay = () => { if (isEnd) setCurrentStepIdx(0); setIsPlaying(prev => !prev); };
-
-      useEffect(() => { if (isPlaying) { playIntervalRef.current = setInterval(() => handleNextRef.current(), 3000); } else { clearInterval(playIntervalRef.current); } return () => clearInterval(playIntervalRef.current); }, [isPlaying]);
-      useEffect(() => { const onKey = (e) => { if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); } if (e.key === 'ArrowLeft') { e.preventDefault(); handlePrevRef.current(); } }; window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []);
-
-      const renderVisual = () => {
-        if (stepData.visual === 'danger') {
-          return (
-            <div className="space-y-3">
-              <div className="text-sm font-bold text-slate-500 mb-1">자동 실행의 위험</div>
-              {[
-                { icon: '📧', label: '이메일 삭제', risk: '높음', color: 'bg-red-50 border-red-300' },
-                { icon: '💳', label: '결제 진행', risk: '매우 높음', color: 'bg-red-50 border-red-300' },
-                { icon: '🗑️', label: '파일 삭제', risk: '높음', color: 'bg-red-50 border-red-300' },
-              ].map((item) => (
-                <div key={item.label} className={"flex items-center gap-3 p-3 rounded-lg border-2 " + item.color}>
-                  <span className="text-xl">{item.icon}</span>
-                  <div className="flex-1"><div className="font-bold text-sm text-red-700">{item.label}</div></div>
-                  <span className="text-xs bg-red-200 text-red-800 px-2 py-0.5 rounded">위험: {item.risk}</span>
-                </div>
-              ))}
-              <div className="text-center text-sm text-red-600 font-bold mt-2">사람 확인 없이 실행하면 위험!</div>
-            </div>
-          );
-        }
-        if (stepData.visual === 'interrupt') {
-          return (
-            <div className="flex flex-col items-center gap-2">
-              <div className="text-sm font-bold text-slate-500 mb-1">interrupt_before (품질 검사)</div>
-              <div className="w-24 h-10 rounded-lg bg-green-500 text-white flex items-center justify-center font-bold text-xs">START</div>
-              <span className="text-slate-400">↓</span>
-              <div className="w-28 h-10 rounded-xl bg-purple-600 text-white flex items-center justify-center font-bold text-sm">agent</div>
-              <span className="text-slate-400">↓</span>
-              <div className="w-full p-2 rounded-lg bg-yellow-100 border-2 border-yellow-400 text-center">
-                <div className="text-yellow-800 font-bold text-sm">⏸ 여기서 중단!</div>
-                <div className="text-yellow-700 text-xs">사람이 확인하는 시간</div>
-              </div>
-              <span className="text-slate-400">↓</span>
-              <div className="w-28 h-10 rounded-xl bg-amber-100 border-2 border-amber-300 flex items-center justify-center font-bold text-sm text-amber-700">tools</div>
-            </div>
-          );
-        }
-        if (stepData.visual === 'pause') {
-          return (
-            <div className="space-y-3">
-              <div className="text-sm font-bold text-slate-500 mb-1">실행 흐름</div>
-              <div className="flex items-center gap-2 p-2 rounded-lg bg-green-50 border border-green-200 text-xs">
-                <span className="bg-green-200 text-green-800 px-2 py-0.5 rounded font-bold">1</span>
-                <span>agent 노드 실행 완료</span>
-                <span className="ml-auto text-green-600">&#10003;</span>
-              </div>
-              <div className="flex items-center gap-2 p-2 rounded-lg bg-yellow-50 border-2 border-yellow-300 text-xs">
-                <span className="bg-yellow-200 text-yellow-800 px-2 py-0.5 rounded font-bold">2</span>
-                <span className="font-bold text-yellow-800">tools 노드 진입 전 — 중단!</span>
-                <span className="ml-auto text-yellow-600">⏸</span>
-              </div>
-              <div className="flex items-center gap-2 p-2 rounded-lg bg-slate-50 border border-slate-200 text-xs opacity-40">
-                <span className="bg-slate-200 text-slate-500 px-2 py-0.5 rounded font-bold">3</span>
-                <span>tools 노드 (대기 중)</span>
-              </div>
-              <div className="p-2 rounded-lg bg-purple-50 border border-purple-200 text-xs text-purple-700">
-                checkpoint에 현재 상태 저장됨
-              </div>
-            </div>
-          );
-        }
-        if (stepData.visual === 'approve') {
-          return (
-            <div className="space-y-3">
-              <div className="text-sm font-bold text-slate-500 mb-1">사람의 확인</div>
-              <div className="p-3 rounded-lg bg-slate-100 border border-slate-200">
-                <div className="text-xs font-bold text-slate-600 mb-2">도구 호출 요청:</div>
-                <div className="bg-white p-2 rounded border text-xs font-mono">
-                  <div>name: "delete_email"</div>
-                  <div>args: {"{"} id: "mail_123" {"}"}</div>
-                </div>
-              </div>
-              <div className="flex gap-3">
-                <div className="flex-1 p-3 rounded-lg bg-green-50 border-2 border-green-300 text-center cursor-pointer hover:bg-green-100 transition">
-                  <div className="font-bold text-green-700 text-sm">&#10003; 승인</div>
-                  <div className="text-xs text-green-600 mt-1">계속 실행</div>
-                </div>
-                <div className="flex-1 p-3 rounded-lg bg-red-50 border-2 border-red-300 text-center cursor-pointer hover:bg-red-100 transition">
-                  <div className="font-bold text-red-700 text-sm">&#10007; 거부</div>
-                  <div className="text-xs text-red-600 mt-1">취소/수정</div>
-                </div>
-              </div>
-            </div>
-          );
-        }
-        if (stepData.visual === 'resume') {
-          return (
-            <div className="space-y-3">
-              <div className="text-sm font-bold text-slate-500 mb-1">재개 (Resume)</div>
-              <div className="p-3 rounded-lg bg-green-50 border border-green-200">
-                <div className="font-bold text-xs text-green-700 mb-2">승인한 경우</div>
-                <div className="flex items-center gap-1 text-xs">
-                  <span className="bg-yellow-200 text-yellow-800 px-2 py-0.5 rounded">중단점</span>
-                  <span>→</span>
-                  <span className="bg-amber-200 text-amber-800 px-2 py-0.5 rounded">tools</span>
-                  <span>→</span>
-                  <span className="bg-purple-200 text-purple-800 px-2 py-0.5 rounded">agent</span>
-                  <span>→</span>
-                  <span className="bg-red-200 text-red-800 px-2 py-0.5 rounded">END</span>
-                </div>
-              </div>
-              <div className="p-3 rounded-lg bg-red-50 border border-red-200">
-                <div className="font-bold text-xs text-red-700 mb-2">거부한 경우</div>
-                <div className="flex items-center gap-1 text-xs">
-                  <span className="bg-yellow-200 text-yellow-800 px-2 py-0.5 rounded">중단점</span>
-                  <span>→</span>
-                  <span className="bg-slate-200 text-slate-800 px-2 py-0.5 rounded">상태 수정</span>
-                  <span>→</span>
-                  <span className="bg-purple-200 text-purple-800 px-2 py-0.5 rounded">다른 경로</span>
-                </div>
-              </div>
-            </div>
-          );
-        }
-        return null;
+    // ─────────────────────────────────────────────────────
+    // 좌측 위: Graph 다이어그램
+    //   START → agent → tools → END (수직)
+    //   각 노드는 phase 색상, paused 노드는 pause-blink
+    //   화살표 위에 흐름 점(running 일 때)
+    // ─────────────────────────────────────────────────────
+    function NodeBox({ node }) {
+      const palette = {
+        slate:   { idle: 'bg-slate-100 text-slate-500 border-slate-200', done: 'bg-slate-200 text-slate-700 border-slate-300', running: 'bg-slate-200 text-slate-700 border-slate-300' },
+        emerald: { idle: 'bg-emerald-50 text-emerald-700 border-emerald-200', done: 'bg-emerald-100 text-emerald-800 border-emerald-400', running: 'bg-emerald-500 text-white border-emerald-700 ring-4 ring-emerald-200' },
+        amber:   { idle: 'bg-amber-50 text-amber-700 border-amber-200', paused: 'bg-amber-200 text-amber-900 border-amber-500 pause-blink' },
+        red:     { idle: 'bg-red-50 text-red-700 border-red-200', running: 'bg-red-500 text-white border-red-700 ring-4 ring-red-200', rejected: 'bg-red-50 text-red-400 border-red-300 line-through opacity-60' },
       };
+      const phaseKey = node.phase === 'paused' ? 'paused' : node.phase === 'running' ? 'running' : node.phase === 'rejected' ? 'rejected' : node.phase === 'done' ? 'done' : 'idle';
+      const cls = (palette[node.color] && palette[node.color][phaseKey]) || palette.slate.idle;
+      const isStartEnd = node.id === 'START' || node.id === 'END';
+      const sizeCls = isStartEnd ? 'w-20 h-9 rounded-full text-[11px]' : 'w-32 h-12 rounded-lg text-sm';
+      const badgeBase = 'absolute -top-2 -right-2 text-white text-[9px] font-bold px-1 py-0.5 rounded shadow';
+      return (
+        <div className={`${sizeCls} ${cls} border-2 flex items-center justify-center font-bold transition-all duration-500 relative`}>
+          {node.label}
+          {node.phase === 'paused'   && <span className={`${badgeBase} bg-amber-500`}>⏸ PAUSE</span>}
+          {node.phase === 'rejected' && <span className={`${badgeBase} bg-red-600 pop-in`}>✗ REJECT</span>}
+          {node.phase === 'running' && node.color === 'emerald' && <span className={`${badgeBase} bg-emerald-700`}>▶ RUN</span>}
+        </div>
+      );
+    }
+
+    function ArrowDown({ active, paused }) {
+      // active: 흐름 점 / paused: 멈춤 표시
+      return (
+        <div className="relative h-7 w-1">
+          <div className={`absolute inset-x-0 top-0 bottom-0 border-l-2 ${paused ? 'border-amber-400 border-dashed' : 'border-slate-300'}`} />
+          {active && <div className="absolute -left-1 w-3 h-3 rounded-full bg-emerald-500 flow-dot shadow"></div>}
+          {paused && <div className="absolute -left-2 top-1/2 -translate-y-1/2 text-[10px] font-bold text-amber-700 whitespace-nowrap pl-3">⏸ checkpoint 저장 후 정지</div>}
+        </div>
+      );
+    }
+
+    function GraphDiagram({ nodes, pauseAt, stepIdx }) {
+      // edge active 판정 — 두 끝 노드의 phase 보고 결정
+      const phaseOf = (id) => nodes.find(n => n.id === id)?.phase;
+      const isEdgeActive = (from, to) => {
+        const a = phaseOf(from), b = phaseOf(to);
+        return a === 'done' && (b === 'running' || b === 'paused');
+      };
+      const isEdgePaused = (to) => pauseAt === to;
 
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-6 text-slate-800">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <nav className="text-sm"><a href="../index.html" className="inline-flex items-center gap-1 text-purple-700 hover:text-purple-900 font-medium"><span aria-hidden="true">&larr;</span> 허브로 돌아가기</a></nav>
-            <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-purple-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part IV. LangGraph &gt; Chapter 2. LangGraph 실전</div>
-                  <h1 className="text-2xl font-bold text-slate-800">IV-2-2. Human-in-the-Loop</h1>
-                </div>
-              </div>
-              <p className="text-slate-600"><b>공장 품질 검사</b> — 자동 라인에서 위험한 단계 전에 검사원(사람)이 확인하고 승인합니다. interrupt_before로 구현합니다.</p>
-            </header>
-
-            <div className="p-5 rounded-xl shadow-sm border min-h-[80px] flex flex-col justify-center bg-purple-700 border-purple-800 text-white">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">Human-in-the-Loop</h3>
-                <span className="text-xs text-purple-200">키보드 &larr;/&rarr;로 단계 이동</span>
-              </div>
-              <p className="text-lg font-medium leading-relaxed">{stepData.desc}</p>
+        <div className="bg-white rounded-lg border-2 border-emerald-200 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-base">🏭</span>
+              <span className="text-[11px] font-bold text-emerald-800">LangGraph 흐름</span>
             </div>
+            <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-mono">
+              step {stepIdx + 1}/5
+            </span>
+          </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                {renderVisual()}
-              </div>
+          <div className="flex flex-col items-center py-2">
+            <NodeBox node={nodes[0]} />
+            <ArrowDown active={isEdgeActive('START', 'agent')} paused={false} />
+            <NodeBox node={nodes[1]} />
+            <ArrowDown active={isEdgeActive('agent', 'tools')} paused={isEdgePaused('tools')} />
+            <NodeBox node={nodes[2]} />
+            <ArrowDown active={isEdgeActive('tools', 'END')} paused={false} />
+            <NodeBox node={nodes[3]} />
+          </div>
 
-              <div>
-                <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">코드</div>
-                <pre className="bg-slate-900 text-slate-100 p-4 rounded-xl text-xs leading-relaxed overflow-x-auto font-mono min-h-[200px]">
-                  {stepData.code.map((l, i) => (<div key={i} className={l.highlight ? 'bg-purple-900/40 -mx-4 px-4' : ''}>{l.line || '\u00A0'}</div>))}
-                </pre>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {['interrupt_before', 'checkpoint', 'resume'].map(kw => (<span key={kw} className="bg-purple-50 text-purple-700 px-3 py-1 rounded-full text-sm font-medium border border-purple-200">{kw}</span>))}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center space-x-2">
-                <button aria-label="이전 단계" onClick={handlePrev} disabled={currentStepIdx === 0} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 20L9 12l10-8v16z"/><line x1="5" y1="19" x2="5" y2="5"/></svg></button>
-                <button aria-label={isPlaying ? '정지' : '자동 실행'} onClick={togglePlay} className="flex items-center px-4 py-2 rounded text-white font-medium transition shadow-sm w-32 justify-center bg-purple-600 hover:bg-purple-700">
-                  {isPlaying ? (<><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> 정지</>) : (<><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mr-2"><polygon points="5 3 19 12 5 21 5 3"/></svg> 자동 실행</>)}
-                </button>
-                <button aria-label="다음 단계" onClick={handleNext} disabled={isEnd} className="p-2 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 4l10 8-10 8V4z"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
-              </div>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {currentStepIdx + 1} / {STEPS.length}</div>
-            </div>
-
-            <div className="flex justify-between text-sm text-slate-500">
-              <a href="./IV-2-1.html" className="text-purple-600 hover:text-purple-800 font-medium">&larr; IV-2-1. ReAct Agent</a>
-              <a href="./IV-2-3.html" className="text-purple-600 hover:text-purple-800 font-medium">IV-2-3. Multi-Agent Supervisor &rarr;</a>
-            </div>
+          <div className="mt-2 pt-2 border-t border-slate-100 flex flex-wrap gap-2 text-[9px] text-slate-500">
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-emerald-500"></span>running</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-amber-400"></span>paused</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-red-500"></span>danger/rejected</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-slate-300"></span>idle/done</span>
           </div>
         </div>
       );
     }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 중간: Human 박스 — kind 별 다른 시각화
+    //   absent     : 사람 미개입 (Step 1 빨간 경고)
+    //   waiting    : 사람 대기 중 (Step 2 회색 hourglass)
+    //   inspecting : 사람이 검토 중 (Step 3 도구 카드 + 경고)
+    //   approved   : 승인 누름 (Step 4 초록 체크)
+    //   rejected   : 거부 누름 (Step 5 빨간 X + 사유)
+    // ─────────────────────────────────────────────────────
+    function HumanBox({ box }) {
+      if (box.kind === 'absent') {
+        return (
+          <div className="bg-red-50 border-2 border-dashed border-red-300 rounded-lg p-3">
+            <div className="flex items-center gap-1.5 mb-2"><span className="text-base grayscale opacity-50">👤</span><span className="text-[11px] font-bold text-red-700">Human: 미개입</span></div>
+            <div className="bg-white rounded border border-red-200 p-2 text-center">
+              <div className="text-[10px] text-red-700 font-bold">⚠ {box.warning}</div>
+              <div className="text-[9px] text-red-500 mt-1">위험 액션도 그대로 통과</div>
+            </div>
+          </div>
+        );
+      }
+      if (box.kind === 'waiting') {
+        return (
+          <div className="bg-amber-50 border-2 border-amber-300 rounded-lg p-3">
+            <div className="flex items-center gap-1.5 mb-2"><span className="text-base">👤</span><span className="text-[11px] font-bold text-amber-800">Human: 대기 중</span><span className="ml-auto text-[10px] text-amber-700 animate-pulse">⏳ pending…</span></div>
+            <div className="bg-white rounded border border-amber-200 p-2 text-center">
+              <div className="text-[10px] text-amber-700">{box.message}</div>
+              <div className="text-[9px] text-amber-500 mt-1 font-mono">graph.invoke 가 return 됨 — 블로킹 X</div>
+            </div>
+          </div>
+        );
+      }
+      if (box.kind === 'inspecting') {
+        return (
+          <div className="bg-blue-50 border-2 border-blue-300 rounded-lg p-3">
+            <div className="flex items-center gap-1.5 mb-2"><span className="text-base">🔍</span><span className="text-[11px] font-bold text-blue-800">Human: 검토 중</span><span className="ml-auto text-[9px] bg-blue-600 text-white px-1.5 py-0.5 rounded font-mono">inspect</span></div>
+            <div className="bg-white rounded border-2 border-blue-300 p-2 mb-2">
+              <div className="text-[9px] font-bold text-blue-700 uppercase tracking-wider mb-1">pending tool call</div>
+              <div className="font-mono text-[10px]">
+                <div className="text-blue-900"><span className="text-slate-500">name:</span> "{box.inspect.toolName}"</div>
+                <div className="text-blue-900"><span className="text-slate-500">args:</span> {JSON.stringify(box.inspect.args)}</div>
+                <div className="text-red-700 font-bold mt-1"><span className="text-slate-500">risk:</span> {box.inspect.risk}</div>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button disabled className="flex-1 px-2 py-1.5 rounded bg-emerald-500 text-white text-[10px] font-bold opacity-90 cursor-default">✓ 승인</button>
+              <button disabled className="flex-1 px-2 py-1.5 rounded bg-red-500 text-white text-[10px] font-bold opacity-90 cursor-default">✗ 거부</button>
+            </div>
+          </div>
+        );
+      }
+      if (box.kind === 'approved') {
+        return (
+          <div className="bg-emerald-50 border-2 border-emerald-400 rounded-lg p-3">
+            <div className="flex items-center gap-1.5 mb-2"><span className="text-base">👤</span><span className="text-[11px] font-bold text-emerald-800">Human: 승인</span><svg className="check-in ml-auto" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#059669" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4L19 7"></path></svg></div>
+            <div className="bg-white rounded border border-emerald-200 p-2">
+              <div className="flex items-center gap-2 mb-1.5"><span className="text-[9px] bg-emerald-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">{box.decision}</span><span className="text-[10px] text-emerald-700">→ invoke(None, config) 으로 재개</span></div>
+              <div className="text-[9px] font-mono text-slate-600 mt-1.5">patched args: <span className="text-emerald-700">{JSON.stringify(box.patched)}</span></div>
+              <div className="text-[9px] text-emerald-700 mt-1">tools 노드 실행 → DELETE 진짜 수행</div>
+            </div>
+          </div>
+        );
+      }
+      if (box.kind === 'rejected') {
+        return (
+          <div className="bg-red-50 border-2 border-red-400 rounded-lg p-3">
+            <div className="flex items-center gap-1.5 mb-2"><span className="text-base">👤</span><span className="text-[11px] font-bold text-red-800">Human: 거부</span><span className="ml-auto inline-flex items-center justify-center w-5 h-5 rounded-full bg-red-600 text-white text-xs font-bold pop-in">✗</span></div>
+            <div className="bg-white rounded border border-red-200 p-2">
+              <div className="flex items-center gap-2 mb-1.5"><span className="text-[9px] bg-red-600 text-white px-1.5 py-0.5 rounded font-mono font-bold">{box.decision}</span><span className="text-[10px] text-red-700">→ ToolMessage("rejected") 주입 후 분기</span></div>
+              <div className="text-[9px] text-red-700 italic mt-1">사유: {box.reason}</div>
+              <div className="text-[9px] text-red-700 mt-1 font-bold">✓ DELETE 는 실행되지 않음</div>
+            </div>
+          </div>
+        );
+      }
+      return null;
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 아래: state Snapshot — messages 배열 시각화
+    //   threadId + checkpoint 표시 + 메시지별 role 색상
+    // ─────────────────────────────────────────────────────
+    function StateSnapshot({ snapshot }) {
+      return (
+        <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5"><span className="text-base">💾</span><span className="text-[11px] font-bold text-slate-700">graph state (checkpoint)</span></div>
+            <span className="text-[9px] bg-slate-700 text-white px-1.5 py-0.5 rounded font-mono">thread_id: {snapshot.threadId}</span>
+          </div>
+          <div className="bg-white rounded border border-slate-200 p-2 max-h-44 overflow-y-auto">
+            <div className="text-[9px] font-bold text-slate-500 mb-1 uppercase tracking-wider">messages</div>
+            <div className="space-y-1.5">
+              {snapshot.messages.map((m, i) => {
+                let cls = 'bg-slate-100 text-slate-700 border-slate-200', roleCls = 'bg-slate-500 text-white';
+                if (m.role === 'user') { cls = 'bg-blue-50 text-blue-900 border-blue-200'; roleCls = 'bg-blue-600 text-white'; }
+                if (m.role === 'ai')   { cls = 'bg-emerald-50 text-emerald-900 border-emerald-200'; roleCls = 'bg-emerald-600 text-white'; }
+                if (m.role === 'tool' && m.success) { cls = 'bg-emerald-100 text-emerald-900 border-emerald-300 font-bold'; roleCls = 'bg-emerald-700 text-white'; }
+                if (m.role === 'tool' && m.danger)  { cls = 'bg-red-100 text-red-900 border-red-300 font-bold'; roleCls = 'bg-red-700 text-white'; }
+                if (m.role === 'tool' && m.rejected){ cls = 'bg-red-50 text-red-700 border-red-300 italic line-through'; roleCls = 'bg-red-600 text-white'; }
+                if (m.role === 'ai' && m.safe)      { cls = 'bg-amber-50 text-amber-900 border-amber-300'; roleCls = 'bg-amber-600 text-white'; }
+                return (
+                  <div key={i} className={`p-1.5 rounded border ${cls}`}>
+                    <div className="flex items-center gap-1.5 mb-0.5"><span className={`text-[8px] px-1 py-0.5 rounded font-bold uppercase ${roleCls}`}>{m.role}</span>{m.toolCall && <span className="text-[8px] bg-purple-600 text-white px-1 rounded font-mono">tool_call</span>}</div>
+                    <div className="text-[10px] leading-tight">{m.text}</div>
+                    {m.toolCall && <div className="text-[9px] font-mono mt-0.5 bg-purple-50 border border-purple-200 rounded px-1.5 py-0.5 text-purple-900">{m.toolCall.name}({JSON.stringify(m.toolCall.args)})</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          {snapshot.checkpoint && <div className="mt-1.5 text-[9px] font-mono text-emerald-600">{snapshot.checkpoint}</div>}
+          {snapshot.inspecting && <div className="mt-1 text-[9px] text-blue-700 font-bold">↑ 사람이 마지막 AIMessage.tool_calls 를 읽는 중</div>}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // LiveDataPane — 좌측 패널 전체 (Graph + Human + State)
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step, stepIdx }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-bold text-slate-700">🏭 공장 품질 검사 게이트</h2>
+            <span className="text-[10px] text-slate-400 font-mono">live</span>
+          </div>
+
+          <div className="space-y-3">
+            <GraphDiagram nodes={step.nodes} pauseAt={step.pauseAt} stepIdx={stepIdx} />
+            <HumanBox box={step.humanBox} />
+            <StateSnapshot snapshot={step.stateSnapshot} />
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // VSCode 스타일 CodeViewer — highlight.js + 5 파일명 탭
+    //   상단 탭에 5개 파일명 (auto-risky / interrupt-before / inspect-state /
+    //                         update-state / reject) — 현재 step 활성화
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total, onTabClick }) {
+      const codeRef = useRef(null);
+      const [renderedLines, setRenderedLines] = useState(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          codeRef.current.className = `language-${code.lang}`;
+          window.hljs.highlightElement(codeRef.current);
+          const html = codeRef.current.innerHTML;
+          setRenderedLines(html.split('\n'));
+        }
+      }, [code]);
+
+      const TAB_FILES = [
+        'auto-risky.py',
+        'interrupt-before.py',
+        'inspect-state.py',
+        'update-state.py',
+        'reject.py',
+      ];
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          {/* 윈도우 dot */}
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">VSCode · IV-2-2</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono uppercase">{code.lang}</span>
+          </div>
+
+          {/* 5 파일명 탭 (클릭하면 해당 step 으로 이동) */}
+          <div className="bg-[#1e2127] flex border-b border-slate-700 overflow-x-auto">
+            {TAB_FILES.map((f, i) => {
+              const active = i === stepIdx;
+              return (
+                <button
+                  key={f}
+                  onClick={() => onTabClick(i)}
+                  className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-r border-slate-700 transition ${
+                    active
+                      ? 'bg-[#282c34] text-emerald-300 border-t-2 border-t-emerald-400 -mt-px'
+                      : 'text-slate-500 hover:text-slate-300 hover:bg-[#262b33]'
+                  }`}
+                >
+                  {f}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* hljs 토큰화용 hidden code */}
+          <pre className="hidden">
+            <code ref={codeRef} className={`language-${code.lang}`}>{code.lines.join('\n')}</code>
+          </pre>
+
+          {/* 실제 렌더링 — 라인 번호 + 강조 라인 */}
+          <div className="overflow-auto max-h-[42rem] text-xs font-mono leading-5">
+            <pre className="p-0 m-0">
+              <code className="block">
+                {(renderedLines || code.lines).map((lineHtml, i) => {
+                  const highlighted = code.highlight && code.highlight.includes(i + 1);
+                  return (
+                    <div
+                      key={i}
+                      className={`flex hover:bg-slate-800/50 ${
+                        highlighted ? 'bg-emerald-500/15 border-l-2 border-emerald-400' : ''
+                      }`}
+                    >
+                      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-12 flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <span
+                        className="pl-3 pr-3 whitespace-pre text-slate-200 flex-1"
+                        dangerouslySetInnerHTML={{ __html: lineHtml || ' ' }}
+                      />
+                    </div>
+                  );
+                })}
+              </code>
+            </pre>
+          </div>
+
+          {/* 푸터 */}
+          <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
+            <span>{code.filename} · {code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App 메인
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const nextRef = useRef(null);
+      const prevRef = useRef(null);
+
+      const step = STEPS[stepIdx];
+
+      const handleNext = () => {
+        setStepIdx((i) => {
+          if (i >= STEPS.length - 1) {
+            setIsPlaying(false);
+            return i;
+          }
+          return i + 1;
+        });
+      };
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      nextRef.current = handleNext;
+      prevRef.current = handlePrev;
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const handleReset = () => {
+        setStepIdx(0);
+        setIsPlaying(false);
+      };
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => nextRef.current(), 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); nextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); prevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 상단 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-emerald-700 hover:text-emerald-900 font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-emerald-600 text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. LangGraph &gt; Chapter 2. LangGraph 실전</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">IV-2-2. Human-in-the-Loop — interrupt + 사람 승인</h1>
+                  <p className="text-sm text-slate-500 mt-0.5">공장 품질 검사 게이트 — 위험 노드 직전에 멈추고 사람이 OK/NG 누른다</p>
+                </div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} onTabClick={setStepIdx} />
+            </div>
+
+            {/* 마지막 단계 alert */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="bg-emerald-50 border-2 border-emerald-300 rounded-xl p-3 text-sm text-emerald-900">
+                💡 정리: <strong>interrupt_before</strong> + <strong>checkpointer</strong> 조합으로 위험 액션 직전에 멈추고, <strong>get_state</strong>로 검토, <strong>invoke(None)</strong> / <strong>update_state</strong>로 승인·수정·거부를 분기한다. 다음(IV-2-3)에서는 Multi-Agent Supervisor를 다룬다.
+              </div>
+            )}
+
+            {/* 설명 패널 */}
+            <div className="p-4 rounded-xl bg-emerald-700 text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-200">
+                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                </h3>
+                <span className="text-xs text-emerald-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={handleReset} disabled={stepIdx === 0 && !isPlaying} aria-label="처음으로" className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">처음</button>
+              <button onClick={handlePrev} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">&larr; 이전</button>
+              <button onClick={togglePlay} aria-pressed={isPlaying} aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 rounded-lg text-sm font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition min-w-[100px]">{isPlaying ? '⏸ 정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}</button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1} aria-label="다음 단계" className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">다음 &rarr;</button>
+            </div>
+
+            {/* 키워드 태그 */}
+            <div className="flex flex-wrap gap-2 justify-center">
+              {['interrupt_before', 'checkpointer', 'MemorySaver', 'get_state', 'update_state', 'invoke(None)', 'ToolMessage', 'thread_id'].map((kw) => (
+                <span key={kw} className="bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full text-xs font-medium border border-emerald-200">{kw}</span>
+              ))}
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./IV-2-1.html" className="text-emerald-700 hover:text-emerald-900 font-medium">&larr; IV-2-1 ReAct Agent</a>
+              <a href="./IV-2-3.html" className="text-emerald-700 hover:text-emerald-900 font-medium">IV-2-3 Multi-Agent Supervisor &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
     ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
