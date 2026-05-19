@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terraform 인터랙티브 학습 — V-1-2. Drift 감지와 Sentinel 정책</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌬️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Terraform V-1-2 — Drift 감지와 Sentinel 정책
+    학습 목표: state와 실제 인프라 사이에 발생하는 drift를 감지하고,
+              Sentinel/OPA 같은 정책 엔진으로 사고를 사전에 차단하는 방법을 5단계로 본다.
+    핵심 비유: "지도에 그려둔 길 vs 실제 길" — 누군가 콘솔에서 길을 바꿔놓으면 지도가 거짓말이 된다.
+    패턴: fastapi v1 — 좌(LiveDataPane: state vs 실제 다이어그램) / 우(VSCode CodeViewer 5탭)
+    색상: pink (terraform Part V — 운영/거버넌스)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — drift 감지 → 정책 차단 흐름
+    //   stateRes  : Terraform state가 알고 있는 리소스
+    //   liveRes   : 클라우드 콘솔의 실제 리소스
+    //   alerts    : 화면 우측 상단에 표시할 알람 [{level, msg}]
+    //   policy    : Sentinel 정책 차단 박스 (Step 4부터 활성)
+    //   ciBox     : CI 자동 점검 박스 (Step 5만 활성)
+    //   code      : 우측 CodeViewer 파일 (lang, filename, lines, highlight)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. Drift란 무엇인가 — 콘솔에서 누가 손댔다',
+        desc: 'Terraform은 "코드가 곧 인프라의 진실"이라는 전제로 동작한다. main.tf에 t3.small이라고 적혀 있고 state도 t3.small을 기억하고 있다. 그런데 어느 날 운영자가 급한 트래픽 때문에 AWS 콘솔에 직접 들어가서 인스턴스를 t3.large로 바꿔버린다. 이 순간부터 "코드/state가 말하는 인프라"와 "진짜 인프라"가 어긋난다. 이 어긋남을 drift(표류)라고 부른다. drift가 쌓이면 다음 번 terraform apply가 사람이 한 변경을 되돌려버려서 운영 사고로 이어진다.',
+        stateRes: { type: 'aws_instance', name: 'web', instanceType: 't3.small', status: '코드 그대로' },
+        liveRes:  { type: 'aws_instance', name: 'web', instanceType: 't3.large', status: '콘솔에서 수정됨', drifted: true },
+        alerts: [
+          { level: 'warn', msg: '⚠ 누군가 콘솔에서 instance_type을 수정했습니다' },
+        ],
+        keyPoint: 'drift = state(코드의 진실) ≠ 실제 인프라. 사람이 콘솔에서 손대면 무조건 발생한다.',
+        code: {
+          lang: 'markdown',
+          filename: 'drift.md',
+          lines: [
+            '# Drift 란 무엇인가',
+            '',
+            '## 정의',
+            'Terraform이 관리하는 "state(상태 파일)"와',
+            '실제 클라우드 콘솔의 리소스가 서로 다른 상태.',
+            '',
+            '## 어떻게 발생하는가',
+            '',
+            '1. 운영자가 트래픽 폭주 때문에 콘솔에서 직접 인스턴스 크기 변경',
+            '2. 보안팀이 콘솔에서 보안그룹 규칙 추가',
+            '3. 다른 팀이 같은 계정에서 리소스를 손댐',
+            '4. 자동 스케일링이 인스턴스를 늘리거나 줄임',
+            '',
+            '## 왜 위험한가',
+            '',
+            '- 다음 번 `terraform apply` 가 콘솔 변경을 "되돌려" 버린다',
+            '- "왜 우리 인스턴스가 작아졌지?" 같은 사고가 발생',
+            '- 코드 리뷰를 거치지 않은 변경이 운영에 들어가 있음',
+            '- 감사 추적(audit trail) 이 불가능해진다',
+            '',
+            '## 핵심 원칙',
+            '',
+            '> 인프라 변경은 모두 코드(Terraform) 를 거쳐야 한다.',
+            '> 콘솔에서의 직접 수정은 "긴급 상황 + 사후 코드 반영" 으로만 허용한다.',
+            '',
+            '## 이 챕터에서 배울 것',
+            '',
+            '- Step 2: `terraform plan` 으로 drift 감지하기',
+            '- Step 3: refresh-only 모드로 state만 동기화',
+            '- Step 4: Sentinel/OPA 정책으로 위험한 변경 차단',
+            '- Step 5: CI 에서 정기적으로 drift 점검',
+          ],
+          highlight: [3, 4, 5, 14, 15, 16, 17, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 2. terraform plan 으로 drift 감지하기',
+        desc: 'drift 감지는 어렵지 않다. `terraform plan` 한 번이면 된다. plan은 state와 실제 인프라를 비교해서 "코드 기준으로 어떤 변경이 필요한지"를 보여준다. 콘솔에서 누가 인스턴스 타입을 t3.large로 바꿔놨다면, plan은 "instance_type을 t3.large → t3.small로 되돌리겠다"고 알려준다. CI에서 매일 plan을 돌려서 변경 사항이 0이 아니면 슬랙 알람을 보내는 것이 가장 기본적인 drift 감지 패턴이다.',
+        stateRes: { type: 'aws_instance', name: 'web', instanceType: 't3.small', status: '코드 그대로' },
+        liveRes:  { type: 'aws_instance', name: 'web', instanceType: 't3.large', status: '콘솔에서 수정됨', drifted: true },
+        alerts: [
+          { level: 'warn', msg: '⚠ Drift 발견: instance_type t3.large → t3.small' },
+          { level: 'info', msg: 'ℹ terraform plan 결과 = 1 to change' },
+        ],
+        keyPoint: 'plan은 단순 비교 도구가 아니다. drift 감지기로도 쓰는 1순위 무기.',
+        code: {
+          lang: 'bash',
+          filename: 'plan-detect.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# plan-detect.sh — 매일 새벽 한 번씩 drift 감지',
+            '',
+            'set -euo pipefail',
+            '',
+            'cd "$(dirname "$0")/.."',
+            '',
+            '# ── 1) 최신 state 로 plan 실행 (변경하지 않고 비교만)',
+            'terraform init -input=false -no-color > /tmp/init.log',
+            '',
+            'terraform plan \\',
+            '  -detailed-exitcode \\',
+            '  -no-color \\',
+            '  -out=/tmp/plan.bin > /tmp/plan.out',
+            '',
+            'EXIT=$?',
+            '',
+            '# ── 2) -detailed-exitcode 의 의미',
+            '#   0 = 변경 없음 (drift 없음)',
+            '#   1 = 에러',
+            '#   2 = 변경 있음 (drift 가능성!)',
+            '',
+            'if [ $EXIT -eq 0 ]; then',
+            '  echo "✅ 변경 없음 — drift 없음"',
+            '  exit 0',
+            'fi',
+            '',
+            'if [ $EXIT -eq 1 ]; then',
+            '  echo "❌ terraform 에러"',
+            '  cat /tmp/plan.out',
+            '  exit 1',
+            'fi',
+            '',
+            '# ── 3) EXIT == 2 : drift 의심',
+            'echo "⚠️ Drift 감지됨 — 코드와 실제가 다릅니다"',
+            'terraform show /tmp/plan.bin',
+            '',
+            '# 슬랙 알람 (예시)',
+            'curl -s -X POST -H "Content-Type: application/json" \\',
+            '  -d "{\\"text\\": \\"Drift detected in prod\\"}" \\',
+            '  "${SLACK_WEBHOOK_URL}"',
+            '',
+            'exit 2',
+          ],
+          highlight: [10, 11, 12, 13, 18, 19, 20, 21, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 3. refresh-only 모드 — state만 안전하게 동기화',
+        desc: '경우에 따라 콘솔에서 손댄 변경이 "맞는 변경"일 때가 있다. 긴급 대응으로 인스턴스를 키워놨는데, 코드보다 콘솔 상태가 옳다고 판단되면 state를 실제 인프라에 맞추는 게 옳다. 이때 사용하는 것이 `terraform apply -refresh-only`다. 이 모드는 클라우드의 진짜 값을 읽어와서 state에 반영만 한다. 리소스를 새로 만들거나 지우지 않기 때문에 안전하다. drift를 "코드를 콘솔에 맞춰주는 방향"으로 해소하는 셈이다 (이후 main.tf도 반드시 같은 값으로 수정해야 한다).',
+        stateRes: { type: 'aws_instance', name: 'web', instanceType: 't3.large', status: 'state 동기화 완료', synced: true },
+        liveRes:  { type: 'aws_instance', name: 'web', instanceType: 't3.large', status: '실제 인프라', drifted: false },
+        alerts: [
+          { level: 'ok', msg: '✅ refresh-only 적용 — state ↔ 실제 일치' },
+          { level: 'todo', msg: '📝 TODO: main.tf 의 instance_type 도 t3.large 로 수정 필요' },
+        ],
+        keyPoint: 'refresh-only = state 만 실제에 맞춘다. 코드는 그대로니까 결국 코드도 수정해야 한다.',
+        code: {
+          lang: 'bash',
+          filename: 'refresh-only.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# refresh-only.sh — drift 를 state 쪽으로 흡수',
+            '#',
+            '# 언제 쓰는가:',
+            '#   콘솔에서의 변경이 "맞는 변경"이라서',
+            '#   state 를 실제에 맞추고 싶을 때.',
+            '#',
+            '# 주의:',
+            '#   refresh-only 는 state 만 바꾼다.',
+            '#   코드(main.tf) 는 별도로 직접 수정해야 다음 plan 이 깨끗하다.',
+            '',
+            'set -euo pipefail',
+            '',
+            'cd "$(dirname "$0")/.."',
+            '',
+            '# ── 1) refresh-only plan 으로 어떤 변경이 일어날지 먼저 확인',
+            'terraform plan \\',
+            '  -refresh-only \\',
+            '  -no-color \\',
+            '  -out=/tmp/refresh.bin',
+            '',
+            'echo "──────────────────────────────────"',
+            'echo " 위 내용이 state 에 반영됩니다."',
+            'echo " 리소스는 만들거나 지우지 않습니다."',
+            'echo "──────────────────────────────────"',
+            'read -p "계속하시겠습니까? (y/N) " yn',
+            '',
+            'if [[ "$yn" != "y" && "$yn" != "Y" ]]; then',
+            '  echo "취소됨"',
+            '  exit 0',
+            'fi',
+            '',
+            '# ── 2) refresh-only 적용 (실제 인프라는 손대지 않음)',
+            'terraform apply \\',
+            '  -refresh-only \\',
+            '  -auto-approve',
+            '',
+            '# ── 3) 다음 단계 안내',
+            'cat <<EOF',
+            '✅ state 동기화 완료',
+            '',
+            '📝 다음 할 일:',
+            '   1. main.tf 를 실제 값에 맞춰 수정',
+            '   2. PR 올려서 코드 리뷰',
+            '   3. merge 후 정상적인 terraform apply',
+            'EOF',
+          ],
+          highlight: [16, 17, 18, 19, 20, 33, 34, 35, 38, 39, 40, 41, 42, 43, 44],
+        },
+      },
+      {
+        title: 'Step 4. Sentinel / OPA 정책 — 위험한 변경을 사전 차단',
+        desc: 'drift 감지는 사후 대응이다. 더 좋은 접근은 "애초에 위험한 변경이 적용되지 못하게" 막는 것. Terraform Cloud의 Sentinel이나 오픈소스 OPA(Conftest)는 plan 결과를 분석해서 정책 위반 시 apply를 차단한다. 예를 들어 "프로덕션에서는 t3.large 이상 인스턴스 금지", "S3 버킷은 반드시 암호화", "퍼블릭 보안그룹 0.0.0.0/0 금지" 같은 규칙을 만들 수 있다. 사람의 실수도 막지만, 콘솔에서 손댄 drift가 코드로 흡수될 때도 같은 정책이 작동한다.',
+        stateRes: { type: 'aws_instance', name: 'web', instanceType: 't3.large', status: 'state 변경 제안' },
+        liveRes:  { type: 'aws_instance', name: 'web', instanceType: 't3.large', status: '실제 인프라' },
+        alerts: [
+          { level: 'block', msg: '🛑 Sentinel 정책 위반: t3.large 는 prod 환경에서 금지' },
+        ],
+        policy: {
+          title: 'Sentinel Policy 차단',
+          rule: 'forbidden_instance_types = ["t3.large", "t3.xlarge", "m5.large"]',
+          actions: [
+            'apply 즉시 중단 (exit code != 0)',
+            '코드 리뷰 단계에서 PR 머지 차단',
+            '정책 위반 사실을 감사 로그에 기록',
+            '필요 시 예외 신청 워크플로우 안내',
+          ],
+        },
+        keyPoint: 'Sentinel/OPA = plan 결과를 정책으로 검사하는 게이트. drift 가 코드로 흡수돼도 막아준다.',
+        code: {
+          lang: 'plaintext',
+          filename: 'sentinel.policy',
+          lines: [
+            '# sentinel.policy',
+            '# Terraform Cloud Sentinel 정책 예시',
+            '# 목적: 비용/사고 위험이 큰 인스턴스 타입을 prod 환경에서 금지',
+            '',
+            'import "tfplan/v2" as tfplan',
+            'import "strings"',
+            '',
+            '# ── 1) 금지 인스턴스 타입 목록',
+            'forbidden_instance_types = [',
+            '  "t3.large",',
+            '  "t3.xlarge",',
+            '  "m5.large",',
+            '  "m5.xlarge",',
+            '  "c5.large",',
+            ']',
+            '',
+            '# ── 2) plan 안에서 변경되는 모든 aws_instance 찾기',
+            'aws_instances = filter tfplan.resource_changes as _, rc {',
+            '  rc.type is "aws_instance" and',
+            '  rc.mode is "managed" and',
+            '  (rc.change.actions contains "create" or',
+            '   rc.change.actions contains "update")',
+            '}',
+            '',
+            '# ── 3) 각 인스턴스에 대해 정책 검사',
+            'violating = filter aws_instances as _, ai {',
+            '  ai.change.after.instance_type in forbidden_instance_types',
+            '}',
+            '',
+            '# ── 4) 메인 규칙 — 위반 0건이어야 통과',
+            'main = rule {',
+            '  length(violating) is 0',
+            '}',
+            '',
+            '# ── 5) 위반 시 어떤 메시지를 보여줄지',
+            'print_violations = func() {',
+            '  for violating as addr, ai {',
+            '    t = ai.change.after.instance_type',
+            '    print("🛑 차단:", addr, "instance_type =", t)',
+            '    print("   사유: 비용 큰 인스턴스는 prod 에서 금지")',
+            '    print("   예외 신청: #infra-policy 슬랙 채널")',
+            '  }',
+            '  return true',
+            '}',
+            '',
+            '# 실행 트리거',
+            'print_violations()',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 29, 30, 31, 32],
+        },
+      },
+      {
+        title: 'Step 5. CI 정기 drift 점검 — 자는 동안에도 확인',
+        desc: '마지막 단계는 모든 것을 자동화하는 것이다. GitHub Actions(또는 다른 CI)에서 매일 새벽에 plan을 돌리고, 변경 사항이 나오면 슬랙으로 알림을 보낸다. 동시에 PR이 올라올 때마다 Sentinel/OPA 정책 검사도 자동으로 돌아간다. 사람이 자는 동안에도 누군가 콘솔에서 손댔으면 다음 날 아침 슬랙에 알림이 와 있다. 정책 위반 PR은 자동으로 머지가 막힌다. 이 두 가지를 합치면 운영자가 일일이 점검하지 않아도 인프라가 코드 기준에서 벗어나지 않는다.',
+        stateRes: { type: 'aws_instance', name: 'web', instanceType: 't3.small', status: 'CI 점검 통과' },
+        liveRes:  { type: 'aws_instance', name: 'web', instanceType: 't3.small', status: '코드와 일치' },
+        alerts: [
+          { level: 'ok', msg: '✅ 매일 03:00 KST drift 점검 통과' },
+          { level: 'ok', msg: '✅ 정책 점검 통과 (Sentinel 0 violations)' },
+        ],
+        ciBox: {
+          title: '자동 운영 흐름',
+          steps: [
+            '03:00 — GitHub Actions 스케줄 트리거',
+            '03:01 — terraform init + plan -detailed-exitcode',
+            '03:02 — 변경 있으면 Sentinel/OPA 검사',
+            '03:03 — 결과를 슬랙 #infra-drift 채널로',
+            'PR 시점 — 같은 정책이 PR check 로 실행됨',
+          ],
+        },
+        keyPoint: 'CI 정기 점검 + 정책 게이트 = 사람의 개입 없이 인프라가 코드 기준을 유지한다.',
+        code: {
+          lang: 'yaml',
+          filename: 'ci-cron.yaml',
+          lines: [
+            '# .github/workflows/ci-cron.yaml',
+            '# 매일 새벽 03:00 KST 에 drift 점검 + 정책 검사',
+            '',
+            'name: drift-and-policy-check',
+            '',
+            'on:',
+            '  schedule:',
+            '    # cron 은 UTC 기준 (KST = UTC + 9)',
+            '    - cron: "0 18 * * *"   # 매일 UTC 18:00 = KST 03:00',
+            '  workflow_dispatch:',
+            '',
+            'jobs:',
+            '  drift-check:',
+            '    runs-on: ubuntu-latest',
+            '    permissions:',
+            '      contents: read',
+            '      id-token: write   # OIDC 로 AWS 인증',
+            '    steps:',
+            '      - uses: actions/checkout@v4',
+            '',
+            '      - name: AWS 자격증명 (OIDC)',
+            '        uses: aws-actions/configure-aws-credentials@v4',
+            '        with:',
+            '          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}',
+            '          aws-region: ap-northeast-2',
+            '',
+            '      - name: Terraform 설치',
+            '        uses: hashicorp/setup-terraform@v3',
+            '        with:',
+            '          terraform_version: 1.7.5',
+            '',
+            '      - name: terraform init',
+            '        run: terraform init -input=false',
+            '',
+            '      - name: drift 감지 (plan)',
+            '        id: plan',
+            '        run: |',
+            '          set +e',
+            '          terraform plan -detailed-exitcode -no-color -out=plan.bin',
+            '          echo "exit=$?" >> "$GITHUB_OUTPUT"',
+            '',
+            '      - name: 정책 검사 (Conftest / OPA)',
+            '        if: steps.plan.outputs.exit == 2',
+            '        run: |',
+            '          terraform show -json plan.bin > plan.json',
+            '          conftest test plan.json --policy policy/',
+            '',
+            '      - name: Slack 알림',
+            '        if: steps.plan.outputs.exit == 2',
+            '        uses: slackapi/slack-github-action@v1.26',
+            '        with:',
+            '          payload: |',
+            '            { "text": "⚠️ Drift detected in prod terraform" }',
+            '        env:',
+            '          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}',
+            '',
+            '      - name: 결과 요약',
+            '        if: always()',
+            '        run: |',
+            '          echo "exit_code = ${{ steps.plan.outputs.exit }}"',
+            '          echo "  0 = 변경 없음 / 1 = 에러 / 2 = drift 있음"',
+          ],
+          highlight: [6, 7, 8, 9, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — pink 톤
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      ok:    { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-800' },
+      info:  { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-800' },
+      warn:  { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-800' },
+      block: { bg: 'bg-rose-50',    border: 'border-rose-400',    text: 'text-rose-800' },
+      todo:  { bg: 'bg-slate-50',   border: 'border-slate-300',   text: 'text-slate-700' },
+    };
+
+    function ResourceCard({ res, side }) {
+      const drift = res.drifted;
+      const synced = res.synced;
+      const sideColor = side === 'state'
+        ? 'border-pink-300 bg-pink-50'
+        : drift ? 'border-rose-400 bg-rose-50' : synced ? 'border-emerald-300 bg-emerald-50' : 'border-slate-300 bg-slate-50';
+      const sideTitle = side === 'state' ? '🗺️ Terraform State' : '☁️ 실제 클라우드';
+      return (
+        <div className={`rounded-lg border-2 ${sideColor} p-3`}>
+          <div className="text-[10px] font-bold text-slate-600 mb-2">{sideTitle}</div>
+          <div className="space-y-1.5 text-xs">
+            <div className="flex justify-between">
+              <span className="text-slate-500">type</span>
+              <span className="font-mono text-slate-800">{res.type}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-500">name</span>
+              <span className="font-mono text-slate-800">{res.name}</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-slate-500">instance_type</span>
+              <span className={`font-mono font-bold ${drift ? 'text-rose-700' : synced ? 'text-emerald-700' : 'text-pink-800'}`}>
+                {res.instanceType}
+              </span>
+            </div>
+            <div className={`mt-2 text-[10px] px-2 py-1 rounded text-center ${drift ? 'bg-rose-200 text-rose-800' : synced ? 'bg-emerald-200 text-emerald-800' : side === 'state' ? 'bg-pink-200 text-pink-800' : 'bg-slate-200 text-slate-700'}`}>
+              {res.status}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AlertList({ alerts }) {
+      if (!alerts || alerts.length === 0) return null;
+      return (
+        <div className="space-y-1.5">
+          {alerts.map((a, i) => {
+            const s = ALERT_STYLE[a.level] || ALERT_STYLE.info;
+            return (
+              <div key={i} className={`text-xs px-3 py-2 rounded border ${s.bg} ${s.border} ${s.text}`}>
+                {a.msg}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function PolicyBox({ policy }) {
+      if (!policy) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-rose-50 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-lg">🛑</span>
+            <span className="text-sm font-bold text-rose-800">{policy.title}</span>
+          </div>
+          <div className="font-mono text-[11px] bg-white border border-rose-200 rounded px-2 py-1 mb-2 text-rose-900">
+            {policy.rule}
+          </div>
+          <ul className="space-y-1">
+            {policy.actions.map((a, i) => (
+              <li key={i} className="text-xs text-rose-900 flex gap-2">
+                <span className="text-rose-500">▸</span>
+                <span>{a}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function CiBox({ ci }) {
+      if (!ci) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-pink-500 bg-gradient-to-br from-pink-50 to-rose-50 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-2xl">🤖</span>
+            <span className="text-lg font-bold text-pink-800">{ci.title}</span>
+          </div>
+          <ol className="space-y-1.5">
+            {ci.steps.map((s, i) => (
+              <li key={i} className="text-xs text-pink-900 flex gap-2">
+                <span className="text-pink-500 mt-0.5">{i + 1}.</span>
+                <span>{s}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-pink-200 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-pink-800">State vs 실제 인프라</h3>
+            <span className="text-[10px] text-slate-500">drift 감지 시뮬레이션</span>
+          </div>
+
+          {/* state vs live 다이어그램 */}
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <ResourceCard res={state.stateRes} side="state" />
+            <ResourceCard res={state.liveRes} side="live" />
+          </div>
+
+          {/* drift 비교 화살표 */}
+          <div className="text-center text-xs font-bold py-2 mb-3 rounded bg-pink-50 border border-pink-200 text-pink-700">
+            {state.stateRes.instanceType === state.liveRes.instanceType
+              ? '↔ state ↔ 실제 = 일치'
+              : '✕ state ≠ 실제 = DRIFT'}
+          </div>
+
+          {/* 알람 리스트 */}
+          <AlertList alerts={state.alerts} />
+
+          {/* 정책 차단 박스 */}
+          <PolicyBox policy={state.policy} />
+
+          {/* CI 자동화 박스 */}
+          <CiBox ci={state.ciBox} />
+
+          {/* 핵심 포인트 */}
+          <div className="mt-3 text-xs text-pink-900 bg-pink-50 border border-pink-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-pink-500/15 border-l-2 border-pink-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App — 4버튼 + 키보드 + 자동재생 3000ms
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-pink-50 to-rose-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-pink-600 text-white font-bold">V</span>
+              <div>
+                <h1 className="text-2xl font-bold text-pink-900">V-1-2. Drift 감지와 Sentinel 정책</h1>
+                <p className="text-sm text-pink-800/80">콘솔 수정 → plan 감지 → refresh-only → 정책 차단 → CI 정기 점검</p>
+              </div>
+              <a href="./index.html" className="ml-auto text-xs text-pink-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-pink-600' : 'bg-pink-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-pink-700 text-pink-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-pink-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 (4버튼) */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-pink-700 text-white' : 'bg-pink-600 text-white hover:bg-pink-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-pink-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-pink-400 bg-white px-4 py-3 text-sm text-pink-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                drift는 콘솔 수정 같은 "코드 밖 변경"으로 무조건 생긴다. plan으로 감지하고, refresh-only로 흡수하고, Sentinel/OPA로 위험 변경을 차단하고, CI로 매일 점검하는 4중 방어선을 갖추면 인프라가 코드 기준에서 벗어나지 않는다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['drift', 'terraform plan', 'refresh-only', 'Sentinel', 'OPA', 'Conftest', 'CI', 'GitHub Actions'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-pink-100 text-pink-800 border border-pink-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-pink-700">
+              <a href="./V-1-1.html" className="underline hover:no-underline">← 이전: V-1-1</a>
+              <a href="./V-1-3.html" className="underline hover:no-underline">다음: V-1-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

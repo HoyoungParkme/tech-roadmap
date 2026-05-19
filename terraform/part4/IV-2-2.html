@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terraform 인터랙티브 학습 — IV-2-2. PR + plan 자동 코멘트 (Atlantis/Spacelift)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🤖</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Terraform IV-2-2 — PR + plan 자동 코멘트 (Atlantis/Spacelift)
+    학습 목표: 수동 로컬 apply의 위험성 → Atlantis bot 자동화 → PR comment에 plan 출력
+              → apply 승인 워크플로우 → Spacelift/Env0/Terraform Cloud 대안 비교
+    핵심 비유: "로컬 apply" = 인쇄소 직원이 검수 없이 인쇄 → 잘못 인쇄, "PR bot" = 자동 견본 출력 + 승인
+    패턴: fastapi v1 — 좌(LiveDataPane: GitHub PR + Atlantis bot 코멘트) / 우(VSCode CodeViewer 5탭)
+    색상: pink (terraform IaC 자동화 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 수동 apply 문제 → Atlantis → PR plan → 승인 → 대안
+    //   pane      : 좌측 LiveDataPane GitHub PR mock 상태
+    //   prMeta    : PR 메타 (제목, 작성자, 브랜치, 상태 배지)
+    //   timeline  : PR 코멘트/이벤트 타임라인 [{kind, who, body, at, accent}]
+    //   alert     : 단계별 경고/안내 박스
+    //   compare   : Step 5 도구 비교 카드 [{name, tag, pros, cons}]
+    //   code      : 우측 CodeViewer 파일
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 수동 PR + 로컬 apply — 무엇이 잘못되는가',
+        desc: '신규 EC2를 띄우는 PR을 올렸다. 코드 리뷰는 받았지만 "잘 모르겠으니 일단 머지하고 내 노트북에서 terraform apply 해볼게요"라는 흐름이다. 보안 그룹 22번 포트가 0.0.0.0/0으로 열렸다는 사실은 plan 출력을 PR에서 본 적이 없어서 아무도 눈치채지 못했다. apply 후 30분 만에 봇이 SSH 무차별 대입을 시도한다. 문제는 (1) plan을 PR 컨텍스트에서 검토하지 않았다 (2) 로컬 머신마다 tf 버전이 달라 결과가 다르다 (3) 누가 언제 apply 했는지 기록이 없다.',
+        prMeta: {
+          title: 'feat: add bastion EC2 for ops team',
+          author: '@junior-dev',
+          branch: 'feature/bastion-ec2 → main',
+          status: 'MERGED',
+          statusColor: 'bg-purple-500',
+        },
+        timeline: [
+          { kind: 'commit', who: '@junior-dev', body: 'EC2 instance + SG 추가', at: '10:12', accent: 'slate' },
+          { kind: 'review', who: '@senior', body: 'LGTM 👍 (plan 출력은 따로 본 적 없음)', at: '10:30', accent: 'slate' },
+          { kind: 'merge',  who: '@junior-dev', body: 'Merged into main', at: '10:31', accent: 'purple' },
+          { kind: 'shell',  who: '💻 local', body: '$ terraform apply (노트북에서 직접 실행)', at: '10:35', accent: 'pink' },
+          { kind: 'alert',  who: '🚨', body: '30분 뒤: SSH brute-force 시도 폭주 (22번 포트 0.0.0.0/0 노출)', at: '11:05', accent: 'rose' },
+        ],
+        alert: {
+          tone: 'rose',
+          title: '문제 진단',
+          lines: [
+            'plan 출력이 PR 어디에도 없어 SG 0.0.0.0/0 노출을 못 잡았다',
+            '로컬 머신 tf 버전이 1.5 / 1.7 섞여 동료와 결과가 다를 수 있다',
+            'apply 주체 / 시각 / 변경 내용이 감사 로그로 남지 않는다',
+          ],
+        },
+        code: {
+          lang: 'markdown',
+          filename: 'manual-bad.md',
+          lines: [
+            '# Step 1. 수동 PR + 로컬 apply 가 무엇을 망가뜨리나',
+            '',
+            '## 흐름 (현재)',
+            '1. 개발자가 main.tf 에 EC2 + Security Group 추가',
+            '2. PR 올림 → 리뷰어가 코드만 훑고 LGTM → 머지',
+            '3. 개발자가 자기 노트북에서 `terraform apply` 실행',
+            '',
+            '## 발생한 사고',
+            '- Security Group ingress = 0.0.0.0/0 (TCP 22) 노출',
+            '- 30 분 뒤 SSH brute-force 시도 → 보안팀 알람 → 운영 격리',
+            '',
+            '## 왜 이렇게 됐나 — 3가지 근본 원인',
+            '',
+            '### 1) plan 출력을 PR 에서 본 적이 없다',
+            '   - `terraform plan` 은 무엇을 만들고/지울지 건수로 보여준다',
+            '   - 그 출력을 PR 코멘트에 붙이지 않아 영향 검토가 빠짐',
+            '',
+            '### 2) 로컬 머신마다 환경이 다르다',
+            '   - 개발자 A: terraform 1.5.7 / B: 1.7.2',
+            '   - provider/plugin 버전 차이로 결과가 미세하게 달라짐',
+            '   - "내 노트북에선 잘 됐는데" 가 운영에서 발생',
+            '',
+            '### 3) 감사 로그가 없다',
+            '   - 누가/언제/어떤 plan 으로/무엇을 apply 했는지 추적 불가',
+            '',
+            '## 해결 방향 (Step 2 부터)',
+            '- PR 이벤트 → bot 이 자동으로 plan 실행 → PR 코멘트 게시',
+            '- 리뷰어가 코드 + plan 결과 둘 다 보고 승인',
+            '- 승인 후에만 `atlantis apply` 코멘트로 적용',
+            '- 모든 작업이 PR 타임라인 기록 → 감사 로그 자동 확보',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 12, 14, 15, 16, 18, 19, 20, 21, 23, 24, 26, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 2. Atlantis bot 도입 — PR 이벤트를 받아 plan 자동 실행',
+        desc: 'Atlantis는 셀프호스팅 가능한 오픈소스 봇이다. GitHub webhook으로 PR 이벤트(opened, synchronize)를 받으면 자동으로 terraform plan을 돌리고, 결과를 PR 코멘트로 붙인다. 한 번 띄워두면 모든 terraform 리포지토리가 같은 워크플로우를 공유한다. 설정 파일은 atlantis.yaml 하나, 봇 자체는 Docker 한 줄. 봇 서버가 GitHub에서 클론하고 자체 환경에서 plan을 돌리므로 "내 노트북" 문제가 사라진다.',
+        prMeta: {
+          title: 'feat: add bastion EC2 for ops team',
+          author: '@junior-dev',
+          branch: 'feature/bastion-ec2 → main',
+          status: 'OPEN · plan 대기',
+          statusColor: 'bg-pink-500',
+        },
+        timeline: [
+          { kind: 'commit',  who: '@junior-dev', body: 'EC2 instance + SG 추가', at: '10:12', accent: 'slate' },
+          { kind: 'webhook', who: 'GitHub → Atlantis', body: 'POST /events {action: opened}', at: '10:12', accent: 'pink' },
+          { kind: 'bot',     who: '🤖 atlantis-bot', body: 'Running `terraform plan` in dir `infra/prod` ...', at: '10:13', accent: 'pink' },
+          { kind: 'bot',     who: '🤖 atlantis-bot', body: 'Locked workspace `prod` 🔒 (다른 PR 동시 작업 차단)', at: '10:13', accent: 'pink' },
+        ],
+        alert: {
+          tone: 'pink',
+          title: 'Atlantis 가 하는 일',
+          lines: [
+            'GitHub webhook 으로 PR 이벤트 수신',
+            '봇 서버가 직접 clone → terraform init → plan',
+            '워크스페이스 락(lock) 으로 동시 plan/apply 충돌 방지',
+          ],
+        },
+        code: {
+          lang: 'yaml',
+          filename: 'atlantis-setup.yaml',
+          lines: [
+            '# Step 2. Atlantis bot 셋업 — 한 번 띄우면 모든 리포에 동일 워크플로우',
+            '',
+            '# (1) 봇 서버 실행 — Docker 한 줄',
+            '# docker run -d --name atlantis \\',
+            '#   -p 4141:4141 \\',
+            '#   -e ATLANTIS_GH_USER=atlantis-bot \\',
+            '#   -e ATLANTIS_GH_TOKEN=ghp_xxx \\',
+            '#   -e ATLANTIS_GH_WEBHOOK_SECRET=shhh \\',
+            '#   -e ATLANTIS_REPO_ALLOWLIST=github.com/myorg/* \\',
+            '#   ghcr.io/runatlantis/atlantis:v0.27',
+            '',
+            '# (2) 리포지토리 루트의 atlantis.yaml',
+            'version: 3',
+            'automerge: false           # 자동 머지 금지 (리뷰어 명시 승인 필요)',
+            'parallel_plan: true        # 여러 디렉터리 plan 병렬 실행',
+            'parallel_apply: false      # apply 는 항상 직렬 (안전)',
+            '',
+            'projects:',
+            '  - name: prod-infra',
+            '    dir: infra/prod',
+            '    workspace: prod',
+            '    terraform_version: v1.7.5',
+            '    autoplan:',
+            '      when_modified:',
+            '        - "*.tf"',
+            '        - "../modules/**/*.tf"',
+            '      enabled: true',
+            '    apply_requirements:',
+            '      - approved              # PR 승인 필수',
+            '      - mergeable             # 충돌 없어야 함',
+            '      - undiverged            # main 과 동기화돼야 함',
+            '',
+            '  - name: staging-infra',
+            '    dir: infra/staging',
+            '    workspace: staging',
+            '    terraform_version: v1.7.5',
+            '    autoplan: { when_modified: ["*.tf"], enabled: true }',
+            '    apply_requirements: [approved]',
+            '',
+            '# (3) GitHub webhook: Payload URL=https://atlantis.../events,',
+            '#     Secret=ATLANTIS_GH_WEBHOOK_SECRET, Events=PR/Review/Push/Issue comments',
+          ],
+          highlight: [13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 3. PR comment 에 plan 출력 — 리뷰어가 영향까지 검토',
+        desc: 'plan이 끝나면 봇이 PR 코멘트로 결과를 붙인다. "1 to add, 0 to change, 0 to destroy" 같은 요약과 함께 리소스별 변경 디테일이 펼쳐진다. 이 단계에서 senior 리뷰어가 보안 그룹 ingress 0.0.0.0/0을 발견하고 "이거 사내 IP로 좁혀주세요"라고 코멘트한다. junior가 코드를 수정해 force-push하면 봇은 자동으로 다시 plan을 돌려 코멘트를 갱신한다. 코드 리뷰가 곧 영향 리뷰가 된다.',
+        prMeta: {
+          title: 'feat: add bastion EC2 for ops team',
+          author: '@junior-dev',
+          branch: 'feature/bastion-ec2 → main',
+          status: 'OPEN · 변경 요청',
+          statusColor: 'bg-amber-500',
+        },
+        timeline: [
+          { kind: 'bot',     who: '🤖 atlantis-bot', body: 'Plan: 1 to add, 0 to change, 0 to destroy. (요약)', at: '10:14', accent: 'pink' },
+          { kind: 'plan',    who: '📋 plan diff', body: '+ aws_instance.bastion / + aws_security_group.bastion_sg (ingress 0.0.0.0/0:22) ⚠️', at: '10:14', accent: 'rose' },
+          { kind: 'review',  who: '@senior', body: '🛑 ingress 0.0.0.0/0 위험. 사내 VPN 대역(10.20.0.0/16)으로 좁혀주세요', at: '10:22', accent: 'amber' },
+          { kind: 'commit',  who: '@junior-dev', body: 'fix: SG ingress 를 사내 VPN 대역으로 제한', at: '10:35', accent: 'slate' },
+          { kind: 'bot',     who: '🤖 atlantis-bot', body: '재실행: Plan: 1 to add. (cidr_blocks = 10.20.0.0/16) ✅', at: '10:36', accent: 'pink' },
+        ],
+        alert: {
+          tone: 'amber',
+          title: 'plan 코멘트가 리뷰 품질을 바꾼다',
+          lines: [
+            '코드 diff 만 보면 cidr 값이 의미하는 영향 파악이 어렵다',
+            'plan 출력은 "무엇이 실제로 만들어지는지" 를 보여줘 검토가 정확해진다',
+            'push 마다 자동 재실행 → 항상 최신 상태가 PR 에 반영',
+          ],
+        },
+        code: {
+          lang: 'markdown',
+          filename: 'pr-plan.md',
+          lines: [
+            '<!-- Atlantis 가 PR 코멘트로 자동 게시한 plan 출력 -->',
+            '',
+            '### Ran `terraform plan` for dir: `infra/prod` workspace: `prod`',
+            '',
+            '<details><summary>Show Output</summary>',
+            '',
+            '```hcl',
+            'Terraform will perform the following actions:',
+            '',
+            '  # aws_instance.bastion will be created',
+            '  + resource "aws_instance" "bastion" {',
+            '      + ami           = "ami-0c11b2c..."',
+            '      + instance_type = "t3.small"',
+            '      + subnet_id     = "subnet-0a1b..."',
+            '      + tags          = { "Name" = "bastion-ops" }',
+            '    }',
+            '',
+            '  # aws_security_group.bastion_sg will be created',
+            '  + resource "aws_security_group" "bastion_sg" {',
+            '      + name = "bastion-sg"',
+            '      + ingress = [{',
+            '          + from_port   = 22',
+            '          + to_port     = 22',
+            '          + protocol    = "tcp"',
+            '          + cidr_blocks = ["0.0.0.0/0"]   # ⚠️ 전체 인터넷 노출!',
+            '        }]',
+            '    }',
+            '',
+            'Plan: 2 to add, 0 to change, 0 to destroy.',
+            '```',
+            '</details>',
+            '',
+            '* :arrow_forward: **apply**: `atlantis apply -d infra/prod -w prod`',
+            '* :repeat: **re-plan**: `atlantis plan -d infra/prod -w prod`',
+            '',
+            '#### 리뷰어가 발견한 점',
+            '- `cidr_blocks = ["0.0.0.0/0"]` ← 전체 인터넷에 22 포트 노출',
+            '- 사내 VPN 대역 `10.20.0.0/16` 으로 좁혀야 함',
+            '- 수정 후 push 하면 Atlantis 가 자동으로 plan 재실행',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29, 36, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 4. apply 승인 워크플로우 — 코멘트 한 줄로 운영 반영',
+        desc: 'plan이 OK라면 누군가 PR 코멘트에 "atlantis apply"라고 적는다. 봇은 사전 조건 3가지를 검사한다: ① PR에 approve 리뷰가 있는가 ② 머지 가능 상태인가 ③ main과 diverge되지 않았는가. 모두 통과해야 실제 apply가 실행된다. 결과는 다시 PR 코멘트로 게시되고, PR이 자동 머지된다. 누가 언제 무엇을 적용했는지가 PR 타임라인에 그대로 남는다 — 감사 로그가 자동으로 완성된다.',
+        prMeta: {
+          title: 'feat: add bastion EC2 for ops team',
+          author: '@junior-dev',
+          branch: 'feature/bastion-ec2 → main',
+          status: 'APPLIED · MERGED',
+          statusColor: 'bg-emerald-500',
+        },
+        timeline: [
+          { kind: 'review',  who: '@senior', body: '✅ Approved (수정된 plan 확인 완료)', at: '10:40', accent: 'emerald' },
+          { kind: 'comment', who: '@senior', body: 'atlantis apply -d infra/prod -w prod', at: '10:41', accent: 'pink' },
+          { kind: 'bot',     who: '🤖 atlantis-bot', body: '✓ approved · ✓ mergeable · ✓ undiverged → apply 시작', at: '10:41', accent: 'pink' },
+          { kind: 'bot',     who: '🤖 atlantis-bot', body: 'Apply complete! Resources: 2 added, 0 changed, 0 destroyed.', at: '10:43', accent: 'emerald' },
+          { kind: 'merge',   who: '🤖 atlantis-bot', body: 'PR auto-merged. 감사 로그는 이 타임라인에 영구 보존.', at: '10:43', accent: 'emerald' },
+        ],
+        alert: {
+          tone: 'emerald',
+          title: 'apply_requirements 3 가지',
+          lines: [
+            'approved    — PR 에 최소 1 명 이상의 approve 리뷰',
+            'mergeable   — 충돌/CI 실패 없이 머지 가능 상태',
+            'undiverged  — main 브랜치와 동기화 (rebase 필요 시 차단)',
+          ],
+        },
+        code: {
+          lang: 'markdown',
+          filename: 'apply-flow.md',
+          lines: [
+            '# Step 4. apply 승인 워크플로우 — PR 코멘트가 운영 명령이 된다',
+            '',
+            '## 흐름',
+            '```',
+            '  PR push → webhook → Atlantis plan → PR 코멘트',
+            '       ↓',
+            '  Reviewer Approve ✅',
+            '       ↓',
+            '  PR 코멘트:  `atlantis apply -d infra/prod -w prod`',
+            '       ↓',
+            '  검증:  ✓ approved  ✓ mergeable  ✓ undiverged',
+            '       ↓ (전부 통과해야)',
+            '  `terraform apply` 실행 → 결과 PR 코멘트 + auto-merge',
+            '```',
+            '',
+            '## 사용 가능한 PR 코멘트 명령',
+            '| 코멘트 | 의미 |',
+            '|:--|:--|',
+            '| `atlantis plan` | 전체 plan 재실행 |',
+            '| `atlantis plan -d infra/prod` | 특정 디렉터리만 plan |',
+            '| `atlantis apply -d infra/prod -w prod` | 특정 워크스페이스 적용 |',
+            '| `atlantis unlock` | 워크스페이스 락 해제 |',
+            '| `atlantis approve_policies` | OPA 정책 위반 예외 승인 |',
+            '',
+            '## 감사 로그 자동 확보',
+            '- 누가/언제/무엇: PR 코멘트 작성자 + GitHub 타임스탬프 + 같은 PR 보존',
+            '→ 별도 감사 시스템 없이도 추적 가능',
+            '',
+            '## 주의할 한계',
+            '- Atlantis 셀프호스팅 = 봇 서버 가용성 직접 책임',
+            '- state 파일은 별도(S3 + DynamoDB lock) 보관 필요',
+            '- 대규모 조직은 RBAC/SSO 약함 → Step 5 SaaS 대안 고려',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 5. 대안 비교 — Spacelift / Env0 / Terraform Cloud',
+        desc: 'Atlantis는 무료/오픈소스라 시작이 좋지만 봇 서버 운영을 직접 해야 한다. SaaS 대안 셋 — Spacelift, Env0, Terraform Cloud(HCP Terraform)는 봇 운영 부담을 없애주고 RBAC, 정책 엔진(OPA), state 관리, drift detection까지 한 묶음으로 제공한다. 규모와 거버넌스 요구가 커지면 SaaS로 전환하는 흐름이 일반적이다. 셋 다 핵심 UX(PR plan 코멘트, 승인 후 apply)는 동일하다.',
+        compare: [
+          {
+            name: 'Atlantis',
+            tag: 'OSS · 셀프호스팅',
+            color: 'pink',
+            pros: ['무료', '봇 서버 한 대로 시작', 'GitHub/GitLab/Bitbucket 지원'],
+            cons: ['봇 가용성 직접 관리', 'RBAC/SSO 약함', 'drift detection 없음'],
+          },
+          {
+            name: 'Spacelift',
+            tag: 'SaaS',
+            color: 'rose',
+            pros: ['OPA 정책 엔진 내장', 'drift detection 자동', 'stack/run 그래프 UI'],
+            cons: ['유료 (사용량 기반)', '러닝 커브가 있음'],
+          },
+          {
+            name: 'Env0',
+            tag: 'SaaS',
+            color: 'fuchsia',
+            pros: ['셀프서비스 환경 프로비저닝', 'cost estimation 기본', 'TTL 환경'],
+            cons: ['유료', '커뮤니티가 비교적 작음'],
+          },
+          {
+            name: 'Terraform Cloud',
+            tag: 'SaaS (HashiCorp)',
+            color: 'purple',
+            pros: ['공식 제품 + 모듈 레지스트리', 'Sentinel 정책', 'state 관리 통합'],
+            cons: ['BSL 라이선스 이슈 인지 필요', 'org/workspace 모델 학습 필요'],
+          },
+        ],
+        alert: {
+          tone: 'pink',
+          title: '선택 가이드',
+          lines: [
+            '시작은 Atlantis — 무료, 가볍게 워크플로우 체득',
+            '50 명 이상 / 정책 강제 필요 → Spacelift / Env0',
+            'HashiCorp 생태계 통합 우선 → Terraform Cloud',
+          ],
+        },
+        code: {
+          lang: 'markdown',
+          filename: 'alternatives.md',
+          lines: [
+            '# Step 5. PR + plan 자동 코멘트 도구 비교',
+            '',
+            '## 공통 핵심 UX (4 도구 모두 동일)',
+            'PR push → 자동 plan → PR 코멘트 → approve → apply → 감사 로그 보존',
+            '',
+            '## 비교표',
+            '| 항목 | Atlantis | Spacelift | Env0 | TFC |',
+            '|:--|:--|:--|:--|:--|',
+            '| 호스팅 | 셀프 | SaaS | SaaS | SaaS |',
+            '| 가격 | 무료 OSS | 사용량 | 사용량 | Free→Plus |',
+            '| 정책 엔진 | OPA(외부) | OPA 내장 | OPA+자체 | Sentinel |',
+            '| Drift/state | 없음/직접 | 자동/내장 | 자동/내장 | 자동/내장 |',
+            '| RBAC/SSO | 약함 | 강함 | 강함 | 강함 |',
+            '| 모듈 레지스트리 | 외부 | 내장 | 내장 | 공식 |',
+            '',
+            '## 상황별 선택',
+            '- **Atlantis**: 팀 ~30 명, IaC 자동화 처음 도입, 외부 SaaS 제약',
+            '- **Spacelift**: 50 명 이상, OPA/drift 필수, Pulumi/CDK/K8s 통합',
+            '- **Env0**: 셀프서비스 PR 환경, TTL/비용 가드레일',
+            '- **TFC**: HashiCorp 생태계(Vault/Consul), 공식 모듈 레지스트리, Sentinel',
+            '',
+            '## 전환 시나리오',
+            'Atlantis 로 6~12 개월 운영 → 한계 명확해지면',
+            '- 정책 부족 → Spacelift / 환경 수요 → Env0 / HashiCorp → TFC',
+            '핵심 워크플로우 동일 → 전환 비용은 학습+설정 이전 수준',
+            '',
+            '## 정리',
+            '- 수동 로컬 apply 는 plan/감사/일관성 부족 (Step 1)',
+            '- bot 자동화로 plan 을 PR 에 노출 (Step 2~3)',
+            '- 코멘트 한 줄 + 사전 조건 검사로 apply (Step 4)',
+            '- 규모/거버넌스에 맞춰 SaaS 로 진화 (Step 5)',
+          ],
+          highlight: [3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 24, 25, 26, 27, 29, 30, 31, 32, 33],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — pink 톤
+    // ─────────────────────────────────────────────────────
+    const ACCENT_STYLE = {
+      slate:   { bg: 'bg-slate-50',    border: 'border-slate-300',   text: 'text-slate-700',   dot: 'bg-slate-400' },
+      pink:    { bg: 'bg-pink-50',     border: 'border-pink-300',    text: 'text-pink-800',    dot: 'bg-pink-500' },
+      rose:    { bg: 'bg-rose-50',     border: 'border-rose-300',    text: 'text-rose-800',    dot: 'bg-rose-500' },
+      amber:   { bg: 'bg-amber-50',    border: 'border-amber-300',   text: 'text-amber-800',   dot: 'bg-amber-500' },
+      emerald: { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', dot: 'bg-emerald-500' },
+      purple:  { bg: 'bg-purple-50',   border: 'border-purple-300',  text: 'text-purple-800',  dot: 'bg-purple-500' },
+      fuchsia: { bg: 'bg-fuchsia-50',  border: 'border-fuchsia-300', text: 'text-fuchsia-800', dot: 'bg-fuchsia-500' },
+    };
+
+    const KIND_ICON = {
+      commit:  '🟦',
+      review:  '👀',
+      merge:   '🟣',
+      shell:   '💻',
+      alert:   '🚨',
+      webhook: '📡',
+      bot:     '🤖',
+      plan:    '📋',
+      comment: '💬',
+    };
+
+    function PRHeader({ meta }) {
+      return (
+        <div className="rounded-lg border border-pink-200 bg-gradient-to-r from-pink-50 to-rose-50 p-3 mb-3">
+          <div className="flex items-start gap-2">
+            <span className="text-lg">🔀</span>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-bold text-pink-900 truncate">{meta.title}</div>
+              <div className="text-[11px] text-pink-700/80 mt-0.5">
+                {meta.author} · <span className="font-mono">{meta.branch}</span>
+              </div>
+            </div>
+            <span className={`text-[10px] font-bold text-white px-2 py-0.5 rounded ${meta.statusColor}`}>{meta.status}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function TimelineItem({ item }) {
+      const s = ACCENT_STYLE[item.accent] || ACCENT_STYLE.slate;
+      const icon = KIND_ICON[item.kind] || '•';
+      return (
+        <div className={`rounded-md border ${s.bg} ${s.border} p-2.5`}>
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-sm">{icon}</span>
+            <span className={`text-xs font-bold ${s.text}`}>{item.who}</span>
+            <span className="ml-auto text-[10px] text-slate-500 font-mono">{item.at}</span>
+          </div>
+          <div className={`text-xs ${s.text} pl-6 leading-snug`}>{item.body}</div>
+        </div>
+      );
+    }
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ACCENT_STYLE[alert.tone] || ACCENT_STYLE.pink;
+      return (
+        <div className={`mt-3 rounded-lg border-2 ${s.border} ${s.bg} p-3`}>
+          <div className={`text-xs font-bold ${s.text} mb-2`}>⚡ {alert.title}</div>
+          <ul className="space-y-1">
+            {alert.lines.map((l, i) => (
+              <li key={i} className={`text-xs ${s.text} flex gap-2 leading-snug`}>
+                <span className={`${s.dot} w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0`} />
+                <span>{l}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function CompareCards({ compare }) {
+      if (!compare) return null;
+      return (
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          {compare.map((c, i) => {
+            const s = ACCENT_STYLE[c.color] || ACCENT_STYLE.pink;
+            return (
+              <div key={i} className={`rounded-lg border ${s.border} ${s.bg} p-2.5`}>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className={`text-xs font-bold ${s.text}`}>{c.name}</span>
+                  <span className={`text-[9px] px-1.5 py-0.5 rounded ${s.bg} ${s.text} border ${s.border}`}>{c.tag}</span>
+                </div>
+                <div className="space-y-0.5">
+                  {c.pros.map((p, j) => (
+                    <div key={`p${j}`} className="text-[10px] text-emerald-700 flex gap-1 leading-tight">
+                      <span>+</span><span>{p}</span>
+                    </div>
+                  ))}
+                  {c.cons.map((p, j) => (
+                    <div key={`c${j}`} className="text-[10px] text-rose-600 flex gap-1 leading-tight">
+                      <span>−</span><span>{p}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-pink-200 bg-white p-4 h-full flex flex-col overflow-auto">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-pink-800">GitHub PR + Atlantis bot 시뮬레이션</h3>
+            <span className="text-[10px] text-slate-500">왼쪽 = PR 타임라인</span>
+          </div>
+          {state.prMeta && <PRHeader meta={state.prMeta} />}
+          {state.timeline && (
+            <div className="space-y-1.5">
+              {state.timeline.map((it, i) => <TimelineItem key={i} item={it} />)}
+            </div>
+          )}
+          {state.compare && <CompareCards compare={state.compare} />}
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex items-center gap-1 px-3 py-1 bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {STEPS.map((s, i) => (
+              <span
+                key={i}
+                className={`text-[10px] font-mono px-2 py-0.5 rounded whitespace-nowrap ${
+                  i === stepIdx
+                    ? 'bg-pink-500 text-white'
+                    : 'bg-slate-800 text-slate-400'
+                }`}
+              >
+                {s.code.filename}
+              </span>
+            ))}
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-pink-500/15 border-l-2 border-pink-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-pink-50 to-rose-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-pink-600 text-white font-bold">IV</span>
+              <div>
+                <h1 className="text-2xl font-bold text-pink-900">IV-2-2. PR + plan 자동 코멘트 (Atlantis/Spacelift)</h1>
+                <p className="text-sm text-pink-800/80">수동 로컬 apply → bot 자동화 → PR 코멘트 plan → 승인 워크플로우 → SaaS 대안</p>
+              </div>
+              <a href="./index.html" className="ml-auto text-xs text-pink-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-pink-600' : 'bg-pink-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-pink-700 text-pink-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-pink-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4" style={{ minHeight: '560px' }}>
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-pink-700 text-white' : 'bg-pink-600 text-white hover:bg-pink-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-pink-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-pink-400 bg-white px-4 py-3 text-sm text-pink-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                수동 로컬 apply 의 3 가지 문제(가시성/일관성/감사)를 PR + bot 워크플로우가 한 번에 해결한다. Atlantis 로 시작하고, 규모와 거버넌스 요구가 커지면 Spacelift/Env0/Terraform Cloud 로 진화한다. 핵심 UX(PR → plan → approve → apply) 는 4 도구 모두 동일하므로 전환 비용은 크지 않다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Atlantis', 'Spacelift', 'Env0', 'Terraform Cloud', 'PR plan', 'webhook', 'apply 승인', 'OPA', 'drift', '감사 로그'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-pink-100 text-pink-800 border border-pink-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-pink-700">
+              <a href="./IV-2-1.html" className="underline hover:no-underline">← 이전: IV-2-1</a>
+              <a href="./index.html" className="underline hover:no-underline">챕터 목록</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

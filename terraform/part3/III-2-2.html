@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terraform 인터랙티브 학습 — III-2-2. 충돌과 lock 복구</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔒</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Terraform III-2-2 — 충돌과 lock 복구
+    학습 목표: 두 사람이 동시 apply 했을 때 state lock 이 어떻게 동작하고,
+              lock 이 꼬였을 때(stale lock) 어떻게 복구하며,
+              충돌 자체를 어떻게 예방하는지 5단계로 학습한다.
+    핵심 비유: "화장실 문" — 한 사람이 잠그면 다른 사람은 못 들어간다.
+              그런데 안에서 쓰러져 있으면(crash) 밖에서 마스터키(force-unlock)로 열어야 한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 두 사용자 + lock 시뮬레이션) / 우(VSCode CodeViewer 5탭)
+    색상: pink (terraform 도메인 — 충돌/위험)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 동시 apply / lock / stale lock / force-unlock / 예방
+    //   pane     : LiveDataPane 상태
+    //     userA  : { state, label } — state = 'idle' | 'apply' | 'wait' | 'blocked' | 'crashed'
+    //     userB  : 동일
+    //     lock   : { state, holder, lockId, since }
+    //              state = 'free' | 'held' | 'stale' | 'released'
+    //     events : 시간순 로그
+    //   code     : 우측 CodeViewer 파일
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 두 사람이 동시에 terraform apply',
+        desc: '같은 팀의 Alice 와 Bob 이 같은 시각에 같은 환경(prod) 을 향해 terraform apply 를 실행한다. 두 사람 다 자기 변경 사항이 반영되기를 원한다. 만약 lock 이 없다면? 둘이 동시에 state 파일에 쓰기를 시도하고, 마지막에 덮어쓴 쪽이 이긴다. 먼저 작업한 사람의 변경 사항이 조용히 사라진다. Terraform 은 이 사고를 막기 위해 백엔드(S3 + DynamoDB)로 state 에 lock 을 건다.',
+        userA: { state: 'apply', label: 'terraform apply' },
+        userB: { state: 'apply', label: 'terraform apply' },
+        lock: { state: 'free', holder: null, lockId: null, since: null },
+        events: [
+          { t: 'T+0.00s', who: 'Alice', msg: 'terraform apply 실행' },
+          { t: 'T+0.01s', who: 'Bob',   msg: 'terraform apply 실행 (동시!)' },
+        ],
+        keyPoint: 'lock 이 없으면 늦게 쓴 사람이 먼저 쓴 사람의 변경을 덮어쓴다. 그래서 백엔드 잠금이 필요하다.',
+        code: {
+          lang: 'bash',
+          filename: 'concurrent.sh',
+          lines: [
+            '# Step 1. 두 사람이 동시에 apply 하는 상황',
+            '# 같은 backend(S3 + DynamoDB)를 바라보는 두 터미널',
+            '',
+            '# === Alice 의 터미널 ===',
+            'cd infra/prod',
+            'terraform plan -out=alice.tfplan',
+            'terraform apply alice.tfplan        # T+0.00s 시작',
+            '',
+            '# === Bob 의 터미널 (같은 순간) ===',
+            'cd infra/prod',
+            'terraform plan -out=bob.tfplan',
+            'terraform apply bob.tfplan          # T+0.01s 시작',
+            '',
+            '# 만약 lock 이 없다면 일어나는 일:',
+            '#  1) Alice 가 terraform.tfstate 를 읽음',
+            '#  2) Bob 도 terraform.tfstate 를 읽음 (같은 버전)',
+            '#  3) Alice 가 변경하고 write',
+            '#  4) Bob 도 변경하고 write → Alice 의 변경 위에 덮어쓰기',
+            '#  5) Alice 의 리소스는 state 에 사라짐 → drift 발생',
+            '',
+            '# → 그래서 Terraform 은 state 에 잠금을 건다',
+            '#   (다음 단계에서 어떻게 잠그는지 본다)',
+          ],
+          highlight: [4, 5, 6, 9, 10, 11, 13, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 2. DynamoDB lock 획득 — 한 명만 통과',
+        desc: 'S3 backend 는 state 파일을, DynamoDB 는 lock 정보를 저장한다. terraform 이 apply 시작 시 DynamoDB 에 lockId 를 PutItem 한다. 조건은 "해당 key 에 항목이 없을 때만 성공" (조건부 쓰기). Alice 가 1/1000초 빨라 lock 획득에 성공했다. Bob 의 PutItem 은 ConditionalCheckFailedException 으로 거절된다. Bob 의 터미널에는 "Error acquiring the state lock" 메시지와 함께 Alice 의 lockId, Operation, Who, Created 정보가 표시된다.',
+        userA: { state: 'apply', label: 'lock 획득 → apply 진행 중' },
+        userB: { state: 'blocked', label: 'lock 거절됨' },
+        lock: { state: 'held', holder: 'Alice', lockId: 'a3f1-9c22-...', since: 'T+0.02s' },
+        events: [
+          { t: 'T+0.02s', who: 'Alice', msg: 'DynamoDB PutItem(lockId=a3f1...) 성공' },
+          { t: 'T+0.03s', who: 'Bob',   msg: 'DynamoDB PutItem 시도 → ConditionalCheckFailed' },
+          { t: 'T+0.03s', who: 'Bob',   msg: '"Error acquiring the state lock" 출력 후 종료' },
+          { t: 'T+0.04s', who: 'Alice', msg: 'state 읽기 → 리소스 변경 적용 시작' },
+        ],
+        keyPoint: 'lock 은 "DynamoDB 조건부 쓰기" 한 줄로 구현된다. 한 명만 성공, 나머지는 즉시 실패.',
+        code: {
+          lang: 'markdown',
+          filename: 'lock-flow.md',
+          lines: [
+            '# Step 2. DynamoDB lock 획득 흐름',
+            '',
+            '## 백엔드 구성 (예시)',
+            '```hcl',
+            'terraform {',
+            '  backend "s3" {',
+            '    bucket         = "team-tfstate"',
+            '    key            = "prod/terraform.tfstate"',
+            '    region         = "ap-northeast-2"',
+            '    dynamodb_table = "tfstate-lock"   # ← lock 저장소',
+            '    encrypt        = true',
+            '  }',
+            '}',
+            '```',
+            '',
+            '## apply 시 일어나는 일 (요약)',
+            '1. terraform 이 무작위 UUID(lockId) 생성',
+            '2. DynamoDB 에 PutItem (조건: key 가 비어있을 때만)',
+            '   - 성공 → lock 보유, state 작업 진행',
+            '   - 실패 → Error acquiring the state lock 출력 후 종료',
+            '3. apply 완료 후 DeleteItem 으로 lock 해제',
+            '',
+            '## Bob 이 본 에러 메시지 (실제 출력 예)',
+            '```',
+            '│ Error: Error acquiring the state lock',
+            '│',
+            '│   Lock Info:',
+            '│     ID:        a3f1-9c22-4e7b-bc01-1d3e9c0f2a44',
+            '│     Path:      team-tfstate/prod/terraform.tfstate',
+            '│     Operation: OperationTypeApply',
+            '│     Who:       alice@team',
+            '│     Created:   2026-05-19 11:02:18 UTC',
+            '```',
+            '',
+            '## 핵심',
+            '- lock 은 "줄 서기" 가 아니라 "즉시 거절"이다',
+            '- Bob 은 잠시 후 다시 시도하면 된다 (Alice 가 끝난 뒤)',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 3. Stale lock — 프로세스가 crash 해 lock 이 안 풀린다',
+        desc: 'Alice 의 apply 가 한창 진행 중인데 그녀의 노트북이 멈춰버렸다(또는 네트워크가 끊기거나 CI 러너가 강제 종료됐다). 정상이라면 apply 끝에 DeleteItem 으로 lock 을 풀어야 한다. 그런데 프로세스가 갑자기 죽으면 그 마지막 정리 단계가 실행되지 않는다. DynamoDB 에는 Alice 의 lockId 가 그대로 남아있다. 30분 뒤 Bob 이 다시 apply 를 해도 여전히 "lock held by alice@team" 으로 거절된다. 이게 stale lock(좀비 lock)이다.',
+        userA: { state: 'crashed', label: 'crash (노트북 멈춤)' },
+        userB: { state: 'blocked', label: '여전히 lock 거절됨' },
+        lock: { state: 'stale', holder: 'Alice (crashed)', lockId: 'a3f1-9c22-...', since: 'T+0.02s (30분 전)' },
+        events: [
+          { t: 'T+1.5min',  who: 'Alice',  msg: 'apply 진행 중 노트북 강제 종료' },
+          { t: 'T+1.5min',  who: 'System', msg: 'DeleteItem 호출되지 못함 → lock 미해제' },
+          { t: 'T+30min',   who: 'Bob',    msg: 'terraform apply 재시도' },
+          { t: 'T+30min',   who: 'Bob',    msg: '여전히 "lock held by alice@team" 에러' },
+        ],
+        keyPoint: 'lock 은 TTL 자동 만료가 없다. 프로세스가 죽으면 사람이 직접 풀어줘야 한다.',
+        code: {
+          lang: 'markdown',
+          filename: 'stale-lock.md',
+          lines: [
+            '# Step 3. Stale lock 이 발생하는 시나리오',
+            '',
+            '## 어떨 때 발생하나?',
+            '',
+            '| 상황 | 원인 |',
+            '|:--|:--|',
+            '| 노트북 갑자기 종료 | 배터리 방전, OS 크래시 |',
+            '| 네트워크 단절 | VPN 끊김, 와이파이 끊김 |',
+            '| Ctrl+C 두 번 | 정리 핸들러 실행 전에 죽음 |',
+            '| CI 러너 강제 종료 | 타임아웃, 잡 취소 |',
+            '| AWS API 호출 중 OOM | terraform 프로세스가 kill -9 |',
+            '',
+            '## 왜 자동으로 안 풀리나?',
+            '',
+            '- DynamoDB 의 lock 항목에는 TTL 이 설정되어 있지 않다',
+            '- terraform 은 "끝났을 때 본인이 푸는" 모델이다',
+            '- 즉, 본인이 죽으면 lock 도 같이 죽지 않는다 (좀비)',
+            '',
+            '## 위험 신호',
+            '',
+            '- 모든 팀원에게 같은 lockId 의 에러가 표시됨',
+            '- "Created" 시각이 비현실적으로 오래됨 (예: 30분 전, 어제)',
+            '- Slack 에 "lock 안 풀려요" 가 두세 번 올라옴',
+            '',
+            '## 절대로 하면 안 되는 것',
+            '',
+            '- DynamoDB 콘솔에서 직접 항목 삭제 (lockId 검증 우회 → 실제 작업 중이던 사람과 충돌)',
+            '- state 파일을 S3 에서 수동으로 덮어쓰기',
+            '- backend 설정을 일시적으로 끄기 (-lock=false)',
+            '',
+            '## 올바른 복구 방법',
+            '- 다음 단계 `terraform force-unlock <LOCK_ID>` 를 사용한다',
+            '- 반드시 Alice 가 정말로 죽었는지 본인에게 확인 후',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 25, 26, 27, 28, 30, 31],
+        },
+      },
+      {
+        title: 'Step 4. terraform force-unlock — 마스터키로 lock 강제 해제',
+        desc: 'Alice 본인에게 "정말 apply 중인지" 확인했고, Slack 에서 다른 누구도 작업 중이 아님을 확인했다. 이제 Bob 이 `terraform force-unlock <LOCK_ID>` 를 실행한다. 인자로 stale lock 의 ID 를 정확히 넣어야 한다 — 무작위 ID 로는 풀리지 않는다(다른 사람의 정상 lock 을 실수로 풀면 진짜 사고다). force-unlock 은 DynamoDB 의 해당 항목을 직접 삭제한다. lock 이 풀리고 Bob 은 다시 apply 를 시작한다. 단, Alice 의 작업이 중간에 죽은 상태라면 state 가 일관되지 않을 수 있으니 `terraform plan` 으로 drift 부터 확인한다.',
+        userA: { state: 'idle', label: '복구 완료 (재시작 필요)' },
+        userB: { state: 'apply', label: 'force-unlock 후 apply 재시작' },
+        lock: { state: 'released', holder: null, lockId: null, since: null },
+        events: [
+          { t: 'T+30min',   who: 'Bob',    msg: 'Alice 에게 슬랙 확인: "지금 apply 중?" → "아니 노트북 죽음"' },
+          { t: 'T+31min',   who: 'Bob',    msg: 'terraform force-unlock a3f1-9c22-... 실행' },
+          { t: 'T+31min',   who: 'System', msg: 'DynamoDB DeleteItem 성공 → lock 해제' },
+          { t: 'T+31min',   who: 'Bob',    msg: 'terraform plan 으로 drift 확인 → 깨끗함' },
+          { t: 'T+32min',   who: 'Bob',    msg: 'terraform apply 재시작 → 정상 진행' },
+        ],
+        keyPoint: 'force-unlock 은 "사람이 책임지는" 비상 키다. 누가 진짜 작업 중인지 사전 확인 필수.',
+        code: {
+          lang: 'bash',
+          filename: 'force-unlock.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# Step 4. force-unlock 복구 절차 — 반드시 순서대로',
+            '',
+            '# ① 누가 lock 을 잡고 있는지 에러 메시지에서 LOCK_ID 와 Who 확인',
+            '#    예) Lock Info:',
+            '#         ID:   a3f1-9c22-4e7b-bc01-1d3e9c0f2a44',
+            '#         Who:  alice@team',
+            '',
+            '# ② 그 사람에게 직접 확인 (필수, 생략 금지)',
+            '#    Slack: "혹시 prod 에 apply 중이세요?"',
+            '#    답: "아니요, 노트북 죽어서 다시 켰어요"',
+            '#    → 죽은 lock 이라고 확정',
+            '',
+            '# ③ force-unlock 실행 — LOCK_ID 인자 정확히 입력',
+            'LOCK_ID="a3f1-9c22-4e7b-bc01-1d3e9c0f2a44"',
+            '',
+            'terraform force-unlock "$LOCK_ID"',
+            '# 출력 예:',
+            '#   Do you really want to force-unlock?',
+            '#     Terraform will remove the lock on the remote state.',
+            '#     This will allow local Terraform commands to modify this state,',
+            '#     even though it may be still be in use. Only do this if you are',
+            '#     sure that no one else is currently working with this state.',
+            '#   Enter a value: yes',
+            '#   Terraform state has been successfully unlocked!',
+            '',
+            '# ④ drift 확인 — 죽기 직전 어디까지 적용됐는지 모름',
+            'terraform plan',
+            '#   - 깨끗하면 그대로 apply 재시작',
+            '#   - 차이가 있으면 어떤 리소스가 어긋났는지 검토',
+            '',
+            '# ⑤ 재시작',
+            'terraform apply',
+            '',
+            '# 주의:',
+            '#  - LOCK_ID 를 잘못 입력하면 "Failed to unlock state: lock id does not match"',
+            '#  - 정상 작업 중인 동료의 lock 을 풀면 실제 사고로 이어진다',
+            '#  - -force 옵션은 -auto-approve 와 다르다. force-unlock 은 반드시 yes 확인 필요',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16, 26, 27, 28, 29, 31, 32, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 5. 충돌 예방 — CI 에서만 apply / Atlantis 도입',
+        desc: '여기까지가 사후 복구다. 더 나은 방법은 충돌 자체를 일으키지 않는 것이다. 사람이 직접 apply 하는 한 stale lock 위험은 사라지지 않는다. 실무에서 가장 일반적인 해법은 두 가지. ① 로컬 apply 금지 정책 — apply 는 CI(GitHub Actions, GitLab CI 등) 에서만 실행한다. CI 잡이 동시에 두 개 돌지 못하도록 concurrency 설정을 건다. ② Atlantis 같은 PR 기반 도구 도입 — PR 마다 plan 을 댓글로 보여주고, 승인 시에만 apply 한다. Atlantis 가 lock 을 PR 단위로 관리해 충돌이 거의 사라진다.',
+        userA: { state: 'idle', label: '로컬 apply 금지' },
+        userB: { state: 'idle', label: '로컬 apply 금지' },
+        lock: { state: 'free', holder: 'CI Bot (sequential)', lockId: null, since: null },
+        events: [
+          { t: '운영', who: 'Policy', msg: 'IAM 으로 인간 IAM user 의 S3 PutObject 금지' },
+          { t: '운영', who: 'CI',     msg: 'GitHub Actions concurrency: prod-apply (잡 1개만)' },
+          { t: '운영', who: 'PR',     msg: 'Atlantis 가 PR 마다 plan 댓글 → 승인 시 apply' },
+          { t: '운영', who: 'Audit',  msg: 'CloudTrail 로 누가 언제 apply 했는지 추적' },
+        ],
+        keyPoint: '복구 절차를 잘 외우는 것보다 충돌이 안 나는 구조를 만드는 것이 100배 낫다.',
+        code: {
+          lang: 'markdown',
+          filename: 'prevent.md',
+          lines: [
+            '# Step 5. 충돌을 예방하는 두 가지 방법',
+            '',
+            '## 방법 A. CI 에서만 apply (가장 단순)',
+            '',
+            '### 정책',
+            '- 사람은 plan 까지만 (로컬에서 검토)',
+            '- apply 는 main 브랜치 merge 시 CI 가 실행',
+            '- CI 잡은 동시에 하나만 (concurrency)',
+            '',
+            '### GitHub Actions 예시',
+            '```yaml',
+            'name: terraform-apply',
+            'on:',
+            '  push:',
+            '    branches: [main]',
+            'concurrency:',
+            '  group: prod-apply        # ← 같은 그룹 잡은 한 번에 1개',
+            '  cancel-in-progress: false',
+            'jobs:',
+            '  apply:',
+            '    runs-on: ubuntu-latest',
+            '    steps:',
+            '      - uses: actions/checkout@v4',
+            '      - uses: hashicorp/setup-terraform@v3',
+            '      - run: terraform init',
+            '      - run: terraform apply -auto-approve',
+            '```',
+            '',
+            '### IAM 정책 (사람 user 의 state 쓰기 금지)',
+            '- s3:PutObject on team-tfstate/prod/* → CI role 에게만',
+            '- dynamodb:PutItem on tfstate-lock → CI role 에게만',
+            '',
+            '## 방법 B. Atlantis 도입 (PR 워크플로)',
+            '',
+            '- PR 을 열면 Atlantis 봇이 자동으로 `terraform plan` 댓글',
+            '- 리뷰어가 승인하고 `atlantis apply` 댓글 → Atlantis 가 apply',
+            '- Atlantis 가 PR 단위로 lock 을 잡아 동시 apply 자체가 불가능',
+            '- 누가 언제 무엇을 적용했는지 PR 에 영구 기록',
+            '',
+            '## 두 방법의 공통 효과',
+            '- 사람의 노트북 crash → lock 영향 없음 (CI 가 처리)',
+            '- 두 사람 동시 apply → 큐잉으로 순차 실행',
+            '- 사후 force-unlock 사용 빈도가 사실상 0 으로 수렴',
+            '',
+            '## 정리',
+            '1. 작은 팀: GitHub Actions + concurrency 만으로 충분',
+            '2. 큰 팀/여러 stack: Atlantis 또는 Terraform Cloud',
+            '3. 어느 쪽이든 "로컬 apply 금지" 가 핵심',
+          ],
+          highlight: [4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29, 30, 31, 33, 34, 35, 36, 37, 38],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — pink 톤
+    // ─────────────────────────────────────────────────────
+    const USER_STYLE = {
+      apply:   { bg: 'bg-pink-50',  border: 'border-pink-400', text: 'text-pink-800',  icon: '▶' },
+      wait:    { bg: 'bg-amber-50', border: 'border-amber-400', text: 'text-amber-800', icon: '⏳' },
+      blocked: { bg: 'bg-rose-50',  border: 'border-rose-400', text: 'text-rose-800',  icon: '⛔' },
+      crashed: { bg: 'bg-slate-100', border: 'border-slate-400', text: 'text-slate-700', icon: '💀' },
+      idle:    { bg: 'bg-white',    border: 'border-slate-300', text: 'text-slate-600', icon: '○' },
+    };
+
+    const LOCK_STYLE = {
+      free:     { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800', icon: '🔓', label: '비어있음 (free)' },
+      held:     { bg: 'bg-pink-100',   border: 'border-pink-500',   text: 'text-pink-900',   icon: '🔒', label: '잠김 (held)' },
+      stale:    { bg: 'bg-rose-100',   border: 'border-rose-500',   text: 'text-rose-900',   icon: '🧟', label: 'STALE (좀비 lock)' },
+      released: { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800', icon: '🔓', label: '해제됨 (released)' },
+    };
+
+    function UserBox({ name, user }) {
+      const s = USER_STYLE[user.state] || USER_STYLE.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.bg} ${s.border} px-3 py-3`}>
+          <div className="flex items-center justify-between mb-1">
+            <span className={`text-sm font-bold ${s.text}`}>👤 {name}</span>
+            <span className="text-lg">{s.icon}</span>
+          </div>
+          <div className={`text-xs ${s.text} font-mono`}>{user.label}</div>
+        </div>
+      );
+    }
+
+    function LockBox({ lock }) {
+      const s = LOCK_STYLE[lock.state] || LOCK_STYLE.free;
+      return (
+        <div className={`rounded-xl border-2 ${s.bg} ${s.border} p-3`}>
+          <div className="flex items-center justify-between mb-2">
+            <span className={`text-sm font-bold ${s.text}`}>DynamoDB Lock</span>
+            <span className="text-2xl">{s.icon}</span>
+          </div>
+          <div className={`text-xs ${s.text} font-bold mb-1`}>{s.label}</div>
+          {lock.holder && (
+            <div className="text-[11px] text-slate-700 font-mono">holder: {lock.holder}</div>
+          )}
+          {lock.lockId && (
+            <div className="text-[11px] text-slate-700 font-mono">id: {lock.lockId}</div>
+          )}
+          {lock.since && (
+            <div className="text-[11px] text-slate-700 font-mono">since: {lock.since}</div>
+          )}
+        </div>
+      );
+    }
+
+    function EventLog({ events }) {
+      return (
+        <div className="mt-3 rounded-lg border border-pink-200 bg-white p-3">
+          <div className="text-xs font-bold text-pink-800 mb-2">이벤트 로그</div>
+          <ul className="space-y-1.5">
+            {events.map((e, i) => (
+              <li key={i} className="text-[11px] flex gap-2 font-mono">
+                <span className="text-pink-500 w-16 shrink-0">{e.t}</span>
+                <span className="text-slate-500 w-14 shrink-0">[{e.who}]</span>
+                <span className="text-slate-800 flex-1">{e.msg}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-pink-200 bg-pink-50/40 p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-pink-800">동시 apply / Lock 시뮬레이션</h3>
+            <span className="text-[10px] text-slate-500">왼쪽 = 도메인 상태</span>
+          </div>
+
+          {/* 두 사용자 박스 + lock 박스 (가운데) */}
+          <div className="grid grid-cols-3 gap-2 items-stretch">
+            <UserBox name="Alice" user={state.userA} />
+            <LockBox lock={state.lock} />
+            <UserBox name="Bob" user={state.userB} />
+          </div>
+
+          {/* 흐름 화살표 */}
+          <div className="mt-2 grid grid-cols-3 gap-2 text-center text-[10px] text-pink-700">
+            <div>→ apply 요청 →</div>
+            <div className="font-bold">(state 잠금)</div>
+            <div>← apply 요청 ←</div>
+          </div>
+
+          <EventLog events={state.events} />
+
+          <div className="mt-3 text-xs text-pink-900 bg-pink-100 border border-pink-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-pink-500/15 border-l-2 border-pink-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-pink-50 to-rose-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-pink-600 text-white font-bold">III</span>
+              <div>
+                <h1 className="text-2xl font-bold text-pink-900">III-2-2. 충돌과 lock 복구</h1>
+                <p className="text-sm text-pink-800/80">동시 apply → lock 획득/거절 → stale lock → force-unlock → 예방. 5단계로 추적</p>
+              </div>
+              <a href="./index.html" className="ml-auto text-xs text-pink-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-pink-600' : 'bg-pink-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-pink-700 text-pink-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-pink-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-pink-700 text-white' : 'bg-pink-600 text-white hover:bg-pink-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-pink-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-pink-400 bg-white px-4 py-3 text-sm text-pink-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                동시 apply 는 DynamoDB lock 으로 자동 차단되지만, 프로세스 crash 시 stale lock 이 남는다. 사람에게 확인 후 force-unlock 으로 복구하되, 진짜 해법은 "로컬 apply 금지 + CI 단일 잡" 또는 Atlantis 로 충돌이 안 나게 만드는 것이다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['state lock', 'DynamoDB', 'ConditionalCheckFailed', 'stale lock', 'force-unlock', 'Atlantis', 'CI concurrency', 'drift'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-pink-100 text-pink-800 border border-pink-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-pink-700">
+              <a href="./III-2-1.html" className="underline hover:no-underline">← 이전: III-2-1</a>
+              <a href="./index.html" className="underline hover:no-underline">챕터 목록</a>
+              <a href="./III-2-3.html" className="underline hover:no-underline">다음: III-2-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

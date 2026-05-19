@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terraform 인터랙티브 학습 — V-2-1. Secret 관리 (Vault / SOPS / 환경변수)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Terraform V-2-1 — Secret 관리 (Vault / SOPS / 환경변수)
+    학습 목표: 평문 tfvars 사고 → 환경변수 → Vault → SOPS → AWS Secrets Manager
+              5단계로 비밀(secret) 저장 위치와 위험도를 추적한다.
+    핵심 비유: "비밀번호를 어디에 적어 둘 것인가" 5가지 방식
+    패턴: fastapi v1 — 좌(LiveDataPane: 비밀 저장 위치 비교 + 위험도 별점) / 우(VSCode CodeViewer 5탭)
+    색상: pink (terraform secret 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 평문 → 환경변수 → Vault → SOPS → AWS Secrets Manager
+    //   pane      : 좌측 LiveDataPane에 표시할 도메인 상태
+    //   secrets   : 비밀 저장소 카드 [{kind, location, value, stars, badge}]
+    //   arrow     : 변환 화살표 라벨
+    //   incident  : 사고 박스 (Step 1만 활성)
+    //   conclusion: 결론 박스 (Step 5만 활성)
+    //   code      : 우측 CodeViewer 파일 (lang, filename, lines, highlight)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 평문 tfvars — git commit 사고가 일어나는 곳',
+        desc: '신입 개발자가 terraform.tfvars 파일에 DB 비밀번호와 AWS access key를 그냥 적어두고 무심코 git commit + push 했다. private repo였지만 한 달 뒤 인턴이 fork하면서 그대로 따라갔고, 결국 권한 없는 사람의 로컬에 평문 키가 남았다. 평문 tfvars는 가장 흔한 사고 원인이다. .gitignore 한 줄 빠뜨리면 끝이다. 이 단계의 위험도는 별 5개(최고 위험).',
+        secrets: [
+          { kind: 'bad',  location: '📄 terraform.tfvars', value: 'db_password = "P@ss123!"', stars: 5, badge: 'git에 그대로 노출' },
+          { kind: 'bad',  location: '📄 terraform.tfvars', value: 'aws_access_key = "AKIA..."', stars: 5, badge: 'git에 그대로 노출' },
+          { kind: 'bad',  location: '📁 .terraform/state', value: 'state 파일에도 평문', stars: 5, badge: 'state도 위험' },
+        ],
+        arrow: '환경변수로 옮기자',
+        incident: {
+          title: '실제 사고 (가상)',
+          actions: [
+            'git log: tfvars 커밋이 6개월 전부터 남아있음',
+            'GitHub 검색에서 "AKIA"로 노출 키 자동 스캔됨',
+            'AWS abuse 팀이 24시간 내 키 자동 비활성화 + 청구서 폭탄',
+          ],
+        },
+        keyPoint: '평문 tfvars + git = 최악의 조합. 단 한 번의 실수가 영구 기록으로 남는다.',
+        code: {
+          lang: 'hcl',
+          filename: 'plaintext-bad.tfvars',
+          lines: [
+            '# Step 1. 평문 tfvars — 절대 하면 안 되는 패턴',
+            '# (실제로 가장 자주 일어나는 사고)',
+            '',
+            '# ❌ 평문으로 비밀번호 저장',
+            'db_password    = "P@ss123!"',
+            'db_username    = "admin"',
+            '',
+            '# ❌ AWS access key를 그대로',
+            'aws_access_key = "AKIAIOSFODNN7EXAMPLE"',
+            'aws_secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+            '',
+            '# ❌ 외부 API 토큰',
+            'github_token   = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456"',
+            'stripe_api_key = "sk_live_51Hxxx..."',
+            '',
+            '# 무엇이 잘못되었나?',
+            '#  1) .gitignore 한 줄 빼먹으면 git commit으로 영구 기록',
+            '#  2) Slack에 파일 첨부, 메일 첨부 시 그대로 유출',
+            '#  3) terraform plan 출력에도 노출 (CI 로그에 박힘)',
+            '#  4) state 파일에도 평문으로 그대로 들어감',
+            '#  5) 한 번 노출되면 git history에서 제거하기 어렵다',
+            '',
+            '# .gitignore에 반드시 (그래도 100% 안전한 것은 아니다)',
+            '#   *.tfvars',
+            '#   !example.tfvars',
+            '#   .terraform/',
+            '#   *.tfstate',
+            '#   *.tfstate.backup',
+            '',
+            '# → 다음 단계 (Step 2): 환경변수 TF_VAR_* 로 옮긴다',
+          ],
+          highlight: [4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 2. 환경변수 TF_VAR_* — 파일에 안 적기',
+        desc: 'Terraform은 TF_VAR_xxx 형태의 환경변수를 자동으로 variable xxx에 매핑해준다. 비밀번호를 파일에 안 적고 셸 환경변수로만 넘기면 git commit 사고는 막을 수 있다. CI/CD에서는 GitHub Actions secrets나 GitLab CI variables로 주입한다. 하지만 로컬 셸 히스토리(.bash_history)에 남거나, 환경변수가 자식 프로세스로 그대로 새는 위험이 있다. 위험도 별 3개.',
+        secrets: [
+          { kind: 'okay', location: '🖥️ shell ENV',      value: 'export TF_VAR_db_password=...', stars: 3, badge: 'git에는 안 남음' },
+          { kind: 'okay', location: '🤖 GitHub Actions', value: '${{ secrets.DB_PASSWORD }}',     stars: 2, badge: 'CI에서 안전' },
+          { kind: 'bad',  location: '📜 .bash_history',  value: 'export ... 그대로 기록',          stars: 3, badge: '히스토리 남음' },
+        ],
+        arrow: '진짜 비밀 저장소로',
+        keyPoint: '환경변수 = git 사고는 막지만, 셸 히스토리/프로세스 노출은 여전. 1단계 개선책일 뿐.',
+        code: {
+          lang: 'bash',
+          filename: 'env-vars.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# Step 2. 환경변수로 비밀 주입',
+            '# Terraform 규칙: TF_VAR_xxx → variable "xxx" 에 자동 매핑',
+            '',
+            '# ✅ 파일에는 변수 선언만, 값은 환경변수로',
+            '# variables.tf',
+            '#   variable "db_password" {',
+            '#     type        = string',
+            '#     sensitive   = true   # plan 출력에서 마스킹',
+            '#   }',
+            '',
+            '# ── 로컬 개발 ──',
+            'export TF_VAR_db_password="P@ss123!"',
+            'export TF_VAR_aws_access_key="AKIA..."',
+            'export TF_VAR_github_token="ghp_..."',
+            '',
+            'terraform plan',
+            'terraform apply',
+            '',
+            '# ── 더 안전하게: direnv + .envrc (gitignore) ──',
+            '# .envrc',
+            '#   export TF_VAR_db_password="P@ss123!"',
+            '# .gitignore',
+            '#   .envrc',
+            '# 셸 진입 시 자동 로드, 떠나면 자동 unset',
+            '',
+            '# ── CI/CD (GitHub Actions) ──',
+            '# .github/workflows/deploy.yml',
+            '#   - name: Terraform Apply',
+            '#     env:',
+            '#       TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}',
+            '#       TF_VAR_aws_access_key: ${{ secrets.AWS_ACCESS_KEY }}',
+            '#     run: terraform apply -auto-approve',
+            '',
+            '# 한계점:',
+            '#  1) .bash_history 에 export 명령이 그대로 남는다',
+            "#     → 'set +o history' 또는 줄 앞 공백 입력으로 회피",
+            '#  2) ps -ef / /proc/<pid>/environ 로 다른 사용자가 볼 수도',
+            '#  3) 키 회전(rotation) 자동화가 어렵다',
+            '#  4) 누가 언제 어떤 키를 썼는지 감사 로그 없음',
+            '',
+            '# → 다음 단계 (Step 3): HashiCorp Vault로 중앙 관리',
+          ],
+          highlight: [12, 13, 14, 15, 17, 18, 27, 28, 29, 30, 31, 32, 33, 34],
+        },
+      },
+      {
+        title: 'Step 3. HashiCorp Vault — 비밀 전용 데이터베이스',
+        desc: 'Vault는 "비밀을 위한 데이터베이스"다. 평문 파일도 없고, 환경변수도 아니다. Terraform이 실행될 때 vault provider를 통해 데이터를 가져와서 메모리에서만 쓰고 끝난다. 누가 언제 어떤 비밀을 읽었는지 감사 로그가 남고, 키 회전도 자동화할 수 있고, TTL(만료)도 줄 수 있다. 운영 환경에서 가장 표준적인 방법. 위험도 별 1개.',
+        secrets: [
+          { kind: 'good', location: '🏛️ Vault KV v2',  value: 'secret/data/prod/db', stars: 1, badge: '중앙 관리' },
+          { kind: 'good', location: '📋 감사 로그',     value: '누가 언제 무엇 조회',  stars: 1, badge: 'audit trail' },
+          { kind: 'good', location: '⏱️ Dynamic creds', value: 'TTL 1h, 자동 회전',   stars: 1, badge: '단명(短命) 자격증명' },
+        ],
+        arrow: 'Vault 서버가 없으면? → SOPS',
+        keyPoint: 'Vault = 운영의 표준. 감사/회전/TTL이 강력. 단점은 Vault 서버 자체를 운영해야 한다.',
+        code: {
+          lang: 'hcl',
+          filename: 'vault.tf',
+          lines: [
+            '# Step 3. HashiCorp Vault data source 로 비밀 가져오기',
+            '# 파일에도 환경변수에도 비밀이 없다. Vault 서버에만 있다.',
+            '',
+            'terraform {',
+            '  required_providers {',
+            '    vault = {',
+            '      source  = "hashicorp/vault"',
+            '      version = "~> 4.0"',
+            '    }',
+            '  }',
+            '}',
+            '',
+            '# Vault provider 설정',
+            '# - 주소는 환경변수 VAULT_ADDR',
+            '# - 토큰은 환경변수 VAULT_TOKEN (또는 AppRole/AWS auth)',
+            'provider "vault" {',
+            '  # address = "https://vault.company.internal:8200"  # 환경변수 권장',
+            '  # token   = "hvs.xxxxx"                            # 환경변수 권장',
+            '}',
+            '',
+            '# ── ① 정적 비밀 (KV v2) ──',
+            'data "vault_kv_secret_v2" "db" {',
+            '  mount = "secret"',
+            '  name  = "prod/db"',
+            '}',
+            '',
+            '# data.vault_kv_secret_v2.db.data 는 map(string)',
+            'resource "aws_db_instance" "main" {',
+            '  identifier = "prod-db"',
+            '  engine     = "postgres"',
+            '  username   = data.vault_kv_secret_v2.db.data["username"]',
+            '  password   = data.vault_kv_secret_v2.db.data["password"]',
+            '  # ...',
+            '}',
+            '',
+            '# ── ② 동적 비밀 (dynamic credentials) ──',
+            '# Vault가 매번 새 DB 사용자를 만들고 TTL 후 자동 삭제',
+            'data "vault_database_secret_backend_creds" "db" {',
+            '  backend = "database"',
+            '  role    = "readonly-app"',
+            '  # TTL 끝나면 username/password 자동 폐기',
+            '}',
+            '',
+            '# 한계점:',
+            '#  1) Vault 서버 자체를 HA로 운영해야 (Raft / Consul)',
+            '#  2) Vault 자체의 unseal 키 관리가 또 다른 난제',
+            '#  3) 소규모 팀에는 과한 인프라',
+            '',
+            '# → 다음 단계 (Step 4): Vault 없이도 git에 암호화 저장 - SOPS',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 22, 23, 24, 25, 28, 29, 30, 31, 32, 33, 34, 37, 38, 39, 40, 41, 42],
+        },
+      },
+      {
+        title: 'Step 4. SOPS — 암호화된 tfvars를 git에 커밋',
+        desc: 'Mozilla SOPS는 "암호화된 파일을 git에 그대로 커밋해도 안전"하게 만들어 준다. 평문 tfvars 대신 SOPS로 암호화된 .enc.yaml을 커밋한다. 복호화 키는 AWS KMS, GCP KMS, age, PGP 중 하나로 관리. CI/CD에서는 KMS 권한이 있는 IAM role로 자동 복호화. Vault 서버를 운영하기 부담스러운 소-중규모 팀에 딱이다. 위험도 별 2개.',
+        secrets: [
+          { kind: 'good', location: '📦 secrets.enc.yaml', value: 'AES256으로 암호화된 git 커밋', stars: 2, badge: 'git에 안전' },
+          { kind: 'good', location: '☁️ AWS KMS key',      value: 'CMK ARN으로 권한 관리',         stars: 1, badge: '키는 KMS에' },
+          { kind: 'okay', location: '🔑 .sops.yaml',       value: '규칙 파일 (git 커밋 OK)',       stars: 1, badge: '평문이지만 키 아님' },
+        ],
+        arrow: 'AWS 안에서는 더 쉽게',
+        keyPoint: 'SOPS = git 친화적 + Vault보다 가볍다. 복호화 키만 KMS로 잘 관리하면 강력하다.',
+        code: {
+          lang: 'yaml',
+          filename: 'sops.yaml',
+          lines: [
+            '# Step 4. SOPS (Secrets OPerationS) 로 tfvars 를 암호화',
+            '# Mozilla 가 만든 도구. AWS KMS / GCP KMS / age / PGP 지원.',
+            '',
+            '# ── ① .sops.yaml (저장소 루트, git에 커밋 OK) ──',
+            'creation_rules:',
+            '  - path_regex: \\.enc\\.yaml$',
+            '    kms: arn:aws:kms:ap-northeast-2:111122223333:key/abc-123',
+            '    # 또는 age',
+            '    # age: age1qzg7...',
+            '',
+            '# ── ② 비밀 파일 작성 후 암호화 ──',
+            '#   $ sops -e -i secrets.enc.yaml',
+            '# 그러면 아래처럼 값들이 ENC[...] 로 바뀐다',
+            '#',
+            '# db_password: ENC[AES256_GCM,data:xxxx,iv:yyyy,tag:zzzz,type:str]',
+            '# aws_access_key: ENC[AES256_GCM,data:xxxx,iv:yyyy,tag:zzzz,type:str]',
+            '# sops:',
+            '#   kms:',
+            '#     - arn: arn:aws:kms:ap-northeast-2:111122223333:key/abc-123',
+            '#       created_at: "2026-05-19T10:00:00Z"',
+            '',
+            '# ── ③ Terraform 에서 사용 ──',
+            '# providers.tf',
+            '# terraform {',
+            '#   required_providers {',
+            '#     sops = { source = "carlpett/sops", version = "~> 1.0" }',
+            '#   }',
+            '# }',
+            '#',
+            '# main.tf',
+            '# data "sops_file" "secrets" {',
+            '#   source_file = "secrets.enc.yaml"',
+            '# }',
+            '#',
+            '# resource "aws_db_instance" "main" {',
+            '#   password = data.sops_file.secrets.data["db_password"]',
+            '# }',
+            '',
+            '# ── ④ CI/CD ──',
+            '# GitHub Actions 에서는 OIDC 로 KMS 권한이 있는 role 가정',
+            '# - uses: aws-actions/configure-aws-credentials@v4',
+            '#   with:',
+            '#     role-to-assume: arn:aws:iam::xxxx:role/ci-deploy',
+            '# - run: terraform apply -auto-approve',
+            '# (sops provider 가 자동으로 KMS 복호화)',
+            '',
+            '# 장점:',
+            '#  1) 비밀이 git에 커밋되어도 안전 (암호화됨)',
+            '#  2) Vault 서버 운영 불필요',
+            '#  3) diff/review 가능 (어떤 키가 추가됐는지)',
+            '#  4) 로컬 개발도 KMS 권한만 있으면 동일하게 동작',
+            '',
+            '# → 다음 단계 (Step 5): AWS 환경이면 Secrets Manager가 가장 간편',
+          ],
+          highlight: [4, 5, 6, 7, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 5. AWS Secrets Manager — 클라우드 네이티브 방식',
+        desc: 'AWS 위에서 운영한다면 가장 자연스러운 선택. Secrets Manager에 비밀을 저장하면 IAM으로 권한 제어, 자동 회전(RDS와 통합), 버전 관리, 감사 로그까지 한 번에 해결된다. Terraform은 data "aws_secretsmanager_secret_version"로 가져온다. GCP는 Secret Manager, Azure는 Key Vault로 동일한 패턴. 위험도 별 1개.',
+        secrets: [
+          { kind: 'good', location: '☁️ AWS Secrets Manager', value: 'arn:aws:secretsmanager:...', stars: 1, badge: 'IAM 통합' },
+          { kind: 'good', location: '🔄 자동 회전',             value: 'RDS 비번 30일마다 변경', stars: 1, badge: 'rotation lambda' },
+          { kind: 'good', location: '📋 CloudTrail',           value: '조회/수정 모두 기록',     stars: 1, badge: 'audit' },
+        ],
+        conclusion: {
+          title: '결론 — 어떤 걸 골라야 하나',
+          actions: [
+            '개인/학습: 환경변수 TF_VAR_* + direnv',
+            '소-중 규모 팀 (AWS): SOPS + KMS 또는 Secrets Manager',
+            '대규모/멀티클라우드: HashiCorp Vault',
+            '절대 금지: 평문 tfvars 커밋',
+          ],
+        },
+        keyPoint: 'AWS Secrets Manager = AWS 환경의 표준. IAM/회전/감사가 매니지드로 다 된다.',
+        code: {
+          lang: 'hcl',
+          filename: 'aws-secrets.tf',
+          lines: [
+            '# Step 5. AWS Secrets Manager 로 비밀 관리',
+            '# AWS 위에서는 가장 자연스러운 선택',
+            '',
+            '# ── ① Secrets Manager 에 비밀 생성 ──',
+            '# (Terraform 으로 만들 수도, 콘솔/CLI 로 만들 수도 있다)',
+            'resource "aws_secretsmanager_secret" "db" {',
+            '  name                    = "prod/db/master"',
+            '  description             = "RDS master credentials"',
+            '  recovery_window_in_days = 7',
+            '  kms_key_id              = aws_kms_key.secrets.id',
+            '}',
+            '',
+            'resource "aws_secretsmanager_secret_version" "db" {',
+            '  secret_id     = aws_secretsmanager_secret.db.id',
+            '  secret_string = jsonencode({',
+            '    username = "admin"',
+            '    password = random_password.db.result',
+            '  })',
+            '}',
+            '',
+            'resource "random_password" "db" {',
+            '  length  = 32',
+            '  special = true',
+            '}',
+            '',
+            '# ── ② 다른 Terraform 코드에서 가져오기 ──',
+            'data "aws_secretsmanager_secret" "db" {',
+            '  name = "prod/db/master"',
+            '}',
+            '',
+            'data "aws_secretsmanager_secret_version" "db" {',
+            '  secret_id = data.aws_secretsmanager_secret.db.id',
+            '}',
+            '',
+            'locals {',
+            '  db_creds = jsondecode(data.aws_secretsmanager_secret_version.db.secret_string)',
+            '}',
+            '',
+            'resource "aws_db_instance" "main" {',
+            '  identifier = "prod-db"',
+            '  engine     = "postgres"',
+            '  username   = local.db_creds.username',
+            '  password   = local.db_creds.password',
+            '  # ...',
+            '}',
+            '',
+            '# ── ③ 자동 회전 (Lambda rotation) ──',
+            'resource "aws_secretsmanager_secret_rotation" "db" {',
+            '  secret_id           = aws_secretsmanager_secret.db.id',
+            '  rotation_lambda_arn = aws_lambda_function.rotation.arn',
+            '  rotation_rules {',
+            '    automatically_after_days = 30',
+            '  }',
+            '}',
+            '',
+            '# 장점:',
+            '#  1) IAM 으로 접근 제어 (별도 서버 불필요)',
+            '#  2) RDS / DocumentDB 와 자동 회전 통합',
+            '#  3) CloudTrail 에 모든 조회 기록',
+            '#  4) 멀티 리전 복제 지원',
+            '',
+            '# 단점:',
+            '#  1) AWS 종속 (멀티클라우드는 Vault)',
+            '#  2) 비용: secret 당 월 $0.40 + API 호출당 과금',
+            '',
+            '# → 끝. 이제 평문 tfvars 를 다시는 git 에 안 올린다.',
+          ],
+          highlight: [6, 7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 19, 26, 27, 28, 30, 31, 32, 35, 36, 37, 39, 40, 41, 42, 43, 44, 45, 48, 49, 50, 51, 52, 53, 54],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — pink 톤
+    // ─────────────────────────────────────────────────────
+    const KIND_STYLE = {
+      bad:  { bg: 'bg-rose-50',   border: 'border-rose-300',   text: 'text-rose-800',   badge: 'bg-rose-200 text-rose-800' },
+      okay: { bg: 'bg-amber-50',  border: 'border-amber-300',  text: 'text-amber-800',  badge: 'bg-amber-200 text-amber-800' },
+      good: { bg: 'bg-pink-50',   border: 'border-pink-300',   text: 'text-pink-800',   badge: 'bg-pink-200 text-pink-800' },
+    };
+
+    function StarRating({ count }) {
+      const stars = [];
+      for (let i = 1; i <= 5; i += 1) {
+        const filled = i <= count;
+        const color = count >= 4 ? 'text-rose-500' : count >= 3 ? 'text-amber-500' : 'text-pink-500';
+        stars.push(
+          <span key={i} className={filled ? color : 'text-slate-300'}>
+            {filled ? '★' : '☆'}
+          </span>,
+        );
+      }
+      return <span className="text-xs tracking-tighter">{stars}</span>;
+    }
+
+    function SecretCard({ item }) {
+      const s = KIND_STYLE[item.kind] || KIND_STYLE.okay;
+      return (
+        <div className={`rounded-lg border ${s.bg} ${s.border} px-3 py-2`}>
+          <div className="flex items-center justify-between mb-1">
+            <span className={`text-xs font-bold ${s.text}`}>{item.location}</span>
+            <StarRating count={item.stars} />
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className={`text-[11px] font-mono ${s.text} truncate`}>{item.value}</span>
+            <span className={`text-[10px] px-2 py-0.5 rounded shrink-0 ${s.badge}`}>{item.badge}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function IncidentBox({ incident }) {
+      if (!incident) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-rose-50 p-3">
+          <div className="text-xs font-bold text-rose-800 mb-2">🚨 {incident.title}</div>
+          <ul className="space-y-1">
+            {incident.actions.map((a, i) => (
+              <li key={i} className="text-sm text-rose-900 flex gap-2">
+                <span className="text-rose-500">▸</span>
+                <span>{a}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function ConclusionBox({ conclusion }) {
+      if (!conclusion) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-pink-500 bg-gradient-to-br from-pink-50 to-rose-50 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-2xl">🎯</span>
+            <span className="text-lg font-bold text-pink-800">{conclusion.title}</span>
+          </div>
+          <ul className="space-y-1.5">
+            {conclusion.actions.map((a, i) => (
+              <li key={i} className="text-sm text-pink-900 flex gap-2">
+                <span className="text-pink-500 mt-0.5">✓</span>
+                <span>{a}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-pink-200 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-pink-800">비밀 저장 위치 + 위험도</h3>
+            <span className="text-[10px] text-slate-500">★ 많을수록 위험</span>
+          </div>
+          <div className="space-y-2">
+            {state.secrets.map((it, i) => (
+              <SecretCard key={i} item={it} />
+            ))}
+          </div>
+          {state.arrow && (
+            <div className="mt-3 text-center text-xs font-bold text-pink-600 py-2 border-y border-dashed border-pink-300">
+              ↓ {state.arrow} ↓
+            </div>
+          )}
+          <IncidentBox incident={state.incident} />
+          <ConclusionBox conclusion={state.conclusion} />
+          <div className="mt-3 text-xs text-pink-900 bg-pink-50 border border-pink-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-pink-500/15 border-l-2 border-pink-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-pink-50 to-rose-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-pink-600 text-white font-bold">V</span>
+              <div>
+                <h1 className="text-2xl font-bold text-pink-900">V-2-1. Secret 관리 — Vault / SOPS / 환경변수</h1>
+                <p className="text-sm text-pink-800/80">평문 tfvars → 환경변수 → Vault → SOPS → AWS Secrets Manager. 5단계로 추적</p>
+              </div>
+              <a href="./index.html" className="ml-auto text-xs text-pink-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-pink-600' : 'bg-pink-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-pink-700 text-pink-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-pink-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-pink-700 text-white' : 'bg-pink-600 text-white hover:bg-pink-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-pink-300 bg-white text-pink-700 hover:bg-pink-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-pink-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-pink-400 bg-white px-4 py-3 text-sm text-pink-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                비밀은 절대 평문 tfvars로 git에 커밋하지 않는다. 가장 가벼운 단계는 환경변수, 표준은 Vault/SOPS/Secrets Manager. 팀 규모와 클라우드 종속도에 따라 골라 쓰면 된다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['tfvars', 'TF_VAR_*', 'Vault', 'SOPS', 'AWS Secrets Manager', 'KMS', 'sensitive', '감사로그'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-pink-100 text-pink-800 border border-pink-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-pink-700">
+              <a href="./index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-2-2.html" className="underline hover:no-underline">다음: V-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
