@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka 인터랙티브 학습 — III-1-2. Idempotent Producer + Transactions</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🟡</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Kafka III-1-2 — Idempotent Producer + Transactions (Exactly-Once Semantics)
+    학습 목표: enable.idempotence → PID + sequence → transactional.id → begin/commit
+              → consumer read_committed 까지 5단계로 EOS를 시각화한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: Producer→Broker 흐름, 중복 차단, 트랜잭션 상태)
+                       우(VSCode CodeViewer 5탭)
+    색상: yellow (kafka 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    //   producerCfg : 좌측 Producer 박스에 보일 설정
+    //   pipeline    : Producer → Broker 메시지 흐름 (msg 배열)
+    //                 status: pending / sent / duplicate / committed / aborted / hidden
+    //   txnState    : 트랜잭션 상태 박스 (none/started/committed/aborted)
+    //   consumerCfg : 좌측 Consumer 박스에 보일 설정 (Step 5)
+    //   alert       : 핵심 메시지
+    //   code        : 우측 CodeViewer 파일
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. enable.idempotence=true — 같은 메시지가 두 번 들어가지 않는다',
+        desc: 'Producer가 메시지를 보낸 직후 네트워크가 끊기면, ack를 못 받은 Producer는 같은 메시지를 다시 보낸다(retry). 옛날 Kafka에서는 그러면 Broker에 똑같은 메시지가 두 번 쌓였다. enable.idempotence=true 한 줄이면 Broker가 "이 PID + sequence 조합은 이미 받았다"고 기억해서 중복을 자동 차단한다. 0.11부터 가능, 3.0부터 기본값이다.',
+        producerCfg: {
+          'enable.idempotence': 'true',
+          'acks': 'all',
+          'retries': 'Integer.MAX_VALUE',
+          'max.in.flight': '5',
+        },
+        pipeline: [
+          { id: 'm1', key: 'orderId=A1', seq: 0, status: 'sent',      note: '정상 전송 완료' },
+          { id: 'm2', key: 'orderId=A1', seq: 0, status: 'duplicate', note: 'retry 재전송 → 중복 차단' },
+        ],
+        txnState: null,
+        consumerCfg: null,
+        alert: { tone: 'good', text: 'enable.idempotence=true 한 줄로 retry 중복이 자동으로 차단된다. (단일 파티션 기준)' },
+        code: {
+          lang: 'python',
+          filename: 'idempotent.py',
+          lines: [
+            '"""',
+            'kafka/idempotent.py',
+            '',
+            '목적: Idempotent Producer 설정 — 재시도로 인한 중복 메시지를 차단',
+            '',
+            '핵심 설정:',
+            '    enable.idempotence=true 한 줄이면',
+            '    Broker가 PID + sequence number 로 중복을 판단해 자동 차단한다.',
+            '',
+            '주요 의존성:',
+            '    - confluent-kafka-python >= 2.0',
+            '"""',
+            'from confluent_kafka import Producer',
+            '',
+            '',
+            '# ── Idempotent Producer 설정 ─────────────────────────',
+            '# Kafka 3.0+ 부터 enable.idempotence 는 기본값 true 이지만',
+            '# 학습 목적상 명시적으로 적어준다.',
+            'producer_config = {',
+            '    "bootstrap.servers": "localhost:9092",',
+            '',
+            '    # 핵심: 이 한 줄이면 중복 차단이 켜진다',
+            '    "enable.idempotence": True,',
+            '',
+            '    # idempotence 가 true 이면 자동으로 강제되는 값들',
+            '    "acks": "all",                       # 모든 ISR 응답 대기',
+            '    "retries": 2_147_483_647,            # 무한 재시도',
+            '    "max.in.flight.requests.per.connection": 5,  # 5 이하여야 순서 보장',
+            '}',
+            '',
+            'producer = Producer(producer_config)',
+            '',
+            '',
+            'def on_delivery(err, msg):',
+            '    """메시지 전송 콜백 — 성공/실패 로깅"""',
+            '    if err is not None:',
+            '        print(f"[실패] {err}")',
+            '    else:',
+            '        print(f"[성공] topic={msg.topic()} partition={msg.partition()} offset={msg.offset()}")',
+            '',
+            '',
+            'def send_order(order_id: str, payload: str) -> None:',
+            '    """주문 메시지 전송 — 네트워크 끊겨도 retry 가 중복을 만들지 않는다"""',
+            '    producer.produce(',
+            '        topic="orders",',
+            '        key=order_id.encode(),',
+            '        value=payload.encode(),',
+            '        on_delivery=on_delivery,',
+            '    )',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    # 같은 주문을 한 번 보낸다',
+            '    send_order("A1", \'{"item":"book","qty":1}\')',
+            '    producer.flush()',
+            '',
+            '    # → 네트워크 일시 단절로 인한 retry 가 발생해도',
+            '    #   Broker 가 PID + seq=0 을 이미 받았다는 걸 알아서 무시한다.',
+            '    #   결과: orders 토픽에는 메시지가 정확히 1개만 들어간다.',
+          ],
+          highlight: [20, 23, 24, 26, 27, 28, 29],
+        },
+      },
+      {
+        title: 'Step 2. PID + Sequence Number — Broker가 "이미 받은 메시지"를 어떻게 알까?',
+        desc: 'Producer가 처음 연결할 때 Broker는 고유한 Producer ID(PID)를 발급한다. 이후 Producer가 보내는 모든 메시지에는 (PID, sequence) 쌍이 붙는다. Broker는 파티션별로 마지막에 받은 sequence를 기억한다. 같은 PID로 같거나 작은 sequence가 또 오면? "이미 처리했다"고 판단하고 ack만 다시 보낸다. 메시지는 추가되지 않는다. 이것이 중복 차단의 정체다.',
+        producerCfg: {
+          'PID': '73 (assigned)',
+          'next.seq[orderId=A1]': '1',
+          'next.seq[orderId=A2]': '0',
+        },
+        pipeline: [
+          { id: 'm1', key: 'orderId=A1', seq: 0, status: 'committed', note: 'Broker 저장됨 (highWater=1)' },
+          { id: 'm2', key: 'orderId=A1', seq: 0, status: 'duplicate', note: 'seq=0 이미 받음 → 거절' },
+          { id: 'm3', key: 'orderId=A2', seq: 0, status: 'sent',      note: '새 key, seq=0 정상 수신' },
+        ],
+        txnState: null,
+        consumerCfg: null,
+        alert: { tone: 'info', text: 'Broker는 (PID, partition) 별 마지막 sequence를 기억해서 중복을 판별한다.' },
+        code: {
+          lang: 'markdown',
+          filename: 'pid-seq.md',
+          lines: [
+            '# PID + Sequence Number — 동작 원리',
+            '',
+            '## 1. Producer 시작 시점',
+            '',
+            '```',
+            'Producer ──── InitProducerId 요청 ───▶ Broker',
+            '         ◀────── PID = 73 응답 ───────',
+            '```',
+            '',
+            '- Broker 가 고유한 Producer ID (PID, 64bit) 를 발급한다',
+            '- Producer 는 이 PID 를 자기 정체성으로 들고 다닌다',
+            '- 재연결되어도 같은 PID 를 재사용한다 (transactional.id 가 있다면)',
+            '',
+            '## 2. 메시지마다 (PID, seq) 가 붙는다',
+            '',
+            '| 보낸 메시지 | PID | partition | sequence |',
+            '|:--|:--|:--|:--|',
+            '| msg-1 | 73 | 0 | 0 |',
+            '| msg-2 | 73 | 0 | 1 |',
+            '| msg-3 | 73 | 1 | 0 |',
+            '| msg-4 | 73 | 0 | 2 |',
+            '',
+            '## 3. Broker 의 중복 판별',
+            '',
+            'Broker 는 파티션별로 "마지막에 받은 seq" 를 저장한다.',
+            '',
+            '```',
+            '[partition 0]  last_seq[PID=73] = 2',
+            '[partition 1]  last_seq[PID=73] = 0',
+            '```',
+            '',
+            '새 메시지가 오면:',
+            '',
+            '| 들어온 seq | 판정 | 동작 |',
+            '|:--|:--|:--|',
+            '| last + 1 | 정상 | append, last 갱신 |',
+            '| last 이하 | 중복 | append 안 함, ack 만 다시 보냄 |',
+            '| last + 2 이상 | 갭 | OutOfOrderSequence 에러 |',
+            '',
+            '## 4. 한계 (혼동 주의)',
+            '',
+            '- idempotence 는 "단일 Producer + 단일 파티션" 에만 보장된다',
+            '- Producer 가 죽었다 살아나면 PID 가 새로 발급될 수 있다',
+            '  → 그 사이 보낸 메시지와 새 PID 메시지가 충돌할 수 있다',
+            '- 이걸 해결하려면 다음 단계: transactional.id 를 부여한다',
+            '',
+            '# → Step 3: transactional.id 가 무엇을 추가로 해결하는가?',
+          ],
+          highlight: [9, 10, 11, 12, 26, 27, 28, 29, 36, 37, 38, 39, 44, 45, 46, 47],
+        },
+      },
+      {
+        title: 'Step 3. transactional.id — Producer 트랜잭션의 시작',
+        desc: 'idempotence 만으로는 부족하다. Producer가 죽었다 살아나면 PID가 새로 받기 때문에 "이미 보낸 메시지"인지 아닌지 알 수가 없다. transactional.id는 Producer에 사람이 붙여주는 고정 ID다. "order-producer-1" 같은. 같은 transactional.id로 다시 떠도 Broker는 "아 이 친구 돌아왔구나" 하고 같은 PID를 재발급한다. 그리고 이제 여러 메시지를 묶어 "원자적 트랜잭션"으로 보낼 수 있다.',
+        producerCfg: {
+          'transactional.id': 'order-producer-1',
+          'enable.idempotence': 'true (자동)',
+          'PID': '73 (재시작 후에도 동일)',
+          'transaction.timeout.ms': '60000',
+        },
+        pipeline: [
+          { id: 'm0', key: 'init', seq: 0, status: 'committed', note: 'initTransactions() 호출' },
+        ],
+        txnState: { phase: 'ready', label: 'Producer 등록 완료 — 트랜잭션 시작 대기' },
+        consumerCfg: null,
+        alert: { tone: 'info', text: 'transactional.id 가 있으면 Producer가 죽었다 살아나도 같은 PID를 재사용 → 좀비 Producer 차단(fencing).' },
+        code: {
+          lang: 'python',
+          filename: 'transactions.py',
+          lines: [
+            '"""',
+            'kafka/transactions.py',
+            '',
+            '목적: Transactional Producer 등록',
+            '',
+            '핵심 설정:',
+            '    transactional.id 를 지정하면',
+            '    - enable.idempotence 가 자동으로 true 가 된다',
+            '    - acks=all, max.in.flight=5 가 강제된다',
+            '    - Producer 가 죽었다 살아나도 같은 PID 를 재사용한다',
+            '    - 좀비 Producer (fencing) 가 자동 차단된다',
+            '',
+            '주요 의존성:',
+            '    - confluent-kafka-python >= 2.0',
+            '"""',
+            'from confluent_kafka import Producer, KafkaException',
+            '',
+            '',
+            'producer_config = {',
+            '    "bootstrap.servers": "localhost:9092",',
+            '',
+            '    # 핵심: Producer 에게 사람이 정한 고정 ID 를 부여한다',
+            '    # 같은 transactional.id 로 다시 떠도 Broker 가 알아본다',
+            '    "transactional.id": "order-producer-1",',
+            '',
+            '    # 트랜잭션 타임아웃 — 이 시간 안에 commit 하지 않으면 abort',
+            '    "transaction.timeout.ms": 60_000,',
+            '',
+            '    # transactional.id 가 있으면 아래 값은 자동 강제',
+            '    # "enable.idempotence": True,',
+            '    # "acks": "all",',
+            '    # "max.in.flight.requests.per.connection": 5,',
+            '}',
+            '',
+            'producer = Producer(producer_config)',
+            '',
+            '',
+            'def initialize_transactional_producer() -> None:',
+            '    """',
+            '    트랜잭션 Producer 등록.',
+            '',
+            '    initTransactions() 가 하는 일:',
+            '        1. Broker 에 transactional.id 등록',
+            '        2. 같은 ID 의 기존 Producer 가 있으면 fencing (좀비 차단)',
+            '        3. PID 발급 (재시작 시 같은 PID 재사용)',
+            '        4. 진행 중이던 트랜잭션이 있으면 자동 abort',
+            '    """',
+            '    producer.init_transactions()',
+            '    print("[준비완료] transactional.id=order-producer-1 등록")',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    initialize_transactional_producer()',
+            '    # 이 시점에서:',
+            '    #   - Broker 는 "order-producer-1" 의 PID 를 안다',
+            '    #   - 다른 좀비 Producer 가 같은 ID 로 떠 있었다면 fencing 됐다',
+            '    #   - 이제 beginTransaction() 을 호출할 준비가 됐다',
+          ],
+          highlight: [22, 23, 24, 25, 26, 27, 28, 42, 43, 44, 45, 46, 47],
+        },
+      },
+      {
+        title: 'Step 4. beginTransaction / send / commitTransaction — 여러 메시지를 하나로 묶는다',
+        desc: '주문 처리는 보통 메시지 한 건이 아니다. orders에 1건, payments에 1건, inventory에 1건 — 3개 토픽에 3건이 동시에 들어가거나, 0건이 들어가야 한다. 결제는 됐는데 재고 차감이 안 되면 데이터 불일치다. beginTransaction() → send 여러 번 → commitTransaction() 으로 묶으면 Broker가 원자적으로 처리한다. 도중에 실패하면 abortTransaction()으로 모두 되돌린다.',
+        producerCfg: {
+          'transactional.id': 'order-producer-1',
+          'phase': 'IN_TRANSACTION',
+        },
+        pipeline: [
+          { id: 't1', key: 'orders → A1',     seq: 1, status: 'pending',  note: '트랜잭션 내 send' },
+          { id: 't2', key: 'payments → A1',   seq: 2, status: 'pending',  note: '트랜잭션 내 send' },
+          { id: 't3', key: 'inventory → A1',  seq: 3, status: 'pending',  note: '트랜잭션 내 send' },
+          { id: 't4', key: 'COMMIT',          seq: 4, status: 'committed', note: 'commitTransaction() — 3건 동시 가시화' },
+        ],
+        txnState: { phase: 'committed', label: 'Transaction COMMITTED — 3개 토픽 동시 가시화' },
+        consumerCfg: null,
+        alert: { tone: 'good', text: 'commit 까지 다른 Consumer 에게 보이지 않는다. abort 하면 3건 모두 사라진다 (원자성).' },
+        code: {
+          lang: 'python',
+          filename: 'commit-rollback.py',
+          lines: [
+            '"""',
+            'kafka/commit-rollback.py',
+            '',
+            '목적: 여러 토픽에 보내는 메시지를 하나의 트랜잭션으로 묶기',
+            '',
+            '시나리오:',
+            '    주문 1건 = orders + payments + inventory 3개 토픽에 동시 기록',
+            '    → 3개 모두 성공해야 commit, 하나라도 실패하면 abort',
+            '',
+            '주요 의존성:',
+            '    - confluent-kafka-python >= 2.0',
+            '"""',
+            'from confluent_kafka import Producer, KafkaException',
+            '',
+            '',
+            'producer = Producer({',
+            '    "bootstrap.servers": "localhost:9092",',
+            '    "transactional.id": "order-producer-1",',
+            '    "transaction.timeout.ms": 60_000,',
+            '})',
+            '',
+            'producer.init_transactions()',
+            '',
+            '',
+            'def place_order_atomic(order_id: str, item: str, price: int, qty: int) -> None:',
+            '    """',
+            '    주문 1건을 3개 토픽에 원자적으로 기록한다.',
+            '',
+            '    Args:',
+            '        order_id: 주문 ID',
+            '        item: 상품명',
+            '        price: 결제 금액',
+            '        qty: 차감할 재고 수량',
+            '',
+            '    Raises:',
+            '        KafkaException: 트랜잭션 실패 시 자동 abort',
+            '    """',
+            '    try:',
+            '        # 1) 트랜잭션 시작 — 이후 send 는 모두 같은 트랜잭션',
+            '        producer.begin_transaction()',
+            '',
+            '        # 2) orders 토픽',
+            '        producer.produce(',
+            '            topic="orders",',
+            '            key=order_id.encode(),',
+            '            value=f\'{{"item":"{item}","qty":{qty}}}\'.encode(),',
+            '        )',
+            '',
+            '        # 3) payments 토픽',
+            '        producer.produce(',
+            '            topic="payments",',
+            '            key=order_id.encode(),',
+            '            value=f\'{{"price":{price}}}\'.encode(),',
+            '        )',
+            '',
+            '        # 4) inventory 토픽',
+            '        producer.produce(',
+            '            topic="inventory",',
+            '            key=order_id.encode(),',
+            '            value=f\'{{"delta":-{qty}}}\'.encode(),',
+            '        )',
+            '',
+            '        # 5) 커밋 — 3건 모두 동시에 read_committed 에 가시화',
+            '        producer.commit_transaction()',
+            '        print(f"[COMMIT] order_id={order_id} 3건 모두 반영")',
+            '',
+            '    except KafkaException as e:',
+            '        # 어떤 send 든 실패하면 모두 되돌린다',
+            '        producer.abort_transaction()',
+            '        print(f"[ABORT] order_id={order_id} 모두 취소 ({e})")',
+            '        raise',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    place_order_atomic("A1", item="book", price=15000, qty=1)',
+            '    # 3개 토픽이 동시에 commit 되었거나, 모두 사라졌다 — 중간 상태는 없다',
+          ],
+          highlight: [38, 39, 41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52, 53, 55, 56, 57, 58, 59, 60, 62, 63, 64, 65, 66, 67, 68, 69, 70],
+        },
+      },
+      {
+        title: 'Step 5. Consumer isolation.level=read_committed — 절반만 본 메시지는 없다',
+        desc: 'Producer가 트랜잭션을 묶어도 Consumer 쪽에서 안 받쳐주면 의미가 없다. 기본값 read_uncommitted Consumer는 아직 commit 안 된 트랜잭션 메시지도 그냥 본다 → 도중에 abort되면 "유령 메시지"가 된다. isolation.level=read_committed로 바꾸면 Broker가 "commit된 트랜잭션의 메시지만" 흘려준다. 이제 Producer + Consumer 양쪽이 합쳐져 진정한 Exactly-Once Semantics가 완성된다.',
+        producerCfg: {
+          'transactional.id': 'order-producer-1',
+          'phase': 'COMMITTED',
+        },
+        pipeline: [
+          { id: 'r1', key: 'orders → A1',    seq: 1, status: 'committed', note: 'read_committed Consumer 에게 보임' },
+          { id: 'r2', key: 'orders → A2',    seq: 2, status: 'pending',   note: '아직 미커밋 → 안 보임' },
+          { id: 'r3', key: 'orders → A3',    seq: 3, status: 'aborted',   note: 'abort 됨 → 평생 안 보임' },
+        ],
+        txnState: { phase: 'eos', label: 'Exactly-Once Semantics 활성 — Producer ⊕ Consumer 동시 보장' },
+        consumerCfg: {
+          'isolation.level': 'read_committed',
+          'group.id': 'orders-processor',
+          'enable.auto.commit': 'false',
+        },
+        eosBox: {
+          title: 'Exactly-Once Semantics — 3가지가 동시에 켜져야 한다',
+          features: [
+            'Producer: enable.idempotence=true (재시도 중복 차단)',
+            'Producer: transactional.id 부여 (여러 토픽 원자적 묶기)',
+            'Consumer: isolation.level=read_committed (미커밋/abort 메시지 차단)',
+            'Consumer: enable.auto.commit=false + sendOffsetsToTransaction (consume→produce 패턴)',
+            '결과: 메시지가 "정확히 한 번" 처리되고, 절반 상태는 절대 노출되지 않는다',
+          ],
+        },
+        alert: { tone: 'good', text: 'EOS 완성. read_committed Consumer 는 abort 된 메시지를 평생 보지 못한다.' },
+        code: {
+          lang: 'python',
+          filename: 'read-committed.py',
+          lines: [
+            '"""',
+            'kafka/read-committed.py',
+            '',
+            '목적: Consumer 측에서 트랜잭션 메시지만 읽도록 격리 수준 설정',
+            '',
+            '핵심 설정:',
+            '    isolation.level=read_committed 이면',
+            '    - commit 된 트랜잭션 메시지만 받는다',
+            '    - 아직 진행 중인 트랜잭션 메시지는 건너뛴다',
+            '    - abort 된 트랜잭션 메시지는 절대 보이지 않는다',
+            '',
+            '주요 의존성:',
+            '    - confluent-kafka-python >= 2.0',
+            '"""',
+            'from confluent_kafka import Consumer',
+            '',
+            '',
+            'consumer_config = {',
+            '    "bootstrap.servers": "localhost:9092",',
+            '    "group.id": "orders-processor",',
+            '',
+            '    # 핵심: 트랜잭션이 commit 된 메시지만 받는다',
+            '    # 기본값은 "read_uncommitted" 이라 abort 된 메시지까지 본다 → 위험',
+            '    "isolation.level": "read_committed",',
+            '',
+            '    # EOS 패턴에서는 수동 commit 이 정석',
+            '    "enable.auto.commit": False,',
+            '',
+            '    "auto.offset.reset": "earliest",',
+            '}',
+            '',
+            'consumer = Consumer(consumer_config)',
+            'consumer.subscribe(["orders"])',
+            '',
+            '',
+            'def process_committed_orders() -> None:',
+            '    """commit 된 주문만 처리한다 — 절반 상태는 결코 보이지 않는다"""',
+            '    try:',
+            '        while True:',
+            '            msg = consumer.poll(timeout=1.0)',
+            '            if msg is None:',
+            '                continue',
+            '            if msg.error():',
+            '                print(f"[에러] {msg.error()}")',
+            '                continue',
+            '',
+            '            # 이 시점에서 받은 msg 는 반드시',
+            '            #   - Producer 가 commit_transaction() 을 호출한 메시지',
+            '            #   - 또는 트랜잭션 없이 보낸 일반 메시지',
+            '            # abort 된 메시지는 절대 여기까지 오지 않는다',
+            '            print(',
+            '                f"[처리] partition={msg.partition()} "',
+            '                f"offset={msg.offset()} key={msg.key()} value={msg.value()}"',
+            '            )',
+            '',
+            '            # 비즈니스 로직 처리 후 수동 commit',
+            '            consumer.commit(msg, asynchronous=False)',
+            '',
+            '    finally:',
+            '        consumer.close()',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    process_committed_orders()',
+            '    # → Producer 가 abort 한 메시지는 이 Consumer 로 절대 들어오지 않는다',
+            '    # → Producer + Consumer 양쪽 설정이 합쳐져 EOS 가 완성된다',
+          ],
+          highlight: [22, 23, 24, 26, 27, 46, 47, 48, 49, 50, 51, 52, 53, 56, 57],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 메시지 상태별 색상
+    // ─────────────────────────────────────────────────────
+    const STATUS_STYLE = {
+      pending:   { bg: 'bg-yellow-50',   border: 'border-yellow-300',  text: 'text-yellow-800',  icon: '⏳', label: 'PENDING' },
+      sent:      { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', icon: '✓',  label: 'SENT' },
+      duplicate: { bg: 'bg-red-50',      border: 'border-red-300',     text: 'text-red-800',     icon: '🚫', label: 'DUPLICATE BLOCKED' },
+      committed: { bg: 'bg-emerald-50',  border: 'border-emerald-400', text: 'text-emerald-900', icon: '✓',  label: 'COMMITTED' },
+      aborted:   { bg: 'bg-slate-100',   border: 'border-slate-400',   text: 'text-slate-600',   icon: '✗',  label: 'ABORTED (hidden)' },
+    };
+
+    // ─────────────────────────────────────────────────────
+    // Producer → Broker 파이프라인 mock
+    // ─────────────────────────────────────────────────────
+    function MessageRow({ msg }) {
+      const s = STATUS_STYLE[msg.status] || STATUS_STYLE.pending;
+      return (
+        <div className={`flex items-center gap-2 rounded border ${s.bg} ${s.border} px-2 py-1.5`}>
+          <span className="text-base">{s.icon}</span>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className={`text-xs font-mono font-bold ${s.text}`}>{msg.key}</span>
+              <span className="text-[10px] text-slate-500 font-mono">seq={msg.seq}</span>
+            </div>
+            <div className="text-[10px] text-slate-600 truncate">{msg.note}</div>
+          </div>
+          <span className={`text-[10px] font-bold ${s.text} whitespace-nowrap`}>{s.label}</span>
+        </div>
+      );
+    }
+
+    function PipelineBox({ producerCfg, pipeline }) {
+      return (
+        <div className="rounded-lg border-2 border-yellow-400 bg-white overflow-hidden">
+          <div className="bg-gradient-to-r from-yellow-500 to-amber-500 text-white px-3 py-1.5 text-xs font-bold flex items-center gap-2">
+            <span>🟡</span>
+            <span>Producer → Broker (mock)</span>
+            <span className="ml-auto text-[10px] bg-white/20 px-2 py-0.5 rounded">메시지 흐름</span>
+          </div>
+
+          {/* Producer 설정 */}
+          {producerCfg && (
+            <div className="px-3 py-2 bg-yellow-50 border-b border-yellow-200">
+              <div className="text-[10px] font-bold text-yellow-800 mb-1">Producer 설정</div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+                {Object.entries(producerCfg).map(([k, v]) => (
+                  <div key={k} className="text-[10px] font-mono flex gap-1">
+                    <span className="text-yellow-700">{k}:</span>
+                    <span className="text-slate-800 font-bold truncate">{String(v)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 파이프라인 */}
+          <div className="p-2 space-y-1">
+            {pipeline.map((m) => (
+              <MessageRow key={m.id} msg={m} />
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 트랜잭션 상태 박스
+    // ─────────────────────────────────────────────────────
+    const TXN_STYLE = {
+      ready:     { bg: 'bg-yellow-50',  border: 'border-yellow-400',  text: 'text-yellow-900',  icon: '🟡' },
+      started:   { bg: 'bg-amber-50',   border: 'border-amber-400',   text: 'text-amber-900',   icon: '⚙️' },
+      committed: { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-900', icon: '✅' },
+      aborted:   { bg: 'bg-red-50',     border: 'border-red-400',     text: 'text-red-900',     icon: '⛔' },
+      eos:       { bg: 'bg-emerald-50', border: 'border-emerald-500', text: 'text-emerald-900', icon: '🛡️' },
+    };
+
+    function TxnStateBox({ txnState }) {
+      if (!txnState) return null;
+      const s = TXN_STYLE[txnState.phase] || TXN_STYLE.ready;
+      return (
+        <div className={`mt-3 rounded-lg border-2 ${s.bg} ${s.border} px-3 py-2 flex items-center gap-2`}>
+          <span className="text-xl">{s.icon}</span>
+          <span className={`text-xs font-bold ${s.text}`}>{txnState.label}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Consumer 설정 박스 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function ConsumerBox({ consumerCfg }) {
+      if (!consumerCfg) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-amber-400 bg-white overflow-hidden">
+          <div className="bg-gradient-to-r from-amber-500 to-yellow-500 text-white px-3 py-1.5 text-xs font-bold flex items-center gap-2">
+            <span>📥</span>
+            <span>Consumer 설정</span>
+          </div>
+          <div className="p-2 grid grid-cols-1 gap-y-0.5">
+            {Object.entries(consumerCfg).map(([k, v]) => (
+              <div key={k} className="text-[11px] font-mono flex gap-2">
+                <span className="text-amber-700 font-bold">{k}:</span>
+                <span className="text-slate-800">{String(v)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // EOS 정리 박스 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function EosBox({ eos }) {
+      if (!eos) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-yellow-500 bg-gradient-to-br from-yellow-50 to-amber-50 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-2xl">🟡</span>
+            <span className="text-lg font-bold text-amber-900">{eos.title}</span>
+          </div>
+          <ul className="space-y-1.5">
+            {eos.features.map((f, i) => (
+              <li key={i} className="text-sm text-amber-900 flex gap-2">
+                <span className="text-yellow-600 mt-0.5">✓</span>
+                <span>{f}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-yellow-50',  border: 'border-yellow-300',  text: 'text-yellow-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — yellow 톤
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-yellow-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-amber-900">Producer → Broker — 중복 차단 & 트랜잭션</h3>
+            <span className="text-[10px] text-slate-500">초록=커밋 · 빨강=중복 · 회색=abort</span>
+          </div>
+          <PipelineBox producerCfg={state.producerCfg} pipeline={state.pipeline} />
+          <TxnStateBox txnState={state.txnState} />
+          <ConsumerBox consumerCfg={state.consumerCfg} />
+          <EosBox eos={state.eosBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-yellow-500/15 border-l-2 border-yellow-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-yellow-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-yellow-500 text-white font-bold">K</span>
+              <div>
+                <h1 className="text-2xl font-bold text-amber-900">III-1-2. Idempotent Producer + Transactions</h1>
+                <p className="text-sm text-amber-800/80">중복 차단(PID+seq) → 트랜잭션(transactional.id) → commit/abort → read_committed</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-amber-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-yellow-500' : 'bg-yellow-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-amber-700 text-yellow-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-yellow-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-400 bg-white text-amber-800 hover:bg-yellow-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-400 bg-white text-amber-800 hover:bg-yellow-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-amber-700 text-white' : 'bg-yellow-500 text-white hover:bg-amber-600'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-400 bg-white text-amber-800 hover:bg-yellow-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-amber-700/70 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-yellow-500 bg-white px-4 py-3 text-sm text-amber-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Kafka의 Exactly-Once Semantics 는 한 번에 켜지는 마법이 아니다 — <b>Idempotent Producer(중복 차단)</b> + <b>Transactional Producer(원자성)</b> + <b>read_committed Consumer(격리)</b> 세 가지가 합쳐져야 한다.
+                Producer 한쪽만 켜면 Consumer가 중간 상태를 보고, Consumer만 켜면 Producer가 중복을 만든다. 다음 절에서는 이 패턴이 실패할 수 있는 시나리오와 트레이드오프를 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Kafka', 'EOS', 'ExactlyOnce', 'Idempotent', 'Transactions', 'PID', 'SequenceNumber', 'TransactionalId', 'ReadCommitted', 'Fencing'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-yellow-100 text-amber-800 border border-yellow-300">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-amber-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-1-3.html" className="underline hover:no-underline">다음: III-1-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

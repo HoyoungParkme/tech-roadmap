@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka 인터랙티브 학습 — III-2-2. Rebalance 폭풍과 해결</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌪️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Kafka III-2-2 — Rebalance 폭풍과 해결
+    학습 목표: Consumer Group rebalance가 왜 발생하고, Stop-The-World 문제를 어떻게 해결하는지
+              5단계로 추적한다. session.timeout 튜닝 → static membership → cooperative sticky.
+    패턴: fastapi v1 — 좌(LiveDataPane: Consumer Group 상태 시각화) / 우(VSCode CodeViewer 5탭)
+    색상: yellow (kafka 도메인 — rebalance 경고 톤)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — Rebalance 폭풍과 해결
+    //   consumers : Consumer 상태 배열 (id, partitions, state)
+    //   partitions: 전체 파티션 (assigned consumer)
+    //   phase     : 단계 라벨 (정상 / 정지 / 재분배 / 재개)
+    //   alert     : 핵심 경고 박스
+    //   code      : 우측 CodeViewer 파일
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. Consumer 합류/이탈 시 rebalance 발생',
+        desc: 'Consumer Group "order-processor"에 C1, C2 두 컨슈머가 partition 0~5를 나눠 처리 중이다. 트래픽이 늘어 C3가 합류한다. 이 순간 Kafka의 GroupCoordinator는 "그룹 구성원이 바뀌었다"고 판단하고 rebalance를 시작한다. Consumer가 이탈해도(crash, GC pause, 배포 종료) 같은 일이 일어난다. rebalance 자체는 정상 동작이지만, 그룹이 클수록 발생 빈도와 비용이 폭발한다.',
+        phase: '⚡ 변경 감지 — C3 합류',
+        consumers: [
+          { id: 'C1', state: 'running', partitions: ['P0', 'P1', 'P2'], color: 'emerald' },
+          { id: 'C2', state: 'running', partitions: ['P3', 'P4', 'P5'], color: 'emerald' },
+          { id: 'C3', state: 'joining', partitions: [], color: 'amber' },
+        ],
+        partitions: [
+          { id: 'P0', owner: 'C1' }, { id: 'P1', owner: 'C1' }, { id: 'P2', owner: 'C1' },
+          { id: 'P3', owner: 'C2' }, { id: 'P4', owner: 'C2' }, { id: 'P5', owner: 'C2' },
+        ],
+        lag: 1200,
+        alert: { tone: 'info', text: 'Consumer 합류/이탈 → GroupCoordinator가 rebalance trigger. 정상 동작이지만 비용이 든다.' },
+        code: {
+          lang: 'markdown',
+          filename: 'rebalance.md',
+          lines: [
+            '# Step 1. Consumer Group Rebalance 발생 조건',
+            '',
+            '## Rebalance가 시작되는 5가지 이벤트',
+            '',
+            '1. 새 Consumer가 그룹에 합류 (subscribe + poll)',
+            '2. 기존 Consumer가 정상 종료 (close)',
+            '3. 기존 Consumer가 비정상 종료 (kill, crash, OOM)',
+            '4. session.timeout.ms 안에 heartbeat가 없음 → 이탈로 간주',
+            '5. Topic 메타데이터 변경 (파티션 수 증가, subscribe pattern 매치 변화)',
+            '',
+            '## 동작 흐름',
+            '',
+            '  Consumer (C3)              GroupCoordinator (broker)',
+            '       │                              │',
+            '       │ ── JoinGroup ──────────────▶ │',
+            '       │                              │ ◀── 다른 모든 Consumer JoinGroup 대기',
+            '       │ ◀── (leader 선출 / 멤버 목록) │',
+            '       │                              │',
+            '       │ ── SyncGroup (assignment) ─▶ │',
+            '       │ ◀── 새 파티션 할당 받음     │',
+            '       │                              │',
+            '       └── 처리 재개                  │',
+            '',
+            '## 왜 자주 발생하는가? (현실)',
+            '',
+            '- 배포 (rolling restart) → Consumer가 순차 재시작 → 매번 rebalance',
+            '- Auto-scaling → 트래픽 따라 Consumer 증감 → 매번 rebalance',
+            '- GC pause / 네트워크 끊김 → heartbeat 누락 → rebalance',
+            '- Consumer가 100개인 그룹은 1개 재시작에도 100개가 영향받음',
+            '',
+            '## 핵심 질문',
+            '',
+            '→ rebalance 중 다른 99개 Consumer는 무엇을 하고 있나?',
+            '→ 답은 Step 2 에서.',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 27, 28, 29, 30, 31, 35, 36],
+        },
+      },
+      {
+        title: 'Step 2. Rebalance 중 모든 consumer 정지 (StopTheWorld)',
+        desc: 'eager rebalance(기본 동작)에서는 rebalance가 시작되면 그룹의 모든 Consumer가 자기 파티션을 즉시 반납하고 처리를 멈춘다. 100개 Consumer가 있다면 100개가 동시에 일을 멈춘다. JoinGroup → SyncGroup이 끝날 때까지 — 보통 수 초, 큰 그룹은 수십 초 — 메시지가 전혀 소비되지 않는다. 이게 "Stop-The-World"다. 그동안 lag은 폭증하고, 실시간 처리 요구사항은 무너진다.',
+        phase: '🛑 STOP THE WORLD — 모든 Consumer 정지',
+        consumers: [
+          { id: 'C1', state: 'stopped', partitions: [], color: 'red' },
+          { id: 'C2', state: 'stopped', partitions: [], color: 'red' },
+          { id: 'C3', state: 'joining', partitions: [], color: 'amber' },
+        ],
+        partitions: [
+          { id: 'P0', owner: '?' }, { id: 'P1', owner: '?' }, { id: 'P2', owner: '?' },
+          { id: 'P3', owner: '?' }, { id: 'P4', owner: '?' }, { id: 'P5', owner: '?' },
+        ],
+        lag: 48000,
+        alert: { tone: 'danger', text: 'rebalance 진행 중 — 모든 Consumer가 파티션을 반납하고 정지. lag 폭증 시작.' },
+        code: {
+          lang: 'plaintext',
+          filename: 'stw.md',
+          lines: [
+            '# Step 2. Stop-The-World — eager rebalance의 비용',
+            '',
+            '## 시간선 (Consumer 100개 그룹, rebalance 1회)',
+            '',
+            '  t = 0.0s   C3 JoinGroup 요청 → rebalance 시작',
+            '  t = 0.1s   ┌─ C1 ~ C100 모두 파티션 반납 (revoke)',
+            '             │  처리 중이던 record 도 commit 못 하고 멈춤',
+            '             │',
+            '  t = 0.2s   │  GroupCoordinator: 모든 멤버의 JoinGroup 대기',
+            '             │  Consumer 100개의 RTT + 처리 큐 = 약 2~5초',
+            '             │',
+            '  t = 3.0s   │  Leader Consumer가 새 assignment 계산',
+            '             │  GroupCoordinator → SyncGroup 응답 (100개에 분배)',
+            '             │',
+            '  t = 4.5s   └─ 각 Consumer가 새 파티션 받아 처리 재개',
+            '',
+            '  → 약 4.5초간 메시지 0건 소비 — Stop-The-World',
+            '',
+            '## 그동안 무슨 일이?',
+            '',
+            '  Producer는 계속 메시지를 보낸다 (TPS 10,000)',
+            '  → 4.5초 × 10,000 = 45,000건의 lag 폭증',
+            '  → 실시간 알림? 결제 처리? 모두 4.5초 지연',
+            '',
+            '## 더 심각한 합병증',
+            '',
+            '  1. 처리 중이던 record 미커밋 → rebalance 후 재처리 (중복)',
+            '  2. 파티션 소유자가 바뀜 → 캐시/상태 무효화',
+            '  3. 100개 Consumer가 동시에 새 파티션 fetch → broker 부하 spike',
+            '  4. rebalance 중 또 timeout → "rebalance 폭풍" 무한루프',
+            '',
+            '## 핵심',
+            '',
+            '  → 작은 그룹은 무시할 만하다',
+            '  → 큰 그룹(50개+)은 운영 사고로 직결',
+            '  → 해결 도구는 3가지: timeout 튜닝 / static / cooperative',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 25, 26, 27, 28, 29],
+        },
+      },
+      {
+        title: 'Step 3. session.timeout.ms / heartbeat.interval.ms 튜닝',
+        desc: '첫 번째 처방: 헛 rebalance를 줄인다. session.timeout.ms는 "Consumer를 죽었다고 판단하는 시간"이다. 기본 10초인데, GC pause나 네트워크 떨림에 너무 민감하면 멀쩡한 Consumer를 죽이고 rebalance를 일으킨다. 너무 길면 진짜 죽었을 때 복구가 느려진다. heartbeat는 그 1/3 주기로 보낸다. 운영 트래픽/처리시간에 맞춰 균형점을 잡는다 — 보통 session 30s, heartbeat 10s, max.poll.interval 5분이 출발선이다.',
+        phase: '⚙️ 튜닝 — 헛 rebalance 줄이기',
+        consumers: [
+          { id: 'C1', state: 'running', partitions: ['P0', 'P1'], color: 'emerald' },
+          { id: 'C2', state: 'running', partitions: ['P2', 'P3'], color: 'emerald' },
+          { id: 'C3', state: 'running', partitions: ['P4', 'P5'], color: 'emerald' },
+        ],
+        partitions: [
+          { id: 'P0', owner: 'C1' }, { id: 'P1', owner: 'C1' },
+          { id: 'P2', owner: 'C2' }, { id: 'P3', owner: 'C2' },
+          { id: 'P4', owner: 'C3' }, { id: 'P5', owner: 'C3' },
+        ],
+        lag: 200,
+        tuning: [
+          { key: 'session.timeout.ms', before: '10000 (기본)', after: '30000', why: 'GC pause 견딤' },
+          { key: 'heartbeat.interval.ms', before: '3000 (기본)', after: '10000', why: 'session의 1/3' },
+          { key: 'max.poll.interval.ms', before: '300000 (기본)', after: '300000', why: '메시지 처리 최대시간 — 그대로 OK' },
+          { key: 'max.poll.records', before: '500 (기본)', after: '100', why: 'poll loop 내 처리 시간 단축' },
+        ],
+        alert: { tone: 'good', text: 'session 30s + heartbeat 10s 로 GC pause 견디기. 헛 rebalance가 줄어든다.' },
+        code: {
+          lang: 'python',
+          filename: 'timeout-tune.py',
+          lines: [
+            '"""',
+            'III-2-2 Step 3 — session.timeout / heartbeat.interval 튜닝',
+            '',
+            '경로: kafka/consumer/timeout_tune.py',
+            '목적: 헛 rebalance(GC pause, 네트워크 떨림으로 인한)를 줄인다',
+            '"""',
+            'from kafka import KafkaConsumer',
+            '',
+            '# ── 기본값(불안정)과 튜닝값 비교 ─────────────────',
+            '',
+            '# 기본값: session 10s / heartbeat 3s',
+            '# → 10초간 heartbeat 못 받으면 죽었다고 판단',
+            '# → JVM GC 풀스캔 5초만 일어나도 rebalance 폭발',
+            '',
+            'consumer = KafkaConsumer(',
+            '    "orders",',
+            '    bootstrap_servers="broker:9092",',
+            '    group_id="order-processor",',
+            '',
+            '    # ── 핵심 3종 세트 ─────────────────────────',
+            '    # (1) 죽음 판정 시간: 길게 → GC pause 견딤',
+            '    session_timeout_ms=30_000,',
+            '',
+            '    # (2) heartbeat 주기: session 의 1/3 권장',
+            '    heartbeat_interval_ms=10_000,',
+            '',
+            '    # (3) poll 사이 최대 간격: 메시지 처리 최대 허용시간',
+            '    #     처리 로직이 5분 넘으면 그룹에서 탈락',
+            '    max_poll_interval_ms=300_000,',
+            '',
+            '    # ── 부가: 한 번에 가져올 record 수 ──────',
+            '    # 너무 많으면 처리 시간 길어져서 max_poll_interval 초과 위험',
+            '    max_poll_records=100,',
+            '',
+            '    # ── 권장: auto commit 끄고 수동 커밋 ───',
+            '    enable_auto_commit=False,',
+            ')',
+            '',
+            'for record in consumer:',
+            '    process_order(record.value)',
+            '    consumer.commit()',
+            '',
+            '# ── 튜닝 룰 ─────────────────────────────────────',
+            '#',
+            '#   heartbeat.interval.ms < session.timeout.ms / 3',
+            '#   session.timeout.ms    < max.poll.interval.ms',
+            '#',
+            '#   너무 짧게 = 헛 rebalance (멀쩡한 Consumer 죽임)',
+            '#   너무 길게 = 진짜 죽었을 때 감지 지연',
+            '#',
+            '# ── 운영 출발점 (참고) ─────────────────────────',
+            '#',
+            '#   session.timeout.ms      = 30_000   (30s)',
+            '#   heartbeat.interval.ms   = 10_000   (10s)',
+            '#   max.poll.interval.ms    = 300_000  (5min)',
+            '#   max.poll.records        = 100      (처리시간 짧으면 더 크게)',
+            '#',
+            '# → 이걸로도 "배포 시 rebalance"는 못 막는다 (Step 4)',
+          ],
+          highlight: [15, 16, 17, 18, 19, 22, 23, 25, 26, 29, 30, 31, 34, 35, 38, 39, 47, 48, 49, 50, 55, 56, 57, 58, 59],
+        },
+      },
+      {
+        title: 'Step 4. static membership (group.instance.id)',
+        desc: '두 번째 처방: "잠깐 사라졌다 돌아오는" 경우를 rebalance 없이 흘려보낸다. Kubernetes pod 재시작이나 배포처럼 같은 신원으로 짧게 자리를 비우는 상황 말이다. Consumer마다 고유한 group.instance.id를 주면, 그 ID가 다시 돌아올 때까지 session.timeout.ms 동안 GroupCoordinator는 파티션을 보존한다. rebalance 자체가 일어나지 않는다. 배포로 인한 rebalance 폭풍을 거의 0으로 줄이는 결정타다.',
+        phase: '🪪 Static Membership — 신원 보존',
+        consumers: [
+          { id: 'C1 (id: pod-a-0)', state: 'running', partitions: ['P0', 'P1'], color: 'emerald' },
+          { id: 'C2 (id: pod-a-1)', state: 'restarting', partitions: ['P2', 'P3'], color: 'sky' },
+          { id: 'C3 (id: pod-a-2)', state: 'running', partitions: ['P4', 'P5'], color: 'emerald' },
+        ],
+        partitions: [
+          { id: 'P0', owner: 'C1' }, { id: 'P1', owner: 'C1' },
+          { id: 'P2', owner: 'C2(예약)' }, { id: 'P3', owner: 'C2(예약)' },
+          { id: 'P4', owner: 'C3' }, { id: 'P5', owner: 'C3' },
+        ],
+        lag: 800,
+        staticBox: {
+          title: 'Static Membership 효과',
+          features: [
+            'group.instance.id 가 같으면 같은 Consumer로 인식',
+            'pod 재시작 / rolling deploy → rebalance 없음',
+            'session.timeout.ms 안에만 돌아오면 파티션 그대로 유지',
+            'KIP-345 (Kafka 2.3+) 부터 지원',
+            'Kubernetes StatefulSet pod 이름과 매핑하면 운영 깔끔',
+          ],
+        },
+        alert: { tone: 'good', text: 'pod 재시작 중에도 파티션 P2, P3는 C2 자리로 예약. rebalance 0회.' },
+        code: {
+          lang: 'python',
+          filename: 'static-member.py',
+          lines: [
+            '"""',
+            'III-2-2 Step 4 — Static Membership (group.instance.id)',
+            '',
+            '경로: kafka/consumer/static_member.py',
+            '목적: pod 재시작/배포로 인한 rebalance 폭풍 제거',
+            '필요: Kafka 2.3+ (KIP-345)',
+            '"""',
+            'import os',
+            'from kafka import KafkaConsumer',
+            '',
+            '# ── 핵심: pod 마다 고유한 group_instance_id ──────',
+            '#',
+            '#   Kubernetes StatefulSet 의 pod 이름이 안성맞춤:',
+            '#     order-processor-0, order-processor-1, order-processor-2',
+            '#   환경변수로 주입:',
+            '#     env:',
+            '#       - name: POD_NAME',
+            '#         valueFrom:',
+            '#           fieldRef:',
+            '#             fieldPath: metadata.name',
+            '',
+            'pod_name = os.environ["POD_NAME"]  # e.g. order-processor-1',
+            '',
+            'consumer = KafkaConsumer(',
+            '    "orders",',
+            '    bootstrap_servers="broker:9092",',
+            '    group_id="order-processor",',
+            '',
+            '    # ── ★ 결정타: 정적 멤버십 ────────────────',
+            '    group_instance_id=pod_name,',
+            '',
+            '    # ── Step 3 의 튜닝값도 함께 ──────────────',
+            '    session_timeout_ms=30_000,',
+            '    heartbeat_interval_ms=10_000,',
+            '    max_poll_interval_ms=300_000,',
+            ')',
+            '',
+            'for record in consumer:',
+            '    process_order(record.value)',
+            '    consumer.commit()',
+            '',
+            '# ── 동작 차이 ──────────────────────────────────',
+            '#',
+            '# [동적 멤버십(기본)]',
+            '#   pod-1 재시작 → 그룹 이탈 감지 → rebalance ▶ 시작',
+            '#   pod-1 복귀  → "새 멤버" 로 인식 → rebalance ▶ 시작',
+            '#   = rebalance 2회, 모든 Consumer 정지 2회',
+            '#',
+            '# [정적 멤버십]',
+            '#   pod-1 재시작 → group.instance.id "pod-1" 자리 예약',
+            '#   pod-1 복귀  → 같은 ID → 기존 파티션 재할당, rebalance 없음',
+            '#   = rebalance 0회',
+            '#',
+            '# ── 주의사항 ───────────────────────────────────',
+            '#',
+            '# 1) session.timeout.ms 보다 빨리 돌아와야 함',
+            '#    (보통 pod 재시작은 5~15초, session 30초면 안전)',
+            '# 2) 영구 종료 시는 명시적 leaveGroup 호출 또는 timeout 대기',
+            '# 3) Auto-scaling 으로 새 Consumer가 늘면 그때는 rebalance 발생',
+            '#    → Step 5 (cooperative) 가 필요한 이유',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53],
+        },
+      },
+      {
+        title: 'Step 5. cooperative sticky assignor (점진적 rebalance)',
+        desc: '세 번째 처방: rebalance가 일어나야만 할 때(스케일 아웃 등) 그 비용을 최소화한다. 기본 assignor는 "다 반납하고 다시 분배"(eager)지만, CooperativeStickyAssignor는 영향받는 파티션만 옮긴다. C1, C2가 안정적으로 잘 처리 중이면 그대로 두고, C3에 일부만 떼어준다. 나머지 99%의 Consumer는 멈추지 않는다. Step 3+4+5를 함께 적용하면 — rebalance 폭풍은 사실상 사라진다.',
+        phase: '✨ Cooperative — 점진적 재분배 (StopTheWorld 없음)',
+        consumers: [
+          { id: 'C1', state: 'running', partitions: ['P0', 'P1'], color: 'emerald' },
+          { id: 'C2', state: 'running', partitions: ['P3', 'P4'], color: 'emerald' },
+          { id: 'C3', state: 'running', partitions: ['P2', 'P5'], color: 'sky' },
+        ],
+        partitions: [
+          { id: 'P0', owner: 'C1' }, { id: 'P1', owner: 'C1' },
+          { id: 'P2', owner: 'C3' }, { id: 'P3', owner: 'C2' },
+          { id: 'P4', owner: 'C2' }, { id: 'P5', owner: 'C3' },
+        ],
+        lag: 50,
+        cooperativeBox: {
+          title: 'Cooperative Sticky Assignor — 핵심',
+          features: [
+            'eager: 다 반납 → 다 재분배 (Stop-The-World)',
+            'cooperative: 옮길 파티션만 revoke → 나머지는 계속 처리',
+            'sticky: 가능하면 기존 owner 유지 (캐시 무효화 최소화)',
+            '2단계 rebalance: revoke만 먼저, 그 다음 assign',
+            'Kafka 2.4+ 부터 지원 (KIP-429)',
+            'Step 3+4+5 모두 적용 = rebalance 폭풍 사실상 제거',
+          ],
+        },
+        alert: { tone: 'good', text: 'P2가 C1→C3로만 이동. C2는 아예 안 멈춤. 99%의 Consumer는 일하는 채로 rebalance 완료.' },
+        code: {
+          lang: 'python',
+          filename: 'cooperative.py',
+          lines: [
+            '"""',
+            'III-2-2 Step 5 — Cooperative Sticky Assignor',
+            '',
+            '경로: kafka/consumer/cooperative.py',
+            '목적: rebalance 비용을 최소화 (StopTheWorld 제거)',
+            '필요: Kafka 2.4+ (KIP-429)',
+            '"""',
+            'import os',
+            'from kafka import KafkaConsumer',
+            'from kafka.coordinator.assignors.sticky.sticky_assignor import StickyPartitionAssignor',
+            '',
+            '# Java client 에서는:',
+            '#   partition.assignment.strategy =',
+            '#     org.apache.kafka.clients.consumer.CooperativeStickyAssignor',
+            '',
+            'pod_name = os.environ["POD_NAME"]',
+            '',
+            'consumer = KafkaConsumer(',
+            '    "orders",',
+            '    bootstrap_servers="broker:9092",',
+            '    group_id="order-processor",',
+            '',
+            '    # ── ★ Step 4: 정적 멤버십 ───────────────',
+            '    group_instance_id=pod_name,',
+            '',
+            '    # ── ★ Step 5: cooperative sticky ────────',
+            '    #   영향받는 파티션만 revoke → 점진적 rebalance',
+            '    partition_assignment_strategy=[StickyPartitionAssignor],',
+            '',
+            '    # ── Step 3: 타임아웃 튜닝 ───────────────',
+            '    session_timeout_ms=30_000,',
+            '    heartbeat_interval_ms=10_000,',
+            '    max_poll_interval_ms=300_000,',
+            ')',
+            '',
+            '# ── 2단계 rebalance 흐름 (cooperative) ─────────',
+            '#',
+            '# [1단계] revoke only',
+            '#   GroupCoordinator: "C1 너만 P2 내놔, 나머지는 그대로"',
+            '#   C1 → P2 revoke, 처리 중 record commit 후 반납',
+            '#   C2, C3 → 영향 없음, 계속 처리',
+            '#',
+            '# [2단계] assign',
+            '#   GroupCoordinator → C3 에게 P2 할당',
+            '#   C3 → P2 fetch 시작',
+            '#',
+            '# = 전체 그룹에서 영향받는 Consumer는 C1 하나뿐',
+            '# = lag 폭증 없음, 처리는 계속',
+            '',
+            '# ── eager vs cooperative 한눈에 ────────────────',
+            '#',
+            '#                  eager (기본)      cooperative',
+            '# 처리 정지 범위    그룹 전체          영향받는 컨슈머만',
+            '# rebalance 시간   ~수초              ~밀리초',
+            '# 100개 그룹 영향   100개 정지        1~2개만 잠시 정지',
+            '#',
+            '# ── 마지막 점검 ────────────────────────────────',
+            '# 1) Java client: CooperativeStickyAssignor 우선 권장',
+            '# 2) Streams: 기본이 이미 cooperative (Kafka 2.4+)',
+            '# 3) 모든 Consumer 가 같은 assignor 를 써야 함',
+            '#    (rolling 변경 시 한 단계씩 호환 모드 필요)',
+            '',
+            '# → Step 3 + 4 + 5 = rebalance 폭풍 종결 패키지 ✨',
+          ],
+          highlight: [10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 64],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Consumer 박스 — 상태별 색상
+    // ─────────────────────────────────────────────────────
+    const STATE_LABEL = {
+      running: '● running',
+      stopped: '■ stopped',
+      joining: '◐ joining',
+      restarting: '↻ restarting',
+    };
+
+    const COLOR_MAP = {
+      emerald: { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800', dot: 'bg-emerald-500' },
+      red:     { bg: 'bg-red-50',     border: 'border-red-400',     text: 'text-red-800',     dot: 'bg-red-500' },
+      amber:   { bg: 'bg-amber-50',   border: 'border-amber-400',   text: 'text-amber-800',   dot: 'bg-amber-500' },
+      sky:     { bg: 'bg-sky-50',     border: 'border-sky-400',     text: 'text-sky-800',     dot: 'bg-sky-500' },
+    };
+
+    function ConsumerCard({ consumer }) {
+      const c = COLOR_MAP[consumer.color] || COLOR_MAP.emerald;
+      return (
+        <div className={`rounded-lg border-2 ${c.border} ${c.bg} p-2`}>
+          <div className="flex items-center gap-2 mb-1">
+            <span className={`w-2 h-2 rounded-full ${c.dot}`}></span>
+            <span className={`text-xs font-bold ${c.text}`}>{consumer.id}</span>
+            <span className={`ml-auto text-[10px] ${c.text}`}>{STATE_LABEL[consumer.state] || consumer.state}</span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {consumer.partitions.length === 0 ? (
+              <span className="text-[10px] text-slate-400 italic">— 파티션 없음 —</span>
+            ) : (
+              consumer.partitions.map((p) => (
+                <span key={p} className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${c.bg} border ${c.border} ${c.text}`}>{p}</span>
+              ))
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Partition Bar — 전체 파티션 소유자 시각화
+    // ─────────────────────────────────────────────────────
+    function PartitionBar({ partitions }) {
+      const ownerColor = (owner) => {
+        if (owner === 'C1') return 'bg-emerald-200 text-emerald-900 border-emerald-400';
+        if (owner === 'C2') return 'bg-sky-200 text-sky-900 border-sky-400';
+        if (owner === 'C3') return 'bg-violet-200 text-violet-900 border-violet-400';
+        if (owner === '?')  return 'bg-red-100 text-red-800 border-red-400 animate-pulse';
+        return 'bg-amber-100 text-amber-900 border-amber-400';
+      };
+      return (
+        <div className="mt-2 rounded-lg border-2 border-yellow-300 bg-white p-2">
+          <div className="text-[10px] font-bold text-yellow-800 mb-1">Partition Assignment</div>
+          <div className="grid grid-cols-6 gap-1">
+            {partitions.map((p) => (
+              <div
+                key={p.id}
+                className={`text-[10px] font-mono text-center px-1 py-1 rounded border ${ownerColor(p.owner)}`}
+              >
+                <div className="font-bold">{p.id}</div>
+                <div className="text-[9px] opacity-80">{p.owner}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Lag Gauge
+    // ─────────────────────────────────────────────────────
+    function LagGauge({ lag }) {
+      const level = lag < 1000 ? 'low' : lag < 10000 ? 'mid' : 'high';
+      const color = level === 'low' ? 'bg-emerald-500' : level === 'mid' ? 'bg-amber-500' : 'bg-red-500';
+      const label = level === 'low' ? '✓ 정상' : level === 'mid' ? '⚠ 주의' : '🔥 폭증';
+      const pct = Math.min(100, Math.log10(Math.max(10, lag)) * 20);
+      return (
+        <div className="mt-2 rounded-lg border-2 border-yellow-300 bg-white p-2">
+          <div className="flex items-center justify-between text-[10px] mb-1">
+            <span className="font-bold text-yellow-800">Consumer Lag</span>
+            <span className="font-mono text-slate-700">{lag.toLocaleString()} msgs · {label}</span>
+          </div>
+          <div className="w-full bg-slate-100 rounded h-2 overflow-hidden">
+            <div className={`h-full ${color} transition-all duration-500`} style={{ width: `${pct}%` }}></div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 튜닝 표 (Step 3)
+    // ─────────────────────────────────────────────────────
+    function TuningBox({ tuning }) {
+      if (!tuning) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-yellow-400 bg-yellow-50 p-3">
+          <div className="text-xs font-bold text-yellow-900 mb-2">⚙️ 설정 튜닝 (Before → After)</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-yellow-800">
+                <th className="text-left pb-1 pr-2">key</th>
+                <th className="text-left pb-1 pr-2">before</th>
+                <th className="text-left pb-1 pr-2">after</th>
+                <th className="text-left pb-1">이유</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tuning.map((t) => (
+                <tr key={t.key} className="border-t border-yellow-200">
+                  <td className="py-1 pr-2 font-mono font-bold text-yellow-900">{t.key}</td>
+                  <td className="py-1 pr-2 font-mono text-slate-500 line-through">{t.before}</td>
+                  <td className="py-1 pr-2 font-mono text-emerald-700 font-bold">{t.after}</td>
+                  <td className="py-1 text-slate-700">{t.why}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Static / Cooperative 안내 박스
+    // ─────────────────────────────────────────────────────
+    function FeatureBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-yellow-500 bg-gradient-to-br from-yellow-50 to-amber-50 p-3">
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-xl">✨</span>
+            <span className="text-sm font-bold text-yellow-900">{box.title}</span>
+          </div>
+          <ul className="space-y-1">
+            {box.features.map((f, i) => (
+              <li key={i} className="text-xs text-yellow-900 flex gap-2">
+                <span className="text-yellow-600 mt-0.5">✓</span>
+                <span>{f}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Alert
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-yellow-50',  border: 'border-yellow-300',  text: 'text-yellow-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — Consumer Group 시각화
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-yellow-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-yellow-900">Consumer Group: order-processor</h3>
+            <span className="text-[10px] font-bold text-yellow-800 bg-yellow-100 px-2 py-0.5 rounded">{state.phase}</span>
+          </div>
+          <div className="grid grid-cols-1 gap-2">
+            {state.consumers.map((c) => (
+              <ConsumerCard key={c.id} consumer={c} />
+            ))}
+          </div>
+          <PartitionBar partitions={state.partitions} />
+          <LagGauge lag={state.lag} />
+          <TuningBox tuning={state.tuning} />
+          <FeatureBox box={state.staticBox} />
+          <FeatureBox box={state.cooperativeBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-yellow-500/15 border-l-2 border-yellow-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-yellow-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-yellow-500 text-white font-bold">K</span>
+              <div>
+                <h1 className="text-2xl font-bold text-yellow-900">III-2-2. Rebalance 폭풍과 해결</h1>
+                <p className="text-sm text-yellow-800/80">Consumer 합류/이탈 → StopTheWorld → timeout 튜닝 → static membership → cooperative sticky</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-yellow-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-yellow-500' : 'bg-yellow-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-yellow-700 text-yellow-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-yellow-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-400 bg-white text-yellow-800 hover:bg-yellow-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-400 bg-white text-yellow-800 hover:bg-yellow-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-yellow-700 text-white' : 'bg-yellow-600 text-white hover:bg-yellow-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-400 bg-white text-yellow-800 hover:bg-yellow-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-yellow-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-yellow-500 bg-white px-4 py-3 text-sm text-yellow-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                rebalance 자체는 정상 동작이지만, eager 방식의 Stop-The-World 비용이 운영을 흔든다.
+                해결은 3종 세트다 — (1) session/heartbeat 튜닝으로 헛 rebalance 줄이고, (2) static membership 으로 배포/재시작은 rebalance 없이 흘려보내고,
+                (3) cooperative sticky 로 꼭 필요한 rebalance만 점진적으로 한다. 세 가지를 함께 적용하면 100개 Consumer 그룹의 rebalance 폭풍이 사실상 사라진다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Kafka', 'ConsumerGroup', 'Rebalance', 'StopTheWorld', 'sessionTimeout', 'heartbeat', 'StaticMembership', 'CooperativeSticky', 'KIP-345', 'KIP-429'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-800 border border-yellow-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-yellow-700">
+              <a href="./III-2-1.html" className="underline hover:no-underline">← III-2-1</a>
+              <a href="../index.html" className="underline hover:no-underline">챕터 목록</a>
+              <a href="./III-2-3.html" className="underline hover:no-underline">다음: III-2-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

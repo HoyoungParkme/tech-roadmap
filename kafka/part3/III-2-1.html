@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kafka 인터랙티브 학습 — III-2-1. Lag 모니터링과 알람</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📊</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Kafka III-2-1 — Lag 모니터링과 알람
+    학습 목표: Consumer Lag의 정의부터 시작해서 측정 도구(CLI), 자동화(exporter),
+              시각화(Grafana), 임계값 알람(Slack)까지 5단계 모니터링 파이프라인을 구축한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: Lag 게이지 + Topic/Consumer 상태) / 우(CodeViewer 5탭)
+    색상: yellow (Kafka 모니터링 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — Lag 정의 → CLI 측정 → exporter → Grafana → Alert
+    //   topicLatest    : Topic latest offset (producer가 쌓은 마지막 위치)
+    //   consumerOffset : Consumer가 커밋한 offset
+    //   lag            : 두 값의 차이
+    //   lagHistory     : 시간에 따른 lag 추이 (Sparkline 용)
+    //   alert          : 핵심 경고 박스
+    //   code           : 우측 CodeViewer 파일
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. Lag의 정의 — (Topic latest offset) − (Consumer committed offset)',
+        desc: 'Kafka에서 가장 먼저 봐야 할 운영 지표는 Consumer Lag이다. Producer는 계속 메시지를 쌓고(latest offset이 증가), Consumer는 그것을 읽고 커밋한다(committed offset 증가). 두 값의 차이가 곧 "아직 처리되지 않은 메시지 수" = Lag이다. Lag이 0이면 실시간, Lag이 점점 커지면 Consumer가 따라가지 못한다는 신호다. 이 단순한 뺄셈이 운영의 핵심 KPI다.',
+        actor: '📐 Lag 공식 이해 — 단순한 뺄셈',
+        group: 'order-processor',
+        topic: 'orders',
+        partition: 0,
+        topicLatest: 10000,
+        consumerOffset: 9985,
+        lag: 15,
+        status: 'healthy',
+        lagHistory: [10, 12, 8, 14, 11, 13, 15, 12, 14, 15],
+        threshold: 1000,
+        alert: { tone: 'info', text: 'Lag = latest(10000) − committed(9985) = 15. 거의 실시간으로 처리 중.' },
+        code: {
+          lang: 'markdown',
+          filename: 'lag-formula.md',
+          lines: [
+            '# Lag 공식 — 가장 먼저 외워야 할 한 줄',
+            '',
+            '## 정의',
+            '',
+            '```',
+            'Lag(partition) = Topic latest offset − Consumer committed offset',
+            '```',
+            '',
+            '## 각 값의 의미',
+            '',
+            '- **Topic latest offset (LEO, Log End Offset)**',
+            '  - Producer가 partition에 마지막 쌓은 위치 + 1',
+            '  - "지금까지 총 몇 개가 들어왔는가"',
+            '',
+            '- **Consumer committed offset**',
+            '  - Consumer Group이 __consumer_offsets 에 커밋한 위치',
+            '  - "내가 어디까지 읽고 처리했는가"',
+            '',
+            '- **Lag**',
+            '  - Lag = 0  → 실시간 처리 (idle)',
+            '  - Lag > 0  → 처리 대기 중',
+            '  - Lag 지속 증가 → Consumer가 못 따라감 (장애 신호)',
+            '',
+            '## 예시',
+            '',
+            '| 시간 | latest | committed | Lag | 해석 |',
+            '|:--|:--|:--|:--|:--|',
+            '| 09:00 | 10000 | 9985  | 15   | 정상 |',
+            '| 09:01 | 11000 | 10800 | 200  | 약간 밀림 |',
+            '| 09:02 | 12000 | 10900 | 1100 | ⚠ 임계 초과 |',
+            '| 09:03 | 13000 | 10950 | 2050 | 🚨 위험 |',
+            '',
+            '## 왜 Lag이 가장 중요한 지표인가?',
+            '- 메시지 수가 아닌 "처리 지연"을 직접 나타낸다',
+            '- 사용자 체감 지연시간과 직결된다',
+            '- Consumer 성능 / 다운 / 무한루프를 가장 먼저 잡는다',
+            '',
+            '# → Step 2: 실제로 Lag을 어떻게 측정하나?',
+          ],
+          highlight: [5, 6, 7, 11, 12, 13, 16, 17, 18, 21, 22, 23, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 2. kafka-consumer-groups.sh --describe — CLI로 직접 확인',
+        desc: 'Lag을 측정하는 가장 기본적인 방법은 Kafka가 기본으로 제공하는 CLI다. kafka-consumer-groups.sh --describe 명령 하나면 Consumer Group의 모든 partition별 latest, current-offset, lag을 표 형태로 보여준다. 운영 중 "어? 처리가 느린데?" 싶을 때 가장 먼저 치는 명령이다. 단점은 사람이 직접 쳐야 한다는 것. 자동화하려면 다음 단계가 필요하다.',
+        actor: '💻 CLI로 즉시 Lag 확인',
+        group: 'order-processor',
+        topic: 'orders',
+        partition: 0,
+        topicLatest: 12000,
+        consumerOffset: 11200,
+        lag: 800,
+        status: 'warning',
+        lagHistory: [15, 50, 120, 200, 350, 450, 600, 700, 750, 800],
+        threshold: 1000,
+        alert: { tone: 'warn', text: 'Lag이 15 → 800으로 급증. CLI로 확인은 되지만, 사람이 매번 칠 수는 없다.' },
+        code: {
+          lang: 'bash',
+          filename: 'describe.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# Consumer Group Lag 조회 — Kafka 기본 CLI',
+            '# 사용 시점: "처리가 느려진 것 같다" 싶을 때 가장 먼저 친다',
+            '',
+            'BROKER="kafka-1.internal:9092"',
+            'GROUP="order-processor"',
+            '',
+            '# ── 1. 모든 Consumer Group 목록 ──────────────────',
+            'kafka-consumer-groups.sh --bootstrap-server "$BROKER" --list',
+            '',
+            '# 출력 예시:',
+            '#   order-processor',
+            '#   payment-processor',
+            '#   notification-sender',
+            '',
+            '# ── 2. 특정 Group의 partition별 Lag 조회 ────────',
+            'kafka-consumer-groups.sh \\',
+            '  --bootstrap-server "$BROKER" \\',
+            '  --group "$GROUP" \\',
+            '  --describe',
+            '',
+            '# 출력 예시:',
+            '# GROUP            TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG',
+            '# order-processor  orders  0          11200           12000           800',
+            '# order-processor  orders  1          11195           12010           815',
+            '# order-processor  orders  2          11210           11995           785',
+            '#                                                                 ────────',
+            '#                                                                 합계: 2400',
+            '',
+            '# ── 3. 합계 추출 (awk) ─────────────────────────────',
+            'kafka-consumer-groups.sh \\',
+            '  --bootstrap-server "$BROKER" --group "$GROUP" --describe \\',
+            '  2>/dev/null | awk "NR>1 {sum+=\\$6} END {print sum+0}"',
+            '',
+            '# ── 4. 임계 초과 시 알람 (간이 버전) ──────────────',
+            'THRESHOLD=1000',
+            'TOTAL_LAG=$(kafka-consumer-groups.sh \\',
+            '  --bootstrap-server "$BROKER" --group "$GROUP" --describe \\',
+            '  2>/dev/null | awk "NR>1 {sum+=\\$6} END {print sum+0}")',
+            '',
+            'if [ "$TOTAL_LAG" -gt "$THRESHOLD" ]; then',
+            '  echo "🚨 $GROUP 전체 Lag = $TOTAL_LAG > $THRESHOLD"',
+            '  # cron + bash 로는 한계 분명 → 다음 단계: exporter',
+            'fi',
+            '',
+            '# 한계',
+            '#   ❌ 매번 사람이 친다 (자동화 안 됨)',
+            '#   ❌ 추세(시간에 따른 변화)를 보기 어렵다',
+            '#   ❌ 여러 Group을 한눈에 못 본다',
+            '#   ❌ 알람 인프라가 따로 필요',
+            '#',
+            '# → 다음 단계: Prometheus Exporter로 상시 수집',
+          ],
+          highlight: [8, 9, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45],
+        },
+      },
+      {
+        title: 'Step 3. Prometheus Exporter — Lag을 시계열로 수집',
+        desc: 'CLI 한 번으로는 추세를 볼 수 없다. kafka-exporter(또는 kminion, jmx-exporter) 같은 Prometheus Exporter를 띄우면 Kafka 브로커에서 주기적으로 Lag을 긁어와 /metrics 엔드포인트로 노출한다. Prometheus가 그 엔드포인트를 15초 간격으로 scrape해서 시계열 DB에 저장한다. 이제 Lag은 "지금 값"이 아니라 "5분 전 값", "1시간 전 값", "어제 같은 시각 값"까지 비교 가능해진다.',
+        actor: '🔄 kafka-exporter → Prometheus 시계열 수집',
+        group: 'order-processor',
+        topic: 'orders',
+        partition: 0,
+        topicLatest: 18000,
+        consumerOffset: 16800,
+        lag: 1200,
+        status: 'danger',
+        lagHistory: [800, 850, 900, 1000, 1050, 1100, 1150, 1180, 1190, 1200],
+        threshold: 1000,
+        alert: { tone: 'danger', text: 'Lag = 1200 > threshold(1000). Prometheus에 시계열로 쌓이는 중. 이제 Grafana로 시각화 차례.' },
+        code: {
+          lang: 'yaml',
+          filename: 'prometheus.yml',
+          lines: [
+            '# Prometheus 설정 — Kafka Lag 시계열 수집',
+            '# 구조:',
+            '#   kafka-exporter (:9308) — 브로커에서 Lag 긁어와 /metrics 노출',
+            '#   prometheus     (:9090) — 15초마다 scrape',
+            '#   grafana        (:3000) — Prometheus를 datasource로 사용',
+            '',
+            'global:',
+            '  scrape_interval: 15s        # 기본 15초 간격',
+            '  evaluation_interval: 15s    # 알람 규칙 평가 주기',
+            '  external_labels:',
+            '    cluster: kafka-prod',
+            '    region: ap-northeast-2',
+            '',
+            '# ── 알람 규칙 파일 ───────────────────────────────────',
+            'rule_files:',
+            '  - /etc/prometheus/rules/kafka-lag.yaml',
+            '',
+            '# ── Alertmanager 연결 (Slack 호출 담당) ──────────────',
+            'alerting:',
+            '  alertmanagers:',
+            '    - static_configs:',
+            '        - targets: ["alertmanager:9093"]',
+            '',
+            '# ── scrape 대상: kafka-exporter ──────────────────────',
+            'scrape_configs:',
+            '  - job_name: "kafka-exporter"',
+            '    scrape_interval: 15s',
+            '    static_configs:',
+            '      - targets: ["kafka-exporter:9308"]',
+            '        labels: { cluster: kafka-prod }',
+            '    # 노출 메트릭:',
+            '    #   kafka_consumergroup_lag{group, topic, partition}',
+            '    #   kafka_consumergroup_current_offset{group, topic, partition}',
+            '    #   kafka_topic_partition_current_offset{topic, partition}',
+            '',
+            '  - job_name: "kafka-jmx"',
+            '    static_configs:',
+            '      - targets: ["kafka-1:7071", "kafka-2:7071", "kafka-3:7071"]',
+            '',
+            '# ── PromQL 예시 (Grafana 패널에서 사용) ───────────────',
+            '#  1. Group별 총 Lag      → sum by (group) (kafka_consumergroup_lag)',
+            '#  2. partition top 10    → topk(10, kafka_consumergroup_lag)',
+            '#  3. Lag 증가 속도       → deriv(kafka_consumergroup_lag[5m])',
+            '#  4. Consumer 처리량     → rate(kafka_consumergroup_current_offset[1m])',
+            '#  5. Producer 입력량     → rate(kafka_topic_partition_current_offset[1m])',
+            '#     → 4 < 5 가 지속되면 Lag은 반드시 누적된다',
+            '',
+            '# 한계와 보완',
+            '#   ✓ 시계열 저장 → 추세 분석 가능',
+            '#   ✓ PromQL → 유연한 집계',
+            '#   ❌ 숫자만으로는 직관적이지 않다 → Grafana 필요',
+            '#   ❌ 단순 임계값은 false positive 많다 → 다음 단계 알람 규칙',
+            '',
+            '# → Step 4: Grafana 대시보드로 한눈에 본다',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 41, 42, 43, 44, 45, 46, 47],
+        },
+      },
+      {
+        title: 'Step 4. Grafana 대시보드 — 한눈에 보이는 시각화',
+        desc: 'Prometheus에 데이터가 쌓여도 PromQL을 매번 치진 않는다. Grafana 대시보드를 만들어 두면 운영자가 출근하자마자 한 화면에서 모든 Consumer Group의 Lag 추이, 처리량, 임계 도달 여부를 확인한다. 보통 4개 패널이 핵심이다 — (1) Group별 총 Lag (Stat), (2) Lag 시간 추이 (Time series), (3) partition별 Lag heatmap, (4) Consumer vs Producer 처리량 비교. 색상으로 정상/경고/위험을 즉시 구분한다.',
+        actor: '📈 Grafana 대시보드로 한눈에 확인',
+        group: 'order-processor',
+        topic: 'orders',
+        partition: 0,
+        topicLatest: 22000,
+        consumerOffset: 19500,
+        lag: 2500,
+        status: 'danger',
+        lagHistory: [1200, 1400, 1600, 1800, 2000, 2150, 2250, 2350, 2450, 2500],
+        threshold: 1000,
+        alert: { tone: 'danger', text: 'Lag 2500이 시각적으로 빨간색 게이지에 표시됨. 운영자가 모니터를 보자마자 인지.' },
+        code: {
+          lang: 'json',
+          filename: 'grafana.json',
+          lines: [
+            '{',
+            '  "dashboard": {',
+            '    "title": "Kafka Consumer Lag — order-processor",',
+            '    "uid": "kafka-lag-order-processor",',
+            '    "tags": ["kafka", "lag", "consumer"],',
+            '    "refresh": "30s",',
+            '    "time": { "from": "now-1h", "to": "now" },',
+            '    "panels": [',
+            '      {',
+            '        "id": 1, "type": "stat",',
+            '        "title": "총 Lag (Consumer Group)",',
+            '        "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },',
+            '        "targets": [{',
+            '          "expr": "sum by (group) (kafka_consumergroup_lag{group=\\"order-processor\\"})",',
+            '          "legendFormat": "{{group}}"',
+            '        }],',
+            '        "fieldConfig": { "defaults": { "thresholds": {',
+            '          "mode": "absolute",',
+            '          "steps": [',
+            '            { "color": "green",  "value": 0 },',
+            '            { "color": "yellow", "value": 500 },',
+            '            { "color": "orange", "value": 1000 },',
+            '            { "color": "red",    "value": 5000 }',
+            '          ]',
+            '        } } }',
+            '      },',
+            '      {',
+            '        "id": 2, "type": "timeseries",',
+            '        "title": "Lag 시간 추이 (1시간)",',
+            '        "gridPos": { "x": 6, "y": 0, "w": 18, "h": 8 },',
+            '        "targets": [{',
+            '          "expr": "sum by (group) (kafka_consumergroup_lag)",',
+            '          "legendFormat": "{{group}}"',
+            '        }],',
+            '        "alert": {',
+            '          "name": "Lag 임계 초과",',
+            '          "conditions": [{',
+            '            "evaluator": { "type": "gt", "params": [1000] },',
+            '            "reducer":   { "type": "avg" }',
+            '          }],',
+            '          "for": "5m"',
+            '        }',
+            '      },',
+            '      {',
+            '        "id": 3, "type": "heatmap",',
+            '        "title": "Partition별 Lag (heatmap)",',
+            '        "gridPos": { "x": 0, "y": 8, "w": 12, "h": 6 },',
+            '        "targets": [{',
+            '          "expr": "kafka_consumergroup_lag{group=\\"order-processor\\"}",',
+            '          "format": "heatmap"',
+            '        }]',
+            '      },',
+            '      {',
+            '        "id": 4, "type": "timeseries",',
+            '        "title": "Producer 입력 vs Consumer 처리 (records/sec)",',
+            '        "gridPos": { "x": 12, "y": 8, "w": 12, "h": 6 },',
+            '        "targets": [',
+            '          { "expr": "rate(kafka_topic_partition_current_offset{topic=\\"orders\\"}[1m])", "legendFormat": "Producer (in)" },',
+            '          { "expr": "rate(kafka_consumergroup_current_offset{group=\\"order-processor\\"}[1m])", "legendFormat": "Consumer (out)" }',
+            '        ]',
+            '      }',
+            '    ]',
+            '  }',
+            '}',
+            '',
+            '/*',
+            '  4개 패널이 한 화면에서 답하는 질문:',
+            '    [1] 지금 얼마나 밀려 있나?      → Stat (큰 숫자 + 색)',
+            '    [2] 추세는 어떤가?              → Time series (1h)',
+            '    [3] 특정 partition만 문제인가?  → Heatmap',
+            '    [4] 처리가 입력을 따라가는가?    → in vs out 비교',
+            '',
+            '  → 그러나 사람이 24시간 보고 있을 수 없다',
+            '  → Step 5: 임계값 알람으로 Slack에 자동 호출',
+            '*/',
+          ],
+          highlight: [18, 19, 20, 21, 22, 23, 24, 25, 26, 35, 36, 37, 38, 39, 40, 41, 42, 43, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74],
+        },
+      },
+      {
+        title: 'Step 5. Alert 임계값 → Slack — Lag > 1000이면 자동 호출',
+        desc: '대시보드를 24시간 보고 있을 수는 없다. Prometheus AlertManager 또는 Grafana Alert에 "Lag > 1000이 5분 지속되면 Slack 채널 #ops-kafka에 호출" 같은 규칙을 등록한다. 임계값을 한 단계가 아니라 warning(>1000), critical(>5000)로 나누면 야간 호출의 피로도가 크게 줄어든다. 이제 운영자는 평소엔 잊고 살다가, 진짜 문제가 생길 때만 Slack 알림으로 깨어난다. 이게 모니터링의 최종 목적이다.',
+        actor: '🔔 Slack #ops-kafka 자동 호출',
+        group: 'order-processor',
+        topic: 'orders',
+        partition: 0,
+        topicLatest: 25000,
+        consumerOffset: 19500,
+        lag: 5500,
+        status: 'critical',
+        lagHistory: [2500, 3000, 3500, 4000, 4500, 4800, 5000, 5200, 5400, 5500],
+        threshold: 1000,
+        slack: {
+          channel: '#ops-kafka',
+          severity: 'critical',
+          message: '🚨 [CRITICAL] order-processor 그룹 Lag = 5,500 (threshold 5,000 초과, 7분 지속)',
+        },
+        alert: { tone: 'good', text: '임계값을 넘자마자 Slack 자동 호출. 사람은 평소엔 자고, 진짜 문제 때만 깨어난다.' },
+        code: {
+          lang: 'yaml',
+          filename: 'alert.yaml',
+          lines: [
+            '# Prometheus 알람 규칙 — Kafka Lag 임계 초과 시 Slack 호출',
+            '# 파일 위치: /etc/prometheus/rules/kafka-lag.yaml',
+            '',
+            'groups:',
+            '  - name: kafka-consumer-lag',
+            '    interval: 30s',
+            '    rules:',
+            '',
+            '      # ── [WARNING] Lag > 1000 이 5분 지속 ──────────────',
+            '      - alert: KafkaConsumerLagWarning',
+            '        expr: sum by (group) (kafka_consumergroup_lag) > 1000',
+            '        for: 5m',
+            '        labels:',
+            '          severity: warning',
+            '          team: data-platform',
+            '        annotations:',
+            '          summary: "Consumer Group {{ $labels.group }} Lag 경고"',
+            '          description: "Lag 이 5분간 1000 초과. 현재 {{ $value }}"',
+            '          runbook_url: "https://wiki/runbook/kafka-lag"',
+            '',
+            '      # ── [CRITICAL] Lag > 5000 이 5분 지속 ─────────────',
+            '      - alert: KafkaConsumerLagCritical',
+            '        expr: sum by (group) (kafka_consumergroup_lag) > 5000',
+            '        for: 5m',
+            '        labels:',
+            '          severity: critical',
+            '          team: data-platform',
+            '          page: "true"',
+            '        annotations:',
+            '          summary: "🚨 {{ $labels.group }} Lag 위험"',
+            '          description: "Lag 이 5분간 5000 초과 — 즉시 확인. 현재 {{ $value }}"',
+            '',
+            '      # ── [INFO] Lag 증가 속도 (가속도 알람) ─────────────',
+            '      - alert: KafkaConsumerLagSpike',
+            '        expr: deriv(kafka_consumergroup_lag[5m]) > 50',
+            '        for: 10m',
+            '        labels:',
+            '          severity: warning',
+            '        annotations:',
+            '          summary: "{{ $labels.group }} Lag 증가 가속 (분당 50+)"',
+            '',
+            '---',
+            '# Alertmanager 설정 (alertmanager.yml) — Slack 라우팅',
+            'route:',
+            '  receiver: slack-ops',
+            '  group_by: ["alertname", "group"]',
+            '  group_wait: 30s',
+            '  repeat_interval: 4h',
+            '  routes:',
+            '    - matchers: [severity = "critical"]',
+            '      receiver: slack-ops-critical',
+            '      continue: true',
+            '',
+            'receivers:',
+            '  - name: slack-ops',
+            '    slack_configs:',
+            '      - api_url: "https://hooks.slack.com/services/T0XXX/B0XXX/XXX"',
+            '        channel: "#ops-kafka"',
+            '        title: "[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}"',
+            '        text: |',
+            '          *Group:* {{ .CommonLabels.group }}',
+            '          *Severity:* {{ .CommonLabels.severity }}',
+            '          *Description:* {{ .CommonAnnotations.description }}',
+            '          *Runbook:* {{ .CommonAnnotations.runbook_url }}',
+            '        send_resolved: true',
+            '',
+            '  - name: slack-ops-critical',
+            '    slack_configs:',
+            '      - api_url: "https://hooks.slack.com/services/T0XXX/B0YYY/YYY"',
+            '        channel: "#ops-kafka-critical"',
+            '        title: "🚨 [CRITICAL] {{ .CommonLabels.group }}"',
+            '        text: "즉시 확인 — {{ (index .Alerts 0).Annotations.description }}"',
+            '        send_resolved: true',
+            '',
+            '# 5단계 파이프라인 최종 정리',
+            '#   ① Lag 정의       — (latest) − (committed)',
+            '#   ② CLI 측정       — kafka-consumer-groups.sh --describe',
+            '#   ③ Exporter 수집  — Prometheus scrape 15s 간격',
+            '#   ④ Grafana 시각화 — 한 화면, 4개 패널',
+            '#   ⑤ Slack 알람     — Lag > 1000 / 5000, 5분 지속',
+            '#',
+            '# → 운영자는 평소엔 잊고, 진짜 문제 때만 깨어난다',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Lag 게이지 (큰 숫자 + 색)
+    // ─────────────────────────────────────────────────────
+    const STATUS_STYLE = {
+      healthy:  { color: 'text-emerald-600', bg: 'bg-emerald-50',  border: 'border-emerald-300', label: '정상',   icon: '✅' },
+      warning:  { color: 'text-amber-600',   bg: 'bg-amber-50',    border: 'border-amber-300',   label: '주의',   icon: '⚠️' },
+      danger:   { color: 'text-orange-600',  bg: 'bg-orange-50',   border: 'border-orange-300',  label: '위험',   icon: '🔥' },
+      critical: { color: 'text-red-600',     bg: 'bg-red-50',      border: 'border-red-400',     label: '심각',   icon: '🚨' },
+    };
+
+    function LagGauge({ lag, threshold, status }) {
+      const s = STATUS_STYLE[status] || STATUS_STYLE.healthy;
+      const ratio = Math.min(1, lag / (threshold * 5));
+      return (
+        <div className={`rounded-lg border-2 ${s.border} ${s.bg} p-3`}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold text-slate-600">현재 Lag</span>
+            <span className={`text-xs font-bold ${s.color}`}>{s.icon} {s.label}</span>
+          </div>
+          <div className={`text-3xl font-bold ${s.color} font-mono`}>
+            {lag.toLocaleString()}
+          </div>
+          <div className="text-[10px] text-slate-500 mt-1">
+            임계값 {threshold.toLocaleString()} · 비율 {(lag / threshold).toFixed(2)}x
+          </div>
+          {/* 게이지 바 */}
+          <div className="mt-2 h-2 rounded-full bg-white border border-slate-200 overflow-hidden">
+            <div
+              className={`h-full transition-all ${
+                status === 'healthy' ? 'bg-emerald-400'
+                : status === 'warning' ? 'bg-amber-400'
+                : status === 'danger' ? 'bg-orange-500'
+                : 'bg-red-500'
+              }`}
+              style={{ width: `${ratio * 100}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-[9px] text-slate-400 mt-0.5">
+            <span>0</span>
+            <span>{threshold}</span>
+            <span>{threshold * 5}+</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Offset 표 (latest vs committed)
+    // ─────────────────────────────────────────────────────
+    function OffsetTable({ group, topic, partition, topicLatest, consumerOffset, lag }) {
+      return (
+        <div className="rounded-lg border-2 border-yellow-300 bg-white overflow-hidden">
+          <div className="bg-gradient-to-r from-yellow-500 to-amber-500 text-white px-3 py-1.5 text-xs font-bold flex items-center gap-2">
+            <span>📊</span>
+            <span>Kafka Consumer Group 상태</span>
+            <span className="ml-auto text-[10px] bg-white/20 px-2 py-0.5 rounded font-mono">{group}</span>
+          </div>
+          <div className="p-2">
+            <table className="w-full border-collapse text-xs">
+              <tbody>
+                <tr>
+                  <td className="text-[10px] font-bold text-yellow-800 py-1 pr-2 w-32">Group</td>
+                  <td className="font-mono text-slate-700 py-1">{group}</td>
+                </tr>
+                <tr>
+                  <td className="text-[10px] font-bold text-yellow-800 py-1 pr-2">Topic</td>
+                  <td className="font-mono text-slate-700 py-1">{topic} (p{partition})</td>
+                </tr>
+                <tr className="border-t border-yellow-100">
+                  <td className="text-[10px] font-bold text-yellow-800 py-1 pr-2">Topic latest offset</td>
+                  <td className="font-mono text-blue-700 font-bold py-1">{topicLatest.toLocaleString()}</td>
+                </tr>
+                <tr>
+                  <td className="text-[10px] font-bold text-yellow-800 py-1 pr-2">Consumer committed</td>
+                  <td className="font-mono text-emerald-700 font-bold py-1">− {consumerOffset.toLocaleString()}</td>
+                </tr>
+                <tr className="border-t-2 border-yellow-300 bg-yellow-50">
+                  <td className="text-[10px] font-bold text-yellow-900 py-1 pr-2">= Lag</td>
+                  <td className="font-mono text-red-700 font-bold py-1 text-base">{lag.toLocaleString()}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Lag 추이 미니 그래프 (SVG sparkline)
+    // ─────────────────────────────────────────────────────
+    function LagSparkline({ history, threshold }) {
+      const W = 280, H = 80, PAD = 4;
+      const max = Math.max(threshold * 1.5, ...history) * 1.1;
+      const min = 0;
+      const stepX = (W - PAD * 2) / Math.max(1, history.length - 1);
+      const yOf = (v) => H - PAD - ((v - min) / (max - min)) * (H - PAD * 2);
+      const points = history.map((v, i) => `${PAD + i * stepX},${yOf(v)}`).join(' ');
+      const thresholdY = yOf(threshold);
+      return (
+        <div className="rounded-lg border border-yellow-200 bg-white p-2">
+          <div className="text-[10px] font-bold text-yellow-800 mb-1 flex justify-between">
+            <span>📈 Lag 추이 (최근 10분)</span>
+            <span className="text-slate-500">threshold {threshold}</span>
+          </div>
+          <svg viewBox={`0 0 ${W} ${H}`} width="100%" height="80" preserveAspectRatio="none">
+            {/* threshold 라인 */}
+            <line
+              x1={PAD} x2={W - PAD}
+              y1={thresholdY} y2={thresholdY}
+              stroke="#ef4444" strokeWidth="1" strokeDasharray="3,3" opacity="0.7"
+            />
+            <text x={W - PAD - 2} y={thresholdY - 2} fontSize="9" fill="#ef4444" textAnchor="end">
+              threshold {threshold}
+            </text>
+            {/* 영역 채움 */}
+            <polygon
+              points={`${PAD},${H - PAD} ${points} ${W - PAD},${H - PAD}`}
+              fill="#fbbf24" opacity="0.25"
+            />
+            {/* Lag 라인 */}
+            <polyline
+              points={points}
+              fill="none"
+              stroke="#d97706"
+              strokeWidth="2"
+            />
+            {/* 마지막 점 */}
+            {history.length > 0 && (
+              <circle
+                cx={PAD + (history.length - 1) * stepX}
+                cy={yOf(history[history.length - 1])}
+                r="3"
+                fill="#dc2626"
+              />
+            )}
+          </svg>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Slack 알림 mock (Step 5)
+    // ─────────────────────────────────────────────────────
+    function SlackBox({ slack }) {
+      if (!slack) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-400 bg-white overflow-hidden">
+          <div className="bg-[#4a154b] text-white px-3 py-1.5 text-xs font-bold flex items-center gap-2">
+            <span>💬</span>
+            <span>Slack — {slack.channel}</span>
+            <span className="ml-auto text-[10px] bg-red-500 px-2 py-0.5 rounded uppercase">{slack.severity}</span>
+          </div>
+          <div className="p-3 bg-slate-50">
+            <div className="flex gap-2">
+              <div className="w-8 h-8 rounded bg-yellow-500 flex items-center justify-center text-white font-bold text-xs flex-shrink-0">
+                AM
+              </div>
+              <div className="flex-1">
+                <div className="text-xs font-bold text-slate-800">
+                  AlertManager <span className="text-[10px] text-slate-400 font-normal ml-1">bot · 방금</span>
+                </div>
+                <div className="text-xs text-slate-700 mt-1">{slack.message}</div>
+                <div className="mt-2 flex gap-1.5">
+                  <button className="text-[10px] px-2 py-0.5 rounded border border-slate-300 bg-white text-slate-700">확인</button>
+                  <button className="text-[10px] px-2 py-0.5 rounded border border-slate-300 bg-white text-slate-700">Runbook 열기</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-yellow-50',  border: 'border-yellow-300',  text: 'text-yellow-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — yellow 톤
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-yellow-200 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-yellow-800">Consumer Lag 모니터</h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="grid grid-cols-1 gap-2">
+            <OffsetTable
+              group={state.group}
+              topic={state.topic}
+              partition={state.partition}
+              topicLatest={state.topicLatest}
+              consumerOffset={state.consumerOffset}
+              lag={state.lag}
+            />
+            <LagGauge lag={state.lag} threshold={state.threshold} status={state.status} />
+            <LagSparkline history={state.lagHistory} threshold={state.threshold} />
+          </div>
+          <SlackBox slack={state.slack} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-yellow-500/15 border-l-2 border-yellow-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-yellow-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-yellow-600 text-white font-bold">K</span>
+              <div>
+                <h1 className="text-2xl font-bold text-yellow-900">III-2-1. Lag 모니터링과 알람</h1>
+                <p className="text-sm text-yellow-800/80">정의 → CLI → Prometheus → Grafana → Slack 알람</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-yellow-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-yellow-600' : 'bg-yellow-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-yellow-700 text-yellow-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-yellow-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-300 bg-white text-yellow-700 hover:bg-yellow-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-300 bg-white text-yellow-700 hover:bg-yellow-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-yellow-700 text-white' : 'bg-yellow-600 text-white hover:bg-yellow-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-yellow-300 bg-white text-yellow-700 hover:bg-yellow-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-yellow-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-yellow-400 bg-white px-4 py-3 text-sm text-yellow-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Consumer Lag = (Topic latest) − (Consumer committed). 가장 단순하지만 가장 중요한 운영 지표.
+                CLI로 즉시 확인 → Prometheus Exporter로 시계열 수집 → Grafana로 시각화 → Alertmanager로 Slack 호출.
+                이 5단계 파이프라인을 한 번 구축해두면, 운영자는 진짜 문제가 생길 때만 깨어난다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Kafka', 'ConsumerLag', 'Prometheus', 'Grafana', 'Alertmanager', 'Slack', 'kafka-exporter', 'Monitoring'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-800 border border-yellow-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-yellow-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-2-2.html" className="underline hover:no-underline">다음: III-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
