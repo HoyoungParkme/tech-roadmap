@@ -9,189 +9,791 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
+  <!--
+    FastAPI Chapter 5-13 — Celery / 메시지 큐
+    학습 목표: 무거운 작업 분리 → broker → worker → backend → 재시도까지
+              FastAPI에서 비동기 작업 큐를 설계하는 5단계를 시각화한다.
+    핵심 비유: 카페 주문 — 손님은 영수증(task_id)만 받고, 바리스타(worker)가 만들고,
+              영수증으로 음료(result)를 찾으러 온다.
+    패턴: fastapi v1 — 좌(LiveDataPane: API → broker → worker → backend 흐름) / 우(VSCode CodeViewer 5탭)
+    색상: indigo (fastapi 도메인)
+  -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 무거운 작업 분리 → broker → worker → backend → 재시도
+    //   api      : 좌측 API 서버 박스
+    //   broker   : 메시지 브로커 박스 (Redis/RabbitMQ)
+    //   worker   : Celery worker 박스
+    //   backend  : 결과 backend 박스
+    //   retry    : 재시도/모니터 박스 (Step 5)
+    //   code     : 우측 CodeViewer 탭 (id, filename, lang, lines, highlight)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'BackgroundTasks의 한계',
-        desc: '[한계] BackgroundTasks는 같은 프로세스에서 실행된다. 서버가 꺼지면 작업도 사라진다. 작업이 실패해도 재시도가 없다. 대규모 서비스에는 부족하다.',
-        blocks: [
-          { label: 'API 서버 프로세스', state: 'warning', children: ['라우터', 'BackgroundTask ← 여기서 실행'] },
-          { label: '서버 재시작 → 작업 유실!', state: 'problem' },
-        ],
-        codeLines: [
-          { code: '# BackgroundTasks 한계', tag: 'label' },
-          { code: '', tag: 'none' },
-          { code: '# 1. 서버 종료 → 작업 유실', tag: 'problem' },
-          { code: '# 2. 재시도 없음 → 실패하면 끝', tag: 'problem' },
-          { code: '# 3. 같은 프로세스 → CPU 경쟁', tag: 'problem' },
-          { code: '', tag: 'none' },
-          { code: '# → 해결: 작업을 외부에 저장하고', tag: 'label' },
-          { code: '#    별도 프로세스가 처리하게 하자', tag: 'label' },
-        ],
+        title: 'Step 1. 무거운 작업을 분리한다 — 요청 안에서 처리하지 마라',
+        desc: '이미지 리사이즈, PDF 생성, 메일 발송, ML 추론 같은 무거운 작업을 API 핸들러 안에서 동기로 돌리면 클라이언트는 30초씩 기다리고, 동시에 들어온 다른 요청은 모두 막힌다. 해결책은 "지금 처리하지 말고 일단 영수증부터 발급"이다. API는 task_id만 즉시 돌려주고 (202 Accepted), 실제 작업은 별도 프로세스(worker)에게 던진다. 카페에서 영수증을 받자마자 자리에 앉는 것과 같다.',
+        api: { method: 'POST', path: '/jobs/resize', note: '이미지 5MB 업로드', status: 202, body: '{ "task_id": "abc-123" }' },
+        broker: null,
+        worker: null,
+        backend: null,
+        retry: null,
+        keyPoint: '무거운 작업은 응답 흐름에서 분리한다. API는 task_id만 즉시 반환하고, 실제 처리는 외부에 위임한다.',
+        code: {
+          id: 'task',
+          filename: 'task.py',
+          lang: 'python',
+          lines: [
+            '"""',
+            'app/tasks.py',
+            '',
+            '목적: Celery 작업(task) 정의 모듈.',
+            '  - @app.task 데코레이터로 일반 함수를 큐 작업으로 등록한다.',
+            '  - API 라우터에서는 task.delay(...)로 큐에 던지고 task_id를 받는다.',
+            '"""',
+            'from celery import Celery',
+            'from fastapi import FastAPI',
+            '',
+            '# ① Celery 앱 생성 (broker / backend 주소만 알면 됨)',
+            'celery_app = Celery(',
+            '    "worker",',
+            '    broker="redis://localhost:6379/0",   # 작업 대기열',
+            '    backend="redis://localhost:6379/1",  # 결과 저장소',
+            ')',
+            '',
+            'api = FastAPI()',
+            '',
+            '',
+            '@celery_app.task(name="resize_image")',
+            'def resize_image(image_id: int, size: int) -> str:',
+            '    """이미지를 리사이즈한다. CPU/IO를 많이 쓰는 무거운 작업."""',
+            '    # 실제로는 PIL/sharp로 처리. 여기서는 결과 경로만 흉내.',
+            '    return f"/uploads/{image_id}_{size}.jpg"',
+            '',
+            '',
+            '@api.post("/jobs/resize", status_code=202)',
+            'def enqueue_resize(image_id: int, size: int = 800):',
+            '    """API는 작업을 큐에 넣고 task_id만 즉시 반환한다."""',
+            '    task = resize_image.delay(image_id, size)  # ← 큐에 던지기',
+            '    return {"task_id": task.id}',
+            '',
+            '# 실행 결과',
+            '#  POST /jobs/resize?image_id=42',
+            '#    → 202 Accepted',
+            '#    → { "task_id": "abc-123" }',
+            '#',
+            '# 핵심: API 핸들러는 무거운 함수를 "직접 호출"하지 않는다.',
+            '#       .delay()로 큐에 넣기만 하고 즉시 응답한다.',
+          ],
+          highlight: [11, 12, 13, 14, 15, 20, 21, 22, 23, 24, 27, 28, 29, 30, 31],
+        },
       },
       {
-        title: '메시지 큐 — 번호표 기계',
-        desc: '[비유] 메시지 큐는 "번호표 뽑는 기계"다. API 서버가 번호표(작업)를 발급하면, 워커가 번호 순서대로 처리한다. Redis나 RabbitMQ가 이 역할을 한다. 서버가 꺼져도 큐에 남은 번호표는 사라지지 않는다.',
-        blocks: [
-          { label: 'API 서버 → 번호표 발급', state: 'active' },
-          { label: '메시지 큐 (Redis/RabbitMQ) ← 대기열', state: 'queue' },
-          { label: 'Worker → 순서대로 처리', state: 'worker' },
-        ],
-        codeLines: [
-          { code: '# 메시지 큐 흐름', tag: 'label' },
-          { code: '', tag: 'none' },
-          { code: '# 1. API 서버가 작업을 큐에 넣는다', tag: 'api' },
-          { code: 'result = process_image.delay(image_id)', tag: 'api' },
-          { code: '', tag: 'none' },
-          { code: '# 2. 큐에 저장된다 (Redis)', tag: 'queue' },
-          { code: '#    [작업1, 작업2, 작업3, ...]', tag: 'queue' },
-          { code: '', tag: 'none' },
-          { code: '# 3. Worker가 꺼내서 처리한다', tag: 'worker' },
-          { code: '#    별도 프로세스! API와 독립', tag: 'worker' },
-        ],
+        title: 'Step 2. Broker — 작업이 잠시 쉬어가는 대기열',
+        desc: 'API가 .delay()로 던진 작업은 Redis 또는 RabbitMQ에 메시지로 저장된다. 이걸 "broker(중개자)"라고 부른다. broker는 단순한 큐(FIFO) 역할만 한다 — 작업을 받고, worker가 가져갈 때까지 보관하고, 가져가면 큐에서 빠진다. API 서버가 죽어도 broker에 들어간 작업은 사라지지 않는다. 카페로 치면 "주문서가 꽂힌 클립보드"다.',
+        api: { method: 'POST', path: '/jobs/resize', note: '큐에 넣기 완료', status: 202, body: '{ "task_id": "abc-123" }' },
+        broker: {
+          name: 'Redis (LIST: celery)',
+          queueState: 'pending',
+          items: [
+            { id: 'abc-123', task: 'resize_image', args: '(42, 800)' },
+            { id: 'def-456', task: 'send_email', args: '("u@x.com")' },
+            { id: 'ghi-789', task: 'generate_pdf', args: '(101)' },
+          ],
+        },
+        worker: null,
+        backend: null,
+        retry: null,
+        keyPoint: 'broker = 작업 메시지를 보관하는 "줄"이다. Redis(가볍고 빠름) 또는 RabbitMQ(메시징 표준)를 쓴다.',
+        code: {
+          id: 'broker',
+          filename: 'broker.md',
+          lang: 'markdown',
+          lines: [
+            '# Broker — Redis vs RabbitMQ',
+            '',
+            '## broker가 하는 일',
+            '',
+            '1. API가 던진 작업을 **메시지로 저장**한다',
+            '2. worker가 `BRPOP` 같은 명령으로 **하나씩 꺼낸다**',
+            '3. 작업이 빠지면 큐에서도 제거된다',
+            '4. API 서버가 죽어도 큐에 들어간 작업은 **남아 있다**',
+            '',
+            '## Redis (가장 흔한 선택)',
+            '',
+            '- 키-값 저장소이지만 LIST 자료구조로 큐를 구현',
+            '- 설치 한 줄: `docker run -p 6379:6379 redis`',
+            '- 백엔드(result store)도 같이 쓸 수 있어 편함',
+            '- 약점: 메시지 전달 보장이 RabbitMQ보다 느슨함',
+            '',
+            '## RabbitMQ (정통 메시지 브로커)',
+            '',
+            '- AMQP 프로토콜, exchange/queue/routing key 개념',
+            '- 메시지 전달 보장(ack/nack)이 강력',
+            '- 큰 트래픽, 복잡한 라우팅에 유리',
+            '- 약점: 운영이 Redis보다 무겁다',
+            '',
+            '## 어떻게 고르나',
+            '',
+            '| 상황               | 선택           |',
+            '|--------------------|----------------|',
+            '| 처음 도입, 단순    | Redis          |',
+            '| ML 추론/이미지     | Redis 충분     |',
+            '| 메시지 유실 금지   | RabbitMQ       |',
+            '| 복잡한 라우팅      | RabbitMQ       |',
+            '',
+            '## 큐에 들어간 메시지 예시 (Redis CLI)',
+            '',
+            '```',
+            '> LRANGE celery 0 -1',
+            '1) "{\\"task\\":\\"resize_image\\",\\"id\\":\\"abc-123\\",...}"',
+            '2) "{\\"task\\":\\"send_email\\",\\"id\\":\\"def-456\\",...}"',
+            '```',
+            '',
+            '# → 다음 단계: worker가 이 큐를 비운다',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22],
+        },
       },
       {
-        title: 'Celery — Python 작업 큐',
-        desc: '[Celery] Python에서 가장 널리 쓰이는 분산 작업 큐. @task 데코레이터로 함수를 작업으로 등록하고, .delay()로 큐에 넣는다. Worker가 별도 프로세스에서 실행.',
-        blocks: [
-          { label: '@task 함수 정의', state: 'active' },
-          { label: '.delay() 호출 → 큐에 등록', state: 'queue' },
-          { label: 'celery worker → 큐에서 꺼내 실행', state: 'worker' },
-        ],
-        codeLines: [
-          { code: '# Celery 기본 사용법', tag: 'label' },
-          { code: 'from celery import Celery', tag: 'code' },
-          { code: '', tag: 'none' },
-          { code: 'app = Celery("tasks", broker="redis://localhost")', tag: 'code' },
-          { code: '', tag: 'none' },
-          { code: '@app.task  # 작업으로 등록', tag: 'highlight' },
-          { code: 'def process_image(image_id: int):', tag: 'highlight' },
-          { code: '    # CPU 집약 작업 (별도 프로세스에서 실행)', tag: 'highlight' },
-          { code: '    image = load(image_id)', tag: 'highlight' },
-          { code: '    return resize(image)', tag: 'highlight' },
-          { code: '', tag: 'none' },
-          { code: '# API에서 호출', tag: 'label' },
-          { code: 'process_image.delay(42)  # 큐에 넣기!', tag: 'api' },
-        ],
+        title: 'Step 3. Worker — 큐를 비우는 별도 프로세스',
+        desc: 'Celery worker는 API 서버와 완전히 다른 프로세스다. `celery -A app.tasks worker` 명령으로 띄운다. worker는 broker를 계속 들여다보다가, 작업이 들어오면 하나 꺼내서 등록된 함수를 실행한다. CPU/메모리를 많이 써도 API 서버 응답속도에는 전혀 영향이 없다. worker는 여러 개 띄워도 되고, --concurrency 옵션으로 한 프로세스가 동시에 N개를 처리할 수도 있다.',
+        api: { method: 'POST', path: '/jobs/resize', note: '응답은 이미 완료됨', status: 202, body: '{ "task_id": "abc-123" }' },
+        broker: {
+          name: 'Redis (LIST: celery)',
+          queueState: 'consumed',
+          items: [
+            { id: 'def-456', task: 'send_email', args: '("u@x.com")' },
+            { id: 'ghi-789', task: 'generate_pdf', args: '(101)' },
+          ],
+        },
+        worker: {
+          name: 'celery worker (PID 21847)',
+          processing: { id: 'abc-123', task: 'resize_image', progress: 'PIL.Image.resize(...) 실행 중' },
+          concurrency: 4,
+        },
+        backend: null,
+        retry: null,
+        keyPoint: 'worker는 API와 별도 프로세스다. broker에서 작업을 꺼내 실제 함수를 실행한다. 죽어도 API는 안 죽는다.',
+        code: {
+          id: 'worker',
+          filename: 'worker.sh',
+          lang: 'bash',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# ──────────────────────────────────────────────',
+            '# worker.sh — Celery worker 실행 스크립트',
+            '#',
+            '# 사용:  ./worker.sh',
+            '# 또는:  docker compose up worker',
+            '# ──────────────────────────────────────────────',
+            '',
+            '# ① broker / backend가 떠 있어야 한다',
+            'docker run -d --name redis -p 6379:6379 redis:7',
+            '',
+            '# ② worker 실행',
+            '#    -A app.tasks       : Celery 앱 모듈 위치',
+            '#    worker             : worker 모드',
+            '#    --loglevel=info    : 로그 레벨',
+            '#    --concurrency=4    : 한 워커가 동시에 4개 처리',
+            '#    -Q default,emails  : 처리할 큐 이름 (큐 분리 가능)',
+            'celery \\',
+            '  -A app.tasks \\',
+            '  worker \\',
+            '  --loglevel=info \\',
+            '  --concurrency=4 \\',
+            '  -Q default,emails',
+            '',
+            '# ③ 실행하면 로그가 이렇게 찍힌다',
+            '#',
+            '# [2026-05-19 12:34:56] celery@host ready.',
+            '# [2026-05-19 12:35:01] Received task: app.tasks.resize_image[abc-123]',
+            '# [2026-05-19 12:35:03] Task resize_image[abc-123] succeeded in 1.8s',
+            '#',
+            '# 이때 API 서버는 전혀 영향을 받지 않는다. 응답은 이미 끝났다.',
+            '',
+            '# ④ worker를 여러 대 띄우려면 (수평 확장)',
+            '#    같은 명령을 다른 머신/컨테이너에서 또 실행하면 된다.',
+            '#    broker가 자동으로 한 작업은 한 worker에게만 전달한다.',
+            '',
+            '# ⑤ 자주 쓰는 옵션',
+            '#    --autoscale=10,2   : 부하에 따라 2~10 워커로 자동 조절',
+            '#    --max-tasks-per-child=100 : 메모리 누수 방지(주기적 재시작)',
+            '#    --without-gossip --without-heartbeat : 통신 오버헤드 줄이기',
+          ],
+          highlight: [9, 10, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30],
+        },
       },
       {
-        title: '비교표 — 언제 뭘 쓸까',
-        desc: '[정리] BackgroundTasks는 간단한 I/O 후처리에, Celery는 CPU 집약/재시도 필요/대용량 작업에. 대부분의 FastAPI 프로젝트는 BackgroundTasks로 충분하다. Celery는 규모가 커졌을 때 도입.',
-        blocks: [
-          { label: 'BackgroundTasks: 간단 I/O ✅', state: 'active' },
-          { label: 'Celery: CPU 집약, 재시도 ✅', state: 'worker' },
-          { label: '대부분은 BackgroundTasks로 충분!', state: 'done' },
-        ],
-        codeLines: [
-          { code: '# ──── 비교표 ────', tag: 'label' },
-          { code: '', tag: 'none' },
-          { code: '#              BackgroundTasks  │  Celery', tag: 'label' },
-          { code: '# ────────────┼────────────────┼──────────', tag: 'label' },
-          { code: '# 설정        │  없음          │  Redis 필요', tag: 'code' },
-          { code: '# 작업 보장   │  없음(유실)    │  있음(큐)', tag: 'code' },
-          { code: '# 재시도      │  없음          │  자동', tag: 'code' },
-          { code: '# 적합        │  이메일,로깅   │  ML,이미지', tag: 'code' },
-          { code: '# 프로세스    │  같은 프로세스  │  별도 Worker', tag: 'code' },
-          { code: '', tag: 'none' },
-          { code: '# → 대부분 BackgroundTasks로 시작', tag: 'highlight' },
-          { code: '# → 규모가 커지면 Celery 도입', tag: 'highlight' },
-        ],
+        title: 'Step 4. Result Backend — 결과를 받아오는 영수증 창구',
+        desc: 'worker가 작업을 끝내면 그 결과(return 값)를 어딘가에 저장해 둬야 API/클라이언트가 나중에 찾으러 올 수 있다. 이걸 "result backend"라고 부른다. Redis, PostgreSQL, S3 등을 쓸 수 있다. 클라이언트는 task_id로 상태를 polling하거나, AsyncResult로 결과를 받는다. 카페 영수증을 들고 와서 "내 음료 나왔어요?" 묻는 것과 같다.',
+        api: { method: 'GET', path: '/jobs/abc-123', note: '결과 조회', status: 200, body: '{ "status": "SUCCESS", "result": "/uploads/42_800.jpg" }' },
+        broker: {
+          name: 'Redis (LIST: celery)',
+          queueState: 'empty',
+          items: [],
+        },
+        worker: {
+          name: 'celery worker (PID 21847)',
+          processing: null,
+          concurrency: 4,
+          done: { id: 'abc-123', returned: '"/uploads/42_800.jpg"' },
+        },
+        backend: {
+          name: 'Redis (backend DB 1)',
+          entries: [
+            { id: 'abc-123', status: 'SUCCESS', result: '/uploads/42_800.jpg' },
+            { id: 'def-456', status: 'SUCCESS', result: 'sent' },
+            { id: 'ghi-789', status: 'STARTED', result: null },
+          ],
+        },
+        retry: null,
+        keyPoint: 'backend = 결과 저장소. task_id로 상태/결과를 조회하는 영수증 창구다. 폴링 또는 AsyncResult로 받는다.',
+        code: {
+          id: 'backend',
+          filename: 'backend.py',
+          lang: 'python',
+          lines: [
+            '"""',
+            'app/result_api.py',
+            '',
+            '목적: task_id로 결과를 조회하는 엔드포인트.',
+            '  - AsyncResult로 worker가 남긴 결과를 backend에서 읽어온다.',
+            '  - 클라이언트는 polling 또는 server-sent events로 진행 상태를 본다.',
+            '"""',
+            'from celery.result import AsyncResult',
+            'from fastapi import FastAPI, HTTPException',
+            'from app.tasks import celery_app',
+            '',
+            'api = FastAPI()',
+            '',
+            '',
+            '@api.get("/jobs/{task_id}")',
+            'def get_job_status(task_id: str):',
+            '    """task_id로 작업 상태/결과를 조회한다."""',
+            '    result = AsyncResult(task_id, app=celery_app)',
+            '',
+            '    # Celery 표준 상태값',
+            '    #   PENDING : 큐에 들어갔지만 아직 worker가 안 꺼냄',
+            '    #   STARTED : worker가 처리 시작 (track_started=True 필요)',
+            '    #   SUCCESS : 정상 완료',
+            '    #   FAILURE : 예외로 종료',
+            '    #   RETRY   : 재시도 대기 중',
+            '    #   REVOKED : 취소됨',
+            '',
+            '    response = {',
+            '        "task_id": task_id,',
+            '        "status": result.status,',
+            '    }',
+            '',
+            '    if result.successful():',
+            '        response["result"] = result.result   # 함수의 return 값',
+            '    elif result.failed():',
+            '        # 실패 시 traceback은 노출하지 않는다(보안). 메시지만.',
+            '        response["error"] = str(result.result)',
+            '',
+            '    return response',
+            '',
+            '',
+            '# 클라이언트 사용 예시',
+            '#',
+            '#   1) POST /jobs/resize        → { task_id: "abc-123" }',
+            '#   2) GET  /jobs/abc-123       → { status: "PENDING" }',
+            '#   3) (1초 후) GET /jobs/...   → { status: "STARTED" }',
+            '#   4) (2초 후) GET /jobs/...   → { status: "SUCCESS",',
+            '#                                  result: "/uploads/42_800.jpg" }',
+            '#',
+            '# 큰 결과를 backend에 그대로 넣지 마라.',
+            '#  • 파일 경로(S3 key)만 저장하고 실제 객체는 S3/디스크에.',
+            '#  • Redis backend는 메모리에 다 들어가므로 결과는 가볍게.',
+          ],
+          highlight: [14, 15, 16, 17, 18, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 5. 재시도와 모니터링 — 실패해도 다시 시도, 항상 들여다본다',
+        desc: '운영에서 가장 중요한 두 가지. 첫째 "재시도(retry)" — 외부 API 호출이 일시적으로 실패해도 자동으로 다시 돌게 만든다. Celery는 autoretry_for, retry_backoff, max_retries 옵션으로 이걸 선언적으로 처리한다. 둘째 "모니터링(monitor)" — 큐 길이, 실패율, 처리 시간을 항상 본다. Flower(웹 대시보드)나 Prometheus exporter를 쓴다. 운영 안 보고 던지면 큐가 쌓여서 며칠 후 폭발한다.',
+        api: { method: 'POST', path: '/jobs/notify', note: '외부 SMS API 호출', status: 202, body: '{ "task_id": "xyz-999" }' },
+        broker: {
+          name: 'Redis (LIST: celery)',
+          queueState: 'pending',
+          items: [
+            { id: 'xyz-999', task: 'send_sms', args: '("010-1234")', retries: 2 },
+          ],
+        },
+        worker: {
+          name: 'celery worker (PID 21847)',
+          processing: { id: 'xyz-999', task: 'send_sms', progress: '재시도 2/5 (4초 후 다음 시도)' },
+          concurrency: 4,
+        },
+        backend: {
+          name: 'Redis (backend DB 1)',
+          entries: [
+            { id: 'xyz-999', status: 'RETRY', result: null },
+          ],
+        },
+        retry: {
+          title: '재시도 + 모니터링',
+          rules: [
+            'autoretry_for=(RequestException,) → 일시 실패만 재시도',
+            'retry_backoff=2 → 2 → 4 → 8초 (exponential)',
+            'max_retries=5 → 5번 실패하면 FAILURE로 종료',
+            'Flower 대시보드 → 큐 길이/처리율/실패율 실시간',
+            'Prometheus → 알람: 큐 길이 1000 초과 시 page',
+          ],
+        },
+        keyPoint: '재시도는 선언적으로(autoretry_for). 모니터링은 Flower/Prometheus 둘 중 하나는 무조건 켜둔다.',
+        code: {
+          id: 'retry',
+          filename: 'retry.py',
+          lang: 'python',
+          lines: [
+            '"""',
+            'app/retry_task.py',
+            '',
+            '목적: 외부 API처럼 "가끔 실패하는" 작업을 안전하게 재시도한다.',
+            '  - autoretry_for: 어떤 예외가 났을 때 재시도할지 선언',
+            '  - retry_backoff: 재시도 간격을 지수적으로 늘림(2,4,8,...초)',
+            '  - max_retries: 몇 번까지 재시도할지 상한선',
+            '"""',
+            'import requests',
+            'from celery import Celery',
+            'from celery.utils.log import get_task_logger',
+            '',
+            'celery_app = Celery(',
+            '    "worker",',
+            '    broker="redis://localhost:6379/0",',
+            '    backend="redis://localhost:6379/1",',
+            ')',
+            'log = get_task_logger(__name__)',
+            '',
+            '',
+            '@celery_app.task(',
+            '    bind=True,',
+            '    autoretry_for=(requests.RequestException,),  # ① 어떤 예외에 재시도할지',
+            '    retry_backoff=2,        # ② 지수 백오프: 2, 4, 8, 16, 32초',
+            '    retry_backoff_max=600,  # ③ 최대 대기 10분',
+            '    retry_jitter=True,      # ④ 동시에 몰리지 않게 약간의 랜덤',
+            '    max_retries=5,          # ⑤ 5번 실패 시 FAILURE',
+            ')',
+            'def send_sms(self, phone: str, body: str) -> str:',
+            '    """외부 SMS API 호출. 네트워크 실패 시 자동 재시도."""',
+            '    log.info("send_sms attempt %s → %s", self.request.retries, phone)',
+            '    res = requests.post(',
+            '        "https://sms.example.com/send",',
+            '        json={"to": phone, "body": body},',
+            '        timeout=5,',
+            '    )',
+            '    res.raise_for_status()   # 4xx/5xx → RequestException → 재시도',
+            '    return res.json()["id"]',
+            '',
+            '',
+            '# 모니터링 — Flower 한 줄로 띄우기',
+            '#',
+            '#   pip install flower',
+            '#   celery -A app.tasks flower --port=5555',
+            '#   → http://localhost:5555 에서 큐/태스크/실패율 확인',
+            '',
+            '# 운영 체크리스트',
+            '#  ✓ 큐 길이 > 1000 알람                 (작업이 쌓이고 있음)',
+            '#  ✓ 실패율 > 1% 알람                    (외부 의존성 문제?)',
+            '#  ✓ 평균 처리시간 > 평소 3배 알람       (DB/네트워크 느려짐)',
+            '#  ✓ worker liveness ping (--heartbeat) (worker가 죽었나)',
+            '#  ✓ idempotent task (재시도 안전성)    (같은 작업 2번 실행돼도 OK)',
+          ],
+          highlight: [20, 21, 22, 23, 24, 25, 26, 27, 32, 33, 34, 35, 36, 37, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51],
+        },
       },
     ];
 
-    const BLOCK_CLASS = {
-      active:  'bg-blue-100 border-blue-400 text-blue-700',
-      done:    'bg-emerald-100 border-emerald-400 text-emerald-700',
-      warning: 'bg-amber-100 border-amber-400 text-amber-700',
-      problem: 'bg-red-100 border-red-400 text-red-700',
-      queue:   'bg-violet-100 border-violet-400 text-violet-700',
-      worker:  'bg-emerald-100 border-emerald-400 text-emerald-700 animate-pulse',
-    };
-    const CODE_TAG_BG = { label: 'bg-slate-100', code: 'bg-white', problem: 'bg-red-50', api: 'bg-blue-50', queue: 'bg-violet-50', worker: 'bg-emerald-50', highlight: 'bg-amber-50', none: 'bg-white' };
-    const CODE_TAG_BORDER = { label: 'border-slate-300', code: 'border-transparent', problem: 'border-red-300', api: 'border-blue-300', queue: 'border-violet-300', worker: 'border-emerald-300', highlight: 'border-amber-300', none: 'border-transparent' };
-
-    function App() {
-      const [currentStepIdx, setCurrentStepIdx] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const stepData = STEPS[currentStepIdx];
-      const isEnd = currentStepIdx >= STEPS.length - 1;
-
-      const handleNext = () => { setCurrentStepIdx(prev => prev < STEPS.length - 1 ? prev + 1 : prev); };
-      const handlePrev = () => setCurrentStepIdx(prev => (prev > 0 ? prev - 1 : prev));
-      const handleNextRef = useRef(handleNext);
-      const handlePrevRef = useRef(handlePrev);
-      handleNextRef.current = handleNext;
-      handlePrevRef.current = handlePrev;
-
-      useEffect(() => { if (currentStepIdx >= STEPS.length - 1) setIsPlaying(false); }, [currentStepIdx]);
-      useEffect(() => { if (!isPlaying) return; const id = setInterval(() => handleNextRef.current(), 3000); return () => clearInterval(id); }, [isPlaying]);
-      useEffect(() => { const h = (e) => { if (e.key === 'ArrowRight') handleNextRef.current(); if (e.key === 'ArrowLeft') handlePrevRef.current(); }; window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h); }, []);
-      const togglePlay = () => { if (isEnd) { setCurrentStepIdx(0); setIsPlaying(true); return; } setIsPlaying(prev => !prev); };
-
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — indigo 톤
+    // ─────────────────────────────────────────────────────
+    function ApiBox({ api }) {
+      if (!api) return null;
+      const methodColor = {
+        GET: 'bg-emerald-500',
+        POST: 'bg-blue-500',
+        PUT: 'bg-amber-500',
+        DELETE: 'bg-rose-500',
+      }[api.method] || 'bg-slate-500';
+      const statusColor = api.status < 300 ? 'bg-emerald-500' : api.status < 400 ? 'bg-blue-500' : 'bg-amber-500';
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
-          <div className="max-w-6xl mx-auto space-y-5">
-            <nav className="flex items-center justify-between text-sm text-slate-500">
-              <a href="../index.html" className="text-blue-600 hover:text-blue-800 font-medium">&larr; 허브로 돌아가기</a>
-              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200">curriculum V-5-2</span>
-            </nav>
-            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-              <h1 className="text-xl md:text-2xl font-bold text-slate-800 mb-2">Chapter 5-13. Celery / 메시지 큐 개요</h1>
-              <p className="text-slate-600 text-sm leading-relaxed">
-                메시지 큐는 <strong>"번호표 뽑는 기계"</strong>. API 서버가 번호표를 발급하면 워커가 순서대로 처리한다.
-                서버가 재시작돼도 큐에 남은 작업은 보장된다.
-              </p>
-            </header>
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-              <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
-                <h2 className="text-sm font-bold text-slate-600">메시지 큐 구조</h2>
-                <div className="space-y-2">
-                  {stepData.blocks.map((block, idx) => (
-                    <div key={idx} className={`p-3 rounded-lg border-2 transition-all duration-300 ${BLOCK_CLASS[block.state]}`}>
-                      <div className="font-bold text-sm">{block.label}</div>
-                      {block.children && (
-                        <ul className="mt-1 ml-3 text-xs opacity-80 list-disc list-inside">
-                          {block.children.map((c, ci) => <li key={ci}>{c}</li>)}
-                        </ul>
-                      )}
-                    </div>
-                  ))}
-                </div>
-                <div className="p-4 rounded-lg border bg-blue-50 border-blue-200 text-blue-800 text-sm leading-relaxed">
-                  <div className="font-bold mb-1">{stepData.title}</div>{stepData.desc}
-                </div>
-              </div>
-              <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-                <div className="bg-slate-800 text-slate-300 px-4 py-2 text-xs font-mono flex justify-between items-center">
-                  <span>Celery / 메시지 큐</span>
-                  <span className="text-slate-500">Step {currentStepIdx + 1} / {STEPS.length}</span>
-                </div>
-                <div className="overflow-auto max-h-[28rem] text-xs font-mono leading-5">
-                  {stepData.codeLines.map((line, idx) => (
-                    <div key={idx} className={`px-4 py-0.5 whitespace-pre border-l-4 transition-all duration-300 ${CODE_TAG_BG[line.tag]} ${CODE_TAG_BORDER[line.tag]}`}>
-                      <span className="inline-block w-4 text-right mr-3 text-slate-400 select-none">{idx + 1}</span>{line.code || '\u00A0'}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-            <div className="flex items-center justify-center gap-3 flex-wrap">
-              <button onClick={() => handlePrevRef.current()} disabled={currentStepIdx === 0} className="px-4 py-2 rounded-lg bg-slate-200 text-slate-700 font-bold text-sm disabled:opacity-40 hover:bg-slate-300 transition-colors" aria-label="이전 단계">← 이전</button>
-              <button onClick={togglePlay} className={`px-6 py-2 rounded-lg font-bold text-sm transition-colors ${isPlaying ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`} aria-label={isPlaying ? '정지' : (isEnd ? '처음부터 재생' : '자동 실행')}>{isPlaying ? '⏸ 정지' : (isEnd ? '⟳ 처음부터' : '▶ 자동 실행')}</button>
-              <button onClick={() => handleNextRef.current()} disabled={isEnd} className="px-4 py-2 rounded-lg bg-slate-200 text-slate-700 font-bold text-sm disabled:opacity-40 hover:bg-slate-300 transition-colors" aria-label="다음 단계">다음 →</button>
-              <div className="text-sm font-medium text-slate-500 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">Step: {currentStepIdx + 1} / {STEPS.length}</div>
-            </div>
-            <footer className="text-center text-xs text-slate-400 py-4">FastAPI 인터랙티브 학습 — Chapter 5-13. Celery / 메시지 큐 | 키보드 ← → 지원</footer>
+        <div className="rounded-lg border border-indigo-200 bg-white p-3">
+          <div className="text-[10px] font-bold text-indigo-700 mb-1.5">① API 서버 (FastAPI)</div>
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className={`text-[10px] font-bold text-white px-2 py-0.5 rounded ${methodColor}`}>{api.method}</span>
+            <span className="text-sm font-mono text-indigo-900">{api.path}</span>
+          </div>
+          {api.note && <div className="text-[10px] text-slate-500 mb-1.5">{api.note}</div>}
+          <div className="flex items-center gap-2">
+            <span className={`text-[10px] font-bold text-white px-2 py-0.5 rounded ${statusColor}`}>{api.status}</span>
+            <span className="text-[10px] font-mono text-indigo-800 break-all">{api.body}</span>
           </div>
         </div>
       );
     }
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+    function BrokerBox({ broker }) {
+      if (!broker) return null;
+      const stateLabel = {
+        pending: '대기 중',
+        consumed: '꺼내짐',
+        empty: '비어있음',
+      }[broker.queueState] || '';
+      const stateColor = {
+        pending: 'bg-amber-100 text-amber-800 border-amber-300',
+        consumed: 'bg-blue-100 text-blue-800 border-blue-300',
+        empty: 'bg-slate-100 text-slate-600 border-slate-300',
+      }[broker.queueState] || 'bg-slate-100';
+      return (
+        <div className="rounded-lg border-2 border-violet-300 bg-violet-50 p-3">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="text-[10px] font-bold text-violet-700">② Broker (메시지 큐)</div>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${stateColor}`}>{stateLabel}</span>
+          </div>
+          <div className="text-[11px] font-mono text-violet-900 mb-2">{broker.name}</div>
+          {broker.items.length === 0 ? (
+            <div className="text-[10px] text-violet-700/70 italic py-2 text-center border border-dashed border-violet-300 rounded">
+              큐가 비었습니다 (worker가 모두 처리)
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {broker.items.map((it, i) => (
+                <li key={i} className="text-[10px] font-mono bg-white border border-violet-200 rounded px-2 py-1 flex items-center justify-between">
+                  <span className="text-violet-900">
+                    <span className="text-violet-500">▸</span> {it.task}<span className="text-slate-500">{it.args}</span>
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    {it.retries !== undefined && (
+                      <span className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded">retry {it.retries}</span>
+                    )}
+                    <span className="text-[9px] text-slate-400">{it.id}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
+
+    function WorkerBox({ worker }) {
+      if (!worker) return null;
+      return (
+        <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 p-3">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="text-[10px] font-bold text-emerald-700">③ Worker (별도 프로세스)</div>
+            <span className="text-[9px] bg-emerald-200 text-emerald-800 px-1.5 py-0.5 rounded">concurrency={worker.concurrency}</span>
+          </div>
+          <div className="text-[11px] font-mono text-emerald-900 mb-2">{worker.name}</div>
+          {worker.processing ? (
+            <div className="bg-white border border-emerald-200 rounded px-2 py-1.5">
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span className="text-[10px] font-bold text-emerald-800">{worker.processing.task}</span>
+                <span className="text-[9px] text-slate-400 ml-auto">{worker.processing.id}</span>
+              </div>
+              <div className="text-[10px] text-emerald-700/80 pl-3.5">{worker.processing.progress}</div>
+            </div>
+          ) : worker.done ? (
+            <div className="bg-white border border-emerald-200 rounded px-2 py-1.5">
+              <div className="flex items-center gap-1.5">
+                <span className="text-emerald-600">✓</span>
+                <span className="text-[10px] font-bold text-emerald-800">완료: {worker.done.id}</span>
+              </div>
+              <div className="text-[10px] font-mono text-emerald-700/80 pl-3.5">return {worker.done.returned}</div>
+            </div>
+          ) : (
+            <div className="text-[10px] text-emerald-700/70 italic py-1 text-center border border-dashed border-emerald-300 rounded">
+              idle (큐 대기 중)
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function BackendBox({ backend }) {
+      if (!backend) return null;
+      const statusColor = {
+        SUCCESS: 'bg-emerald-200 text-emerald-800',
+        STARTED: 'bg-blue-200 text-blue-800',
+        RETRY: 'bg-amber-200 text-amber-800',
+        FAILURE: 'bg-rose-200 text-rose-800',
+        PENDING: 'bg-slate-200 text-slate-700',
+      };
+      return (
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3">
+          <div className="text-[10px] font-bold text-indigo-700 mb-1.5">④ Result Backend (결과 저장소)</div>
+          <div className="text-[11px] font-mono text-indigo-900 mb-2">{backend.name}</div>
+          <ul className="space-y-1">
+            {backend.entries.map((e, i) => (
+              <li key={i} className="text-[10px] font-mono bg-white border border-indigo-200 rounded px-2 py-1 flex items-center justify-between gap-2">
+                <span className="text-indigo-900 truncate">{e.id}</span>
+                <span className="flex items-center gap-1.5 shrink-0">
+                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${statusColor[e.status] || 'bg-slate-200'}`}>{e.status}</span>
+                  {e.result && <span className="text-[9px] text-indigo-700 truncate max-w-[120px]">{e.result}</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function RetryBox({ retry }) {
+      if (!retry) return null;
+      return (
+        <div className="rounded-lg border-2 border-rose-300 bg-rose-50 p-3">
+          <div className="text-[10px] font-bold text-rose-700 mb-1.5">⑤ {retry.title}</div>
+          <ul className="space-y-1">
+            {retry.rules.map((r, i) => (
+              <li key={i} className="text-[10px] text-rose-900 flex gap-1.5">
+                <span className="text-rose-500">▸</span>
+                <span className="font-mono">{r}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-indigo-200 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-indigo-800">Celery 작업 흐름</h3>
+            <span className="text-[10px] text-slate-500">API → broker → worker → backend</span>
+          </div>
+          <div className="space-y-2">
+            <ApiBox api={state.api} />
+            {state.broker && <div className="text-center text-xs font-bold text-indigo-500 py-0.5">↓ .delay() 큐에 넣기 ↓</div>}
+            <BrokerBox broker={state.broker} />
+            {state.worker && <div className="text-center text-xs font-bold text-indigo-500 py-0.5">↓ worker가 꺼냄 ↓</div>}
+            <WorkerBox worker={state.worker} />
+            {state.backend && <div className="text-center text-xs font-bold text-indigo-500 py-0.5">↓ 결과 저장 ↓</div>}
+            <BackendBox backend={state.backend} />
+            {state.retry && <div className="text-center text-xs font-bold text-rose-500 py-0.5">↓ 실패 시 자동 재시도 ↓</div>}
+            <RetryBox retry={state.retry} />
+          </div>
+          <div className="mt-3 text-xs text-indigo-900 bg-indigo-50 border border-indigo-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer — 5탭
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ steps, stepIdx, setStepIdx }) {
+      const code = steps[stepIdx].code;
+      const codeRef = useRef(null);
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          {/* 탭 바 */}
+          <div className="flex items-center gap-0.5 bg-slate-900 px-2 pt-2 border-b border-slate-700 overflow-x-auto">
+            {steps.map((s, i) => {
+              const active = i === stepIdx;
+              return (
+                <button
+                  key={s.code.id}
+                  onClick={() => setStepIdx(i)}
+                  className={`px-3 py-1.5 text-[11px] font-mono rounded-t whitespace-nowrap transition ${
+                    active
+                      ? 'bg-[#282c34] text-indigo-300 border-t border-l border-r border-slate-700'
+                      : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {s.code.filename}
+                </button>
+              );
+            })}
+          </div>
+          {/* 파일 경로 바 */}
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 border-b border-slate-700">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-400"></span>
+            <span className="w-2.5 h-2.5 rounded-full bg-yellow-400"></span>
+            <span className="w-2.5 h-2.5 rounded-full bg-green-400"></span>
+            <span className="ml-2 text-[11px] text-slate-300 font-mono">app/{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          {/* 코드 */}
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-indigo-500/15 border-l-2 border-indigo-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          {/* 상태 바 */}
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines · {code.highlight ? code.highlight.length : 0} highlighted</span>
+            <span>Step {stepIdx + 1} / {steps.length}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-indigo-600 text-white font-bold">5-13</span>
+              <div>
+                <h1 className="text-2xl font-bold text-indigo-900">Chapter 5-13. Celery / 메시지 큐</h1>
+                <p className="text-sm text-indigo-800/80">API → broker → worker → backend → 재시도. 5단계로 추적</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-indigo-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-indigo-600' : 'bg-indigo-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-indigo-700 text-indigo-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-indigo-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer steps={STEPS} stepIdx={stepIdx} setStepIdx={setStepIdx} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-indigo-300 bg-white text-indigo-700 hover:bg-indigo-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-indigo-300 bg-white text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-indigo-700 text-white' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-indigo-300 bg-white text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-indigo-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계 · 우측 탭 클릭으로 직접 이동</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-indigo-400 bg-white px-4 py-3 text-sm text-indigo-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                무거운 작업 분리 → broker(Redis) → worker(별도 프로세스) → result backend → autoretry/Flower 모니터링까지, Celery로 비동기 작업 큐를 안전하게 운영하는 5단계를 정리했다. API 응답 흐름과 무거운 작업을 분리하는 것이 핵심이고, 모니터링 없이는 운영하지 마라.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Celery', 'Redis', 'RabbitMQ', 'broker', 'worker', 'result-backend', 'AsyncResult', 'autoretry_for', 'retry_backoff', 'Flower'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 border border-indigo-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-indigo-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <span className="text-indigo-500">Chapter 5-13 / Part 5</span>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
   </script>
 </body>
 </html>

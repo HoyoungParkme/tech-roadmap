@@ -3,212 +3,687 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>FastAPI 학습 — VII-2-2. Redis 세션</title>
+  <title>FastAPI 학습 — VII-4. Redis 세션</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 </head>
 <body>
   <div id="root"></div>
+
   <!--
-    VII-2-2. Redis 세션
-    학습 목표: Redis를 세션 저장소로 활용하는 방법을 이해한다.
-    핵심 비유: 메모 보드 — 빠르게 쓰고 읽는 임시 저장소
+    FastAPI Chapter VII-4 — Redis 세션
+    학습 목표: 인메모리 세션의 한계 → Redis 연결 → session_id 저장 → TTL 만료 → 분산 환경 공유
+              5단계로 Redis가 왜 세션 저장소로 적합한지 시각화한다.
+    핵심 비유: 메모 보드 — 여러 직원이 동시에 보는 빠른 공용 노트
+    패턴: fastapi v1 — 좌(LiveDataPane: 인스턴스 ↔ Redis ↔ 인스턴스 토폴로지) / 우(VSCode CodeViewer)
+    색상: indigo (FastAPI 인프라 도메인)
   -->
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 인메모리 한계 → Redis 연결 → 저장 → TTL → 분산 공유
+    //   pane        : 좌측 LiveDataPane에 표시할 토폴로지 상태
+    //   instances   : 앱 서버 인스턴스 카드들 (label, status, sessionView)
+    //   redisBox    : Redis 박스 (없으면 표시 안 함)
+    //   problem     : 문제 박스 (Step 1)
+    //   ttlNote     : TTL 안내 박스 (Step 4)
+    //   arrow       : 인스턴스 ↔ Redis 화살표 라벨
+    //   keyPoint    : 하단 핵심 메시지
+    //   code        : 우측 CodeViewer 파일 (lang, filename, lines, highlight)
+    // ─────────────────────────────────────────────────────
     const STEPS = [
       {
-        title: 'Redis란 (인메모리 Key-Value)',
-        desc: 'Redis는 메모리에 데이터를 저장하는 Key-Value 저장소다. 디스크 DB보다 수십~수백 배 빠르다. "메모 보드"처럼 빠르게 쓰고 읽는 임시 저장소. 세션, 캐시, 큐 등에 사용.',
-        visual: 'concept',
+        title: 'Step 1. 인메모리 세션의 한계',
+        desc: '서버 메모리 dict에 세션을 저장하면 단일 서버에서는 간단하다. 그러나 ① 서버 재시작하면 전부 사라지고 ② 인스턴스 2대로 늘리면 로그인한 서버와 요청 받는 서버가 달라 세션이 보이지 않는다. "내 서버 메모리"는 다른 인스턴스에서 접근할 수 없다. 그래서 트래픽이 늘어 스케일아웃하는 순간 인메모리 세션은 무너진다.',
+        instances: [
+          { label: 'app-1', status: 'alone', sessionView: ['abc123 → 홍길동'] },
+        ],
+        problem: {
+          title: '인메모리의 한계',
+          items: [
+            '재시작하면 전부 휘발 — 모든 사용자 강제 로그아웃',
+            '인스턴스 추가 시 세션 공유 불가 — 50%만 인증됨',
+            '메모리 누수 — 만료된 세션이 계속 쌓임',
+          ],
+        },
+        keyPoint: '인메모리 세션 = 단일 서버용. 스케일아웃하면 즉시 깨진다.',
+        code: {
+          lang: 'python',
+          filename: 'in-memory.py',
+          lines: [
+            '"""',
+            'in-memory.py — 인메모리 세션 (안티 패턴)',
+            '',
+            '단일 서버에서만 동작한다. 재시작/스케일아웃 시 전부 깨진다.',
+            '"""',
+            'import uuid',
+            'from fastapi import FastAPI, Response, Cookie, HTTPException',
+            '',
+            'app = FastAPI()',
+            '',
+            '# 서버 프로세스 메모리에 저장 — 이 dict가 한계다',
+            'SESSIONS: dict[str, dict] = {}',
+            '',
+            '',
+            '@app.post("/login")',
+            'def login(response: Response, user_id: int):',
+            '    """로그인 시 세션 발급 — 같은 프로세스 메모리에만 저장된다."""',
+            '    session_id = str(uuid.uuid4())',
+            '    SESSIONS[session_id] = {"user_id": user_id}',
+            '    response.set_cookie("session_id", session_id, httponly=True)',
+            '    return {"ok": True}',
+            '',
+            '',
+            '@app.get("/me")',
+            'def me(session_id: str | None = Cookie(default=None)):',
+            '    """세션 조회 — 다른 인스턴스에서는 빈 dict라 401이 난다."""',
+            '    if not session_id or session_id not in SESSIONS:',
+            '        raise HTTPException(401, "세션 없음")',
+            '    return SESSIONS[session_id]',
+            '',
+            '',
+            '# 문제점',
+            '#  1) 서버 재시작 → SESSIONS = {} 로 초기화',
+            '#  2) app-1 에 로그인한 사용자가 app-2 에 요청 → 401',
+            '#  3) 만료된 세션이 영원히 메모리에 남는다',
+            '#',
+            '# → 다음 단계: Redis 라는 외부 저장소로 옮긴다',
+          ],
+          highlight: [11, 12, 18, 19, 26, 27, 32, 33, 34],
+        },
       },
       {
-        title: 'Python Redis 클라이언트',
-        desc: 'redis-py (또는 redis[hiredis]) 패키지로 Python에서 Redis에 접근한다. 비동기는 redis.asyncio 모듈을 사용한다.',
-        code: [
-          '# pip install redis[hiredis]',
-          'import redis.asyncio as aioredis',
-          '',
-          '# Redis 연결',
-          'redis_client = aioredis.from_url(',
-          '    "redis://localhost:6379",',
-          '    encoding="utf-8",',
-          '    decode_responses=True,',
-          ')',
-          '',
-          '# 기본 사용',
-          'await redis_client.set("key", "value", ex=3600)  # 1시간 TTL',
-          'value = await redis_client.get("key")',
+        title: 'Step 2. Redis 연결 — 외부 인메모리 저장소',
+        desc: 'Redis는 메모리에서 동작하는 Key-Value 저장소다. 별도의 프로세스(보통 6379 포트)로 떠 있고, 어떤 앱 인스턴스도 네트워크로 접속할 수 있다. FastAPI에서는 redis.asyncio 모듈로 비동기 클라이언트를 만들고, lifespan에서 한 번만 생성해 재사용한다. 이제 "내 서버 메모리"가 아닌 "모두가 보는 외부 메모리"가 생겼다.',
+        instances: [
+          { label: 'app-1', status: 'connected', sessionView: ['연결됨'] },
         ],
-        highlight: [1, 4, 5, 6, 7, 11, 12],
+        redisBox: {
+          title: 'Redis',
+          host: 'localhost:6379',
+          state: 'empty',
+          entries: [],
+        },
+        arrow: 'aioredis.from_url',
+        keyPoint: 'Redis = 모든 앱 인스턴스가 공유할 수 있는 별도 프로세스의 인메모리 저장소.',
+        code: {
+          lang: 'python',
+          filename: 'redis-connect.py',
+          lines: [
+            '"""',
+            'redis-connect.py — Redis 비동기 클라이언트 연결',
+            '',
+            'lifespan 에서 단 한 번 만들고 앱 전역에서 재사용한다.',
+            '"""',
+            'from contextlib import asynccontextmanager',
+            'import redis.asyncio as aioredis',
+            'from fastapi import FastAPI',
+            '',
+            '',
+            '@asynccontextmanager',
+            'async def lifespan(app: FastAPI):',
+            '    """앱 시작 시 Redis 풀 생성, 종료 시 정리."""',
+            '    app.state.redis = aioredis.from_url(',
+            '        "redis://localhost:6379",',
+            '        encoding="utf-8",',
+            '        decode_responses=True,',
+            '        max_connections=20,',
+            '    )',
+            '    try:',
+            '        await app.state.redis.ping()',
+            '    except Exception as e:',
+            '        raise RuntimeError(f"Redis 연결 실패: {e}")',
+            '',
+            '    yield',
+            '',
+            '    await app.state.redis.aclose()',
+            '',
+            '',
+            'app = FastAPI(lifespan=lifespan)',
+            '',
+            '',
+            '@app.get("/health/redis")',
+            'async def health_redis():',
+            '    """Redis 살아 있는지 확인 — 모니터링용."""',
+            '    pong = await app.state.redis.ping()',
+            '    return {"redis": "ok" if pong else "down"}',
+            '',
+            '# 포인트',
+            '#  • from_url 한 번 호출 = 연결 풀 1개 (요청마다 만들지 않는다)',
+            '#  • decode_responses=True → 문자열로 바로 받기',
+            '#  • ping() 으로 부팅 시 연결 검증',
+          ],
+          highlight: [11, 12, 14, 15, 16, 17, 18, 21, 22, 27, 30],
+        },
       },
       {
-        title: 'Session 저장소로 활용',
-        desc: '로그인 시 세션 ID를 생성하고 Redis에 사용자 정보를 저장한다. TTL(만료 시간)을 설정하면 자동으로 세션이 만료된다. 다중 서버에서도 동일한 Redis를 바라보면 세션 공유가 된다.',
-        code: [
-          'import uuid',
-          'import json',
-          '',
-          'async def create_session(user_id: int, data: dict) -> str:',
-          '    session_id = str(uuid.uuid4())',
-          '    session_data = json.dumps({"user_id": user_id, **data})',
-          '    await redis_client.set(',
-          '        f"session:{session_id}",',
-          '        session_data,',
-          '        ex=3600,  # 1시간 만료',
-          '    )',
-          '    return session_id',
-          '',
-          'async def get_session(session_id: str) -> dict | None:',
-          '    data = await redis_client.get(f"session:{session_id}")',
-          '    return json.loads(data) if data else None',
+        title: 'Step 3. session_id를 Redis에 저장',
+        desc: '로그인이 성공하면 uuid로 session_id를 만들고, 사용자 정보를 JSON 직렬화해서 Redis에 `SET session:<id> <json> EX <ttl>` 로 저장한다. 응답에는 session_id를 HttpOnly 쿠키로 내려준다. 이제 어느 앱 인스턴스가 처리하든 같은 키로 같은 Redis를 조회하므로 로그인 상태가 일관된다.',
+        instances: [
+          { label: 'app-1', status: 'connected', sessionView: ['SET session:abc123'] },
         ],
-        highlight: [4, 5, 6, 7, 8, 9, 14, 15],
+        redisBox: {
+          title: 'Redis',
+          host: 'localhost:6379',
+          state: 'filled',
+          entries: [
+            { key: 'session:abc123', value: '{"user_id":42,"role":"admin"}', ttl: '3600s' },
+          ],
+        },
+        arrow: 'SET session:<id> EX 3600',
+        keyPoint: '세션 저장 = 한 줄의 SET. 키 네임스페이스(session:)를 정해두면 관리가 쉽다.',
+        code: {
+          lang: 'python',
+          filename: 'store.py',
+          lines: [
+            '"""',
+            'store.py — 세션 저장 / 조회 서비스',
+            '',
+            '단순한 Repository 패턴: 키 포맷과 TTL을 한 곳에 모아둔다.',
+            '"""',
+            'import json',
+            'import uuid',
+            'from typing import Any',
+            'import redis.asyncio as aioredis',
+            '',
+            'SESSION_KEY = "session:{sid}"',
+            'SESSION_TTL_SECONDS = 60 * 60  # 1시간',
+            '',
+            '',
+            'async def create_session(',
+            '    redis: aioredis.Redis,',
+            '    user_id: int,',
+            '    extra: dict[str, Any] | None = None,',
+            ') -> str:',
+            '    """세션을 발급하고 session_id 를 돌려준다.',
+            '',
+            '    Args:',
+            '        redis: 비동기 Redis 클라이언트',
+            '        user_id: 인증된 사용자 id',
+            '        extra: 추가로 담을 메타데이터 (role 등)',
+            '    Returns:',
+            '        새 session_id (uuid4 문자열)',
+            '    """',
+            '    session_id = str(uuid.uuid4())',
+            '    payload = json.dumps({"user_id": user_id, **(extra or {})})',
+            '    await redis.set(',
+            '        SESSION_KEY.format(sid=session_id),',
+            '        payload,',
+            '        ex=SESSION_TTL_SECONDS,',
+            '    )',
+            '    return session_id',
+            '',
+            '',
+            'async def get_session(',
+            '    redis: aioredis.Redis,',
+            '    session_id: str,',
+            ') -> dict[str, Any] | None:',
+            '    """session_id 로 세션을 조회한다. 없거나 만료면 None."""',
+            '    raw = await redis.get(SESSION_KEY.format(sid=session_id))',
+            '    return json.loads(raw) if raw else None',
+            '',
+            '',
+            'async def delete_session(redis: aioredis.Redis, session_id: str) -> None:',
+            '    """로그아웃 시 세션 삭제."""',
+            '    await redis.delete(SESSION_KEY.format(sid=session_id))',
+          ],
+          highlight: [11, 12, 29, 30, 31, 32, 33, 34, 35, 44, 45, 50, 51],
+        },
       },
       {
-        title: 'FastAPI + Redis 통합',
-        desc: 'Lifespan에서 Redis 연결을 관리하고, Depends()로 세션 검증을 수행한다. 로그인 시 쿠키에 세션 ID를 설정하고, 이후 요청에서 쿠키로 세션을 조회한다.',
-        code: [
-          '@asynccontextmanager',
-          'async def lifespan(app: FastAPI):',
-          '    app.state.redis = aioredis.from_url("redis://localhost")',
-          '    yield',
-          '    await app.state.redis.close()',
-          '',
-          '@app.post("/login")',
-          'async def login(response: Response, form: LoginForm = Depends()):',
-          '    user = authenticate(form.username, form.password)',
-          '    session_id = await create_session(user.id, {"role": user.role})',
-          '    response.set_cookie("session_id", session_id, httponly=True)',
-          '    return {"message": "로그인 성공"}',
-          '',
-          'async def get_current_user(session_id: str = Cookie(default=None)):',
-          '    if not session_id:',
-          '        raise HTTPException(401)',
-          '    session = await get_session(session_id)',
-          '    if not session:',
-          '        raise HTTPException(401, "세션 만료")',
-          '    return session',
+        title: 'Step 4. TTL — 자동 만료로 메모리 누수 차단',
+        desc: 'SET 명령의 EX 옵션을 주면 Redis가 알아서 만료된 키를 삭제한다. 직접 청소 스크립트를 짤 필요가 없다. 사용자가 활동할 때마다 EXPIRE로 TTL을 갱신하면 "활동 중인 세션만 유지"하는 슬라이딩 만료도 한 줄로 구현된다. 인메모리 dict처럼 만료 세션이 쌓일 일이 없다.',
+        instances: [
+          { label: 'app-1', status: 'connected', sessionView: ['요청 → EXPIRE 3600'] },
         ],
-        highlight: [2, 4, 9, 10, 13, 16, 17, 18],
+        redisBox: {
+          title: 'Redis',
+          host: 'localhost:6379',
+          state: 'filled',
+          entries: [
+            { key: 'session:abc123', value: '{"user_id":42,...}', ttl: '3600s ↻' },
+            { key: 'session:old999', value: '(만료됨)', ttl: 'expired' },
+          ],
+        },
+        ttlNote: {
+          title: 'TTL 자동 만료',
+          items: [
+            'SET ... EX 3600 — 1시간 뒤 자동 삭제',
+            'EXPIRE key 3600 — 매 요청마다 TTL 연장 (슬라이딩)',
+            'TTL key — 남은 초 확인 (모니터링)',
+            '만료 키는 Redis 가 lazy + active 방식으로 정리',
+          ],
+        },
+        arrow: '각 요청마다 EXPIRE 갱신',
+        keyPoint: 'TTL = 만료 자동화. 인메모리에서는 직접 짜야 했던 GC가 한 줄로 해결.',
+        code: {
+          lang: 'python',
+          filename: 'ttl.py',
+          lines: [
+            '"""',
+            'ttl.py — 슬라이딩 만료 (활동 시 TTL 연장)',
+            '',
+            '활동 중인 사용자는 계속 로그인 유지, 가만히 있으면 1시간 뒤 자동 로그아웃.',
+            '"""',
+            'from fastapi import Depends, Cookie, HTTPException, Request',
+            'from .store import SESSION_KEY, SESSION_TTL_SECONDS, get_session',
+            '',
+            '',
+            'async def get_current_user(',
+            '    request: Request,',
+            '    session_id: str | None = Cookie(default=None),',
+            '):',
+            '    """세션 검증 + TTL 슬라이딩 연장.',
+            '',
+            '    Returns:',
+            '        세션 dict (user_id, role 등)',
+            '    Raises:',
+            '        HTTPException(401): 세션 없음 또는 만료',
+            '    """',
+            '    if not session_id:',
+            '        raise HTTPException(401, "세션 없음")',
+            '',
+            '    redis = request.app.state.redis',
+            '    session = await get_session(redis, session_id)',
+            '    if session is None:',
+            '        raise HTTPException(401, "세션 만료")',
+            '',
+            '    # 슬라이딩 만료 — 활동했으므로 TTL 다시 1시간',
+            '    await redis.expire(',
+            '        SESSION_KEY.format(sid=session_id),',
+            '        SESSION_TTL_SECONDS,',
+            '    )',
+            '    return session',
+            '',
+            '',
+            '# TTL 운영 팁',
+            '#  • 보안 민감 화면(결제 등)은 짧은 TTL (5~10분) 별도 키로',
+            '#  • TTL 0 이하 → 키 영원히 유지 (절대 쓰지 말 것)',
+            '#  • TTL <key> 명령으로 남은 시간 직접 확인 가능',
+            '#  • EXPIRE 는 atomic — 동시에 만료/연장 되어도 안전',
+          ],
+          highlight: [10, 11, 12, 13, 22, 23, 25, 26, 29, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 5. 분산 환경 — 여러 인스턴스가 같은 세션 공유',
+        desc: '이제 앱 인스턴스를 3개로 늘려도 모두 같은 Redis를 바라본다. 로드밸런서가 어느 인스턴스로 보내든 session_id 만 있으면 동일한 사용자 정보를 읽을 수 있다. 인스턴스를 죽이거나 추가해도, 배포로 인해 재시작해도 세션은 그대로다. 이게 Redis 세션이 표준이 된 이유다.',
+        instances: [
+          { label: 'app-1', status: 'shared', sessionView: ['GET session:abc123'] },
+          { label: 'app-2', status: 'shared', sessionView: ['GET session:abc123'] },
+          { label: 'app-3', status: 'shared', sessionView: ['SET session:xyz789'] },
+        ],
+        redisBox: {
+          title: 'Redis (공유)',
+          host: 'redis.internal:6379',
+          state: 'filled',
+          entries: [
+            { key: 'session:abc123', value: '{"user_id":42}', ttl: '3580s' },
+            { key: 'session:xyz789', value: '{"user_id":17}', ttl: '3599s' },
+            { key: 'session:def456', value: '{"user_id":99}', ttl: '1820s' },
+          ],
+        },
+        arrow: '3개 인스턴스 ↔ 1개 Redis',
+        keyPoint: '분산 세션 = 무상태 앱 + 상태 외부화. 인스턴스는 언제든 교체 가능해진다.',
+        code: {
+          lang: 'markdown',
+          filename: 'distributed.md',
+          lines: [
+            '# 분산 환경에서의 Redis 세션',
+            '',
+            '## 토폴로지',
+            '',
+            '```',
+            '          ┌─────────┐',
+            '          │   LB    │  ← 라운드로빈',
+            '          └────┬────┘',
+            '       ┌───────┼───────┐',
+            '       ▼       ▼       ▼',
+            '   ┌─────┐ ┌─────┐ ┌─────┐',
+            '   │app-1│ │app-2│ │app-3│  (stateless)',
+            '   └──┬──┘ └──┬──┘ └──┬──┘',
+            '      └───────┼───────┘',
+            '              ▼',
+            '         ┌────────┐',
+            '         │ Redis  │  ← 세션 단일 진실 소스',
+            '         └────────┘',
+            '```',
+            '',
+            '## 왜 동작하는가',
+            '',
+            '- 앱 인스턴스는 **무상태(stateless)** — 자체 메모리에 세션 없음',
+            '- 세션은 Redis 한 곳 — 어떤 인스턴스가 받아도 같은 결과',
+            '- 인스턴스 추가/제거/재시작에 영향 없음',
+            '',
+            '## 운영 체크리스트',
+            '',
+            '| 항목 | 권장 |',
+            '|:--|:--|',
+            '| 배포 방식 | Redis 는 별도 매니지드 서비스 (ElastiCache, Memorystore) |',
+            '| 고가용성 | Redis Sentinel 또는 Cluster 로 페일오버 |',
+            '| 백업 | RDB + AOF 동시 활성화 |',
+            '| 보안 | requirepass + TLS + VPC 내부 통신 |',
+            '| 모니터링 | used_memory, connected_clients, evicted_keys |',
+            '| 키 정책 | maxmemory-policy = allkeys-lru (세션은 evict 가능) |',
+            '',
+            '## 흔한 함정',
+            '',
+            '1. **Redis 1대 단일 장애점** — Sentinel/Cluster 필수',
+            '2. **JSON 직렬화 비용** — 세션 페이로드는 작게 (수 KB 이하)',
+            '3. **TTL 누락** — 만료 없는 키는 메모리 누수',
+            '4. **키 충돌** — `session:` 같은 네임스페이스 prefix 강제',
+            '5. **세션 폭증** — 활성 사용자 × 평균 페이로드 모니터링',
+            '',
+            '## 마무리',
+            '',
+            '인메모리 dict → Redis 로 옮기는 한 번의 작업으로',
+            '앱은 무한히 수평 확장 가능한 구조가 된다.',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36],
+        },
       },
     ];
 
-    function App() {
-      const [currentStepIdx, setCurrentStepIdx] = useState(0);
-      const [isPlaying, setIsPlaying] = useState(false);
-      const playIntervalRef = useRef(null);
-      const stepData = STEPS[currentStepIdx];
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — indigo 톤
+    // ─────────────────────────────────────────────────────
+    const STATUS_STYLE = {
+      alone:     { bg: 'bg-slate-100',   border: 'border-slate-300',   text: 'text-slate-700',   badge: 'bg-slate-200 text-slate-700' },
+      connected: { bg: 'bg-indigo-50',   border: 'border-indigo-300',  text: 'text-indigo-800',  badge: 'bg-indigo-200 text-indigo-800' },
+      shared:    { bg: 'bg-violet-50',   border: 'border-violet-300',  text: 'text-violet-800',  badge: 'bg-violet-200 text-violet-800' },
+    };
 
-      const handleNext = () => { setCurrentStepIdx(prev => Math.min(prev + 1, STEPS.length - 1)); };
-      const handleNextRef = useRef(handleNext); handleNextRef.current = handleNext;
-      const handlePrev = () => { setCurrentStepIdx(prev => Math.max(prev - 1, 0)); };
-      const handlePrevRef = useRef(handlePrev); handlePrevRef.current = handlePrev;
-      const togglePlay = () => { if (currentStepIdx >= STEPS.length - 1) setCurrentStepIdx(0); setIsPlaying(prev => !prev); };
+    function InstanceCard({ inst }) {
+      const s = STATUS_STYLE[inst.status] || STATUS_STYLE.connected;
+      return (
+        <div className={`rounded-lg border ${s.bg} ${s.border} px-3 py-2 flex items-center justify-between`}>
+          <div className="flex items-center gap-2">
+            <span className="text-base">🖥️</span>
+            <span className={`text-xs font-bold ${s.text} w-14`}>{inst.label}</span>
+            <span className={`text-[11px] font-mono ${s.text}`}>{inst.sessionView.join(' / ')}</span>
+          </div>
+          <span className={`text-[10px] px-2 py-0.5 rounded ${s.badge}`}>{inst.status}</span>
+        </div>
+      );
+    }
 
-      useEffect(() => { if (currentStepIdx >= STEPS.length - 1) setIsPlaying(false); }, [currentStepIdx]);
+    function ProblemBox({ problem }) {
+      if (!problem) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-rose-50 p-3">
+          <div className="text-xs font-bold text-rose-800 mb-2">⚠️ {problem.title}</div>
+          <ul className="space-y-1">
+            {problem.items.map((it, i) => (
+              <li key={i} className="text-sm text-rose-900 flex gap-2">
+                <span className="text-rose-500">▸</span>
+                <span>{it}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function TtlNote({ ttlNote }) {
+      if (!ttlNote) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-violet-400 bg-violet-50 p-3">
+          <div className="text-xs font-bold text-violet-800 mb-2">⏱️ {ttlNote.title}</div>
+          <ul className="space-y-1">
+            {ttlNote.items.map((it, i) => (
+              <li key={i} className="text-sm text-violet-900 flex gap-2">
+                <span className="text-violet-500">▸</span>
+                <span>{it}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    function RedisBox({ redis }) {
+      if (!redis) return null;
+      const empty = redis.state === 'empty' || redis.entries.length === 0;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-indigo-500 bg-gradient-to-br from-indigo-50 to-violet-50 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-2xl">🧠</span>
+            <span className="text-lg font-bold text-indigo-800">{redis.title}</span>
+            <span className="ml-auto text-[10px] font-mono text-indigo-600">{redis.host}</span>
+          </div>
+          {empty ? (
+            <div className="text-xs text-indigo-700/70 bg-white/60 rounded p-2 border border-dashed border-indigo-300">
+              (비어 있음 — 아직 세션이 저장되지 않았다)
+            </div>
+          ) : (
+            <ul className="space-y-1.5">
+              {redis.entries.map((e, i) => (
+                <li key={i} className="text-[11px] font-mono bg-white/70 rounded px-2 py-1 border border-indigo-200 flex flex-wrap gap-x-2 items-center">
+                  <span className="text-indigo-800 font-bold">{e.key}</span>
+                  <span className="text-slate-600">→</span>
+                  <span className="text-slate-700 break-all flex-1">{e.value}</span>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${e.ttl === 'expired' ? 'bg-rose-100 text-rose-700' : 'bg-indigo-100 text-indigo-700'}`}>TTL {e.ttl}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-indigo-200 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-indigo-800">세션 토폴로지 시뮬레이션</h3>
+            <span className="text-[10px] text-slate-500">왼쪽 = 인스턴스 ↔ Redis</span>
+          </div>
+          <div className="space-y-2">
+            {state.instances.map((inst, i) => (
+              <InstanceCard key={i} inst={inst} />
+            ))}
+          </div>
+          {state.arrow && (
+            <div className="mt-3 text-center text-xs font-bold text-indigo-600 py-2 border-y border-dashed border-indigo-300">
+              ↓ {state.arrow} ↓
+            </div>
+          )}
+          <RedisBox redis={state.redisBox} />
+          <ProblemBox problem={state.problem} />
+          <TtlNote ttlNote={state.ttlNote} />
+          <div className="mt-3 text-xs text-indigo-900 bg-indigo-50 border border-indigo-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
       useEffect(() => {
-        if (isPlaying) { playIntervalRef.current = setInterval(() => handleNextRef.current(), 4000); }
-        else { clearInterval(playIntervalRef.current); }
-        return () => clearInterval(playIntervalRef.current);
-      }, [isPlaying]);
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-indigo-500/15 border-l-2 border-indigo-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
       useEffect(() => {
         const onKey = (e) => {
-          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
-          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
 
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
       return (
-        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
-          <div className="max-w-5xl mx-auto space-y-5">
-            <nav className="flex items-center justify-between text-sm">
-              <a href="../index.html" className="text-blue-600 hover:text-blue-800 font-medium">&larr; 허브로 돌아가기</a>
-              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200">curriculum VII-2-2</span>
-            </nav>
-            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
-              <div className="flex items-center gap-3 mb-2">
-                <div className="w-8 h-8 bg-sky-600 text-white flex items-center justify-center rounded-full font-bold text-sm">VII</div>
-                <div>
-                  <div className="text-xs text-slate-500 font-medium">Part VII. 인프라 &gt; Chapter 2. 캐시와 세션</div>
-                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">VII-2-2. Redis 세션</h1>
-                </div>
+        <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-violet-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-indigo-600 text-white font-bold">VII</span>
+              <div>
+                <h1 className="text-2xl font-bold text-indigo-900">Chapter VII-4. Redis 세션</h1>
+                <p className="text-sm text-indigo-800/80">인메모리 한계 → Redis 연결 → 저장 → TTL → 분산 공유. 5단계로 추적</p>
               </div>
-              <p className="text-slate-600 text-sm leading-relaxed">
-                <strong>Redis</strong>를 세션 저장소로 활용한다. "메모 보드"처럼 빠르게 쓰고 읽는 임시 저장소.
-              </p>
+              <a href="../index.html" className="ml-auto text-xs text-indigo-700 underline hover:no-underline">← 챕터 목록</a>
             </header>
 
-            {stepData.visual === 'concept' && (
-              <div className="bg-white rounded-xl border border-slate-200 p-4">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-center">
-                    <div className="font-bold text-sm text-red-700">Redis</div>
-                    <div className="text-xs text-slate-600 mt-1">인메모리 Key-Value 저장소</div>
-                    <div className="text-xs font-mono mt-2 bg-white p-1 rounded">SET key value EX 3600</div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-sky-50 border border-sky-200 text-center">
-                    <div className="font-bold text-sm text-sky-700">용도</div>
-                    <div className="text-xs text-slate-600 mt-1 space-y-0.5">
-                      <div>- 세션 저장</div>
-                      <div>- 캐시</div>
-                      <div>- 메시지 큐</div>
-                    </div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-center">
-                    <div className="font-bold text-sm text-emerald-700">장점</div>
-                    <div className="text-xs text-slate-600 mt-1 space-y-0.5">
-                      <div>- 초고속 (1ms 이하)</div>
-                      <div>- TTL 자동 만료</div>
-                      <div>- 다중 서버 공유</div>
-                    </div>
-                  </div>
-                </div>
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-indigo-600' : 'bg-indigo-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-indigo-700 text-indigo-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-indigo-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-indigo-300 bg-white text-indigo-700 hover:bg-indigo-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-indigo-300 bg-white text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-indigo-700 text-white' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-indigo-300 bg-white text-indigo-700 hover:bg-indigo-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-indigo-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-indigo-400 bg-white px-4 py-3 text-sm text-indigo-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                인메모리 dict → Redis 외부 저장소로 세션을 옮기면 앱이 무상태(stateless)가 되어 수평 확장이 가능해진다. TTL로 만료 자동화, 키 네임스페이스로 관리 용이성, Sentinel/Cluster로 고가용성까지 챙기면 운영 표준 구성이 완성된다.
               </div>
             )}
 
-            {stepData.code && (
-              <div className="bg-slate-900 rounded-xl overflow-hidden">
-                <div className="bg-slate-800 text-slate-300 px-4 py-2 text-xs font-mono">{stepData.title}</div>
-                <div className="p-4 text-xs font-mono leading-5">
-                  {stepData.code.map((line, i) => (
-                    <div key={i} className={`px-2 py-0.5 ${stepData.highlight.includes(i) ? 'bg-sky-900/40 text-sky-300' : 'text-slate-300'}`}>{line || '\u00A0'}</div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="p-4 rounded-xl bg-sky-700 text-white shadow-sm">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-200">Step {currentStepIdx + 1}/{STEPS.length}: {stepData.title}</h3>
-                <span className="text-xs text-sky-200">키보드 &larr;/&rarr;</span>
-              </div>
-              <p className="text-sm leading-relaxed">{stepData.desc}</p>
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Redis', '세션', 'TTL', 'lifespan', 'redis.asyncio', 'stateless', '분산', 'HttpOnly Cookie'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 border border-indigo-200">#{k}</span>
+              ))}
             </div>
 
-            <div className="flex items-center justify-center gap-3">
-              <button onClick={() => { setCurrentStepIdx(0); setIsPlaying(false); }} disabled={currentStepIdx === 0} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">처음</button>
-              <button onClick={() => handlePrev()} disabled={currentStepIdx === 0} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">&larr; 이전</button>
-              <button onClick={togglePlay} className="px-4 py-1.5 rounded-lg text-sm font-bold bg-sky-600 text-white hover:bg-sky-700 transition min-w-[80px]">{isPlaying ? '일시정지' : currentStepIdx >= STEPS.length - 1 ? '다시보기' : '자동재생'}</button>
-              <button onClick={() => handleNext()} disabled={currentStepIdx >= STEPS.length - 1} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">다음 &rarr;</button>
-            </div>
-
-            <nav className="flex justify-between text-sm pt-2">
-              <a href="../part5/chapter-05-15-static-files.html" className="text-slate-500 hover:text-slate-700">&larr; V-5-4 StaticFiles</a>
-              <a href="../part4/chapter-04-17-request-object.html" className="text-blue-600 hover:text-blue-800 font-medium">IV-4-17 Request 객체 &rarr;</a>
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-indigo-700">
+              <a href="./chapter-07-03-oauth2.html" className="underline hover:no-underline">← VII-3 OAuth2</a>
+              <a href="./chapter-07-05-static-vs-dynamic.html" className="underline hover:no-underline">다음: VII-5 정적 vs 동적 →</a>
             </nav>
           </div>
         </div>
       );
     }
 
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
   </script>
 </body>
 </html>
