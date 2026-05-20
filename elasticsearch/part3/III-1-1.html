@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Elasticsearch 학습 — III-1-1. Bulk API</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📦</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Elasticsearch Chapter III-1-1 — Bulk API
+    학습 목표: 대량 색인을 한 건씩이 아니라 묶음으로 보내는 이유
+    핵심 비유: 우편 1통씩 보내기 vs 박스에 100통 묶어 보내기
+    패턴: fastapi v1 — 좌(LiveDataPane: 처리량 비교) / 우(VSCode CodeViewer)
+    색상: zinc
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 한 건씩 POST — 100배 느림',
+        desc: '문서 10만 건을 _doc 으로 한 건씩 색인하면? HTTP 왕복 × 10만 번 + connection 오버헤드. 실측으로 30분 이상 걸리는 경우가 많다. 매 요청마다 fsync, refresh 가 일어나서 ES 도 IO 폭증.',
+        method: '단건 POST',
+        docsPerSec: 50,
+        totalSec: 2000,
+        verdict: '느림',
+        verdictTone: 'danger',
+        keyPoint: '대량 색인을 단건 API 로 하면 처리량이 100배 이상 떨어진다.',
+        code: {
+          lang: 'python',
+          filename: 'step1-naive.py',
+          lines: [
+            '# Step 1. 한 건씩 색인 — 절대 하지 말 것',
+            '',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            '',
+            '# CSV 에서 읽은 10만 건',
+            'docs = load_csv("products.csv")  # len = 100,000',
+            '',
+            'for doc in docs:',
+            '    es.index(index="products", document=doc)',
+            '',
+            '# 측정 결과',
+            '#  • 소요 시간: 약 30~60분',
+            '#  • 처리량: 약 50 docs/sec',
+            '#  • HTTP 왕복: 100,000회',
+            '#',
+            '# 왜 느린가',
+            '#  1) HTTP 왕복 RTT (1~5ms) × 100k = 100~500초',
+            '#  2) ES 매 요청마다 단일 문서 처리 오버헤드',
+            '#  3) refresh 가 너무 자주 → segment 폭발',
+            '#  4) translog fsync 빈번',
+            '',
+            '# CPU 도 다 못 쓴다 — bottleneck 이 네트워크',
+            '# CPU 사용률 5%, 디스크 IOPS 500 정도',
+            '',
+            '# 결론: 1000 건 이상이면 무조건 Bulk',
+          ],
+          highlight: [10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 27],
+        },
+      },
+      {
+        title: 'Step 2. Bulk API — NDJSON 묶음 전송',
+        desc: '_bulk 엔드포인트는 NDJSON (Newline Delimited JSON) 포맷. 각 작업이 2줄 (액션 + 문서) 또는 1줄. 한 요청에 수천 건을 묶어 보낸다. HTTP 왕복 1번으로 1000건 처리.',
+        method: '_bulk',
+        docsPerSec: 5000,
+        totalSec: 20,
+        verdict: '100배 빠름',
+        verdictTone: 'good',
+        keyPoint: '_bulk = NDJSON 포맷. 한 요청에 여러 작업 묶음.',
+        code: {
+          lang: 'bash',
+          filename: 'step2-bulk-format.sh',
+          lines: [
+            '# Step 2. _bulk NDJSON 포맷',
+            '',
+            '# bulk.ndjson 파일 — 짝수 줄은 액션, 홀수 줄은 문서',
+            'cat <<EOF > bulk.ndjson',
+            '{ "index": { "_index": "products", "_id": "1" } }',
+            '{ "title": "MacBook Pro 14", "price": 2899000 }',
+            '{ "index": { "_index": "products", "_id": "2" } }',
+            '{ "title": "Galaxy Book 4",  "price": 1599000 }',
+            '{ "create": { "_index": "products", "_id": "3" } }',
+            '{ "title": "LG Gram 16",     "price": 1299000 }',
+            '{ "update": { "_index": "products", "_id": "1" } }',
+            '{ "doc": { "price": 2799000 } }',
+            '{ "delete": { "_index": "products", "_id": "2" } }',
+            'EOF',
+            '',
+            '# 보내기 — Content-Type 이 x-ndjson 이어야 함',
+            'curl -X POST "http://localhost:9200/_bulk" \\',
+            '  -H "Content-Type: application/x-ndjson" \\',
+            '  --data-binary @bulk.ndjson',
+            '',
+            '# 액션 종류',
+            '#  index   — 있으면 덮어쓰기, 없으면 생성',
+            '#  create  — 있으면 실패 (중복 방지)',
+            '#  update  — 부분 업데이트 (doc 또는 script)',
+            '#  delete  — 삭제 (다음 줄 없음)',
+            '',
+            '# 응답',
+            '# { "took": 30, "errors": false, "items": [',
+            '#   { "index": {"_id": "1", "result": "updated", "status": 200} },',
+            '#   { "index": {"_id": "2", "result": "created", "status": 201} },',
+            '#   ...',
+            '# ]}',
+            '',
+            '# 주의',
+            '#  • 한 줄 = 한 JSON (개행 포함 안 됨)',
+            '#  • 마지막 줄에도 개행 필수',
+            '#  • errors=true 면 items 안에 부분 실패 확인',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 3. helpers.bulk — Python 표준',
+        desc: '직접 NDJSON 만들기 귀찮으니 elasticsearch-py 의 helpers.bulk 를 쓴다. iterator 만 넘기면 알아서 chunk 단위로 묶어 보낸다. 에러 처리, 재시도, 진행률 추적 모두 내장.',
+        method: 'helpers.bulk',
+        docsPerSec: 8000,
+        totalSec: 13,
+        verdict: '표준 방식',
+        verdictTone: 'good',
+        keyPoint: 'Python 은 helpers.bulk, JS 는 client.helpers.bulk. 거의 모든 언어가 제공.',
+        code: {
+          lang: 'python',
+          filename: 'step3-helpers-bulk.py',
+          lines: [
+            '# Step 3. elasticsearch-py helpers.bulk',
+            '',
+            'from elasticsearch import Elasticsearch',
+            'from elasticsearch.helpers import bulk, parallel_bulk',
+            'import csv',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            '',
+            'def gen_actions(csv_path: str):',
+            '    """ generator — 메모리 안에 다 안 올림 """',
+            '    with open(csv_path) as f:',
+            '        for row in csv.DictReader(f):',
+            '            yield {',
+            '                "_op_type": "index",',
+            '                "_index":   "products",',
+            '                "_id":      row["id"],',
+            '                "_source": {',
+            '                    "title": row["title"],',
+            '                    "price": int(row["price"]),',
+            '                }',
+            '            }',
+            '',
+            '# (1) 단일 스레드 bulk',
+            'success, errors = bulk(',
+            '    es,',
+            '    gen_actions("products.csv"),',
+            '    chunk_size=1000,         # 1000 건씩 묶어 전송',
+            '    max_chunk_bytes=10*1024*1024,  # 10MB 제한',
+            '    raise_on_error=False,    # 부분 실패 허용',
+            ')',
+            'print(f"성공: {success}, 실패: {len(errors)}")',
+            '',
+            '# (2) 병렬 bulk — 더 빠름',
+            'for ok, item in parallel_bulk(',
+            '    es,',
+            '    gen_actions("products.csv"),',
+            '    chunk_size=1000,',
+            '    thread_count=4,',
+            '):',
+            '    if not ok:',
+            '        print("실패:", item)',
+            '',
+            '# 측정 결과 (10만 건)',
+            '#  • chunk_size=1000  → 12초 (8000 docs/sec)',
+            '#  • chunk_size=5000  → 10초 (10000 docs/sec) — 메모리 ↑',
+            '#  • parallel + 4 thread → 5초 (20000 docs/sec)',
+          ],
+          highlight: [3, 4, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28, 29, 30, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46],
+        },
+      },
+      {
+        title: 'Step 4. chunk_size 튜닝',
+        desc: '몇 개씩 묶어 보낼지가 중요. 너무 작으면 (10) HTTP 오버헤드, 너무 크면 (50000) 메모리 + http.max_content_length 초과. 권장은 5~15MB 또는 1000~5000건. 클러스터 환경과 문서 크기에 따라 실측 조정.',
+        method: 'chunk_size 1000',
+        docsPerSec: 10000,
+        totalSec: 10,
+        verdict: '최적화',
+        verdictTone: 'good',
+        keyPoint: '한 chunk 의 byte 크기를 5~15MB 로. 그게 안전 영역.',
+        code: {
+          lang: 'python',
+          filename: 'step4-tuning.py',
+          lines: [
+            '# Step 4. Bulk 튜닝 — chunk_size 가 핵심',
+            '',
+            'from elasticsearch.helpers import bulk',
+            'import time',
+            '',
+            '# 측정 헬퍼',
+            'def benchmark(chunk_size: int, n: int = 100000):',
+            '    actions = ({"_index": "test", "_source": {"v": i}} for i in range(n))',
+            '    t0 = time.time()',
+            '    ok, _ = bulk(es, actions, chunk_size=chunk_size)',
+            '    return n / (time.time() - t0)',
+            '',
+            '# 다양한 크기로 측정',
+            'for cs in [100, 500, 1000, 2000, 5000, 10000]:',
+            '    rps = benchmark(cs)',
+            '    print(f"chunk_size={cs:5d}  →  {rps:7.0f} docs/sec")',
+            '',
+            '# 일반적 결과 (단일 노드, 작은 문서 100바이트)',
+            '#  chunk_size=  100  →   2500 docs/sec   (HTTP 오버헤드)',
+            '#  chunk_size=  500  →   7000 docs/sec',
+            '#  chunk_size= 1000  →  10000 docs/sec   ← sweet spot',
+            '#  chunk_size= 2000  →  11000 docs/sec',
+            '#  chunk_size= 5000  →  10500 docs/sec   (메모리 압박)',
+            '#  chunk_size=10000  →   9000 docs/sec   (max_content_length 위험)',
+            '',
+            '# 튜닝 원칙',
+            '#  1) 한 chunk 의 raw byte 가 5~15MB 들어가도록',
+            '#  2) 문서가 크면 (10KB) chunk_size ↓ (500~1000)',
+            '#  3) 문서가 작으면 (100B) chunk_size ↑ (3000~5000)',
+            '#  4) max_chunk_bytes 로 byte 캡 (기본 100MB)',
+            '#  5) http.max_content_length 도 확인 (기본 100MB)',
+            '',
+            '# 클러스터 설정',
+            '#  • elasticsearch.yml:',
+            '#     http.max_content_length: 100mb',
+            '#  • thread_pool.write.queue_size 도 영향 (기본 200)',
+          ],
+          highlight: [6, 7, 8, 9, 10, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 5. refresh=false + 사후 forcemerge',
+        desc: '초기 대량 색인 시 refresh=false 로 색인 중간에 검색 가능하게 하지 않고 처리량 ↑ (refresh 비용 제거). number_of_replicas=0 으로 시작해서 끝나면 1 로 복구. 마지막에 forcemerge 로 segment 정리.',
+        method: 'no refresh + replicas=0',
+        docsPerSec: 50000,
+        totalSec: 2,
+        verdict: '극한 최적화',
+        verdictTone: 'good',
+        summary: {
+          title: 'Bulk 튜닝 효과 (10만 건)',
+          rows: [
+            { metric: '단건 POST', before: '50/s', after: '2000초', delta: '기준' },
+            { metric: 'Bulk 1000', before: '10000/s', after: '10초', delta: '200x' },
+            { metric: 'Parallel 4', before: '20000/s', after: '5초', delta: '400x' },
+            { metric: 'no refresh', before: '50000/s', after: '2초', delta: '1000x' },
+            { metric: 'forcemerge 후', before: '검색 빠름', after: 'segment 1개', delta: '+ 검색' },
+          ],
+        },
+        keyPoint: '초기 대량 색인 = no refresh + replicas 0. 검색 시작 전에 forcemerge.',
+        code: {
+          lang: 'python',
+          filename: 'step5-initial-load.py',
+          lines: [
+            '# Step 5. 초기 적재의 표준 패턴 (10만 → 10억 건 모두 동일)',
+            '',
+            '# 1) 인덱스 만들 때 처리량 최적화 설정',
+            'es.indices.create(',
+            '    index="products",',
+            '    body={',
+            '        "settings": {',
+            '            "number_of_shards":   3,',
+            '            "number_of_replicas": 0,         # ← 처음엔 0',
+            '            "refresh_interval":   "-1",      # ← 자동 refresh 끔',
+            '            "translog.durability": "async",  # ← 동기 fsync 끔',
+            '        }',
+            '    }',
+            ')',
+            '',
+            '# 2) Bulk 적재 (parallel_bulk + chunk 1000)',
+            'from elasticsearch.helpers import parallel_bulk',
+            'for ok, info in parallel_bulk(',
+            '    es,',
+            '    gen_actions(),',
+            '    chunk_size=1000,',
+            '    thread_count=4,',
+            '    request_timeout=120,',
+            '):',
+            '    if not ok:',
+            '        print(info)',
+            '',
+            '# 3) 적재 완료 후 운영 설정 복구',
+            'es.indices.put_settings(',
+            '    index="products",',
+            '    body={',
+            '        "refresh_interval":   "1s",',
+            '        "number_of_replicas": 1,             # ← 복제 만들기',
+            '    }',
+            ')',
+            '',
+            '# 4) segment 정리 (검색 빨라짐)',
+            'es.indices.forcemerge(index="products", max_num_segments=1)',
+            '',
+            '# 5) 결과 확인',
+            'count = es.count(index="products")["count"]',
+            'print(f"색인 완료: {count:,} docs")',
+            '',
+            '# 비교',
+            '#  순진하게 단건 POST → 30분',
+            '#  최적화 후                → 2초     (900x 빠름)',
+            '#  같은 데이터, 같은 클러스터, 다른 코드',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29, 30, 31, 32, 33, 34, 35, 38, 41, 42, 45, 46, 47],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function MetricCard({ label, value, unit, max, current, tone }) {
+      const t = TONE[tone] || TONE.warn;
+      const pct = Math.min(100, (current / max) * 100);
+      return (
+        <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+          <div className="flex justify-between items-baseline mb-1">
+            <span className={`text-xs ${t.text}`}>{label}</span>
+            <span className={`text-lg font-mono font-bold ${t.text}`}>
+              {value.toLocaleString()}<span className="text-xs opacity-70">{unit}</span>
+            </span>
+          </div>
+          <div className="h-1.5 bg-white/60 rounded overflow-hidden">
+            <div className={`h-full ${t.badge.split(' ')[0]}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-zinc-400 bg-white p-3">
+          <div className="text-sm font-bold text-zinc-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-zinc-500 border-b border-zinc-200">
+                <th className="py-1 pr-2">방식</th><th className="py-1 pr-2">처리량</th><th className="py-1 pr-2">시간</th><th className="py-1">배수</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-zinc-100">
+                  <td className="py-1 pr-2 font-medium text-zinc-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono">{r.before}</td>
+                  <td className="py-1 pr-2 text-zinc-700 font-mono">{r.after}</td>
+                  <td className="py-1 text-zinc-800 font-bold">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border border-zinc-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-zinc-800">색인 처리량 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="rounded-lg border border-zinc-300 bg-zinc-50 p-3">
+            <div className="text-[10px] text-zinc-500">방식</div>
+            <div className="text-sm font-bold text-zinc-800 font-mono">{state.method}</div>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 gap-2">
+            <MetricCard label="처리량 (docs/sec)" value={state.docsPerSec} unit="" max={50000} current={state.docsPerSec} tone={state.docsPerSec >= 5000 ? 'good' : state.docsPerSec >= 500 ? 'warn' : 'danger'} />
+            <MetricCard label="10만 건 소요 (초)" value={state.totalSec} unit="s" max={2000} current={state.totalSec} tone={state.totalSec <= 30 ? 'good' : state.totalSec <= 300 ? 'warn' : 'danger'} />
+          </div>
+
+          <div className="mt-3 rounded-lg bg-zinc-50 border border-zinc-200 p-3">
+            <div className="text-[11px] font-bold text-zinc-700 mb-2">10만 건 색인 비교</div>
+            <div className="space-y-1">
+              {[
+                ['단건 POST', 2000, 'bg-rose-500'],
+                ['Bulk 1000', 10, 'bg-emerald-500'],
+                ['Bulk + parallel', 5, 'bg-emerald-600'],
+                ['최적화 풀세트', 2, 'bg-emerald-700'],
+              ].map(([name, sec, color]) => (
+                <div key={name} className="flex items-center gap-2">
+                  <span className="text-[10px] text-zinc-700 w-28">{name}</span>
+                  <div className="flex-1 h-2 bg-zinc-200 rounded">
+                    <div className={`h-full ${color} rounded`} style={{ width: `${Math.max(2, Math.min(100, (sec / 2000) * 100))}%` }} />
+                  </div>
+                  <span className="text-[10px] font-mono text-zinc-700">{sec}s</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-zinc-800 bg-zinc-100 border border-zinc-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-zinc-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-zinc-800 border-b border-zinc-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-zinc-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-zinc-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-zinc-500/25 border-l-2 border-zinc-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-zinc-800 border-t border-zinc-700 flex items-center justify-between text-[10px] text-zinc-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-zinc-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-zinc-700 text-white font-bold">E</span>
+              <div>
+                <h1 className="text-2xl font-bold text-zinc-900">Chapter III-1-1. Bulk API</h1>
+                <p className="text-sm text-zinc-700/80">10만 건 색인 30분 → 2초 (900x)</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-zinc-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-zinc-700' : 'bg-zinc-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-zinc-800 text-zinc-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-zinc-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-zinc-900 text-white' : 'bg-zinc-700 text-white hover:bg-zinc-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-zinc-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-zinc-400 bg-white px-4 py-3 text-sm text-zinc-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                대량 색인 = Bulk API + chunk 1000~5000 + refresh -1 + replicas 0. 초기 적재 후 setting 복구 + forcemerge. 단건 대비 1000x 처리량.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Bulk', 'NDJSON', 'chunk_size', 'parallel_bulk', 'refresh', 'forcemerge'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-800 border border-zinc-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-zinc-700">
+              <a href="../part2/II-2-2.html" className="underline hover:no-underline">← II-2-2 Aggregation</a>
+              <a href="./III-1-2.html" className="underline hover:no-underline">다음: III-1-2 Refresh interval →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

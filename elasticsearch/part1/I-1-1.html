@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Elasticsearch 학습 — I-1-1. RDB LIKE 검색의 한계</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔎</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Elasticsearch Chapter I-1-1 — RDB LIKE 검색의 한계
+    학습 목표: SQL LIKE '%xx%' 가 왜 전문 검색에 부적합한지 직관적으로 보여주고
+              Elasticsearch 가 필요한 이유를 깨닫게 한다.
+    핵심 비유: 책에서 단어 찾기 — 목차/색인 없이 책 전체를 한 장씩 넘기는 셈
+    패턴: fastapi v1 — 좌(LiveDataPane: LIKE 검색 시뮬레이션) / 우(VSCode CodeViewer)
+    색상: zinc (elasticsearch 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 평범한 SELECT — 10만 행까지는 OK',
+        desc: '쇼핑몰 상품이 10만 건. WHERE title LIKE \'%kafka%\' 로 검색하면 PostgreSQL 이 인덱스 없이 풀스캔(seq scan) 한다. 10만 행은 300ms 정도라 견딜 만하다. 여기까지는 "그냥 LIKE 쓰면 되지" 라고 생각한다.',
+        rows: 100000,
+        scanTime: 300,
+        latency: 300,
+        verdict: '아직 견딜 만',
+        verdictTone: 'good',
+        keyPoint: '데이터 작을 땐 LIKE 도 동작한다. 문제는 규모가 커질 때.',
+        code: {
+          lang: 'sql',
+          filename: 'simple-like.sql',
+          lines: [
+            '-- Step 1. 상품 10만 건에서 \'kafka\' 검색',
+            '-- products 테이블에 인덱스 없음',
+            '',
+            'SELECT id, title, price',
+            'FROM products',
+            'WHERE title LIKE \'%kafka%\'',
+            'ORDER BY created_at DESC',
+            'LIMIT 20;',
+            '',
+            '-- EXPLAIN ANALYZE 결과',
+            '-- Seq Scan on products  (cost=0.00..2543.00 rows=12 width=64)',
+            '--   Filter: (title ~~ \'%kafka%\')',
+            '--   Rows Removed by Filter: 99988',
+            '-- Planning Time: 0.180 ms',
+            '-- Execution Time: 312 ms',
+            '',
+            '-- 풀스캔이지만 10만 행은 300ms 안에 끝남',
+            '-- 사용자도 살짝 기다리면 되니까 견딜 만하다',
+            '-- "검색 = LIKE 면 충분하다" 라고 결론 내리기 쉬운 단계',
+          ],
+          highlight: [4, 5, 6, 7, 8, 11, 12, 13, 15],
+        },
+      },
+      {
+        title: 'Step 2. 100만 행 — 5초 응답, 사용자 이탈',
+        desc: '서비스가 자라서 상품이 100만 건이 됐다. 같은 LIKE 쿼리가 4~5초 걸린다. Google 연구 결과 응답 1초 넘으면 사용자 32% 가 이탈한다. 검색창에 글자 입력할 때마다 5초씩 기다리는 UX 는 출시 자체가 불가능하다.',
+        rows: 1000000,
+        scanTime: 5000,
+        latency: 5000,
+        verdict: '한계 도달',
+        verdictTone: 'danger',
+        keyPoint: '% 가 앞에 붙은 LIKE 는 인덱스를 못 쓴다. 행 수에 정비례해서 느려진다.',
+        code: {
+          lang: 'sql',
+          filename: 'million-rows.sql',
+          lines: [
+            '-- Step 2. 같은 쿼리, 데이터만 100만 행',
+            '',
+            'SELECT id, title, price',
+            'FROM products',
+            'WHERE title LIKE \'%kafka%\'',
+            'LIMIT 20;',
+            '',
+            '-- EXPLAIN ANALYZE',
+            '-- Seq Scan on products  (cost=0.00..25430.00 rows=120 width=64)',
+            '--   Filter: (title ~~ \'%kafka%\')',
+            '--   Rows Removed by Filter: 999880',
+            '-- Execution Time: 4870 ms   ← 5초!',
+            '',
+            '-- 100만 행 모두 메모리로 읽고 한 행씩 substring 매칭',
+            '-- 행 수 N → O(N) 으로 정비례 증가',
+            '',
+            '-- 사용자 관점',
+            '--  • 검색창 한 글자 → 5초 wait',
+            '--  • 다음 글자 입력 → 5초 wait 다시',
+            '--  • 5초 × 5글자 = 25초',
+            '--  • 32% 가 그 사이에 떠난다 (구글 SRE 데이터)',
+            '',
+            '-- "캐시 늘리자" "DB 사양 키우자" 다 미봉책',
+            '-- LIKE 자체가 검색 도구가 아니다',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 3. 인덱스를 만들어도 — prefix 만 살린다',
+        desc: 'CREATE INDEX ON products(title) 로 B-tree 인덱스를 만들면 \'kafka%\' (prefix) 검색은 빨라진다. 하지만 \'%kafka%\' 처럼 양쪽 와일드카드는 인덱스가 무용지물. B-tree 는 "앞 글자가 같은 것"끼리 정렬되어 있기 때문이다.',
+        rows: 1000000,
+        scanTime: 4900,
+        latency: 4900,
+        verdict: '인덱스도 무력',
+        verdictTone: 'danger',
+        keyPoint: 'B-tree 인덱스는 prefix 만 빠르다. 중간 단어 검색은 못 한다.',
+        code: {
+          lang: 'sql',
+          filename: 'btree-fail.sql',
+          lines: [
+            '-- Step 3. B-tree 인덱스를 만들어 보자',
+            '',
+            'CREATE INDEX idx_products_title ON products (title);',
+            '',
+            '-- ✅ prefix 검색 — 인덱스가 살아남',
+            'EXPLAIN SELECT * FROM products WHERE title LIKE \'kafka%\';',
+            '-- Index Range Scan using idx_products_title',
+            '-- Execution Time: 8 ms   ← 빠름',
+            '',
+            '-- ❌ 양쪽 와일드카드 — 인덱스 못 씀',
+            'EXPLAIN SELECT * FROM products WHERE title LIKE \'%kafka%\';',
+            '-- Seq Scan on products',
+            '-- Execution Time: 4900 ms   ← 그대로 5초',
+            '',
+            '-- B-tree 가 \'apple\', \'apricot\', \'banana\' 순으로 정렬되어 있을 때',
+            '-- \'%pric%\' 으로 찾으면? 어디서부터 봐야 할지 모른다',
+            '-- 결국 처음부터 끝까지 봐야 함 = 풀스캔',
+            '',
+            '-- 우회 ① reverse 인덱스로 suffix 처리 (suffix 만 빨라짐)',
+            '-- 우회 ② trigram 인덱스 (pg_trgm) — n-gram 으로 부분 매칭',
+            '--        100만 행에서 200ms 까지는 가능하지만',
+            '--        한국어 형태소나 동의어, 점수 랭킹은 여전히 불가능',
+            '',
+            '-- 결론: 관계형 DB 의 인덱스는 "검색"이 아닌 "조회"용',
+          ],
+          highlight: [3, 5, 6, 7, 10, 11, 12, 13, 15, 16, 17, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 4. 어형 변화 — running ≠ ran, 검색 → 검색하다',
+        desc: 'LIKE 는 문자열 매칭이다. \'running\' 으로 검색해도 \'ran\', \'runs\' 는 안 잡힌다. 한국어는 더 심각 — \'검색\' 으로 찾아도 \'검색했다\', \'검색이\', \'검색을\' 은 다 다른 문자열. 사용자가 원하는 건 의미 매칭인데, LIKE 는 문자 매칭만 한다.',
+        rows: 1000000,
+        scanTime: 5000,
+        latency: 5000,
+        verdict: '의미 불일치',
+        verdictTone: 'danger',
+        keyPoint: '검색은 단순 문자열 매칭이 아니라 형태소/어간/동의어를 알아야 한다.',
+        code: {
+          lang: 'markdown',
+          filename: 'language-problem.md',
+          lines: [
+            '# Step 4. LIKE 의 의미 매칭 한계',
+            '',
+            '## 영어 어형 변화 (Stemming)',
+            '| 사용자 입력 | 문서 본문 | LIKE 매칭? | 사용자 기대 |',
+            '|:--|:--|:--|:--|',
+            '| running | "He ran fast" | ❌ | ✅ |',
+            '| run     | "running shoes" | ❌ | ✅ |',
+            '| mouse   | "mice" | ❌ | ✅ |',
+            '| better  | "good" | ❌ | ✅ (동의어) |',
+            '',
+            '## 한국어 조사/어미',
+            '검색어 "쿠팡" 으로 다음 문서가 다 잡혀야 한다:',
+            '- 쿠팡이 빠르다',
+            '- 쿠팡에서 샀다',
+            '- 쿠팡을 이용했다',
+            '- 쿠팡의 배송',
+            '',
+            '하지만 `WHERE title LIKE \'%쿠팡%\'` 은 운 좋게 다 잡힌다 (substring).',
+            '문제는 **점수** — 어떤 문서가 더 관련 있는지 모른다.',
+            '',
+            '## 점수 랭킹 (Relevance)',
+            '검색 결과 100건이 매칭됐을 때',
+            '- "쿠팡" 이 제목에 있는 vs 본문 끝에 한 번 있는',
+            '- 단어가 3번 등장 vs 1번 등장',
+            '- 짧은 문서 vs 긴 문서',
+            '',
+            '이걸 `ORDER BY` 로 어떻게 표현할 것인가?',
+            '관계형 DB 의 `WHERE` 는 boolean (참/거짓) 만 안다.',
+            '"얼마나 관련 있는가" 의 0~1 점수는 직접 계산할 수 없다.',
+            '',
+            '## 추가 한계',
+            '- 동의어 (notebook = laptop) 처리 불가',
+            '- 오타 허용 (kakfa → kafka) 불가',
+            '- 자동완성/추천어 불가',
+            '- 패싯 검색 (가격대, 카테고리별 카운트) 매우 비쌈',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24, 25, 27, 28, 29],
+        },
+      },
+      {
+        title: 'Step 5. 전문 검색 도구가 답 — Elasticsearch',
+        desc: '문제를 정리하면 (a) 양쪽 와일드카드는 인덱스 못 씀 (b) 100만 행에서 5초 (c) 어형/동의어/오타 불가 (d) 점수 랭킹 불가. 이걸 한 번에 푸는 게 전문 검색 엔진. Lucene 기반 Elasticsearch 는 Inverted Index 로 같은 검색을 10ms 안에 끝낸다.',
+        rows: 1000000,
+        scanTime: 10,
+        latency: 10,
+        verdict: '해결',
+        verdictTone: 'good',
+        summary: {
+          title: 'RDB LIKE vs Elasticsearch (100만 행 기준)',
+          rows: [
+            { metric: '응답 시간', before: '4900ms', after: '10ms', delta: '−490x' },
+            { metric: '인덱스 사용', before: 'prefix 만', after: '모든 위치', delta: '✓' },
+            { metric: '어형 처리', before: '불가', after: 'Stemming/Nori', delta: '✓' },
+            { metric: '점수 랭킹', before: 'WHERE boolean', after: 'BM25 score', delta: '✓' },
+            { metric: '오타 허용', before: '불가', after: 'fuzzy query', delta: '✓' },
+          ],
+        },
+        keyPoint: 'LIKE 는 조회용, 전문 검색은 별도 도구가 필요하다. 다음 챕터에서 그 원리 (Inverted Index) 를 본다.',
+        code: {
+          lang: 'markdown',
+          filename: 'why-elasticsearch.md',
+          lines: [
+            '# Step 5. 왜 Elasticsearch 인가',
+            '',
+            '## 같은 검색, 같은 데이터, 다른 결과',
+            '| 항목 | PostgreSQL LIKE | Elasticsearch |',
+            '|:--|:--|:--|',
+            '| 100만 행 응답 | 4900ms | **10ms** |',
+            '| 1000만 행 응답 | 49초 | **30ms** |',
+            '| 인덱스 위치 | prefix 만 | 모든 위치 |',
+            '| 어형 변화 | 불가 | Stemming/Nori |',
+            '| 점수 랭킹 | 불가 | BM25 + TF-IDF |',
+            '| 오타 허용 | 불가 | fuzzy query |',
+            '| 집계 | 무거움 | 빠른 aggregation |',
+            '',
+            '## 비결: Inverted Index',
+            '- 문서 → 단어가 아니라 **단어 → 문서 ID 리스트**',
+            '- 책 뒤에 있는 색인(index) 처럼 동작',
+            '- "kafka" 가 어느 문서에 몇 번 나오는지 미리 정리',
+            '',
+            '## RDB 가 못 하는 게 아니다',
+            '- 트랜잭션, JOIN, 일관성 → PostgreSQL 압승',
+            '- 텍스트 검색 → Elasticsearch 압승',
+            '- **둘 다 쓰는 게 정답** (CDC/Logstash 로 동기화)',
+            '',
+            '## 언제 도입하나',
+            '✅ 검색이 핵심 기능 (쇼핑몰, 위키, 사내문서)',
+            '✅ 로그/메트릭 분석 (ELK Stack)',
+            '✅ 자동완성, 패싯 필터',
+            '✅ RAG 벡터 검색 (kNN)',
+            '❌ 단순 ID 조회 → 그냥 RDB',
+            '❌ 트랜잭션 필요 → 절대 RDB',
+            '',
+            '## 다음 챕터',
+            '> I-1-2 에서 Inverted Index 가 어떻게 동작하는지 본다.',
+            '> "단어 표 한 번 lookup" 으로 100만 문서를 10ms 만에 검색.',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 23, 24, 25, 26, 27],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function MetricCard({ label, value, unit, max, current, tone }) {
+      const t = TONE[tone] || TONE.warn;
+      const pct = Math.min(100, (current / max) * 100);
+      return (
+        <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+          <div className="flex justify-between items-baseline mb-1">
+            <span className={`text-xs ${t.text}`}>{label}</span>
+            <span className={`text-lg font-mono font-bold ${t.text}`}>
+              {value}<span className="text-xs opacity-70">{unit}</span>
+            </span>
+          </div>
+          <div className="h-1.5 bg-white/60 rounded overflow-hidden">
+            <div className={`h-full ${t.badge.split(' ')[0]}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-zinc-400 bg-white p-3">
+          <div className="text-sm font-bold text-zinc-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-zinc-500 border-b border-zinc-200">
+                <th className="py-1 pr-2">지표</th><th className="py-1 pr-2">Before</th><th className="py-1 pr-2">After</th><th className="py-1">변화</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-zinc-100">
+                  <td className="py-1 pr-2 font-medium text-zinc-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono">{r.after}</td>
+                  <td className="py-1 text-zinc-800 font-bold">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border border-zinc-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-zinc-800">LIKE 검색 부하 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2">
+            <MetricCard label="대상 행 수" value={state.rows.toLocaleString()} unit="" max={1000000} current={state.rows} tone={state.rows >= 1000000 ? 'warn' : 'good'} />
+            <MetricCard label="풀스캔 시간" value={state.scanTime} unit="ms" max={5000} current={state.scanTime} tone={state.scanTime >= 1000 ? 'danger' : state.scanTime >= 300 ? 'warn' : 'good'} />
+            <MetricCard label="사용자 체감 응답" value={state.latency} unit="ms" max={5000} current={state.latency} tone={state.latency >= 1000 ? 'danger' : state.latency >= 200 ? 'warn' : 'good'} />
+          </div>
+
+          {/* 검색 흐름 다이어그램 */}
+          <div className="mt-3 rounded-lg bg-zinc-50 border border-zinc-200 p-3">
+            <div className="flex items-center justify-between text-xs font-mono">
+              <span className="px-2 py-1 rounded bg-white border border-zinc-300">🔎 Query</span>
+              <span className="text-zinc-400">→</span>
+              {state.latency <= 100 ? (
+                <>
+                  <span className="px-2 py-1 rounded bg-zinc-700 text-white">🔠 Inverted Index</span>
+                  <span className="text-zinc-400">→</span>
+                  <span className="px-2 py-1 rounded bg-emerald-600 text-white">⚡ 10ms</span>
+                </>
+              ) : (
+                <>
+                  <span className={`px-2 py-1 rounded text-white ${state.latency >= 1000 ? 'bg-rose-600 animate-pulse' : 'bg-amber-500'}`}>📄 Seq Scan</span>
+                  <span className="text-zinc-400">→</span>
+                  <span className={`px-2 py-1 rounded text-white ${state.latency >= 1000 ? 'bg-rose-600' : 'bg-amber-500'}`}>🐢 {state.latency}ms</span>
+                </>
+              )}
+            </div>
+          </div>
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-zinc-800 bg-zinc-100 border border-zinc-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-zinc-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-zinc-800 border-b border-zinc-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-zinc-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-zinc-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-zinc-500/25 border-l-2 border-zinc-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-zinc-800 border-t border-zinc-700 flex items-center justify-between text-[10px] text-zinc-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-zinc-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-zinc-700 text-white font-bold">E</span>
+              <div>
+                <h1 className="text-2xl font-bold text-zinc-900">Chapter I-1-1. RDB LIKE 검색의 한계</h1>
+                <p className="text-sm text-zinc-700/80">100만 행 풀스캔 5초 → 전문 검색 엔진이 답</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-zinc-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-zinc-700' : 'bg-zinc-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-zinc-800 text-zinc-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-zinc-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-zinc-900 text-white' : 'bg-zinc-700 text-white hover:bg-zinc-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-zinc-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-zinc-400 bg-white px-4 py-3 text-sm text-zinc-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                LIKE 는 조회용이지 검색용이 아니다. 100만 행에서 5초, 인덱스도 prefix 만, 어형/동의어/오타/점수 다 불가. Elasticsearch 의 Inverted Index 가 이 모든 걸 10ms 안에 푼다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['LIKE', 'Full Scan', 'B-tree', 'Stemming', 'Relevance', 'Elasticsearch'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-800 border border-zinc-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-zinc-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-1-2.html" className="underline hover:no-underline">다음: I-1-2 Inverted Index →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
