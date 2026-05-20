@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Microservices 학습 — IV-1-2. Blue-Green / Canary / Rolling</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🚦</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Microservices Chapter IV-1-2 — 무중단 배포 전략
+    학습 목표: Rolling / Blue-Green / Canary 의 차이를 트래픽 분배 관점에서 본다.
+    핵심 비유: 카페에서 메뉴 바꿀 때
+                  Rolling = 한 명씩 교대
+                  Blue-Green = 새 가게 다 차린 뒤 간판만 옮김
+                  Canary = 신메뉴 손님 1%만 테스트
+    패턴: fastapi v1 — 좌(LiveDataPane: v1/v2 트래픽 분배) / 우(VSCode CodeViewer)
+    색상: deep cyan #0e7490
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Rolling Update — k8s 기본 전략',
+        desc: 'Deployment 의 기본값. 한 번에 maxSurge 만큼 새 파드를 만들고 maxUnavailable 만큼 옛 파드를 줄인다. 점진적으로 v1 → v2 로 교체되어 무중단 + 점진 검증이 가능. 단점은 두 버전이 동시에 트래픽 받는 시간 동안 호환성이 보장돼야 한다.',
+        scenario: 'rolling',
+        v1: 4,
+        v2: 4,
+        v2Traffic: 50,
+        errorRate: 0.1,
+        verdict: '기본 안전',
+        verdictTone: 'good',
+        keyPoint: 'Rolling 은 가장 간단·안전. 단, v1↔v2 가 같은 시점에 공존하므로 API/DB 스키마 호환성을 깨면 안 된다.',
+        code: {
+          lang: 'yaml',
+          filename: 'rolling_update.yaml',
+          lines: [
+            '# k8s Deployment 기본 전략 = RollingUpdate',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata: { name: orders }',
+            'spec:',
+            '  replicas: 8',
+            '  strategy:',
+            '    type: RollingUpdate',
+            '    rollingUpdate:',
+            '      maxSurge:       2   # 한 번에 2개까지 추가 생성',
+            '      maxUnavailable: 1   # 한 번에 1개까지 없어도 됨',
+            '  selector: { matchLabels: { app: orders } }',
+            '  template:',
+            '    metadata: { labels: { app: orders } }',
+            '    spec:',
+            '      containers:',
+            '        - name: orders',
+            '          image: registry/orders:2.0.0   # ← 1.0 → 2.0',
+            '          readinessProbe:',
+            '            httpGet: { path: /readyz, port: 8000 }',
+            '',
+            '# 적용',
+            '#   kubectl set image deployment/orders orders=registry/orders:2.0.0',
+            '#',
+            '# 진행 과정 (replicas=8, surge=2, unavail=1)',
+            '#  t=0   v1:8  v2:0',
+            '#  t=20  v1:7  v2:2     ← v2 readyz OK 까지 트래픽 X',
+            '#  t=40  v1:6  v2:3',
+            '#   ...',
+            '#  t=120 v1:0  v2:8     ← 완료',
+            '#',
+            '# 장점 : k8s 가 자동, 사람이 안 봐도 됨, 무중단',
+            '# 단점 : 일시적으로 v1+v2 공존',
+            '#        → 호환되지 않으면 5XX 가 일부 사용자에게 노출',
+            '',
+            '# 안전 장치',
+            '# • progressDeadlineSeconds: 600  (10분 안 끝나면 실패)',
+            '# • kubectl rollout undo deployment/orders  (즉시 롤백)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 25, 26, 27, 28, 29, 30, 36, 37],
+        },
+      },
+      {
+        title: 'Step 2. Blue-Green — 새 환경 다 띄우고 한 번에 전환',
+        desc: 'v1(blue) 그대로 둔 채 v2(green) 를 같은 규모로 새로 띄운다. green 이 완전 준비된 뒤 LB/Service selector 만 바꿔 트래픽을 한 방에 옮긴다. 롤백은 selector 만 다시 되돌리면 끝(즉시). 단점은 잠시 리소스 2배가 필요하고, DB 스키마는 forward-compatible 해야 한다.',
+        scenario: 'bluegreen',
+        v1: 8,
+        v2: 8,
+        v2Traffic: 100,
+        errorRate: 0.1,
+        verdict: '즉시 전환',
+        verdictTone: 'good',
+        keyPoint: 'Blue-Green = "스위치 한 번에 전환 + 즉시 롤백". 리소스 2배가 트레이드오프.',
+        code: {
+          lang: 'yaml',
+          filename: 'blue_green.yaml',
+          lines: [
+            '# 1) blue 와 green 두 개의 Deployment',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata: { name: orders-blue }',
+            'spec:',
+            '  replicas: 8',
+            '  selector: { matchLabels: { app: orders, color: blue } }',
+            '  template:',
+            '    metadata: { labels: { app: orders, color: blue } }',
+            '    spec:',
+            '      containers:',
+            '        - { name: orders, image: registry/orders:1.0.0 }',
+            '---',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata: { name: orders-green }',
+            'spec:',
+            '  replicas: 8',
+            '  selector: { matchLabels: { app: orders, color: green } }',
+            '  template:',
+            '    metadata: { labels: { app: orders, color: green } }',
+            '    spec:',
+            '      containers:',
+            '        - { name: orders, image: registry/orders:2.0.0 }',
+            '---',
+            '# 2) Service selector 가 트래픽을 결정',
+            'apiVersion: v1',
+            'kind: Service',
+            'metadata: { name: orders }',
+            'spec:',
+            '  selector:',
+            '    app: orders',
+            '    color: blue       # ← 현재 사용 중',
+            '  ports: [{ port: 80, targetPort: 8000 }]',
+            '',
+            '# 3) 전환 (한 줄)',
+            '#   kubectl patch svc orders -p \'{"spec":{"selector":{"color":"green"}}}\'',
+            '#',
+            '#   → 100% 트래픽이 green 으로',
+            '#   → 문제 생기면 다시 blue 로 patch (rollback < 1s)',
+            '#',
+            '# 4) 검증 끝나면 blue Deployment 삭제',
+            '#   kubectl delete deployment orders-blue',
+            '',
+            '# 장점',
+            '#  • 즉시 100% 전환 / 즉시 롤백',
+            '#  • 사전에 green 풀 검증 가능',
+            '# 단점',
+            '#  • 리소스 잠시 2배',
+            '#  • DB 스키마는 forward-compatible 필요',
+            '#  • 트래픽 패턴 따라 첫 분 cold start 위험',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 14, 15, 16, 17, 18, 19, 27, 28, 29, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 41, 43, 44, 46, 47, 48, 49, 50, 51, 52],
+        },
+      },
+      {
+        title: 'Step 3. Canary — 1% → 10% → 50% → 100% 점진적 노출',
+        desc: '신버전을 소수 사용자에게만 보내 실측 지표(에러율, 지연, 비즈니스 메트릭) 를 보고 단계적으로 비중을 늘린다. 문제가 보이면 비중을 줄이거나 0으로 되돌린다. Istio/Argo Rollouts/Flagger 같은 도구로 자동화 가능.',
+        scenario: 'canary',
+        v1: 8,
+        v2: 2,
+        v2Traffic: 10,
+        errorRate: 0.4,
+        verdict: '점진적',
+        verdictTone: 'good',
+        keyPoint: 'Canary = "위험을 작은 비중에 가둠". 실제 트래픽으로 검증한다는 점에서 가장 안전.',
+        code: {
+          lang: 'yaml',
+          filename: 'canary_argo.yaml',
+          lines: [
+            '# Argo Rollouts — 카나리 단계 자동화',
+            'apiVersion: argoproj.io/v1alpha1',
+            'kind: Rollout',
+            'metadata: { name: orders }',
+            'spec:',
+            '  replicas: 10',
+            '  strategy:',
+            '    canary:',
+            '      canaryService: orders-canary    # 새 버전 트래픽',
+            '      stableService: orders-stable    # 안정 버전 트래픽',
+            '      trafficRouting:',
+            '        istio:',
+            '          virtualService:',
+            '            name: orders-vs',
+            '            routes: [primary]',
+            '      steps:',
+            '        - setWeight: 1     # 1%',
+            '        - pause:    { duration: 5m }',
+            '        - setWeight: 10    # 10%',
+            '        - pause:    { duration: 10m }',
+            '        - analysis:        # 메트릭 자동 검사',
+            '            templates: [{ templateName: success-rate }]',
+            '        - setWeight: 50    # 50%',
+            '        - pause:    { duration: 15m }',
+            '        - setWeight: 100   # 완료',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - { name: orders, image: registry/orders:2.0.0 }',
+            '---',
+            '# AnalysisTemplate — 자동 promotion / rollback 기준',
+            'apiVersion: argoproj.io/v1alpha1',
+            'kind: AnalysisTemplate',
+            'metadata: { name: success-rate }',
+            'spec:',
+            '  metrics:',
+            '    - name: success-rate',
+            '      successCondition: result[0] >= 0.99',
+            '      failureLimit: 2',
+            '      provider:',
+            '        prometheus:',
+            '          address: http://prom:9090',
+            '          query: |',
+            '            sum(rate(http_requests_total{',
+            '              service="orders-canary", code=~"2.."}[2m]))',
+            '            /',
+            '            sum(rate(http_requests_total{',
+            '              service="orders-canary"}[2m]))',
+            '',
+            '# 동작',
+            '#  1%   5분 관찰 → success 99% 이상이면 다음 단계',
+            '#  10%  Prometheus 쿼리로 자동 분석 → 실패면 자동 abort',
+            '#  50% → 100% 까지 자동 진행',
+          ],
+          highlight: [3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55],
+        },
+      },
+      {
+        title: 'Step 4. Feature Flag 와 결합 — 코드와 배포를 분리',
+        desc: 'Canary 와 별개로 Feature Flag 는 "코드는 다 배포돼 있지만 사용자별로 기능을 켜고 끈다". 카나리(인프라 단계) + 플래그(앱 단계) 를 같이 쓰면 (a) 신기능을 베타 사용자 1% 에게만 보여주거나 (b) 장애 시 코드 재배포 없이 플래그만 꺼서 즉시 회피할 수 있다.',
+        scenario: 'flag',
+        v1: 0,
+        v2: 10,
+        v2Traffic: 100,
+        errorRate: 0.1,
+        flagOn: 10,
+        verdict: '코드/배포 분리',
+        verdictTone: 'good',
+        keyPoint: '"배포 = 코드 노출" 이 아니라 "배포 = 코드 도달", "플래그 = 사용자 노출" 로 분리. 디플로이와 릴리즈를 분리한다.',
+        code: {
+          lang: 'python',
+          filename: 'feature_flag.py',
+          lines: [
+            '"""Feature Flag — 사용자 단위로 기능 토글"""',
+            '# 라이브러리 예: Unleash, LaunchDarkly, OpenFeature',
+            'from openfeature import api',
+            'from fastapi import APIRouter, Depends',
+            '',
+            'router = APIRouter()',
+            '',
+            '@router.post("/orders")',
+            'def create_order(dto: OrderIn, user: User = Depends(get_user)):',
+            '    """v2 가격 엔진을 일부 사용자에게만 적용"""',
+            '    client = api.get_client()',
+            '',
+            '    use_v2_pricing = client.get_boolean_value(',
+            '        flag_key="pricing_v2",',
+            '        default_value=False,',
+            '        evaluation_context={',
+            '            "targetingKey": user.id,',
+            '            "country":      user.country,',
+            '            "beta_group":   user.beta,',
+            '        },',
+            '    )',
+            '',
+            '    if use_v2_pricing:',
+            '        total = price_engine_v2(dto)',
+            '    else:',
+            '        total = price_engine_v1(dto)',
+            '',
+            '    return service.create(dto, total=total)',
+            '',
+            '# 운영 패턴',
+            '# 1) 코드 배포 (v2 한참 전에 배포 가능, 0% 노출)',
+            '# 2) 내부 직원 100% 토글 → 사내 검증',
+            '# 3) 베타 1% → 10% → 50% → 100% (UI 한 번 클릭)',
+            '# 4) 장애 시 토글 OFF → 즉시 v1 동작 (재배포 X)',
+            '#',
+            '# 카나리 vs 플래그',
+            '#  카나리 = 인프라 단계 (트래픽 비중)',
+            '#  플래그 = 앱 단계 (사용자 별 분기)',
+            '#  → 같이 쓰면 (a) 베타 5% × (b) v2 코드',
+            '#',
+            '# 주의',
+            '#  • 플래그가 너무 많으면 코드가 if 지옥',
+            '#  • 라이프사이클 (정리 시점) 관리 필수',
+            '#  • 플래그 평가 자체 SLO 와 캐싱 전략',
+          ],
+          highlight: [3, 4, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35, 37, 38, 39, 40, 42, 43, 44],
+        },
+      },
+      {
+        title: 'Step 5. Auto-rollback — 메트릭 기반 자동 복구',
+        desc: 'Prometheus 의 에러율/지연 메트릭, 비즈니스 KPI(주문 성공률, 결제 실패) 를 보고 임계치 초과 시 카나리 도구가 자동으로 비중을 0으로 돌린다. 사람이 자다가 깰 필요가 없다. 단, 메트릭의 시그널 노이즈 (false alarm) 와 시간 윈도우 설정이 중요.',
+        scenario: 'rollback',
+        v1: 8,
+        v2: 2,
+        v2Traffic: 0,
+        errorRate: 3.2,
+        verdict: 'Auto-rollback',
+        verdictTone: 'warn',
+        summary: {
+          title: '무중단 배포 전략 비교',
+          rows: [
+            { metric: 'Rolling',     before: '리소스 적음',    after: 'v1/v2 공존',         delta: '간단' },
+            { metric: 'Blue-Green',  before: '리소스 2배',    after: '즉시 전환·롤백',      delta: '안전' },
+            { metric: 'Canary',      before: '관찰 필요',     after: '점진 + 자동 분석',    delta: '정밀' },
+            { metric: 'Flag',        before: '배포=릴리즈',   after: '디플로이 ≠ 릴리즈',   delta: '유연' },
+            { metric: 'Auto-rollback', before: '사람 콜',     after: 'SLO 기반 자동',       delta: '즉시' },
+          ],
+        },
+        keyPoint: 'Rolling = 기본기, Blue-Green = 한 방, Canary = 정밀, Flag = 유연, Auto-rollback = 안전망. 같이 쓰면 진짜 무중단.',
+        code: {
+          lang: 'yaml',
+          filename: 'auto_rollback.yaml',
+          lines: [
+            '# Flagger / Argo Rollouts 자동 롤백 설정 발췌',
+            'apiVersion: flagger.app/v1beta1',
+            'kind: Canary',
+            'metadata: { name: orders }',
+            'spec:',
+            '  targetRef: { name: orders, kind: Deployment }',
+            '  service: { port: 80 }',
+            '  analysis:',
+            '    interval: 1m',
+            '    threshold: 5            # 5번 실패 → 자동 rollback',
+            '    stepWeight: 10',
+            '    maxWeight: 100',
+            '    metrics:',
+            '      - name: request-success-rate',
+            '        thresholdRange: { min: 99 }   # 99% 미만이면 fail',
+            '        interval: 1m',
+            '      - name: request-duration',
+            '        thresholdRange: { max: 500 }  # P99 < 500ms',
+            '        interval: 1m',
+            '      - name: payment-success-rate    # 비즈니스 KPI',
+            '        thresholdRange: { min: 95 }',
+            '',
+            '# 동작 (사고 시나리오)',
+            '#  • 10% 단계에서 success rate 97% → threshold 99% 위반',
+            '#  • 1분 후 동일 → fail 카운트 1',
+            '#  • 5번 누적 → 자동 rollback (weight 0)',
+            '#  • Slack 알림 + Grafana 그래프 링크',
+            '#',
+            '# 운영 체크리스트',
+            '#  1. 메트릭은 시간 윈도우 충분히 (트래픽 적으면 노이즈)',
+            '#  2. 비즈니스 KPI 포함 (HTTP 200 인데 결제는 실패할 수 있음)',
+            '#  3. rollback 도 SLO — 1분 안에 끝나야 사용자 영향 최소',
+            '#  4. 롤백 후 post-mortem 자동 트리거',
+            '',
+            '# 4가지 전략 의사결정',
+            '#  • 빠른 hotfix     → Rolling (k8s 기본)',
+            '#  • Big-bang 안전   → Blue-Green',
+            '#  • 위험한 변경     → Canary + Auto-rollback',
+            '#  • 사용자별 베타   → Feature Flag',
+            '#  • 다 합쳐서 사용  → 진짜 무중단',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 41],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function TrafficBar({ v2Pct }) {
+      return (
+        <div className="rounded border border-cyan-300 bg-white overflow-hidden">
+          <div className="flex h-7 text-[10px] font-mono">
+            <div className="flex items-center justify-center bg-cyan-200 text-cyan-900" style={{ width: `${100 - v2Pct}%` }}>
+              {100 - v2Pct > 5 ? `v1 ${100 - v2Pct}%` : ''}
+            </div>
+            <div className="flex items-center justify-center bg-cyan-700 text-white" style={{ width: `${v2Pct}%` }}>
+              {v2Pct > 5 ? `v2 ${v2Pct}%` : ''}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function PodRow({ label, count, color }) {
+      return (
+        <div className="flex items-center gap-1.5 text-xs">
+          <span className={`w-12 font-mono ${color}`}>{label}</span>
+          <div className="flex gap-1">
+            {Array.from({ length: 10 }).map((_, i) => (
+              <div key={i} className={`w-3.5 h-3.5 rounded-sm ${
+                i < count
+                  ? label === 'v1' ? 'bg-cyan-300 border border-cyan-500' : 'bg-cyan-700 border border-cyan-800'
+                  : 'bg-cyan-50 border border-cyan-200'
+              }`} />
+            ))}
+          </div>
+          <span className="ml-1 font-mono text-cyan-700">{count}</span>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-cyan-400 bg-white p-3">
+          <div className="text-sm font-bold text-cyan-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-cyan-600 border-b border-cyan-200">
+                <th className="py-1 pr-2">전략</th><th className="py-1 pr-2">Before</th><th className="py-1 pr-2">After</th><th className="py-1">특징</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-cyan-50">
+                  <td className="py-1 pr-2 font-medium text-cyan-800">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono">{r.after}</td>
+                  <td className="py-1 text-cyan-900 font-bold">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const errTone = state.errorRate > 1 ? 'text-rose-700' : state.errorRate > 0.5 ? 'text-amber-700' : 'text-emerald-700';
+      return (
+        <div className="rounded-xl border border-cyan-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-cyan-800">배포 트래픽 분배</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="rounded-lg bg-gradient-to-br from-cyan-50 to-sky-50 border border-cyan-200 p-3">
+            <div className="text-[10px] text-cyan-700 mb-1.5">트래픽 비중</div>
+            <TrafficBar v2Pct={state.v2Traffic} />
+
+            <div className="mt-3 space-y-1.5">
+              <PodRow label="v1" count={state.v1} color="text-cyan-700" />
+              <PodRow label="v2" count={state.v2} color="text-cyan-900" />
+            </div>
+          </div>
+
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <div className="rounded-lg border bg-cyan-50 border-cyan-300 px-3 py-2">
+              <div className="text-[10px] text-cyan-800">v2 트래픽</div>
+              <div className="text-lg font-bold text-cyan-900 font-mono">{state.v2Traffic}%</div>
+            </div>
+            <div className={`rounded-lg border px-3 py-2 ${state.errorRate > 1 ? 'bg-rose-50 border-rose-300' : 'bg-emerald-50 border-emerald-300'}`}>
+              <div className="text-[10px] text-cyan-800">v2 에러율</div>
+              <div className={`text-lg font-bold font-mono ${errTone}`}>{state.errorRate}%</div>
+            </div>
+          </div>
+
+          {state.flagOn !== undefined && (
+            <div className="mt-2 rounded-lg bg-cyan-100 border border-cyan-300 px-3 py-2 text-xs text-cyan-900">
+              🚩 Feature Flag <span className="font-mono font-bold">pricing_v2</span> ON 비율: <span className="font-mono font-bold">{state.flagOn}%</span> (앱 단계 노출)
+            </div>
+          )}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-cyan-900 bg-cyan-100 border border-cyan-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-cyan-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-cyan-800 border-b border-cyan-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-cyan-100 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-cyan-200">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-cyan-500/25 border-l-2 border-cyan-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-cyan-800 border-t border-cyan-700 flex items-center justify-between text-[10px] text-cyan-200">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-cyan-50 to-sky-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: '#0e7490' }}>M</span>
+              <div>
+                <h1 className="text-2xl font-bold text-cyan-900">Chapter IV-1-2. Blue-Green / Canary / Rolling</h1>
+                <p className="text-sm text-cyan-800/80">Rolling → Blue-Green → Canary → Feature Flag → Auto-rollback</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-cyan-800 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-cyan-700' : 'bg-cyan-100'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-cyan-50 px-5 py-4 shadow" style={{ backgroundColor: '#0e7490' }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-cyan-50/95 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-cyan-300 bg-white text-cyan-700 hover:bg-cyan-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-cyan-300 bg-white text-cyan-700 hover:bg-cyan-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-cyan-900 text-white' : 'bg-cyan-700 text-white hover:bg-cyan-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-cyan-300 bg-white text-cyan-700 hover:bg-cyan-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-cyan-700 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-cyan-400 bg-white px-4 py-3 text-sm text-cyan-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Rolling 은 기본, Blue-Green 은 한 번에 전환·즉시 롤백, Canary 는 점진적 안전, Feature Flag 는 코드/노출 분리, Auto-rollback 은 메트릭 기반 자동 복구. 5가지를 상황에 맞게 조합하면 진짜 무중단 배포가 된다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Rolling', 'Blue-Green', 'Canary', 'Argo Rollouts', 'Feature Flag', 'Auto-rollback'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-cyan-100 text-cyan-800 border border-cyan-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-cyan-800">
+              <a href="./IV-1-1.html" className="underline hover:no-underline">← 이전: IV-1-1 Container + k8s</a>
+              <a href="./IV-2-1.html" className="underline hover:no-underline">다음: IV-2-1 Service Mesh →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

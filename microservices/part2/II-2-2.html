@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Microservices 학습 — II-2-2. Circuit Breaker + Bulkhead</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛡️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Microservices Chapter II-2-2 — Circuit Breaker + Bulkhead
+    학습 목표: 도미노 장애, Circuit Breaker 3상태, Hystrix/Resilience4j, Bulkhead, Timeout+Retry.
+    패턴: fastapi v1 — 좌(LiveDataPane: CB 상태) / 우(CodeViewer)
+    색상: deep cyan #0e7490
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 한 서비스 장애 → 도미노 — Cascade Failure',
+        desc: 'payment-service 가 응답 3초씩 지연. order-service 가 호출하면 스레드 3초씩 잡힘. 트래픽 200 req/s 면 600개 스레드가 점유. order 도 곧 죽음. order 가 죽으면 frontend 가 죽음. 한 서비스 장애가 전체로 퍼진다. MSA 의 가장 큰 위험.',
+        cbState: 'CLOSED',
+        failureRate: 95,
+        availability: 5,
+        verdict: '도미노 진행',
+        verdictTone: 'danger',
+        diagram: 'cascade',
+        keyPoint: '동기 호출은 호출 측 스레드를 점유한다. 한 곳의 지연이 호출 체인 전체로 퍼진다.',
+        code: {
+          lang: 'java',
+          filename: 'cascade-failure.java',
+          lines: [
+            '// ❌ 보호 없음 — Cascade Failure 시나리오',
+            '',
+            '@Service',
+            'public class OrderService {',
+            '    private final PaymentClient paymentClient;',
+            '',
+            '    public OrderResult place(Cmd cmd) {',
+            '        // payment-service 가 살아있다는 가정으로 호출',
+            '        var result = paymentClient.charge(cmd);  // ⚠ timeout 도 없음',
+            '        return /* ... */;',
+            '    }',
+            '}',
+            '',
+            '// 시나리오: payment-service 가 갑자기 응답 3초씩 지연',
+            '',
+            '// t=0s   order 200 req/s 들어옴',
+            '//        → 200개 스레드가 payment 호출, 3초씩 대기',
+            '//',
+            '// t=1s   다음 200 req/s 들어옴',
+            '//        → 또 200 스레드, 총 400 점유',
+            '//',
+            '// t=3s   첫 200개 완료 (3초 걸려서)',
+            '//        그동안 600개 더 쌓임',
+            '//        order 스레드 풀 800 / 1000',
+            '//',
+            '// t=5s   order 스레드 풀 1000/1000 → 새 요청 거부',
+            '//        order 도 사실상 죽음',
+            '//',
+            '// t=10s  frontend 가 order 호출 → timeout',
+            '//        frontend 도 응답 안 함',
+            '//',
+            '// → 전체 시스템 다운',
+            '// → 원인은 payment 하나였는데 전체가 죽음',
+            '',
+            '// 필요한 것들 (다음 step 부터)',
+            '// 1) Timeout — 무한 대기 금지',
+            '// 2) Circuit Breaker — 빠른 실패',
+            '// 3) Bulkhead — 자원 격리',
+            '// 4) Retry — 일시적 오류 흡수',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 19, 20, 22, 23, 24, 25, 27, 28, 30, 31, 33, 34, 35, 37, 38, 39, 40],
+        },
+      },
+      {
+        title: 'Step 2. Circuit Breaker — CLOSED / OPEN / HALF-OPEN',
+        desc: '전기 차단기처럼: 실패율이 임계치를 넘으면 회로를 OPEN (호출 차단) → 일정 시간 후 HALF-OPEN (몇 개 시범 호출) → 성공하면 CLOSED (정상) → 실패하면 다시 OPEN. 핵심은 OPEN 상태에서 즉시 실패시켜 스레드를 잡지 않는다.',
+        cbState: 'OPEN',
+        failureRate: 100,
+        availability: 60,
+        verdict: 'CB 차단 중',
+        verdictTone: 'warn',
+        diagram: 'cb-states',
+        keyPoint: 'CB 의 핵심은 "빨리 실패" — 100ms 안에 fallback. 3초 대기보다 즉시 실패가 훨씬 낫다.',
+        code: {
+          lang: 'java',
+          filename: 'resilience4j-cb.java',
+          lines: [
+            '// Resilience4j — Circuit Breaker',
+            '// (Hystrix 는 maintenance 모드, Resilience4j 가 후속 표준)',
+            '',
+            '// application.yml',
+            '// resilience4j.circuitbreaker:',
+            '//   instances:',
+            '//     paymentCB:',
+            '//       failureRateThreshold: 50      # 실패율 50% 넘으면 OPEN',
+            '//       slowCallDurationThreshold: 2s # 2초 넘으면 slow 로 카운트',
+            '//       slowCallRateThreshold: 50',
+            '//       waitDurationInOpenState: 10s  # OPEN 후 10초 뒤 HALF-OPEN',
+            '//       permittedNumberOfCallsInHalfOpenState: 5',
+            '//       slidingWindowSize: 20         # 최근 20개 측정',
+            '//       minimumNumberOfCalls: 10',
+            '',
+            '// 코드',
+            '@Service',
+            'public class OrderService {',
+            '    private final PaymentClient paymentClient;',
+            '',
+            '    @CircuitBreaker(name = "paymentCB", fallbackMethod = "chargeFallback")',
+            '    public OrderResult place(Cmd cmd) {',
+            '        var result = paymentClient.charge(cmd);',
+            '        return OrderResult.success(result);',
+            '    }',
+            '',
+            '    // CB 가 OPEN 일 때 호출되는 fallback',
+            '    public OrderResult chargeFallback(Cmd cmd, Exception ex) {',
+            '        log.warn("payment CB open, queueing for retry");',
+            '        // 옵션 1) 큐에 넣고 나중에 처리',
+            '        outboxRepo.save(new PendingPayment(cmd));',
+            '        return OrderResult.pending(cmd.orderId());',
+            '        // 옵션 2) 빠른 실패 — return Error',
+            '        // 옵션 3) 캐시된 응답 반환',
+            '    }',
+            '}',
+            '',
+            '// 3가지 상태',
+            '//',
+            '// CLOSED   — 정상. 모든 호출 통과. 실패율 측정 중.',
+            '// OPEN     — 실패율 초과. 모든 호출 즉시 fallback. (예: 10초)',
+            '// HALF-OPEN— 시범 호출 5개. 성공하면 CLOSED, 실패하면 OPEN.',
+            '//',
+            '// 효과',
+            '// - OPEN 상태에서 호출 0.1ms 만에 fallback',
+            '// - payment 회복할 시간 확보',
+            '// - order 스레드 점유 방지',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48],
+        },
+      },
+      {
+        title: 'Step 3. Resilience4j — Hystrix 의 후속 표준',
+        desc: 'Netflix Hystrix 는 2018년 maintenance 모드(neue 개발 중단). 후속이 Resilience4j — 함수형 + 더 가벼움 + JDK 8+. CB, RateLimiter, Retry, Bulkhead, TimeLimiter 모두 제공. Spring Boot 와 통합 좋아 사실상 Java MSA 표준.',
+        cbState: 'CLOSED',
+        failureRate: 5,
+        availability: 99.5,
+        verdict: 'Resilience4j',
+        verdictTone: 'good',
+        diagram: 'resilience4j',
+        keyPoint: 'Hystrix 는 더 쓰지 말 것. Resilience4j 가 현재 표준. 함수형 데코레이터로 깔끔.',
+        code: {
+          lang: 'java',
+          filename: 'resilience4j-stack.java',
+          lines: [
+            '// Resilience4j 의 5가지 모듈 — 함수형 데코레이터',
+            '',
+            '// 1. CircuitBreaker',
+            'CircuitBreaker cb = CircuitBreaker.ofDefaults("payment");',
+            '',
+            '// 2. RateLimiter — 초당 호출 제한',
+            'RateLimiter rateLimiter = RateLimiter.of("payment",',
+            '    RateLimiterConfig.custom()',
+            '        .limitForPeriod(100)',
+            '        .limitRefreshPeriod(Duration.ofSeconds(1))',
+            '        .build());',
+            '',
+            '// 3. Retry — 일시적 실패 흡수',
+            'Retry retry = Retry.of("payment",',
+            '    RetryConfig.custom()',
+            '        .maxAttempts(3)',
+            '        .intervalFunction(IntervalFunction.ofExponentialBackoff(',
+            '            Duration.ofMillis(100), 2))   // 100ms, 200ms, 400ms',
+            '        .retryOnException(e -> e instanceof IOException)',
+            '        .build());',
+            '',
+            '// 4. Bulkhead — 동시 호출 수 제한',
+            'Bulkhead bulkhead = Bulkhead.of("payment",',
+            '    BulkheadConfig.custom()',
+            '        .maxConcurrentCalls(20)',
+            '        .maxWaitDuration(Duration.ofMillis(100))',
+            '        .build());',
+            '',
+            '// 5. TimeLimiter — 시간 초과 차단',
+            'TimeLimiter timeLimiter = TimeLimiter.of("payment",',
+            '    TimeLimiterConfig.custom()',
+            '        .timeoutDuration(Duration.ofSeconds(2))',
+            '        .build());',
+            '',
+            '// 합성 — 데코레이터 체이닝',
+            'Supplier<PaymentResult> supplier = () -> paymentClient.charge(cmd);',
+            'supplier = Decorators.ofSupplier(supplier)',
+            '    .withCircuitBreaker(cb)',
+            '    .withRateLimiter(rateLimiter)',
+            '    .withRetry(retry)',
+            '    .withBulkhead(bulkhead)',
+            '    .decorate();',
+            '',
+            'try {',
+            '    var result = supplier.get();',
+            '} catch (Exception e) {',
+            '    // 모든 보호가 실패 시',
+            '    return OrderResult.failed();',
+            '}',
+            '',
+            '// Spring Boot 통합 — annotation 으로 간단히',
+            '// @CircuitBreaker @Retry @Bulkhead @TimeLimiter',
+            '// 또는 application.yml 만으로 설정',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 36, 37, 38, 39, 40, 41, 42, 51, 52, 53],
+        },
+      },
+      {
+        title: 'Step 4. Bulkhead — 스레드 풀 격리 (선박의 격벽)',
+        desc: '선박이 한 칸이 침수돼도 다른 칸은 안전한 것처럼, 외부 호출별로 스레드 풀을 분리한다. payment 가 느려져도 product 호출 풀은 영향 없음. 자원 격리가 핵심. 두 가지 구현: ① 세마포어 (가볍게 동시 수 제한) ② 별도 스레드 풀.',
+        cbState: 'CLOSED',
+        failureRate: 5,
+        availability: 99.9,
+        verdict: '격벽',
+        verdictTone: 'good',
+        diagram: 'bulkhead',
+        keyPoint: 'Bulkhead 없으면 한 외부 호출이 전체 스레드 풀을 잠식. 외부 의존성마다 별도 풀.',
+        code: {
+          lang: 'java',
+          filename: 'bulkhead-isolation.java',
+          lines: [
+            '// Bulkhead — 외부 의존성별 스레드 풀 격리',
+            '',
+            '// ❌ 안티 — 한 풀에 모두 섞임',
+            '// Tomcat 기본 200 스레드',
+            '// payment 호출이 3초씩 지연 → 200 스레드 다 점유',
+            '// product 호출이 들어와도 스레드 없음 → 거부',
+            '',
+            '// ✅ 격벽 — 의존성별 풀 분리',
+            '',
+            '// application.yml',
+            '// resilience4j.bulkhead:',
+            '//   instances:',
+            '//     payment:',
+            '//       maxConcurrentCalls: 20',
+            '//       maxWaitDuration: 100ms',
+            '//     product:',
+            '//       maxConcurrentCalls: 50',
+            '//       maxWaitDuration: 50ms',
+            '//     inventory:',
+            '//       maxConcurrentCalls: 30',
+            '',
+            '// 코드',
+            '@Service',
+            'public class OrderService {',
+            '',
+            '    @Bulkhead(name = "payment", type = Type.SEMAPHORE)',
+            '    public PaymentResult charge(Cmd cmd) {',
+            '        return paymentClient.charge(cmd);',
+            '    }',
+            '',
+            '    @Bulkhead(name = "product", type = Type.SEMAPHORE)',
+            '    public ProductDto getProduct(Long id) {',
+            '        return productClient.getProduct(id);',
+            '    }',
+            '',
+            '    @Bulkhead(name = "inventory", type = Type.SEMAPHORE)',
+            '    public InventoryDto checkStock(Long id) {',
+            '        return inventoryClient.check(id);',
+            '    }',
+            '}',
+            '',
+            '// 동작',
+            '// - payment 동시 호출 = 최대 20',
+            '// - 21번째 호출은 100ms 대기 후 BulkheadFullException',
+            '// - product 와 inventory 는 별도 카운터 — 영향 없음',
+            '',
+            '// 두 가지 타입',
+            '// Type.SEMAPHORE — 가벼움, 같은 스레드에서 카운트',
+            '// Type.THREADPOOL — 별도 스레드, 비동기 효과 (Mono/Future 반환)',
+            '',
+            '// 효과',
+            '// payment 지연 → payment 풀 20개 점유',
+            '// product 호출은 50개 풀 그대로 사용 가능',
+            '// → 한 의존성 장애가 다른 호출 영향 0',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 48, 49, 50, 52, 53, 54, 55],
+        },
+      },
+      {
+        title: 'Step 5. Timeout + Retry — 일시적 오류 흡수',
+        desc: 'Timeout 없이 호출하면 무한 대기. 0.5~3초 timeout 이 표준. Retry 는 지수 백오프(100, 200, 400ms) 최대 3회. 단, 중복 처리되면 안 되는 작업(결제)은 idempotency key 필수. CB + Timeout + Retry + Bulkhead 가 한 세트.',
+        cbState: 'CLOSED',
+        failureRate: 3,
+        availability: 99.95,
+        verdict: '4종 세트',
+        verdictTone: 'good',
+        diagram: 'four-set',
+        summary: {
+          title: '안정성 패턴 4종 세트',
+          rows: [
+            { metric: 'Timeout', before: '무한 대기 방지', after: '0.5~3s 권장' },
+            { metric: 'Retry', before: '일시 오류 흡수', after: '지수 backoff, 3회 max' },
+            { metric: 'Circuit Breaker', before: '빠른 실패', after: '50% 실패율 → OPEN' },
+            { metric: 'Bulkhead', before: '자원 격리', after: '의존성별 풀' },
+            { metric: 'Idempotency', before: '중복 방지', after: 'POST 마다 key' },
+          ],
+        },
+        keyPoint: 'CB · Timeout · Retry · Bulkhead 는 한 세트. 하나만 빠져도 cascade failure 가능.',
+        code: {
+          lang: 'java',
+          filename: 'full-resilience-stack.java',
+          lines: [
+            '// 풀 스택 — Timeout + Retry + CB + Bulkhead + Idempotency',
+            '',
+            '@Service',
+            'public class OrderService {',
+            '    private final PaymentClient paymentClient;',
+            '',
+            '    @TimeLimiter(name = "payment")',
+            '    @CircuitBreaker(name = "payment", fallbackMethod = "fallback")',
+            '    @Retry(name = "payment")',
+            '    @Bulkhead(name = "payment")',
+            '    public CompletableFuture<PaymentResult> charge(Cmd cmd) {',
+            '        // idempotency key — 같은 요청은 한 번만 처리',
+            '        return CompletableFuture.supplyAsync(() ->',
+            '            paymentClient.charge(',
+            '                cmd, IdempotencyKey.from(cmd.orderId())));',
+            '    }',
+            '',
+            '    public CompletableFuture<PaymentResult> fallback(Cmd cmd, Throwable e) {',
+            '        log.warn("payment 모든 보호 실패, queue 로", e);',
+            '        outboxRepo.save(new PendingPayment(cmd));',
+            '        return CompletableFuture.completedFuture(',
+            '            PaymentResult.pending());',
+            '    }',
+            '}',
+            '',
+            '// application.yml',
+            'resilience4j:',
+            '  timelimiter.instances.payment:',
+            '    timeoutDuration: 2s',
+            '    cancelRunningFuture: true',
+            '',
+            '  retry.instances.payment:',
+            '    maxAttempts: 3',
+            '    waitDuration: 100ms',
+            '    intervalBiFunction: exponentialBackoff',
+            '    exponentialBackoffMultiplier: 2',
+            '    retryExceptions:',
+            '      - java.io.IOException',
+            '      - java.util.concurrent.TimeoutException',
+            '',
+            '  circuitbreaker.instances.payment:',
+            '    failureRateThreshold: 50',
+            '    waitDurationInOpenState: 10s',
+            '    slidingWindowSize: 20',
+            '',
+            '  bulkhead.instances.payment:',
+            '    maxConcurrentCalls: 20',
+            '    maxWaitDuration: 100ms',
+            '',
+            '# 호출 흐름',
+            '# 1) Bulkhead — 동시 20개만 (초과 = wait or fail)',
+            '# 2) CircuitBreaker — OPEN 이면 즉시 fallback',
+            '# 3) TimeLimiter — 2초 안에 끝나야',
+            '# 4) Retry — 실패 시 3회 재시도 (idempotent key 필수)',
+            '# 5) 다 실패하면 fallback → outbox queue',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 53, 54, 55, 56, 57, 58, 59],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800', bar: 'bg-emerald-400' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800',     bar: 'bg-amber-400' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800',       bar: 'bg-rose-400' },
+    };
+
+    function MetricCard({ label, value, unit, max, current, tone }) {
+      const t = TONE[tone] || TONE.warn;
+      const pct = Math.min(100, (current / max) * 100);
+      return (
+        <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+          <div className="flex justify-between items-baseline mb-1">
+            <span className={`text-xs ${t.text}`}>{label}</span>
+            <span className={`text-sm font-mono font-bold ${t.text}`}>
+              {value}<span className="text-xs opacity-70">{unit}</span>
+            </span>
+          </div>
+          <div className="h-1.5 bg-white/60 rounded overflow-hidden">
+            <div className={`h-full ${t.bar}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+
+    function CBStatePill({ state }) {
+      const map = {
+        CLOSED: { color: 'bg-emerald-500', text: '닫힘 (정상)' },
+        OPEN:   { color: 'bg-rose-500',    text: '열림 (차단)' },
+        'HALF-OPEN': { color: 'bg-amber-500', text: '반열림 (시범)' },
+      };
+      const m = map[state] || map.CLOSED;
+      return (
+        <div className="rounded-lg border border-cyan-300 bg-white px-3 py-2 flex items-center gap-2">
+          <span className={`w-3 h-3 rounded-full ${m.color}`}></span>
+          <span className="text-xs text-cyan-900">CB 상태: <b>{state}</b></span>
+          <span className="ml-auto text-[10px] text-cyan-700">{m.text}</span>
+        </div>
+      );
+    }
+
+    function CBDiagram({ variant }) {
+      if (variant === 'cascade') {
+        return (
+          <div className="mt-2 rounded bg-rose-50 border border-rose-200 p-2 text-[10px] font-mono text-rose-900">
+            payment 3초 지연 → order 스레드 점유<br/>
+            order 스레드 풀 만석 → order 사망<br/>
+            frontend timeout → frontend 사망<br/>
+            <span className="opacity-70">cascade failure</span>
+          </div>
+        );
+      }
+      if (variant === 'cb-states') {
+        return (
+          <div className="mt-2 grid grid-cols-3 gap-1.5">
+            {[
+              { name: 'CLOSED', tone: 'bg-emerald-100 border-emerald-300 text-emerald-900' },
+              { name: 'OPEN', tone: 'bg-rose-100 border-rose-300 text-rose-900' },
+              { name: 'HALF', tone: 'bg-amber-100 border-amber-300 text-amber-900' },
+            ].map((s) => (
+              <div key={s.name} className={`rounded ${s.tone} border text-[10px] text-center py-1 font-mono`}>{s.name}</div>
+            ))}
+          </div>
+        );
+      }
+      if (variant === 'resilience4j') {
+        return (
+          <div className="mt-2 grid grid-cols-5 gap-1 text-[9px]">
+            {['CB', 'Rate', 'Retry', 'Bulk', 'Time'].map((m) => (
+              <div key={m} className="rounded bg-cyan-100 border border-cyan-300 text-center py-1 text-cyan-900 font-mono">{m}</div>
+            ))}
+          </div>
+        );
+      }
+      if (variant === 'bulkhead') {
+        return (
+          <div className="mt-2 rounded bg-cyan-50 border border-cyan-200 p-2 text-[10px] font-mono text-cyan-900">
+            [payment pool: 20] [product pool: 50] [inv pool: 30]<br/>
+            <span className="opacity-70">한 풀 점유 ≠ 다른 풀 영향</span>
+          </div>
+        );
+      }
+      if (variant === 'four-set') {
+        return (
+          <div className="mt-2 grid grid-cols-2 gap-1">
+            {['Timeout', 'Retry', 'CB', 'Bulkhead'].map((m) => (
+              <div key={m} className="rounded bg-cyan-100 border border-cyan-300 text-[10px] text-center py-1 text-cyan-900 font-mono">{m}</div>
+            ))}
+          </div>
+        );
+      }
+      return null;
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-cyan-400 bg-white p-3">
+          <div className="text-sm font-bold text-cyan-900 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-cyan-700 border-b border-cyan-200">
+                <th className="py-1 pr-2">패턴</th><th className="py-1 pr-2">역할</th><th className="py-1">설정</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-cyan-100">
+                  <td className="py-1 pr-2 font-medium text-cyan-900">{r.metric}</td>
+                  <td className="py-1 pr-2 text-cyan-900 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 text-cyan-900 font-mono text-[10px]">{r.after}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border border-cyan-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-cyan-900">CB · Bulkhead 상태</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2">
+            <CBStatePill state={state.cbState} />
+            <MetricCard label="payment 실패율" value={state.failureRate} unit="%" max={100} current={state.failureRate} tone={state.failureRate >= 50 ? 'danger' : state.failureRate >= 20 ? 'warn' : 'good'} />
+            <MetricCard label="전체 가용성" value={state.availability} unit="%" max={100} current={state.availability} tone={state.availability >= 99 ? 'good' : state.availability >= 90 ? 'warn' : 'danger'} />
+          </div>
+
+          <CBDiagram variant={state.diagram} />
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-auto pt-3 text-xs text-cyan-900 bg-cyan-50 border border-cyan-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-cyan-800 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-cyan-900 border-b border-cyan-800">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-cyan-100 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-cyan-200">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-cyan-500/25 border-l-2 border-cyan-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-cyan-900 border-t border-cyan-800 flex items-center justify-between text-[10px] text-cyan-200">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-cyan-50 to-sky-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap" style={{padding:'0.5rem'}}>
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{backgroundColor:'#0e7490'}}>M</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:'#0e7490'}}>Chapter II-2-2. Circuit Breaker + Bulkhead</h1>
+                <p className="text-sm text-cyan-800/80">cascade failure 방지의 4종 세트: CB · Timeout · Retry · Bulkhead</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-cyan-800 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{backgroundColor: i <= stepIdx ? '#0e7490' : '#cffafe'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-white px-5 py-4 shadow" style={{backgroundColor:'#0e7490'}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-cyan-50 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-cyan-300 bg-white text-cyan-800 hover:bg-cyan-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-cyan-300 bg-white text-cyan-800 hover:bg-cyan-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{backgroundColor: playing ? '#155e75' : '#0e7490'}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-cyan-300 bg-white text-cyan-800 hover:bg-cyan-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-cyan-700 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-cyan-400 bg-white px-4 py-3 text-sm text-cyan-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                cascade failure 방지에 4종 세트 필요: Circuit Breaker(빠른 실패), Bulkhead(자원 격리), Timeout(무한 대기 방지), Retry(일시 오류 흡수). Resilience4j 가 표준.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Circuit Breaker', 'Bulkhead', 'Resilience4j', 'Hystrix', 'Timeout', 'Retry'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-cyan-100 text-cyan-900 border border-cyan-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-cyan-800">
+              <a href="./II-2-1.html" className="underline hover:no-underline">← 이전: II-2-1</a>
+              <a href="../part3/III-1-1.html" className="underline hover:no-underline">다음: III-1-1 DB-per-Service →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
