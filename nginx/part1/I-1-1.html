@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nginx 학습 — I-1-1. 웹 서버란 (Event-driven)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🟢</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Nginx Chapter I-1-1 — 웹 서버란 (Event-driven)
+    학습 목표: Apache process-per-request 모델과 Nginx event-driven 모델의 차이를
+              C10K 문제와 메모리 사용량으로 설명한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 동시 연결 부하 시뮬레이션) / 우(VSCode CodeViewer)
+    색상: green (nginx 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Apache — 요청마다 프로세스/스레드 하나',
+        desc: 'Apache 의 전통적인 prefork MPM 은 요청 1건당 프로세스 1개를 띄운다. 100명이 동시 접속하면 프로세스 100개. 메모리는 평균 25MB/req. 100 × 25MB = 2.5GB. 코어 수 만큼 병렬 처리되지만, 그 이상은 컨텍스트 스위칭 오버헤드로 느려진다.',
+        connections: 100,
+        memPerConn: 25,
+        totalMem: 2500,
+        model: 'process-per-request',
+        verdict: '괜찮음',
+        verdictTone: 'good',
+        keyPoint: '소규모 사이트에서는 prefork 가 단순하고 안정적이다. 문제는 동시 연결이 늘어날 때.',
+        code: {
+          lang: 'apache',
+          filename: 'apache-prefork.conf',
+          lines: [
+            '# Apache prefork MPM — 요청마다 프로세스 1개',
+            '# /etc/apache2/mods-available/mpm_prefork.conf',
+            '',
+            '<IfModule mpm_prefork_module>',
+            '    StartServers          5',
+            '    MinSpareServers       5',
+            '    MaxSpareServers      10',
+            '    MaxRequestWorkers   150   # 동시 처리 최대 150개',
+            '    MaxConnectionsPerChild   0',
+            '</IfModule>',
+            '',
+            '# 동작 방식',
+            '#  • 요청 도착 → fork() → 자식 프로세스 1개 → 응답 → 종료',
+            '#  • 각 프로세스가 독립 메모리 공간 (mod_php, mod_perl 적재)',
+            '#  • 평균 RSS 20~30MB / 프로세스',
+            '',
+            '# 한계',
+            '#  • 150개 초과 요청은 큐에 대기 (응답 지연)',
+            '#  • 프로세스 fork 비용 (1~2ms per request)',
+            '#  • 100 동시 접속 = 2.5GB RAM 점유',
+            '#  • 1만 동시 접속 = 250GB RAM 필요 (불가능)',
+            '',
+            '# 그래서 Apache 는 "동시성 < 1000" 환경에 적합',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 18, 19, 20, 21, 22],
+        },
+      },
+      {
+        title: 'Step 2. C10K 문제 — 1만 동시 연결의 벽',
+        desc: '1999년 Dan Kegel 이 제기한 C10K 문제. "한 서버에서 동시 연결 1만 개를 어떻게 처리할 것인가?" Apache 모델로는 1만 × 25MB = 250GB 메모리가 필요해서 불가능. 컨텍스트 스위칭만으로 CPU 가 다 소모된다. 새로운 I/O 모델이 필요했다.',
+        connections: 10000,
+        memPerConn: 25,
+        totalMem: 250000,
+        model: 'process-per-request',
+        verdict: '한계 도달',
+        verdictTone: 'danger',
+        keyPoint: '동시성 1만을 process/thread 모델로 풀면 메모리도 CPU 도 폭발한다.',
+        code: {
+          lang: 'markdown',
+          filename: 'c10k-problem.md',
+          lines: [
+            '# C10K Problem (1999, Dan Kegel)',
+            '',
+            '## 문제 정의',
+            '> "한 서버에서 동시 연결(concurrent connections) 1만 개를',
+            '>  어떻게 효율적으로 처리할 것인가?"',
+            '',
+            '## 왜 Apache 모델로는 안 되는가',
+            '| 연결 수 | 메모리 (25MB/conn) | CPU context switch |',
+            '|:--|:--|:--|',
+            '| 100   | 2.5 GB   | 무시할 만 |',
+            '| 1,000 | 25 GB    | 빡빡함 |',
+            '| 10,000 | **250 GB** | 100% 소모 |',
+            '',
+            '## 근본 원인',
+            '1. **메모리** — 프로세스/스레드마다 스택, 힙, FD 테이블',
+            '2. **컨텍스트 스위칭** — 1만 프로세스 ↔ 코어 16개 = 초당 수만 회',
+            '3. **fork/clone 비용** — 요청마다 시스템콜',
+            '4. **blocking I/O** — read() 가 끝날 때까지 CPU 놀음',
+            '',
+            '## 해결 아이디어',
+            '- 프로세스 1개가 **여러 연결을 동시에** 처리',
+            '- 연결마다 메모리는 작게 (FD + 작은 컨텍스트 = 수 KB)',
+            '- I/O 가 준비된 연결만 골라서 처리 (event-driven)',
+            '- 커널이 "어떤 FD 가 읽을 준비됐다" 알려줌 (epoll/kqueue)',
+            '',
+            '## 이 아이디어를 구현한 것이',
+            '- **Nginx** (2004, Igor Sysoev) — 웹서버/리버스 프록시',
+            '- **Node.js** (2009) — 자바스크립트 런타임',
+            '- **HAProxy** — 로드 밸런서',
+            '- 모두 "event loop + non-blocking I/O" 기반',
+          ],
+          highlight: [3, 4, 5, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 3. Nginx — Event-driven + epoll',
+        desc: 'Nginx 는 worker 프로세스 (CPU 코어 수 만큼) 가 각자 event loop 를 돌린다. Linux 의 epoll 시스템콜이 "어떤 소켓이 read 준비됐다" 를 O(1) 로 알려준다. worker 1개가 수만 연결을 비동기로 처리. 메모리는 연결당 2~3KB.',
+        connections: 10000,
+        memPerConn: 2,
+        totalMem: 20,
+        model: 'event-driven',
+        verdict: '확장 가능',
+        verdictTone: 'good',
+        keyPoint: 'epoll 은 등록된 FD 중에서 "준비된 것만" 반환한다. select 와 달리 O(연결 수) 가 아니라 O(이벤트 수).',
+        code: {
+          lang: 'nginx',
+          filename: 'nginx-event.conf',
+          lines: [
+            '# Nginx 핵심 설정 — Event-driven',
+            '# /etc/nginx/nginx.conf',
+            '',
+            'user www-data;',
+            'worker_processes auto;          # CPU 코어 수 = worker 수',
+            'worker_rlimit_nofile 65535;     # 프로세스당 FD 한도',
+            '',
+            'events {',
+            '    use epoll;                  # Linux 2.6+ 의 epoll(7)',
+            '    worker_connections 10000;   # worker 1개가 1만 연결',
+            '    multi_accept on;            # 한 번에 여러 연결 수락',
+            '}',
+            '',
+            '# 전체 동시 연결 한도',
+            '#   = worker_processes × worker_connections',
+            '#   = 8 × 10000 = 80,000',
+            '',
+            '# 동작 흐름 (worker 1개 기준)',
+            '#  1. epoll_create() — 이벤트 큐 생성',
+            '#  2. epoll_ctl(ADD) — listen 소켓 등록',
+            '#  3. epoll_wait() — 준비된 이벤트만 받아옴',
+            '#  4. 각 이벤트마다 non-blocking read/write',
+            '#  5. 다음 epoll_wait() 로 무한 루프',
+            '',
+            '# fork 도 thread 생성도 없음',
+            '# 1 worker = 1 thread = 1 event loop',
+          ],
+          highlight: [4, 5, 6, 8, 9, 10, 11, 14, 15, 16, 18, 19, 20, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 4. 메모리 사용 비교 — 25MB vs 2MB',
+        desc: '같은 1만 연결을 두 모델로 처리하면 메모리가 100배 이상 차이 난다. Apache prefork: 1만 × 25MB = 250GB (불가능). Nginx: 1만 × 2MB = 20GB (충분히 가능). 실제로는 idle 연결 (keep-alive) 비중이 높아서 Nginx 가 더 효율적이다.',
+        connections: 10000,
+        memPerConn: 2,
+        totalMem: 20,
+        model: 'event-driven',
+        verdict: '12배 절약',
+        verdictTone: 'good',
+        keyPoint: '연결당 메모리: Apache 25MB (프로세스 전체) vs Nginx 2KB (FD + 작은 컨텍스트만).',
+        code: {
+          lang: 'markdown',
+          filename: 'memory-compare.md',
+          lines: [
+            '# Apache vs Nginx 메모리 비교',
+            '',
+            '## 같은 1만 동시 연결 환경',
+            '| 항목 | Apache prefork | Nginx |',
+            '|:--|:--|:--|',
+            '| 모델 | process-per-request | event-driven |',
+            '| 프로세스 수 | 10,000 | 8 (worker) |',
+            '| 연결당 메모리 | ~25 MB | ~2 MB (실제 2~10KB) |',
+            '| 총 메모리 | 250 GB (불가) | 20 GB |',
+            '| context switch | 매우 많음 | 거의 없음 |',
+            '| fork() 비용 | 매 요청마다 | 시작 시 1회 |',
+            '',
+            '## Apache 메모리 25MB 의 내역',
+            '- 프로세스 기본 RSS: 5MB',
+            '- mod_php / mod_perl 적재: 15MB',
+            '- 요청 버퍼, 환경 변수: 3MB',
+            '- 기타 모듈 (rewrite, ssl): 2MB',
+            '- **합계: ~25MB per 연결**',
+            '',
+            '## Nginx 연결당 2KB ~ 수 MB 내역',
+            '- 소켓 FD: 작음',
+            '- ngx_connection_t 구조체: 232 bytes',
+            '- 요청 버퍼 (lazy 할당): 1~8 KB',
+            '- proxy_buffers (응답 받을 때만): 8 × 4KB',
+            '- **idle keep-alive 연결: ~2.5 KB**',
+            '- **활성 요청: 수 ~ 수십 KB**',
+            '',
+            '## 결과',
+            '- 같은 H/W (32GB RAM 서버) 에서',
+            '- Apache: 동시 연결 ~1,200 한계',
+            '- Nginx: 동시 연결 100,000+ 여유',
+            '- **약 100배 효율**',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 28, 29, 30, 31, 32],
+        },
+      },
+      {
+        title: 'Step 5. 동시 연결 10만 처리 — Nginx 의 정체성',
+        desc: 'Cloudflare, Netflix, GitHub, 한국 네이버/카카오 모두 Nginx 또는 그 변형(OpenResty/Tengine)을 쓴다. 이유는 단순 — 같은 H/W 로 10배 ~ 100배 더 많은 트래픽을 처리한다. 정적 파일 서빙, 리버스 프록시, 로드 밸런싱, TLS 종단 — 이 모든 것이 동시성 위에 쌓인다.',
+        connections: 100000,
+        memPerConn: 2,
+        totalMem: 200,
+        model: 'event-driven',
+        verdict: '실전 검증',
+        verdictTone: 'good',
+        summary: {
+          title: 'Apache prefork vs Nginx (1만 동시 연결 기준)',
+          rows: [
+            { metric: '메모리 총량', before: '250 GB', after: '20 GB', delta: '−92%' },
+            { metric: '프로세스 수', before: '10,000', after: '8', delta: '−1250x' },
+            { metric: 'fork 횟수', before: '매 요청', after: '시작 1회', delta: '✓' },
+            { metric: 'I/O 모델', before: 'blocking', after: 'epoll non-block', delta: '✓' },
+            { metric: '동시성 상한', before: '~1,200', after: '100,000+', delta: '+80x' },
+          ],
+        },
+        keyPoint: '다음 챕터부터는 이 event-driven 엔진을 어떻게 설정하고 활용하는지 본다.',
+        code: {
+          lang: 'markdown',
+          filename: 'why-nginx.md',
+          lines: [
+            '# 왜 모두가 Nginx 를 쓰는가',
+            '',
+            '## 시장 점유율 (2024 W3Techs)',
+            '| 순위 | 서버 | 점유율 |',
+            '|:--|:--|:--|',
+            '| 1위 | **Nginx** | 33.8% |',
+            '| 2위 | Apache | 26.4% |',
+            '| 3위 | Cloudflare Server | 22.4% (실은 Nginx 기반) |',
+            '| 4위 | LiteSpeed | 14.1% |',
+            '',
+            '## 누가 쓰는가',
+            '- **Netflix** — 전 세계 트래픽의 1/3, 모두 Nginx',
+            '- **GitHub** — pages.github.com, raw.githubusercontent.com',
+            '- **Cloudflare** — edge 서버 전체 (수정한 Nginx)',
+            '- **Dropbox, Pinterest, Airbnb, Hulu**',
+            '- **국내**: 네이버, 카카오, 쿠팡 (대부분 Nginx + OpenResty)',
+            '',
+            '## Nginx 의 역할 5가지',
+            '1. **웹 서버** — 정적 파일 (HTML/CSS/JS/이미지) 서빙',
+            '2. **리버스 프록시** — 백엔드 (FastAPI, Node, Spring) 앞단',
+            '3. **로드 밸런서** — upstream 여러 대로 트래픽 분산',
+            '4. **TLS 종단** — HTTPS 인증서 처리 → 백엔드는 HTTP',
+            '5. **캐시 / 정적 가속** — proxy_cache, gzip, brotli',
+            '',
+            '## 핵심 정체성',
+            '> "한 프로세스가 동시 연결 10만을 들고 있어도 안 죽는다"',
+            '> 이게 Nginx 의 모든 것이다.',
+            '',
+            '## 다음',
+            '> I-1-2 에서 docker 로 Nginx 첫 페이지를 띄운다.',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 26, 27, 28],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function MetricCard({ label, value, unit, max, current, tone }) {
+      const t = TONE[tone] || TONE.warn;
+      const pct = Math.min(100, (current / max) * 100);
+      return (
+        <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+          <div className="flex justify-between items-baseline mb-1">
+            <span className={`text-xs ${t.text}`}>{label}</span>
+            <span className={`text-lg font-mono font-bold ${t.text}`}>
+              {value}<span className="text-xs opacity-70">{unit}</span>
+            </span>
+          </div>
+          <div className="h-1.5 bg-white/60 rounded overflow-hidden">
+            <div className={`h-full ${t.badge.split(' ')[0]}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-green-400 bg-white p-3">
+          <div className="text-sm font-bold text-green-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-green-700 border-b border-green-200">
+                <th className="py-1 pr-2">지표</th><th className="py-1 pr-2">Before</th><th className="py-1 pr-2">After</th><th className="py-1">변화</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-green-100">
+                  <td className="py-1 pr-2 font-medium text-green-900">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono">{r.after}</td>
+                  <td className="py-1 text-green-900 font-bold">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border border-green-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-green-900">동시 연결 부하 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2">
+            <MetricCard label="동시 연결 수" value={state.connections.toLocaleString()} unit="" max={100000} current={state.connections} tone={state.connections >= 10000 ? (state.model === 'event-driven' ? 'good' : 'danger') : 'good'} />
+            <MetricCard label="연결당 메모리" value={state.memPerConn} unit="MB" max={25} current={state.memPerConn} tone={state.memPerConn >= 20 ? 'danger' : state.memPerConn >= 10 ? 'warn' : 'good'} />
+            <MetricCard label="총 메모리 사용" value={state.totalMem.toLocaleString()} unit="MB" max={250000} current={state.totalMem} tone={state.totalMem >= 100000 ? 'danger' : state.totalMem >= 10000 ? 'warn' : 'good'} />
+          </div>
+
+          {/* 처리 모델 다이어그램 */}
+          <div className="mt-3 rounded-lg bg-green-50 border border-green-200 p-3">
+            <div className="text-[10px] text-green-700 mb-1 font-mono">처리 모델: {state.model}</div>
+            <div className="flex items-center justify-between text-xs font-mono">
+              <span className="px-2 py-1 rounded bg-white border border-green-300">🌐 Clients</span>
+              <span className="text-green-400">→</span>
+              {state.model === 'event-driven' ? (
+                <>
+                  <span className="px-2 py-1 rounded bg-green-700 text-white">🔁 epoll worker</span>
+                  <span className="text-green-400">→</span>
+                  <span className="px-2 py-1 rounded bg-emerald-600 text-white">⚡ 100K conns</span>
+                </>
+              ) : (
+                <>
+                  <span className={`px-2 py-1 rounded text-white ${state.connections >= 10000 ? 'bg-rose-600 animate-pulse' : 'bg-amber-500'}`}>🧱 fork×N</span>
+                  <span className="text-green-400">→</span>
+                  <span className={`px-2 py-1 rounded text-white ${state.connections >= 10000 ? 'bg-rose-600' : 'bg-amber-500'}`}>🐢 {state.totalMem.toLocaleString()}MB</span>
+                </>
+              )}
+            </div>
+          </div>
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-green-900 bg-green-100 border border-green-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-zinc-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-zinc-800 border-b border-zinc-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-zinc-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-zinc-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-green-500/25 border-l-2 border-green-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-zinc-800 border-t border-zinc-700 flex items-center justify-between text-[10px] text-zinc-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-green-700 text-white font-bold">N</span>
+              <div>
+                <h1 className="text-2xl font-bold text-green-900">Chapter I-1-1. 웹 서버란 (Event-driven)</h1>
+                <p className="text-sm text-green-800/80">Apache process-per-request 한계 → C10K → Nginx epoll</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-green-800 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-green-700' : 'bg-green-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-green-700 text-white px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-green-50/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-green-300 bg-white text-green-800 hover:bg-green-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-green-300 bg-white text-green-800 hover:bg-green-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-green-900 text-white' : 'bg-green-700 text-white hover:bg-green-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-green-300 bg-white text-green-800 hover:bg-green-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-green-700 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-green-400 bg-white px-4 py-3 text-sm text-green-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Apache 는 요청마다 프로세스, Nginx 는 worker 1개가 event loop 로 수만 연결을 동시에 처리. 메모리 100배 절약, C10K 문제 해결. 이게 Nginx 가 시장 1위인 이유.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Apache', 'prefork', 'C10K', 'epoll', 'event-loop', 'worker', 'Nginx'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-green-100 text-green-800 border border-green-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-green-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-1-2.html" className="underline hover:no-underline">다음: I-1-2 설치 + 첫 페이지 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

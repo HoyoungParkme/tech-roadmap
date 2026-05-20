@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nginx 학습 — III-2-2. sticky session vs stateless</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🟢</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- III-2-2 sticky session vs stateless -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. in-memory 세션의 위험',
+        desc: '세션 데이터를 백엔드 메모리에 저장. 같은 사용자가 다른 노드로 가면 로그인 풀림. 노드 재시작이나 OOM 으로 세션 통째 증발. 수평 확장의 가장 큰 적.',
+        scenario: 'in-memory session',
+        flow: ['User → app1 (저장)', 'User → app2 (없음!)', 'User → 다시 로그인'],
+        verdict: '치명적',
+        verdictTone: 'danger',
+        keyPoint: 'in-memory 세션 + LB = 같은 사용자가 다른 노드 가면 로그인 풀림. 절대 금기.',
+        code: {
+          lang: 'python',
+          filename: 'in_memory_session.py (안티 패턴)',
+          lines: [
+            '"""안티 패턴 — in-memory 세션"""',
+            'from fastapi import FastAPI, Cookie',
+            'import secrets',
+            '',
+            'app = FastAPI()',
+            '',
+            '# 프로세스 메모리에 세션 저장',
+            'SESSIONS = {}    # ← 노드마다 따로 존재!',
+            '',
+            '@app.post("/login")',
+            'def login(user_id: int):',
+            '    token = secrets.token_hex(16)',
+            '    SESSIONS[token] = {"user_id": user_id}',
+            '    return {"token": token}',
+            '',
+            '@app.get("/me")',
+            'def me(token: str = Cookie(None)):',
+            '    session = SESSIONS.get(token)',
+            '    if not session:',
+            '        return {"error": "not logged in"}',
+            '    return session',
+            '',
+            '# ── 문제 시나리오 ────────',
+            '# 1) 사용자 login → Nginx 가 app1 으로 보냄 → SESSIONS[abc]={user_id:42}',
+            '# 2) 사용자 /me → Nginx 가 app2 로 보냄  → SESSIONS 비어있음 → "not logged in"',
+            '# 3) 사용자: 왜 자꾸 로그아웃되지?',
+            '',
+            '# ── 더 큰 문제 ───────────',
+            '# 1) app1 재시작 → SESSIONS 모두 증발',
+            '# 2) 사용자 100,000 명이 동시 로그아웃',
+            '# 3) 1시간 동안 로그인 폭주 → DB/Auth 서비스 다운',
+            '',
+            '# ── 해결 방향 ────────────',
+            '# A. ip_hash (sticky) — 단점 많음 (다음 Step)',
+            '# B. JWT (stateless) — 권장',
+            '# C. Redis 세션 공유 — 권장',
+          ],
+          highlight: [7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 30, 31, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 2. ip_hash 로 sticky — 임시 처방',
+        desc: 'ip_hash 알고리즘으로 같은 IP 는 항상 같은 노드. in-memory 세션이 일단 유지. 단, NAT 환경에서 한 노드 몰림 + 노드 추가/제거시 재매핑으로 세션 끊김.',
+        scenario: 'ip_hash sticky',
+        flow: ['IP 203.x → 항상 app1', '세션 유지', 'NAT 뒤 100명도 모두 app1'],
+        verdict: '임시 미봉책',
+        verdictTone: 'warn',
+        keyPoint: 'ip_hash 는 진짜 해결이 아니라 응급 처방. 노드 추가/제거 + NAT 환경에서 문제 폭증.',
+        code: {
+          lang: 'nginx',
+          filename: 'ip-hash-sticky.conf',
+          lines: [
+            '# ip_hash sticky — 임시 방편',
+            '',
+            'upstream backend {',
+            '    ip_hash;',
+            '    server app1:8000;',
+            '    server app2:8000;',
+            '    server app3:8000;',
+            '}',
+            '',
+            '# 효과',
+            '#  • IP 203.0.113.45 → 늘 app1',
+            '#  • IP 198.51.100.30 → 늘 app3',
+            '#  • in-memory 세션 유지',
+            '',
+            '# 문제 ①: NAT/회사망',
+            '#  • 한 회사의 100명이 NAT 뒤에서 같은 외부 IP',
+            '#  • 100명이 모두 한 노드 (예: app1) 로 몰림',
+            '#  • app1 부하 폭증, app2/app3 한가함',
+            '#  • 로드 밸런싱 의미 없음',
+            '',
+            '# 문제 ②: 노드 추가',
+            '#  • 4번째 노드 (app4) 추가',
+            '#  • ip_hash 가 IP→노드 매핑 재계산',
+            '#  • 일부 IP 의 노드가 바뀜 → 세션 끊김',
+            '',
+            '# 문제 ③: 노드 down',
+            '#  • app1 다운',
+            '#  • 그 IP 들은 다른 노드로 fail-over',
+            '#  • 거기엔 세션 없음 → 다시 로그인',
+            '',
+            '# 결국 sticky 는 "확률 게임"',
+            '#  • 노드 안 죽고, 추가 안 하고, NAT 없을 때만 작동',
+            '#  • 그 조건이 항상 깨질 수 있음',
+            '',
+            '# ── 다음 단계 ─────────',
+            '# stateless 또는 외부 저장소로 가는 게 정답',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 3. stateless JWT — 권장',
+        desc: '세션 데이터를 서명된 JWT 토큰에 담아 클라이언트가 들고 다니게. 서버는 토큰 검증만. 어느 노드로 가도 동일하게 작동. LB 자유 + 수평 확장 100%.',
+        scenario: 'stateless JWT',
+        flow: ['User → JWT 발급', 'JWT 가지고 어디든', '서버는 검증만 (메모리 0)'],
+        verdict: '확장 가능',
+        verdictTone: 'good',
+        keyPoint: 'JWT = 서명된 토큰. 서버 메모리 0. 어떤 노드든 같은 secret 으로 검증. 진정한 stateless.',
+        code: {
+          lang: 'python',
+          filename: 'jwt_stateless.py',
+          lines: [
+            '"""stateless JWT — 권장 패턴"""',
+            'from fastapi import FastAPI, Depends, HTTPException',
+            'from fastapi.security import OAuth2PasswordBearer',
+            'import jwt    # PyJWT',
+            'import os',
+            'from datetime import datetime, timedelta',
+            '',
+            'SECRET = os.environ["JWT_SECRET"]    # 모든 노드 같은 값',
+            'ALGO = "HS256"',
+            '',
+            'app = FastAPI()',
+            'oauth2 = OAuth2PasswordBearer(tokenUrl="/login")',
+            '',
+            '@app.post("/login")',
+            'def login(user_id: int):',
+            '    payload = {',
+            '        "sub": str(user_id),',
+            '        "exp": datetime.utcnow() + timedelta(hours=1),',
+            '    }',
+            '    token = jwt.encode(payload, SECRET, ALGO)',
+            '    return {"access_token": token, "token_type": "bearer"}',
+            '',
+            'def get_current_user(token: str = Depends(oauth2)):',
+            '    try:',
+            '        payload = jwt.decode(token, SECRET, algorithms=[ALGO])',
+            '        return int(payload["sub"])',
+            '    except jwt.PyJWTError:',
+            '        raise HTTPException(401, "invalid token")',
+            '',
+            '@app.get("/me")',
+            'def me(user_id: int = Depends(get_current_user)):',
+            '    return {"user_id": user_id}',
+            '',
+            '# 흐름',
+            '#  1) 로그인 → JWT 발급 (서버 메모리 0)',
+            '#  2) 모든 요청에 Authorization: Bearer <jwt>',
+            '#  3) 서버는 토큰 서명 검증만 (DB 조회 없음)',
+            '#  4) 어떤 노드로 가도 동일 작동 — sticky 불필요',
+            '',
+            '# 주의',
+            '#  • SECRET 은 모든 노드 동일 (환경변수 / Vault)',
+            '#  • 토큰 만료 짧게 + refresh 토큰',
+            '#  • 토큰 폐기 (logout) 는 별도 처리 (blacklist 가벼움)',
+          ],
+          highlight: [3, 4, 8, 9, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 30, 31, 32, 35, 36, 37, 38, 39, 41, 42, 43, 44],
+        },
+      },
+      {
+        title: 'Step 4. Redis 세션 공유 — 또 다른 권장',
+        desc: 'JWT 가 안 맞는 경우 (서버 측 세션 폐기 빈번, 큰 데이터, 보안 요구) Redis 같은 외부 저장소에 세션 저장. 모든 노드가 같은 Redis 를 보므로 어느 노드로 가도 동일.',
+        scenario: 'Redis 세션',
+        flow: ['User → app1 → Redis SET', 'User → app2 → Redis GET', '같은 세션 보임'],
+        verdict: '공유 저장소',
+        verdictTone: 'good',
+        keyPoint: '세션 즉시 폐기, 큰 페이로드, IdP 연동이 필요하면 Redis. JWT 와 비교해서 trade-off 선택.',
+        code: {
+          lang: 'python',
+          filename: 'redis_session.py',
+          lines: [
+            '"""Redis 세션 공유 — 또 다른 stateless 전략"""',
+            'from fastapi import FastAPI, Cookie, Response',
+            'import redis.asyncio as redis',
+            'import secrets',
+            'import json',
+            '',
+            'app = FastAPI()',
+            '',
+            '# 모든 노드가 같은 Redis 를 본다',
+            'r = redis.from_url("redis://session-redis:6379/0")',
+            '',
+            'TTL = 3600    # 1시간',
+            '',
+            '@app.post("/login")',
+            'async def login(user_id: int, response: Response):',
+            '    token = secrets.token_hex(16)',
+            '    await r.setex(',
+            '        f"sess:{token}",',
+            '        TTL,',
+            '        json.dumps({"user_id": user_id}),',
+            '    )',
+            '    response.set_cookie("token", token, httponly=True, secure=True)',
+            '    return {"ok": True}',
+            '',
+            '@app.get("/me")',
+            'async def me(token: str = Cookie(None)):',
+            '    if not token:',
+            '        return {"error": "no token"}',
+            '    data = await r.get(f"sess:{token}")',
+            '    if not data:',
+            '        return {"error": "expired"}',
+            '    return json.loads(data)',
+            '',
+            '@app.post("/logout")',
+            'async def logout(token: str = Cookie(None)):',
+            '    await r.delete(f"sess:{token}")',
+            '    return {"ok": True}',
+            '',
+            '# JWT vs Redis 세션',
+            '# JWT     : 서버 메모리 0, 폐기 어려움, 큰 토큰',
+            '# Redis   : 즉시 폐기, 작은 토큰, Redis 의존',
+            '#',
+            '# 보통 둘 다 적용 (JWT = access token, Redis = refresh + blacklist)',
+          ],
+          highlight: [2, 3, 4, 7, 9, 10, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30, 31, 32, 34, 35, 36, 37, 39, 40, 41, 42, 43, 44],
+        },
+      },
+      {
+        title: 'Step 5. trade-off — 어떤 선택?',
+        desc: '실전 권장: 새 프로젝트는 무조건 stateless. JWT 가 80%, Redis 세션이 추가 케이스. ip_hash 는 레거시 호환 외엔 비추.',
+        scenario: 'overview',
+        flow: ['stateless 가 정답', 'JWT 또는 Redis', 'ip_hash 는 최후의 수단'],
+        verdict: '의사결정',
+        verdictTone: 'good',
+        summary: {
+          title: '세션 전략 4종 비교',
+          rows: [
+            { metric: 'in-memory', before: '메모리 저장', after: '치명적 (재시작=증발)', delta: '❌ 안티' },
+            { metric: 'ip_hash sticky', before: 'IP 고정', after: 'NAT 문제+노드교체 끊김', delta: '△ 임시' },
+            { metric: 'JWT stateless', before: '서명된 토큰', after: '서버 메모리 0', delta: '✓ 권장' },
+            { metric: 'Redis 공유', before: '외부 저장', after: '폐기 즉시, 큰 페이로드', delta: '✓ 권장' },
+            { metric: '하이브리드', before: 'JWT + Redis blacklist', after: '둘의 장점', delta: '🏆 베스트' },
+          ],
+        },
+        keyPoint: '신규는 무조건 stateless. JWT 가 첫 선택. 세션 폐기/관리가 까다로우면 Redis 추가. ip_hash 는 레거시 호환 용도.',
+        code: {
+          lang: 'markdown',
+          filename: 'decision.md',
+          lines: [
+            '# 세션 전략 의사결정',
+            '',
+            '## Q1. 신규 프로젝트인가?',
+            '  - YES → 무조건 stateless (JWT 또는 Redis)',
+            '  - NO  → 다음',
+            '',
+            '## Q2. in-memory 세션 코드가 이미 깔려 있는가?',
+            '  - YES → 단기: ip_hash sticky 로 응급 처치',
+            '          중기: Redis 세션으로 점진적 마이그레이션',
+            '          장기: JWT 도입',
+            '  - NO  → 다음',
+            '',
+            '## Q3. 세션 즉시 폐기가 필요한가? (강제 로그아웃, 권한 변경 즉시 반영)',
+            '  - YES → Redis 세션',
+            '  - NO  → JWT (단순, 빠름, 의존성 0)',
+            '',
+            '## Q4. 세션에 큰 데이터를 담아야 하는가? (장바구니, 검색 컨텍스트)',
+            '  - YES → Redis 세션 (JWT 는 헤더 크기 한계)',
+            '  - NO  → JWT',
+            '',
+            '## 실전 베스트 패턴',
+            '> JWT access token (15분) + Redis refresh token (7일)',
+            '> + Redis blacklist 로 폐기 처리',
+            '',
+            '## Nginx 설정과의 관계',
+            '- stateless → upstream 알고리즘 자유 (RR/least_conn/random)',
+            '- ip_hash  → 그 자체가 sticky',
+            '- Redis    → 알고리즘 자유 + 모든 노드가 같은 Redis',
+            '',
+            '## 한 문장 요약',
+            '"세션을 백엔드 메모리에 두지 마라. 서명된 토큰 또는 공유 저장소."',
+          ],
+          highlight: [3, 4, 5, 7, 8, 9, 10, 13, 14, 15, 17, 18, 19, 22, 23, 24, 26, 27, 28, 29, 31, 32],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-green-400 bg-white p-3">
+          <div className="text-sm font-bold text-green-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-green-700 border-b border-green-200">
+                <th className="py-1 pr-2">전략</th><th className="py-1 pr-2">방식</th><th className="py-1 pr-2">특성</th><th className="py-1">권장</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-green-100">
+                  <td className="py-1 pr-2 font-mono font-bold text-green-900">{r.metric}</td>
+                  <td className="py-1 pr-2 text-emerald-700">{r.before}</td>
+                  <td className="py-1 pr-2 text-green-800">{r.after}</td>
+                  <td className="py-1 text-green-900 font-bold">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border border-green-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-green-900">시나리오: {state.scenario}</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="rounded-lg bg-green-50 border border-green-200 p-3">
+            <div className="text-[10px] text-green-700 mb-2 font-mono">흐름</div>
+            <div className="space-y-2">
+              {state.flow.map((f, i) => (
+                <div key={i} className="px-3 py-2 rounded bg-white border border-green-200 text-xs font-mono text-green-800">
+                  <span className="text-green-500 mr-2">{i + 1}.</span>{f}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-lg bg-white border border-green-200 p-3 text-[11px] text-green-800">
+            <div className="font-bold mb-1">분류</div>
+            <table className="w-full">
+              <tbody>
+                <tr><td className="py-0.5">in-memory</td><td className="text-rose-700">❌ 안티 패턴</td></tr>
+                <tr><td className="py-0.5">ip_hash</td><td className="text-amber-700">△ 임시 처방</td></tr>
+                <tr><td className="py-0.5">JWT</td><td className="text-emerald-700">✓ 권장</td></tr>
+                <tr><td className="py-0.5">Redis 공유</td><td className="text-emerald-700">✓ 권장</td></tr>
+                <tr><td className="py-0.5">하이브리드</td><td className="text-emerald-700 font-bold">🏆 베스트</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-green-900 bg-green-100 border border-green-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-zinc-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-zinc-800 border-b border-zinc-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-zinc-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-zinc-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-green-500/25 border-l-2 border-green-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-zinc-800 border-t border-zinc-700 flex items-center justify-between text-[10px] text-zinc-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-green-700 text-white font-bold">N</span>
+              <div>
+                <h1 className="text-2xl font-bold text-green-900">Chapter III-2-2. sticky vs stateless</h1>
+                <p className="text-sm text-green-800/80">in-memory → ip_hash → JWT → Redis → 하이브리드</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-green-800 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-green-700' : 'bg-green-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-green-700 text-white px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-green-50/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-green-300 bg-white text-green-800 hover:bg-green-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-green-300 bg-white text-green-800 hover:bg-green-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-green-900 text-white' : 'bg-green-700 text-white hover:bg-green-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-green-300 bg-white text-green-800 hover:bg-green-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-green-700 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-green-400 bg-white px-4 py-3 text-sm text-green-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                in-memory 세션 안 됨. ip_hash 는 임시. JWT 또는 Redis 가 정답. JWT access + Redis refresh+blacklist 하이브리드가 베스트.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['session', 'stateless', 'JWT', 'Redis', 'ip_hash', 'sticky'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-green-100 text-green-800 border border-green-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-green-800">
+              <a href="./III-2-1.html" className="underline hover:no-underline">← III-2-1 health check</a>
+              <a href="../part4/IV-1-1.html" className="underline hover:no-underline">다음: IV-1-1 TLS →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
