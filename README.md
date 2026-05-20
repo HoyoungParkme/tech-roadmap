@@ -4,7 +4,7 @@
 
 ## 이 프로젝트는 뭔가요?
 
-D3.js 마인드맵 하나가 12개 학습 자료를 연결하는 허브 역할을 합니다. 각 학습 자료는 단계별 애니메이션 시각화(총 약 442개)로 구성되어 있습니다. 비유를 써서 설명하면, 도서관 안내판(마인드맵)을 보고 원하는 책(학습 자료)을 찾아가는 구조입니다.
+D3.js 마인드맵 하나가 28개 학습 자료를 연결하는 허브 역할을 합니다. 각 학습 자료는 단계별 애니메이션 시각화(총 712개)로 구성되어 있습니다. 비유를 써서 설명하면, 도서관 안내판(마인드맵)을 보고 원하는 책(학습 자료)을 찾아가는 구조입니다.
 
 빌드 도구가 전혀 없습니다. HTML 파일을 브라우저로 열거나 정적 서버 하나를 띄우면 바로 동작합니다.
 
@@ -21,7 +21,9 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 
 루트(`/`)에 접속하면 마인드맵으로 자동 이동합니다.
 
-## 12개 학습 자료
+## 28개 학습 자료
+
+(2026-05-20 기준, Sprint 93)
 
 | 폴더 | 시각화 수 | 핵심 주제 |
 |:--|:--:|:--|
@@ -36,9 +38,25 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 | `react/` | 39개 | React 함수형 컴포넌트 |
 | `github/` | 12개 | Git 흐름 9 Parts + 56 섹션 |
 | `gcp/` | 4 + SPA 52섹션 | GCP 서비스 (viewer SPA 별도) |
-| `graphrag/` | **21개 (100% 완성)** | GraphRAG + Neo4j — 5 Parts 21 섹션 |
+| `graphrag/` | 21개 | GraphRAG + Neo4j — 5 Parts |
+| `kubernetes/` | 20개 | K8s 워크로드/서비스/스토리지/운영 |
+| `mlops/` | 20개 | 데이터/학습/배포/모니터링/운영 |
+| `observability/` | 20개 | 메트릭/로그/트레이스/SLO/사고대응 |
+| `data-engineering/` | 20개 | 수집/저장/처리/스트리밍/거버넌스 |
+| `cloud-infra/` | 20개 | 멀티 클라우드/네트워킹/메시징/DR |
+| `terraform/` | 20개 | HCL/상태/모듈/CI/보안 |
+| `kafka/` | 20개 | 브로커/프로듀서/컨슈머/스트림/운영 |
+| `redis/` | 20개 | 자료구조/캐시/Pub-Sub/Cluster/운영 |
+| `elasticsearch/` | 20개 | 인덱스/쿼리/Aggregation/Cluster/운영 |
+| `llmops/` | 20개 | 프롬프트/RAG/평가/배포/거버넌스 |
+| `nginx/` | 20개 | 설정/리버스 프록시/로드밸런싱/SSL/튜닝 |
+| `nextjs/` | 20개 | App Router/Server Components/배포/Edge |
+| `mongodb/` | 20개 | Document/Query/인덱스/Replica/Sharding |
+| `graphql/` | 20개 | 스키마/Resolver/Federation/캐시/보안 |
+| `microservices/` | 20개 | 도메인 분리/통신/데이터/배포/모니터링 |
+| `linux/` | 20개 | 파일/프로세스/네트워크/자동화/운영 |
 
-**총 시각화: 396개 + GCP SPA 52섹션** (2026-05-06 기준, Sprint 47 favicon 일관성 적용)
+**총 시각화: 712개 + GCP SPA 52섹션** (2026-05-20 기준)
 
 ## 마인드맵
 
@@ -51,7 +69,7 @@ D3.js로 구현한 마인드맵이 전체 학습 자료의 허브입니다.
 ## 주요 기능
 
 - **인터랙티브 시각화**: 단계별 애니메이션 + 키보드 ←/→ 탐색 + 자동 재생
-- **giscus 댓글**: 11개 허브 + 마인드맵에 GitHub Discussions 기반 댓글
+- **giscus 댓글**: 28개 허브 + 마인드맵에 GitHub Discussions 기반 댓글
 - **즉시 실행**: 빌드 없이 브라우저에서 바로 동작
 - **반응형**: 모바일/데스크톱 모두 지원 (Tailwind 반응형 클래스)
 
@@ -72,8 +90,8 @@ D3.js로 구현한 마인드맵이 전체 학습 자료의 허브입니다.
 ```
 tech-roadmap/
 ├── mindmap/          # D3.js 마인드맵 허브 (전체 진입점)
-├── ai-agent/         # AI Agent 학습 자료
-├── fastapi/          # FastAPI 학습 자료 (가장 많은 시각화)
+├── ai-agent/         # AI Agent
+├── fastapi/          # FastAPI (79개 시각화)
 ├── langchain/        # LangChain + LangGraph
 ├── rag/              # RAG 파이프라인
 ├── vector-db/        # Vector DB
@@ -83,7 +101,23 @@ tech-roadmap/
 ├── react/            # React 함수형 컴포넌트
 ├── github/           # Git 흐름
 ├── gcp/              # GCP (SPA 패턴 별도)
-├── graphrag/         # GraphRAG + Neo4j (100% 완성)
+├── graphrag/         # GraphRAG + Neo4j
+├── kubernetes/       # K8s 워크로드/서비스/스토리지
+├── mlops/            # MLOps 데이터~운영
+├── observability/    # 메트릭/로그/트레이스/SLO
+├── data-engineering/ # DE 수집~거버넌스
+├── cloud-infra/      # 멀티 클라우드/네트워킹
+├── terraform/        # IaC HCL~보안
+├── kafka/            # Kafka 브로커~운영
+├── redis/            # Redis 자료구조~운영
+├── elasticsearch/    # Elastic 인덱스~운영
+├── llmops/           # LLMOps 프롬프트~거버넌스
+├── nginx/            # Nginx 설정~튜닝
+├── nextjs/           # Next.js App Router~Edge
+├── mongodb/          # MongoDB Document~Sharding
+├── graphql/          # GraphQL 스키마~보안
+├── microservices/    # MSA 도메인~모니터링
+├── linux/            # Linux 파일~운영
 └── docs/             # 프로젝트 설계·운영 문서 (Claude 전용)
 ```
 
