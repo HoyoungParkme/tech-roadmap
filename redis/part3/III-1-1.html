@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Redis 학습 — III-1-1. TTL과 만료</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Redis Chapter III-1-1 — TTL과 만료
+    학습 목표: EXPIRE/PERSIST, lazy vs active expiration, keyspace notification.
+    캐시의 핵심 = "오래된 데이터는 자동으로 사라진다".
+    패턴: fastapi v1 — 좌(LiveDataPane: TTL 카운트다운) / 우(VSCode CodeViewer)
+    색상: neutral (redis 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. EXPIRE — 키에 만료 시간 부여',
+        desc: 'EXPIRE key 60 → 60초 후 자동 삭제. TTL 없는 키는 영구 보관. 캐시의 본질은 "오래되면 사라진다". TTL은 메모리를 자동 회수하는 가장 단순한 방법.',
+        viz: {
+          kind: 'ttl-list',
+          rows: [
+            { key: 'session:abc', ttl: 1800, status: 'active' },
+            { key: 'cache:post:42', ttl: 60, status: 'active' },
+            { key: 'config:app', ttl: -1, status: 'persistent' },
+          ],
+        },
+        verdict: '자동 만료',
+        verdictTone: 'good',
+        keyPoint: 'TTL = 메모리 자동 회수. 세션 30분, API 캐시 1분, 알림 1일 등.',
+        code: {
+          lang: 'python',
+          filename: 'expire-basic.py',
+          lines: [
+            '# Step 1. EXPIRE / SETEX',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# 방법 1) SET 후 EXPIRE',
+            'r.set("session:abc", "user-data")',
+            'r.expire("session:abc", 1800)        # 30분',
+            '',
+            '# 방법 2) SETEX 한 번에',
+            'r.setex("session:abc", 1800, "user-data")',
+            '',
+            '# 방법 3) SET 옵션',
+            'r.set("session:abc", "data", ex=1800)        # 초',
+            'r.set("session:abc", "data", px=1800000)     # 밀리초',
+            'r.set("session:abc", "data", exat=1700000000)  # UNIX timestamp',
+            '',
+            '# Hash / List 등 다른 타입도 EXPIRE 가능',
+            'r.hset("user:1", mapping={"name": "Alice"})',
+            'r.expire("user:1", 3600)',
+            '',
+            '# TTL 확인',
+            'r.ttl("session:abc")        # 남은 초',
+            'r.pttl("session:abc")       # 남은 밀리초',
+            '',
+            '# 반환 값',
+            '# >  0: 남은 시간',
+            '# -1: TTL 없음 (영구)',
+            '# -2: 키 자체 없음',
+            '',
+            '# 흔한 TTL 패턴',
+            '# 세션:          30분 ~ 24시간',
+            '# API 응답 캐시:  1분 ~ 1시간',
+            '# 비밀번호 토큰:  5분',
+            '# 일별 통계 키:   24~48시간',
+            '# 분산 락:        5초 ~ 30초',
+          ],
+          highlight: [5, 6, 7, 9, 10, 12, 13, 14, 15, 17, 18, 19, 21, 22, 23, 30, 31, 32, 33, 34],
+        },
+      },
+      {
+        title: 'Step 2. TTL 확인 — 남은 시간 추적',
+        desc: 'TTL key로 남은 만료 시간(초) 조회. -1은 만료 없음, -2는 키 자체 없음. PTTL로 밀리초 단위. 디버깅과 모니터링에 핵심.',
+        viz: {
+          kind: 'ttl-countdown',
+          key: 'session:abc',
+          startTtl: 1800,
+          currentTtl: 1543,
+        },
+        verdict: 'TTL 추적',
+        verdictTone: 'good',
+        keyPoint: 'TTL key 반환: 양수=남은 시간, -1=영구, -2=없음. 모니터링 알람의 기초.',
+        code: {
+          lang: 'python',
+          filename: 'ttl-monitor.py',
+          lines: [
+            '# Step 2. TTL 확인',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            'r.setex("session:abc", 1800, "data")',
+            '',
+            '# 남은 시간',
+            'ttl = r.ttl("session:abc")',
+            '# 1800 → 1799 → ... → 1 → 0 → 키 삭제 (-2 반환)',
+            '',
+            '# 디버깅 패턴',
+            'def diagnose(key: str):',
+            '    ttl = r.ttl(key)',
+            '    if ttl == -2:',
+            '        return f"키 없음: {key}"',
+            '    if ttl == -1:',
+            '        return f"영구 보관: {key} (의도적? 누락?)"',
+            '    return f"{key}: 남은 {ttl}초"',
+            '',
+            '# 만료 직전 갱신 (sliding window)',
+            'def touch_session(session_id: str):',
+            '    """사용자 활동 시 세션 TTL 갱신."""',
+            '    r.expire(f"session:{session_id}", 1800)',
+            '',
+            '# 다중 키 TTL 일괄 확인',
+            'def ttl_audit(pattern: str = "cache:*"):',
+            '    """SCAN 으로 캐시 키 TTL 분포 확인."""',
+            '    no_ttl = 0',
+            '    short = 0',
+            '    long_ttl = 0',
+            '    for key in r.scan_iter(match=pattern, count=100):',
+            '        t = r.ttl(key)',
+            '        if t == -1: no_ttl += 1',
+            '        elif t < 60: short += 1',
+            '        else: long_ttl += 1',
+            '    print(f"영구={no_ttl}, 60초 이하={short}, 장기={long_ttl}")',
+            '    # 영구가 많으면 TTL 누락 위험',
+          ],
+          highlight: [7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 3. PERSIST — 만료 제거',
+        desc: 'PERSIST key로 TTL 제거 → 영구 보관 전환. SET으로 덮어쓰면 기존 TTL이 사라지는 부작용도 있음 (KEEPTTL 옵션으로 유지 가능). TTL 라이프사이클의 함정.',
+        viz: {
+          kind: 'persist-flow',
+          steps: [
+            { state: 'SETEX key 60 v', ttl: 60, persistent: false },
+            { state: 'TTL key → 60', ttl: 60, persistent: false },
+            { state: 'PERSIST key', ttl: -1, persistent: true },
+            { state: 'TTL key → -1', ttl: -1, persistent: true },
+          ],
+        },
+        verdict: 'TTL 제거',
+        verdictTone: 'good',
+        keyPoint: 'SET은 기본적으로 TTL 제거 → 의도치 않은 영구 보관. KEEPTTL 옵션 필수.',
+        code: {
+          lang: 'python',
+          filename: 'persist-pitfall.py',
+          lines: [
+            '# Step 3. PERSIST 와 SET 의 함정',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# PERSIST — TTL 명시적 제거',
+            'r.setex("temp", 60, "value")',
+            'r.ttl("temp")          # 60',
+            'r.persist("temp")      # TTL 제거',
+            'r.ttl("temp")          # -1 (영구)',
+            '',
+            '# 함정 — SET 이 TTL 을 날린다',
+            'r.setex("key", 60, "v1")',
+            'r.ttl("key")           # 60',
+            '',
+            'r.set("key", "v2")     # ❌ TTL 도 함께 제거',
+            'r.ttl("key")           # -1 (의도치 않게 영구)',
+            '',
+            '# 해결 — KEEPTTL 옵션 (Redis 6+)',
+            'r.set("key", "v3", keepttl=True)',
+            'r.ttl("key")           # 60 그대로',
+            '',
+            '# Hash / List 도 마찬가지',
+            'r.hset("h", "f", "v")',
+            'r.expire("h", 60)',
+            'r.hset("h", "f2", "v2")  # HSET 은 TTL 유지 (Redis 7+)',
+            '',
+            '# 운영 권장 패턴',
+            '# 1) 캐시 키는 항상 SETEX 로 통일',
+            '# 2) UPDATE 시 KEEPTTL 사용',
+            '# 3) 정기적으로 TTL=-1 키 audit',
+            '#    KEYS 대신 SCAN + TTL 체크',
+            '',
+            '# 운영 사례',
+            '# "메모리 풀이 안 됐는데 키가 안 사라져요"',
+            '# → SET 으로 덮어써서 TTL 사라짐. 메모리 누수.',
+            '# → SCAN 으로 TTL=-1 인 cache:* 키 찾아 EXPIRE 재설정',
+          ],
+          highlight: [5, 6, 7, 8, 9, 11, 12, 13, 15, 16, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 4. Lazy vs Active Expiration — 어떻게 사라지나',
+        desc: 'Redis는 두 가지 방식으로 만료 키를 삭제: (a) Lazy — 접근 시 만료 확인 후 삭제 (b) Active — 백그라운드 샘플링으로 매초 ~20개씩. 즉시 삭제 X — TTL=0 후에도 잠시 살아 있을 수 있음.',
+        viz: {
+          kind: 'expiration-modes',
+          lazy: { name: 'Lazy', desc: '접근 시 검사', cost: 'O(1)' },
+          active: { name: 'Active', desc: '백그라운드 샘플링', cost: '초당 100회×20키' },
+        },
+        verdict: '두 방식 병행',
+        verdictTone: 'good',
+        keyPoint: '만료가 즉시 아님 — TTL=0 직후에도 메모리 차지 가능. 정확한 시점 필요하면 keyspace notification.',
+        code: {
+          lang: 'markdown',
+          filename: 'expiration-modes.md',
+          lines: [
+            '# Lazy vs Active Expiration',
+            '',
+            '## ① Lazy Expiration (수동 검사)',
+            '- 키 접근 시 (GET/HGET 등) TTL 검사',
+            '- 만료됐으면 즉시 삭제 + nil 반환',
+            '- 비용: O(1) per access',
+            '- 단점: 아무도 안 찾으면 영원히 메모리에 남음',
+            '',
+            '## ② Active Expiration (백그라운드)',
+            '- 초당 10번 (hz 10 기본) 실행',
+            '- 각 실행마다 무작위 20키 샘플링',
+            '- 만료된 키 발견 시 삭제',
+            '- 25% 이상 만료됐으면 같은 작업 반복',
+            '- 비용: 초당 최대 100ms (서버 영향 최소)',
+            '',
+            '## 둘이 합쳐서',
+            '- 인기 키 = Lazy 로 즉시 정리',
+            '- 비인기 키 = Active 로 점진 정리',
+            '- "TTL=0 됐다고 즉시 메모리 회수" 보장 X',
+            '',
+            '## 흔한 오해',
+            '"EXPIRE 1 으로 했는데 키가 아직 보여요"',
+            '→ Active expiration 이 아직 못 찾았음.',
+            '→ 1~2초 후엔 사라짐.',
+            '→ 정확한 시점이 필요하면 keyspace notification 으로 이벤트 받기',
+            '',
+            '## 설정 조정',
+            '- hz 10: 초당 10회 (default)',
+            '- hz 100: 100회 — 정확하지만 CPU 부담',
+            '- active-expire-effort 1~10: 노력 강도',
+            '',
+            '## 실무 영향',
+            '- 메모리 모니터링 시 used_memory 가 TTL 만료 시점에 즉시 줄지 않음',
+            '- 정확한 통계는 expired_keys 카운터 확인',
+            '- INFO stats → expired_keys',
+          ],
+          highlight: [3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 21, 22, 23, 24, 25, 31, 32, 33, 34],
+        },
+      },
+      {
+        title: 'Step 5. Keyspace Notification — 만료 이벤트 받기',
+        desc: '키 만료 순간 Pub/Sub 메시지로 알림. CONFIG SET notify-keyspace-events Ex로 활성화. __keyevent@0__:expired 채널 SUBSCRIBE. 세션 만료 알림, 작업 만료 후 정리 등에 활용.',
+        viz: {
+          kind: 'notification-flow',
+          publisher: 'EXPIRE session:abc 0',
+          channel: '__keyevent@0__:expired',
+          message: 'session:abc',
+          subscribers: ['cleanup-worker', 'audit-log'],
+        },
+        verdict: 'Pub/Sub 알림',
+        verdictTone: 'good',
+        summary: {
+          title: 'III-1-1 TTL 정리',
+          rows: [
+            { metric: '설정', before: 'SET + EXPIRE', after: 'SETEX 한 번에', delta: '안전' },
+            { metric: '확인', before: 'DB 컬럼 체크', after: 'TTL key', delta: '명령 1줄' },
+            { metric: '제거', before: 'TTL 영구 보관', after: 'PERSIST 명시', delta: '의도 분명' },
+            { metric: '실제 삭제', before: 'TTL=0 즉시', after: 'Lazy+Active', delta: '점진' },
+            { metric: '이벤트', before: '폴링', after: 'Pub/Sub 알림', delta: '실시간' },
+          ],
+        },
+        keyPoint: 'TTL 5단계: SETEX → TTL → PERSIST → Lazy/Active → notification. 다음(III-1-2) Eviction.',
+        code: {
+          lang: 'python',
+          filename: 'expire-event.py',
+          lines: [
+            '# Step 5. Keyspace Notification',
+            '',
+            'import redis',
+            '',
+            '# 1) 활성화 (운영자가 한 번)',
+            "# redis-cli CONFIG SET notify-keyspace-events 'Ex'",
+            '#   E: keyevent',
+            '#   x: expired 이벤트',
+            '',
+            'r = redis.Redis(decode_responses=True)',
+            'r.config_set("notify-keyspace-events", "Ex")',
+            '',
+            '# 2) 구독 — 만료 이벤트 듣기',
+            'pubsub = r.pubsub()',
+            'pubsub.psubscribe("__keyevent@0__:expired")',
+            '',
+            'for msg in pubsub.listen():',
+            '    if msg["type"] == "pmessage":',
+            '        expired_key = msg["data"]',
+            '        print(f"만료: {expired_key}")',
+            '        # 후처리 — DB 정리, 알림 전송 등',
+            '',
+            '# 실전: 세션 만료 시 정리',
+            'def on_session_expired(key: str):',
+            '    if key.startswith("session:"):',
+            '        session_id = key.split(":")[1]',
+            '        # DB 의 last_active 업데이트',
+            '        # 사용자에게 "다시 로그인" 알림',
+            '',
+            '# 사용 시나리오',
+            '# - 세션 만료 후 로그아웃 후처리',
+            '# - 임시 파일 만료 시 디스크 정리',
+            '# - 분산 락 만료 알림 (Owner 죽음 감지)',
+            '# - 작업 큐 timeout 알림',
+            '',
+            '# 주의',
+            '# 1) Pub/Sub 은 fire-and-forget — 구독자 없으면 손실',
+            '# 2) 만료 시점이 정확하지 않음 (Lazy/Active 영향)',
+            '# 3) 운영급은 Stream (IV-2-1) 권장',
+          ],
+          highlight: [4, 5, 6, 7, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function TTLListViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-1.5">
+            {viz.rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 bg-white border border-neutral-300 rounded p-2">
+                <span className="flex-1 text-xs font-mono text-neutral-800">{r.key}</span>
+                {r.ttl === -1 ? (
+                  <span className="text-[10px] bg-neutral-700 text-white px-2 py-0.5 rounded">영구</span>
+                ) : (
+                  <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded font-mono">
+                    TTL {r.ttl}s
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function TTLCountdownViz({ viz }) {
+      const pct = (viz.currentTtl / viz.startTtl) * 100;
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs text-neutral-500">key:</span>
+            <span className="font-mono text-sm bg-neutral-700 text-white px-2 py-0.5 rounded">{viz.key}</span>
+          </div>
+          <div className="text-center my-4">
+            <div className="text-4xl font-bold font-mono text-neutral-900">{viz.currentTtl}</div>
+            <div className="text-xs text-neutral-500">초 남음 / {viz.startTtl} 초 중</div>
+          </div>
+          <div className="h-2 bg-white rounded overflow-hidden border border-neutral-200">
+            <div className="h-full bg-neutral-700 transition-all" style={{ width: `${pct}%` }}></div>
+          </div>
+          <div className="mt-2 text-[10px] text-neutral-500 text-center">자동 감소 → 0 도달 시 삭제</div>
+        </div>
+      );
+    }
+
+    function PersistFlowViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-2">
+            {viz.steps.map((s, i) => (
+              <div key={i} className={`flex items-center gap-2 px-3 py-2 rounded border ${
+                s.persistent ? 'bg-amber-50 border-amber-300' : 'bg-white border-neutral-300'
+              }`}>
+                <span className="text-[10px] text-neutral-500 w-4">{i+1}</span>
+                <span className="flex-1 text-xs font-mono">{s.state}</span>
+                <span className={`text-[10px] px-2 py-0.5 rounded ${
+                  s.persistent ? 'bg-amber-200 text-amber-800' : 'bg-emerald-200 text-emerald-800'
+                }`}>{s.persistent ? '영구' : `TTL ${s.ttl}s`}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function ExpirationModesViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4 space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white border border-emerald-300 rounded p-3">
+              <div className="font-bold text-sm text-emerald-800 mb-1">① {viz.lazy.name}</div>
+              <div className="text-xs text-neutral-600 mb-2">{viz.lazy.desc}</div>
+              <div className="text-[10px] font-mono bg-emerald-50 px-2 py-1 rounded">{viz.lazy.cost}</div>
+            </div>
+            <div className="bg-white border border-amber-300 rounded p-3">
+              <div className="font-bold text-sm text-amber-800 mb-1">② {viz.active.name}</div>
+              <div className="text-xs text-neutral-600 mb-2">{viz.active.desc}</div>
+              <div className="text-[10px] font-mono bg-amber-50 px-2 py-1 rounded">{viz.active.cost}</div>
+            </div>
+          </div>
+          <div className="text-[10px] text-neutral-600 bg-white p-2 rounded border border-neutral-200">
+            ⚠ TTL=0 직후에도 잠시 메모리에 남을 수 있음. 정확한 만료 시점이 필요하면 keyspace notification 사용.
+          </div>
+        </div>
+      );
+    }
+
+    function NotificationFlowViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4 space-y-2">
+          <div className="flex items-center gap-2 text-xs">
+            <span className="bg-rose-100 text-rose-800 px-2 py-1 rounded font-mono">{viz.publisher}</span>
+            <span className="text-neutral-400">→</span>
+            <span className="bg-neutral-700 text-white px-2 py-1 rounded font-mono text-[10px]">{viz.channel}</span>
+          </div>
+          <div className="text-center text-[10px] text-neutral-500">↓ message: <span className="font-mono">{viz.message}</span></div>
+          <div className="grid grid-cols-2 gap-2">
+            {viz.subscribers.map((s, i) => (
+              <div key={i} className="bg-emerald-50 border border-emerald-300 rounded p-2 text-xs font-mono text-emerald-800">
+                📥 {s}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-neutral-400 bg-white p-3">
+          <div className="text-sm font-bold text-neutral-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <th className="py-1 pr-2">분류</th><th className="py-1 pr-2">전</th><th className="py-1 pr-2">후</th><th className="py-1">효과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-neutral-100">
+                  <td className="py-1 pr-2 font-medium text-neutral-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-neutral-800 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-neutral-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-neutral-800">TTL 시각화</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'ttl-list' && <TTLListViz viz={viz} />}
+          {viz?.kind === 'ttl-countdown' && <TTLCountdownViz viz={viz} />}
+          {viz?.kind === 'persist-flow' && <PersistFlowViz viz={viz} />}
+          {viz?.kind === 'expiration-modes' && <ExpirationModesViz viz={viz} />}
+          {viz?.kind === 'notification-flow' && <NotificationFlowViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-neutral-800 bg-neutral-100 border border-neutral-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-neutral-500/25 border-l-2 border-neutral-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-neutral-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-neutral-700 text-white font-bold">R</span>
+              <div>
+                <h1 className="text-2xl font-bold text-neutral-900">Chapter III-1-1. TTL과 만료</h1>
+                <p className="text-sm text-neutral-700/80">EXPIRE / PERSIST / Lazy vs Active / Keyspace Notification</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-neutral-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-neutral-700' : 'bg-neutral-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-neutral-800 text-neutral-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-neutral-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-neutral-900 text-white' : 'bg-neutral-700 text-white hover:bg-neutral-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-neutral-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-neutral-400 bg-white px-4 py-3 text-sm text-neutral-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                TTL은 캐시의 핵심. SETEX로 안전하게 설정, KEEPTTL로 유지, PERSIST로 명시적 제거. 실제 삭제는 Lazy+Active 병행. 정확한 시점 필요하면 keyspace notification.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['TTL', 'EXPIRE', 'PERSIST', 'Lazy', 'Active', 'Notification'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-800 border border-neutral-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-neutral-700">
+              <a href="../part2/II-2-2.html" className="underline hover:no-underline">← II-2-2 Set/Sorted Set</a>
+              <a href="./III-1-2.html" className="underline hover:no-underline">다음: III-1-2 Eviction 정책 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Redis 학습 — III-1-2. Eviction 정책</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Redis Chapter III-1-2 — Eviction 정책
+    학습 목표: maxmemory 초과 시 어떤 키를 버릴 것인가. allkeys-lru/lfu, volatile, noeviction.
+    패턴: fastapi v1 — 좌(LiveDataPane: eviction 시뮬레이션) / 우(VSCode CodeViewer)
+    색상: neutral (redis 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. maxmemory — 메모리 상한 설정',
+        desc: 'Redis 인스턴스의 메모리 상한. 도달하면 정책에 따라 키 제거 or 쓰기 거부. 운영 1순위 설정 — 안 정해두면 OS swap 시작 → 응답 시간 10000배 폭증.',
+        viz: {
+          kind: 'memory-bar',
+          used: 1.8,
+          max: 2.0,
+          totalKeys: 1500000,
+        },
+        verdict: '메모리 90%',
+        verdictTone: 'warn',
+        keyPoint: 'maxmemory 안 정해두면 위험. 항상 RAM의 70~80% 정도로 명시.',
+        code: {
+          lang: 'bash',
+          filename: 'maxmemory-config.sh',
+          lines: [
+            '# Step 1. maxmemory 설정',
+            '',
+            '# 방법 1) redis.conf',
+            'maxmemory 2gb',
+            'maxmemory-policy allkeys-lru',
+            '',
+            '# 방법 2) CONFIG SET (런타임)',
+            'redis-cli CONFIG SET maxmemory 2gb',
+            'redis-cli CONFIG SET maxmemory-policy allkeys-lru',
+            '',
+            '# 단위',
+            '# 1b, 1kb, 1mb, 1gb',
+            '# 100mb, 4gb, 16gb',
+            '',
+            '# 권장 값',
+            '# 인스턴스 RAM 의 70~80%',
+            '#   - 나머지 20~30% 는 OS / fork(RDB save) / 클라이언트 버퍼 용',
+            '#   - 100% 로 두면 RDB save 시 fork 메모리 부족 → OOM',
+            '',
+            '# 확인',
+            'redis-cli CONFIG GET maxmemory',
+            'redis-cli INFO memory | grep used_memory_human',
+            '',
+            '# 메모리 사용량 추적',
+            'redis-cli INFO memory',
+            '# used_memory_human       (실제 사용)',
+            '# used_memory_peak_human  (최대 도달)',
+            '# maxmemory_human         (상한)',
+            '# evicted_keys            (eviction 누적 수)',
+            '',
+            '# 위험',
+            '# maxmemory 0 (제한 없음) → swap 사용 시작',
+            '#   응답 0.2ms → 200ms (1000배 ↓)',
+            '#   인스턴스 실질 사망',
+          ],
+          highlight: [3, 4, 7, 8, 10, 11, 12, 14, 15, 16, 17, 18, 20, 21, 22, 24, 25, 26, 27, 28, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 2. allkeys-lru — 가장 안 쓴 키부터 제거',
+        desc: 'Least Recently Used. 모든 키 중 가장 오래 안 쓴 키 제거. 캐시의 정답 정책 — 자주 쓰는 키 살림. 단 LRU는 정확하지 않고 샘플 기반 근사 (maxmemory-samples 조절).',
+        viz: {
+          kind: 'lru',
+          keys: [
+            { key: 'cache:popular', lastAccess: 1, color: 'emerald' },
+            { key: 'cache:trending', lastAccess: 5, color: 'emerald' },
+            { key: 'cache:medium', lastAccess: 60, color: 'amber' },
+            { key: 'cache:old', lastAccess: 3600, color: 'rose', evicted: true },
+            { key: 'cache:ancient', lastAccess: 86400, color: 'rose', evicted: true },
+          ],
+        },
+        verdict: 'LRU 정책',
+        verdictTone: 'good',
+        keyPoint: 'LRU = 캐시의 표준. 인기 키는 살리고 오래된 키 자동 제거.',
+        code: {
+          lang: 'bash',
+          filename: 'allkeys-lru.sh',
+          lines: [
+            '# Step 2. allkeys-lru 정책',
+            '',
+            'redis-cli CONFIG SET maxmemory-policy allkeys-lru',
+            '',
+            '# 동작',
+            '# 1. maxmemory 도달',
+            '# 2. 새 SET 요청 옴',
+            '# 3. Redis 가 무작위 N 개 키 샘플링 (기본 5개)',
+            '# 4. 그 중 가장 오래 안 쓴 키 제거',
+            '# 5. 새 키 저장',
+            '',
+            '# 샘플 수 조절',
+            'CONFIG SET maxmemory-samples 10',
+            '# 5: 빠름, 부정확',
+            '# 10: 균형 (default 5)',
+            '# 50: 정확, 느림',
+            '',
+            '# LRU 추적 정확도',
+            '# Redis 는 정확한 LRU 리스트를 유지하지 않음',
+            '#   → 메모리 절약 위해',
+            '# 대신 키마다 24bit "lastaccess" timestamp 저장',
+            '#   → 샘플 5개 비교 후 가장 오래된 것 제거',
+            '#',
+            '# 결과: "근사 LRU"',
+            '#   완벽한 LRU 의 99% 효과',
+            '#   메모리는 훨씬 적게 사용',
+            '',
+            '# 운영 확인',
+            'redis-cli INFO stats | grep evicted',
+            '# evicted_keys: 누적 eviction 수',
+            '# 갑자기 폭증하면 → 메모리 부족 / TTL 누락 / 핫 데이터 너무 많음',
+            '',
+            '# 추천 시나리오',
+            '# - 캐시 전용 인스턴스 (가장 흔함)',
+            '# - 정확한 priority 가 명확하지 않을 때',
+          ],
+          highlight: [2, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 28, 29, 30, 31],
+        },
+      },
+      {
+        title: 'Step 3. allkeys-lfu — 가장 적게 쓴 키부터 제거',
+        desc: 'Least Frequently Used (Redis 4.0+). "최근"이 아니라 "총 사용 횟수". 평소 별 인기 없다가 가끔 폭주하는 키를 잘 살림. LRU보다 정교하지만 카운터 메모리/연산 약간 더 듦.',
+        viz: {
+          kind: 'lfu',
+          keys: [
+            { key: 'cache:hot', freq: 10000, color: 'emerald' },
+            { key: 'cache:popular', freq: 5000, color: 'emerald' },
+            { key: 'cache:occasional', freq: 100, color: 'amber' },
+            { key: 'cache:rare', freq: 10, color: 'rose', evicted: true },
+            { key: 'cache:single-hit', freq: 1, color: 'rose', evicted: true },
+          ],
+        },
+        verdict: 'LFU 정책',
+        verdictTone: 'good',
+        keyPoint: 'LFU는 빈도 기반 — 트래픽 패턴이 burst 형태일 때 LRU보다 우월.',
+        code: {
+          lang: 'bash',
+          filename: 'allkeys-lfu.sh',
+          lines: [
+            '# Step 3. allkeys-lfu 정책 (Redis 4.0+)',
+            '',
+            'redis-cli CONFIG SET maxmemory-policy allkeys-lfu',
+            '',
+            '# LFU = Least Frequently Used',
+            '# 키마다 카운터 유지 → 가장 적게 쓴 키 제거',
+            '',
+            '# 차이',
+            '# LRU: "최근에 안 썼다" → 시간',
+            '# LFU: "거의 안 쓴다" → 빈도',
+            '',
+            '# 시나리오 — burst 트래픽',
+            '# /api/dashboard 시간당 1000회',
+            '# /api/help     하루 5회',
+            '#',
+            '# LRU: /api/help 가 잠깐 호출되면 신선해 보여 살아남',
+            '# LFU: 빈도 차이 명확 → /api/help 우선 제거',
+            '',
+            '# Redis LFU 알고리즘 — Morris counter',
+            '# 정확한 카운트가 아니라 확률적 증가',
+            '#   → 적은 메모리 (8bit) 로 ~1M 사용량 표현',
+            '',
+            '# 옵션',
+            'CONFIG SET lfu-log-factor 10           # 증가 속도 (default 10)',
+            'CONFIG SET lfu-decay-time 1            # 시간이 지나면 빈도 감소 (분, default 1)',
+            '',
+            '# 빈도 확인',
+            'OBJECT FREQ key                        # 해당 키의 LFU 카운터',
+            '',
+            '# 추천 시나리오',
+            '# - 트래픽이 일정하지 않음 (이벤트 burst)',
+            '# - 핫 데이터와 콜드 데이터 차이가 큼',
+            '# - 정확한 인기 키 추적 필요',
+            '',
+            '# 단점',
+            '# - CPU 약간 더 소비',
+            '# - 초반 측정 기간 부정확 (warmup 필요)',
+          ],
+          highlight: [2, 4, 5, 7, 8, 9, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 23, 24, 25, 27, 28, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 4. volatile-ttl — TTL 있는 키 중에서만',
+        desc: 'volatile-* 정책은 EXPIRE 설정된 키만 제거 대상. TTL 없는 키(영구 데이터)는 보호. 일부는 캐시, 일부는 영구 데이터를 한 인스턴스에서 운영할 때.',
+        viz: {
+          kind: 'volatile',
+          keys: [
+            { key: 'permanent:config', ttl: -1, protected: true },
+            { key: 'cache:short', ttl: 60, candidate: true },
+            { key: 'permanent:auth', ttl: -1, protected: true },
+            { key: 'cache:medium', ttl: 600, candidate: true },
+            { key: 'cache:expired', ttl: 5, candidate: true, evicted: true },
+          ],
+        },
+        verdict: 'TTL 있는 것만',
+        verdictTone: 'good',
+        keyPoint: 'volatile-* 정책은 영구 데이터 보호. 단 TTL 없는 키만 있으면 OOM 위험.',
+        code: {
+          lang: 'bash',
+          filename: 'volatile-policies.sh',
+          lines: [
+            '# Step 4. volatile-* 정책 — TTL 있는 키만 대상',
+            '',
+            '# 종류',
+            '# volatile-lru   TTL 있는 키 중 LRU',
+            '# volatile-lfu   TTL 있는 키 중 LFU',
+            '# volatile-ttl   TTL 가장 짧게 남은 것부터',
+            '# volatile-random TTL 있는 키 중 무작위',
+            '',
+            'redis-cli CONFIG SET maxmemory-policy volatile-ttl',
+            '',
+            '# 사용 시나리오',
+            '# 한 Redis 인스턴스에 두 종류 데이터',
+            '#   - 영구: 설정, 인증 정보, lookup table',
+            '#   - 임시: 캐시 (TTL 60s ~ 1h)',
+            '#',
+            '# 메모리 부족 시 영구 데이터 제거하면 안 됨!',
+            '#   → volatile-* 로 보호',
+            '',
+            '# 예시',
+            'SET permanent:config "..." # TTL 없음 → 보호',
+            'SET cache:post:42 "..." EX 60  # TTL 있음 → 제거 대상',
+            'SET cache:post:43 "..." EX 600',
+            '',
+            '# 메모리 부족 발생 시:',
+            '#   volatile-lru → cache:post:* 중 가장 안 쓴 것 제거',
+            '#   volatile-ttl → cache:post:42 (60초 남음) 먼저 제거',
+            '#   permanent:* 는 절대 제거 X',
+            '',
+            '# 주의 — 함정',
+            '# 만약 TTL 있는 키가 0개라면?',
+            '#   → volatile-* 정책은 제거할 게 없음',
+            '#   → 새 SET 실패 (OOM error)',
+            '#   → 운영 사고',
+            '#',
+            '# 안전 패턴: 모든 캐시 키에 TTL 명시',
+            '# 또는 allkeys-lru 로 변경',
+          ],
+          highlight: [3, 4, 5, 6, 9, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 5. noeviction — 기본값의 함정',
+        desc: 'Redis 기본 정책은 noeviction. maxmemory 도달 시 새 쓰기 거부 (OOM error 반환). DB 같은 영속 데이터엔 안전, 캐시엔 재앙. 첫 운영 사고 1순위.',
+        viz: {
+          kind: 'noeviction',
+          state: {
+            memory: 100,
+            attempts: ['SET foo "v1" → ✅', 'SET foo "v2" → ✅', 'SET bar "v3" → ❌ OOM'],
+          },
+        },
+        verdict: '쓰기 거부',
+        verdictTone: 'danger',
+        summary: {
+          title: 'III-1-2 Eviction 정리',
+          rows: [
+            { metric: '기본', before: 'noeviction', after: '캐시는 allkeys-lru', delta: '안전' },
+            { metric: 'LRU', before: '시간 기준', after: '인기 키 살림', delta: '표준' },
+            { metric: 'LFU', before: '빈도 기준', after: 'burst 트래픽', delta: '정교' },
+            { metric: 'volatile', before: 'TTL 있는 키만', after: '영구 데이터 보호', delta: '혼합 OK' },
+            { metric: 'noeviction', before: '쓰기 거부', after: '영속 DB', delta: '캐시 X' },
+          ],
+        },
+        keyPoint: '캐시는 allkeys-lru/lfu. 혼합은 volatile-*. 영속은 noeviction. 정책 선택이 운영 안정성.',
+        code: {
+          lang: 'bash',
+          filename: 'noeviction-trap.sh',
+          lines: [
+            '# Step 5. noeviction 함정 + 정책 선택 가이드',
+            '',
+            '# noeviction (default)',
+            '# maxmemory 도달 시 → 새 쓰기 모두 거부',
+            '# DEL 같은 삭제는 가능, SET 은 OOM 에러',
+            '',
+            '# 사고 시나리오',
+            '# 1. Redis 캐시 인스턴스 maxmemory=2gb, noeviction',
+            '# 2. 캐시 키 누적 → 2gb 도달',
+            '# 3. 새 캐시 저장 시도 → "OOM command not allowed"',
+            '# 4. 앱 측: 캐시 미스 + 캐시 저장 실패 → 모든 요청 DB 직행',
+            '# 5. DB CPU 95% → 도미노',
+            '',
+            '# 즉시 조치',
+            'redis-cli CONFIG SET maxmemory-policy allkeys-lru',
+            '# 또는',
+            'redis-cli FLUSHDB             # ⚠ 모든 데이터 삭제',
+            '',
+            '# 영구 예방',
+            '# redis.conf 에 명시',
+            'maxmemory 2gb',
+            'maxmemory-policy allkeys-lru   # 캐시 용도면',
+            '',
+            '# 정책 선택 가이드',
+            '# ┌──────────────────────────┐',
+            '# │ 캐시 전용 (대부분)         │ → allkeys-lru',
+            '# │ Burst 트래픽 있음          │ → allkeys-lfu',
+            '# │ 영구 + 캐시 혼합            │ → volatile-lru',
+            '# │ 영속 DB (캐시 아님)         │ → noeviction (+모니터링)',
+            '# │ 모르겠음 + 단순            │ → allkeys-lru ← 안전한 default',
+            '# └──────────────────────────┘',
+            '',
+            '# 모니터링 알람',
+            '# 1) used_memory_human > 90% of maxmemory',
+            '# 2) evicted_keys/sec 급증',
+            '# 3) rejected_connections > 0 (noeviction OOM)',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 10, 11, 14, 15, 16, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function MemoryBarViz({ viz }) {
+      const pct = (viz.used / viz.max) * 100;
+      const tone = pct >= 90 ? 'rose' : pct >= 75 ? 'amber' : 'emerald';
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="flex justify-between text-xs mb-1">
+            <span className="text-neutral-700">메모리 사용량</span>
+            <span className="font-mono font-bold">{viz.used} / {viz.max} GB</span>
+          </div>
+          <div className="h-6 bg-white rounded overflow-hidden border border-neutral-200">
+            <div className={`h-full bg-${tone}-500 flex items-center justify-end pr-2`} style={{ width: `${pct}%` }}>
+              <span className="text-[10px] text-white font-bold">{pct.toFixed(0)}%</span>
+            </div>
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+            <div className="bg-white border border-neutral-200 rounded p-2">
+              <div className="text-[10px] text-neutral-500">전체 키 수</div>
+              <div className="font-mono font-bold">{viz.totalKeys.toLocaleString()}</div>
+            </div>
+            <div className="bg-white border border-neutral-200 rounded p-2">
+              <div className="text-[10px] text-neutral-500">남은 메모리</div>
+              <div className="font-mono font-bold text-rose-600">{(viz.max - viz.used).toFixed(1)} GB</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LRUViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">최근 접근 시간 (초)</div>
+          <div className="space-y-1.5">
+            {viz.keys.map((k, i) => (
+              <div key={i} className={`flex items-center gap-2 px-2 py-1.5 rounded border ${
+                k.evicted ? 'bg-rose-50 border-rose-300 opacity-70' : 'bg-white border-neutral-200'
+              }`}>
+                <span className="flex-1 text-xs font-mono">{k.key}</span>
+                <span className={`text-[10px] px-2 py-0.5 rounded bg-${k.color}-100 text-${k.color}-800 font-mono`}>
+                  {k.lastAccess < 60 ? `${k.lastAccess}s` : k.lastAccess < 3600 ? `${k.lastAccess/60}m` : `${k.lastAccess/3600}h`} 전
+                </span>
+                {k.evicted && <span className="text-[10px] text-rose-700">✗ 제거</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function LFUViz({ viz }) {
+      const max = Math.max(...viz.keys.map(k => k.freq));
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">접근 빈도 (총 횟수)</div>
+          <div className="space-y-1.5">
+            {viz.keys.map((k, i) => (
+              <div key={i}>
+                <div className="flex justify-between text-[11px] mb-0.5">
+                  <span className={`font-mono ${k.evicted ? 'text-rose-600 line-through' : 'text-neutral-700'}`}>{k.key}</span>
+                  <span className="font-mono font-bold text-neutral-900">{k.freq.toLocaleString()}</span>
+                </div>
+                <div className="h-3 bg-white rounded overflow-hidden border border-neutral-200">
+                  <div className={`h-full bg-${k.color}-500`} style={{ width: `${(k.freq/max)*100}%` }}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function VolatileViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-1.5">
+            {viz.keys.map((k, i) => (
+              <div key={i} className={`flex items-center gap-2 px-2 py-1.5 rounded border ${
+                k.protected ? 'bg-blue-50 border-blue-300' :
+                k.evicted ? 'bg-rose-50 border-rose-300 opacity-70' :
+                'bg-white border-neutral-200'
+              }`}>
+                <span className="flex-1 text-xs font-mono">{k.key}</span>
+                <span className="text-[10px] px-2 py-0.5 rounded bg-white border border-neutral-300 font-mono">
+                  {k.ttl === -1 ? '영구' : `TTL ${k.ttl}s`}
+                </span>
+                {k.protected && <span className="text-[10px] text-blue-700">🛡 보호</span>}
+                {k.evicted && <span className="text-[10px] text-rose-700">✗ 제거</span>}
+                {k.candidate && !k.evicted && <span className="text-[10px] text-amber-700">대상</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function NoevictionViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="bg-rose-100 border border-rose-300 rounded p-3 mb-3">
+            <div className="text-xs font-bold text-rose-800">⚠ 메모리 {viz.state.memory}% 도달 — 쓰기 거부 모드</div>
+          </div>
+          <div className="space-y-1">
+            {viz.state.attempts.map((a, i) => (
+              <div key={i} className="bg-white border border-neutral-300 rounded p-2 text-[11px] font-mono">{a}</div>
+            ))}
+          </div>
+          <div className="mt-3 text-[10px] text-rose-700">앱이 캐시 저장 못함 → 모든 요청이 DB 직행 → 도미노</div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-neutral-400 bg-white p-3">
+          <div className="text-sm font-bold text-neutral-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <th className="py-1 pr-2">정책</th><th className="py-1 pr-2">의미</th><th className="py-1 pr-2">용도</th><th className="py-1">비고</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-neutral-100">
+                  <td className="py-1 pr-2 font-medium text-neutral-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-neutral-800 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-neutral-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-neutral-800">Eviction 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'memory-bar' && <MemoryBarViz viz={viz} />}
+          {viz?.kind === 'lru' && <LRUViz viz={viz} />}
+          {viz?.kind === 'lfu' && <LFUViz viz={viz} />}
+          {viz?.kind === 'volatile' && <VolatileViz viz={viz} />}
+          {viz?.kind === 'noeviction' && <NoevictionViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-neutral-800 bg-neutral-100 border border-neutral-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-neutral-500/25 border-l-2 border-neutral-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-neutral-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-neutral-700 text-white font-bold">R</span>
+              <div>
+                <h1 className="text-2xl font-bold text-neutral-900">Chapter III-1-2. Eviction 정책</h1>
+                <p className="text-sm text-neutral-700/80">메모리 도달 시 어떤 키를 제거할 것인가</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-neutral-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-neutral-700' : 'bg-neutral-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-neutral-800 text-neutral-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-neutral-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-neutral-900 text-white' : 'bg-neutral-700 text-white hover:bg-neutral-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-neutral-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-neutral-400 bg-white px-4 py-3 text-sm text-neutral-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                maxmemory + eviction policy는 운영 1순위. 캐시는 allkeys-lru/lfu, 영구+캐시 혼합은 volatile-*, 영속 DB는 noeviction. 첫 운영 사고 1순위가 noeviction OOM.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['maxmemory', 'LRU', 'LFU', 'volatile', 'noeviction', 'Eviction'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-800 border border-neutral-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-neutral-700">
+              <a href="./III-1-1.html" className="underline hover:no-underline">← III-1-1 TTL</a>
+              <a href="./III-2-1.html" className="underline hover:no-underline">다음: III-2-1 Persistence RDB vs AOF →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

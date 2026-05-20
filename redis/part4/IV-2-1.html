@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Redis 학습 — IV-2-1. Streams + Consumer Group</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Redis Chapter IV-2-1 — Streams + Consumer Group
+    학습 목표: XADD/XREAD 깊이, XGROUP/XREADGROUP 부하 분산, XACK, PEL 재시도.
+    패턴: fastapi v1 — 좌(LiveDataPane: stream + consumer 시각화) / 우(VSCode CodeViewer)
+    색상: neutral (redis 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. XADD — 엔트리 추가',
+        desc: 'XADD stream * field val ... → timestamp 기반 ID로 엔트리 추가. * = 자동 ID 생성 (밀리초-시퀀스). 메시지는 field-value 쌍의 집합 (마치 Hash). MAXLEN/MINID로 길이 제한.',
+        viz: {
+          kind: 'xadd',
+          stream: 'orders',
+          recent: [
+            { id: '1715000000-0', fields: { type: 'new', order_id: '42' } },
+            { id: '1715000100-0', fields: { type: 'paid', order_id: '42', amount: '100' } },
+            { id: '1715000200-0', fields: { type: 'shipped', order_id: '42' } },
+          ],
+        },
+        verdict: 'XADD 저장',
+        verdictTone: 'good',
+        keyPoint: 'XADD * = 자동 ID. ID는 timestamp-seq 형식. MAXLEN으로 무한 성장 방지.',
+        code: {
+          lang: 'python',
+          filename: 'xadd-deep.py',
+          lines: [
+            '# Step 1. XADD 깊이',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# 기본 — 자동 ID',
+            'r.xadd("orders", {"type": "new", "order_id": 42})',
+            '# 반환: "1715000000-0"  (ms-seq)',
+            '',
+            '# 같은 ms 안에 여러 추가 시',
+            'r.xadd("orders", {"x": 1})  # 1715000001-0',
+            'r.xadd("orders", {"x": 2})  # 1715000001-1  (seq 증가)',
+            'r.xadd("orders", {"x": 3})  # 1715000001-2',
+            '',
+            '# 명시적 ID (단조 증가 보장 필요)',
+            'r.xadd("orders", {"x": 1}, id="1715000002-0")',
+            '',
+            '# MAXLEN — 길이 상한',
+            'r.xadd("orders", {"x": 1}, maxlen=10000)',
+            '# 10000 넘으면 오래된 것부터 제거 (~ 근사)',
+            'r.xadd("orders", {"x": 1}, maxlen=10000, approximate=False)  # 정확',
+            '',
+            '# MINID — 특정 ID 이전 모두 제거',
+            'r.xadd("orders", {"x": 1}, minid="1715000000-0")',
+            '',
+            '# 메시지 = field-value 쌍 (Hash 처럼)',
+            'r.xadd("events", {',
+            '    "type": "click",',
+            '    "user_id": 42,',
+            '    "page": "/home",',
+            '    "ts": 1715000000,',
+            '})',
+            '',
+            '# 조회 — XRANGE / XREVRANGE / XREAD',
+            'r.xrange("orders", "-", "+")        # 전체',
+            'r.xrange("orders", "-", "+", count=10)  # 처음 10개',
+            'r.xrevrange("orders", "+", "-", count=10)  # 최신 10개',
+            '',
+            '# XLEN — 길이',
+            'r.xlen("orders")',
+          ],
+          highlight: [5, 6, 7, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 22, 23, 25, 26, 27, 28, 29, 30, 32, 33, 34, 36, 37],
+        },
+      },
+      {
+        title: 'Step 2. XREAD — 단일 consumer 조회',
+        desc: 'XREAD STREAMS key id로 특정 ID 이후 메시지 가져오기. "$" = 새 메시지 대기, "0" = 처음부터. BLOCK 옵션으로 대기. 단일 consumer 패턴 — 모든 메시지를 한 consumer가 받음.',
+        viz: {
+          kind: 'xread-single',
+          stream: 'events',
+          consumer: 'W1',
+          messages: 5,
+          rate: '200 msg/s',
+        },
+        verdict: '단일 consumer',
+        verdictTone: 'good',
+        keyPoint: 'XREAD = 단일 consumer 패턴. 모든 메시지를 한 명이 받음. 부하 분산 필요하면 XREADGROUP.',
+        code: {
+          lang: 'python',
+          filename: 'xread-basic.py',
+          lines: [
+            '# Step 2. XREAD — 단일 consumer',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# 처음부터 읽기',
+            'msgs = r.xread({"events": "0"}, count=10)',
+            '# [(stream, [(id, {field: val}), ...])]',
+            '',
+            '# 새 메시지만 대기 — "$"',
+            'msgs = r.xread({"events": "$"}, count=10, block=5000)',
+            '# block=5000: 5초 wait for new messages',
+            '',
+            '# 무한 루프 패턴',
+            'last_id = "$"',
+            'while True:',
+            '    msgs = r.xread({"events": last_id}, count=10, block=0)',
+            '    for stream, entries in msgs:',
+            '        for entry_id, data in entries:',
+            '            process(data)',
+            '            last_id = entry_id  # 다음 호출에 이어서',
+            '',
+            '# 여러 stream 동시 구독',
+            'msgs = r.xread({',
+            '    "orders": "$",',
+            '    "payments": "$",',
+            '}, block=0)',
+            '',
+            '# 단일 consumer 의 한계',
+            '# - 모든 메시지를 한 명이 받음 → 부하 집중',
+            '# - 처리 실패 시 재시도 메커니즘 X',
+            '# - 여러 consumer 띄워도 각자 모든 메시지 받음 (중복 처리)',
+            '',
+            '# → Consumer Group 으로 해결 (Step 3)',
+          ],
+          highlight: [5, 6, 7, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 3. XGROUP / XREADGROUP — 부하 분산',
+        desc: 'XGROUP CREATE로 consumer group 생성. 여러 consumer가 한 group에 속해 메시지를 분담 처리. 같은 메시지는 한 consumer에게만 (round-robin 비슷). Kafka의 consumer group과 동일 개념.',
+        viz: {
+          kind: 'consumer-group',
+          stream: 'events',
+          group: 'workers',
+          consumers: [
+            { name: 'W1', processed: 1543, pending: 2 },
+            { name: 'W2', processed: 1521, pending: 1 },
+            { name: 'W3', processed: 1567, pending: 3 },
+          ],
+        },
+        verdict: 'Group 부하 분산',
+        verdictTone: 'good',
+        keyPoint: 'Consumer Group = "워커 풀". 같은 메시지를 한 명만 받음. 처리량 N배 확장.',
+        code: {
+          lang: 'python',
+          filename: 'consumer-group.py',
+          lines: [
+            '# Step 3. Consumer Group — 부하 분산',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# 1) Group 생성 (1번만)',
+            'try:',
+            '    r.xgroup_create("events", "workers", id="0")',
+            '    # id="0": 처음부터 / "$": 새 메시지만',
+            'except redis.ResponseError:',
+            '    pass  # group 이미 존재',
+            '',
+            '# 2) Consumer 시작 (여러 명 띄움)',
+            'def worker(consumer_name: str):',
+            '    while True:',
+            '        msgs = r.xreadgroup(',
+            '            "workers",                 # group',
+            '            consumer_name,             # consumer 이름 (W1, W2, ...)',
+            '            {"events": ">"},           # > = 새 메시지만',
+            '            count=10,',
+            '            block=5000,',
+            '        )',
+            '',
+            '        if not msgs:',
+            '            continue',
+            '',
+            '        for stream, entries in msgs:',
+            '            for entry_id, data in entries:',
+            '                try:',
+            '                    handle(data)',
+            '                    # 3) XACK — 처리 완료 (Step 4)',
+            '                    r.xack("events", "workers", entry_id)',
+            '                except Exception:',
+            '                    pass  # PEL 에 남아 재시도 가능',
+            '',
+            '# 여러 워커 띄우기',
+            '# python worker.py W1 &',
+            '# python worker.py W2 &',
+            '# python worker.py W3 &',
+            '',
+            '# 분배 방식',
+            '# 메시지 1 → W1 (먼저 요청한 사람)',
+            '# 메시지 2 → W2',
+            '# 메시지 3 → W3',
+            '# 메시지 4 → W1 (라운드로빈 아님, 빨리 요청한 순)',
+            '',
+            '# 같은 group 안 consumer 끼리 자동 분담',
+            '# 다른 group 은 독립 처리 (분석 group + 알림 group 같이)',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 4. XACK — 처리 완료 신호',
+        desc: 'XREADGROUP으로 받은 메시지는 자동으로 "pending" 상태. XACK group entry_id로 "처리 완료" 표시해야 PEL에서 빠짐. ack 안 한 메시지는 consumer 죽어도 살아남아 재처리 가능.',
+        viz: {
+          kind: 'xack-flow',
+          steps: [
+            { state: 'XREADGROUP', desc: '메시지 받음 → PEL 등록', color: 'amber' },
+            { state: '처리 중', desc: 'handle(data) 실행', color: 'blue' },
+            { state: 'XACK', desc: 'PEL 에서 제거', color: 'emerald' },
+            { state: '완료', desc: '메시지 처리 끝', color: 'emerald' },
+          ],
+        },
+        verdict: 'At-least-once',
+        verdictTone: 'good',
+        keyPoint: 'XACK 안 하면 메시지가 PEL에 남음 → consumer 죽어도 다른 consumer가 재처리.',
+        code: {
+          lang: 'python',
+          filename: 'xack-pel.py',
+          lines: [
+            '# Step 4. XACK + PEL (Pending Entries List)',
+            '',
+            'import redis',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# 처리 완료 → XACK',
+            'def process_with_ack(entry_id: str, data: dict):',
+            '    try:',
+            '        handle(data)',
+            '        # 성공 시 ack — PEL 에서 제거',
+            '        r.xack("events", "workers", entry_id)',
+            '        return True',
+            '    except Exception as e:',
+            '        # 실패 시 ack 안 함 — PEL 에 남음',
+            '        print(f"실패 {entry_id}: {e}")',
+            '        return False',
+            '',
+            '# PEL 확인',
+            'r.xpending("events", "workers")',
+            '# {',
+            '#   "pending": 5,',
+            '#   "min": "1715000000-0",',
+            '#   "max": "1715000100-0",',
+            '#   "consumers": {"W1": 2, "W2": 3}',
+            '# }',
+            '',
+            '# 상세 PEL — 가장 오래된 5개',
+            'r.xpending_range("events", "workers", "-", "+", 5)',
+            '# [{id, consumer, time_since_delivery, deliveries}, ...]',
+            '',
+            '# at-least-once 보장',
+            '# 1) XREADGROUP → 메시지 PEL 등록',
+            '# 2) consumer 처리 중 crash',
+            '# 3) 메시지는 PEL 에 남음',
+            '# 4) 다른 consumer 가 XREADGROUP id="0" 으로 PEL 메시지 다시 가져옴',
+            '#    또는 XCLAIM 으로 명시적 인수',
+            '',
+            '# at-least-once 의 함의',
+            '# - 같은 메시지가 2번 처리될 가능성 있음',
+            '# - 멱등성(idempotency) 설계 필수',
+            '#   예: order_id 별로 1번만 처리',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41],
+        },
+      },
+      {
+        title: 'Step 5. PEL 재시도 — XCLAIM / Dead consumer',
+        desc: 'Consumer가 죽으면 그 consumer 이름의 PEL 메시지가 남음. XPENDING으로 확인 후 XCLAIM으로 다른 consumer가 인수. min-idle-time으로 충분히 오래 pending인 것만 안전하게 인수.',
+        viz: {
+          kind: 'xclaim',
+          deadConsumer: 'W1 (crashed)',
+          pendingMessages: 3,
+          newConsumer: 'W2 (claiming)',
+          claimedAfter: '30s idle',
+        },
+        verdict: 'Dead consumer 회수',
+        verdictTone: 'good',
+        summary: {
+          title: 'IV-2-1 Stream 정리',
+          rows: [
+            { metric: '추가', before: 'XADD * field val', after: '자동 ID', delta: 'ms-seq' },
+            { metric: '조회', before: 'XREAD 단일', after: 'XREADGROUP 분담', delta: 'N배' },
+            { metric: 'Ack', before: '자동 처리됨 가정', after: 'XACK 명시', delta: 'at-least-once' },
+            { metric: '재시도', before: '메시지 손실', after: 'PEL + XCLAIM', delta: '안전' },
+            { metric: '운영', before: '재시도 X', after: 'Dead consumer 회수', delta: '자동' },
+          ],
+        },
+        keyPoint: 'Stream + Group + Ack + XCLAIM = 운영급 메시지 큐. 다음(IV-2-2) Cluster.',
+        code: {
+          lang: 'python',
+          filename: 'xclaim-recovery.py',
+          lines: [
+            '# Step 5. XCLAIM — Dead Consumer 메시지 회수',
+            '',
+            'import redis, time',
+            'r = redis.Redis(decode_responses=True)',
+            '',
+            '# 1) Dead consumer 메시지 발견',
+            'pending = r.xpending_range(',
+            '    "events", "workers",',
+            '    "-", "+",',
+            '    count=100,',
+            '    consumername="W1",     # 죽은 consumer',
+            ')',
+            '',
+            '# 2) XCLAIM — 다른 consumer 가 인수',
+            'for p in pending:',
+            '    if p["time_since_delivered"] > 30000:    # 30초 넘게 pending',
+            '        r.xclaim(',
+            '            "events", "workers",',
+            '            consumername="W2",                # 새 owner',
+            '            min_idle_time=30000,              # 30초 미만이면 skip',
+            '            message_ids=[p["message_id"]],',
+            '        )',
+            '',
+            '# 3) XAUTOCLAIM (Redis 6.2+) — 자동화',
+            'r.xautoclaim(',
+            '    "events", "workers",',
+            '    "W2",                                    # 새 consumer',
+            '    min_idle_time=30000,',
+            '    start_id="0",',
+            '    count=10,',
+            ')',
+            '# 반환: (next_cursor, claimed_ids, deleted_ids)',
+            '',
+            '# 4) 정기 작업으로 dead consumer 청소',
+            'def reaper():',
+            '    """30초마다 dead consumer 메시지 회수."""',
+            '    while True:',
+            '        cursor = "0"',
+            '        while True:',
+            '            cursor, claimed, _ = r.xautoclaim(',
+            '                "events", "workers", "reaper",',
+            '                min_idle_time=60000,         # 1분 넘게 pending',
+            '                start_id=cursor,',
+            '            )',
+            '            if cursor == "0":',
+            '                break',
+            '            for id, data in claimed:',
+            '                handle(data)',
+            '                r.xack("events", "workers", id)',
+            '        time.sleep(30)',
+            '',
+            '# 운영급 패턴',
+            '# - Worker 별 heartbeat 모니터링',
+            '# - 죽은 worker 감지 시 reaper 작동',
+            '# - 멱등성 보장 + at-least-once = 완전한 메시지 큐',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function XADDViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">stream: <span className="font-mono">{viz.stream}</span></div>
+          <div className="space-y-1">
+            {viz.recent.map((e, i) => (
+              <div key={i} className="bg-white border border-neutral-300 rounded p-1.5">
+                <div className="flex items-center gap-2 text-[10px] font-mono">
+                  <span className="text-emerald-600">{e.id}</span>
+                  <span className="text-neutral-300">|</span>
+                  <span className="flex-1 text-neutral-700">
+                    {Object.entries(e.fields).map(([k, v]) => (
+                      <span key={k} className="mr-2"><span className="text-amber-600">{k}</span>={v}</span>
+                    ))}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function XReadSingleViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="flex items-center gap-3">
+            <div className="bg-neutral-700 text-white px-3 py-3 rounded text-center">
+              <div className="text-[10px] opacity-70">stream</div>
+              <div className="font-mono">{viz.stream}</div>
+            </div>
+            <span className="text-neutral-400">→</span>
+            <div className="bg-amber-100 text-amber-800 px-3 py-3 rounded text-center">
+              <div className="text-[10px]">consumer</div>
+              <div className="font-mono">{viz.consumer}</div>
+              <div className="text-[9px] mt-1">받은 메시지 {viz.messages}개</div>
+            </div>
+          </div>
+          <div className="mt-3 text-center text-[10px] text-amber-700">⚠ 모든 메시지가 한 명에게 — {viz.rate}</div>
+        </div>
+      );
+    }
+
+    function ConsumerGroupViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-center mb-3">
+            <div className="inline-block bg-neutral-700 text-white px-3 py-1.5 rounded text-xs font-mono">{viz.stream}</div>
+            <div className="text-[10px] text-neutral-500 mt-1">↓ XREADGROUP "{viz.group}" ↓</div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {viz.consumers.map((c, i) => (
+              <div key={i} className="bg-white border border-emerald-300 rounded p-2 text-center">
+                <div className="text-xs font-bold font-mono">{c.name}</div>
+                <div className="text-[10px] text-emerald-700 mt-1">✓ {c.processed.toLocaleString()}</div>
+                <div className="text-[10px] text-amber-700">⏳ PEL {c.pending}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-center text-[10px] text-emerald-700">메시지 자동 분담 — 같은 메시지는 1명에게만</div>
+        </div>
+      );
+    }
+
+    function XAckFlowViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-1.5">
+            {viz.steps.map((s, i) => (
+              <div key={i} className={`flex items-center gap-2 px-3 py-2 rounded border bg-${s.color}-50 border-${s.color}-300`}>
+                <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold bg-${s.color}-200 text-${s.color}-800`}>{i+1}</span>
+                <div className="flex-1">
+                  <div className="text-xs font-bold font-mono">{s.state}</div>
+                  <div className="text-[10px] text-neutral-600">{s.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function XClaimViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="flex items-center gap-3">
+            <div className="flex-1 bg-rose-100 border border-rose-300 rounded p-2 text-center">
+              <div className="text-xs font-bold text-rose-800">{viz.deadConsumer}</div>
+              <div className="text-[10px] text-rose-700 mt-1">PEL {viz.pendingMessages}개</div>
+            </div>
+            <span className="text-neutral-400">→</span>
+            <div className="text-[10px] text-center font-mono text-purple-800 bg-purple-50 border border-purple-300 rounded p-2">
+              XCLAIM<br/>{viz.claimedAfter}
+            </div>
+            <span className="text-neutral-400">→</span>
+            <div className="flex-1 bg-emerald-100 border border-emerald-300 rounded p-2 text-center">
+              <div className="text-xs font-bold text-emerald-800">{viz.newConsumer}</div>
+              <div className="text-[10px] text-emerald-700 mt-1">PEL {viz.pendingMessages}개 인수</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-neutral-400 bg-white p-3">
+          <div className="text-sm font-bold text-neutral-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <th className="py-1 pr-2">분류</th><th className="py-1 pr-2">전</th><th className="py-1 pr-2">후</th><th className="py-1">효과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-neutral-100">
+                  <td className="py-1 pr-2 font-medium text-neutral-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-neutral-800 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-neutral-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-neutral-800">Stream + Consumer Group</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'xadd' && <XADDViz viz={viz} />}
+          {viz?.kind === 'xread-single' && <XReadSingleViz viz={viz} />}
+          {viz?.kind === 'consumer-group' && <ConsumerGroupViz viz={viz} />}
+          {viz?.kind === 'xack-flow' && <XAckFlowViz viz={viz} />}
+          {viz?.kind === 'xclaim' && <XClaimViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-neutral-800 bg-neutral-100 border border-neutral-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-neutral-500/25 border-l-2 border-neutral-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-neutral-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-neutral-700 text-white font-bold">R</span>
+              <div>
+                <h1 className="text-2xl font-bold text-neutral-900">Chapter IV-2-1. Streams + Consumer Group</h1>
+                <p className="text-sm text-neutral-700/80">XADD → XREAD → XGROUP → XACK → XCLAIM</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-neutral-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-neutral-700' : 'bg-neutral-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-neutral-800 text-neutral-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-neutral-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-neutral-900 text-white' : 'bg-neutral-700 text-white hover:bg-neutral-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-neutral-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-neutral-400 bg-white px-4 py-3 text-sm text-neutral-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Stream + Consumer Group + XACK + XCLAIM = 운영급 메시지 큐. Kafka 패턴을 Redis로. 멱등성 보장 + at-least-once. 다음(IV-2-2) Cluster.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Stream', 'XADD', 'XREADGROUP', 'XACK', 'PEL', 'XCLAIM'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-800 border border-neutral-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-neutral-700">
+              <a href="./IV-1-2.html" className="underline hover:no-underline">← IV-1-2 Pub/Sub vs Stream</a>
+              <a href="./IV-2-2.html" className="underline hover:no-underline">다음: IV-2-2 Cluster →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

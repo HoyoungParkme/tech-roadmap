@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Redis 학습 — IV-2-2. Cluster 16384 slot</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Redis Chapter IV-2-2 — Cluster 16384 slot
+    학습 목표: 단일 노드 한계, cluster mode, hash slot, slot 이동, MOVED/ASK.
+    패턴: fastapi v1 — 좌(LiveDataPane: cluster 토폴로지) / 우(VSCode CodeViewer)
+    색상: neutral (redis 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 단일 노드 한계 — 메모리/처리량 천장',
+        desc: '단일 Redis 노드는 RAM 한 대 크기까지 (~256GB 정도가 실용 상한). CPU도 단일 스레드라 처리량 ~200K ops/sec. 더 큰 데이터/트래픽은 sharding 필요 → Cluster.',
+        viz: {
+          kind: 'single-limit',
+          metrics: [
+            { name: '메모리', value: '256GB', limit: 'RAM 1개', tone: 'warn' },
+            { name: 'CPU', value: '단일 스레드', limit: '~200K ops/s', tone: 'warn' },
+            { name: '백업', value: 'RDB fork', limit: '메모리 2x 일시 사용', tone: 'amber' },
+            { name: '가용성', value: '단일 노드', limit: '다운 = 서비스 다운', tone: 'rose' },
+          ],
+        },
+        verdict: '단일 한계',
+        verdictTone: 'warn',
+        keyPoint: '단일 노드 한계: 메모리/처리량/가용성. 그 너머는 Cluster로 수평 확장.',
+        code: {
+          lang: 'markdown',
+          filename: 'single-node-limits.md',
+          lines: [
+            '# 단일 Redis 노드 한계',
+            '',
+            '## 메모리',
+            '- 실용 상한 ~256GB (서버 RAM)',
+            '- 그 이상은 fork() 시 메모리 부족',
+            '- 백업/replication 시 메모리 압박',
+            '',
+            '## CPU (단일 스레드)',
+            '- 200K ops/sec 정도',
+            '- 큰 키 LRANGE 등은 메인 스레드 블로킹',
+            '- 멀티코어 활용 불가',
+            '',
+            '## 가용성',
+            '- 노드 다운 = 서비스 다운',
+            '- Sentinel + Replica 로 보완 가능',
+            '- 그러나 같은 메모리 한계는 그대로',
+            '',
+            '## 언제 Cluster 필요?',
+            '| 시나리오 | 대안 |',
+            '|:--|:--|',
+            '| 메모리 < 64GB | 단일 노드 |',
+            '| 64GB~256GB | Replica 활용 |',
+            '| 256GB 이상 | Cluster |',
+            '| 처리량 > 200K ops/s | Cluster or DragonflyDB |',
+            '| 가용성 + 분산 | Cluster |',
+            '',
+            '## 결정 가이드',
+            '- 작으면: 단일 노드 + Sentinel',
+            '- 크면: Cluster (3+ shard)',
+            '- 운영 단순함 우선: DragonflyDB (단일 노드 + 멀티스레드)',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 2. Cluster mode — 16384 hash slot',
+        desc: 'Redis Cluster는 16384개 hash slot으로 키 공간을 나눈다. 각 노드가 일부 slot을 담당. 키 → slot 계산은 CRC16(key) % 16384. 노드 추가 시 slot 일부를 새 노드로 이동.',
+        viz: {
+          kind: 'slots',
+          nodes: [
+            { id: 'N1', slots: '0-5460', count: 5461, color: 'blue' },
+            { id: 'N2', slots: '5461-10922', count: 5462, color: 'emerald' },
+            { id: 'N3', slots: '10923-16383', count: 5461, color: 'amber' },
+          ],
+          total: 16384,
+        },
+        verdict: '3 노드 sharding',
+        verdictTone: 'good',
+        keyPoint: '16384 slot을 노드별 나눠 담당. 키 분산은 CRC16(key) % 16384. 균등 분배.',
+        code: {
+          lang: 'bash',
+          filename: 'cluster-setup.sh',
+          lines: [
+            '# Step 2. Cluster 구성',
+            '',
+            '# Cluster 모드로 6개 노드 띄우기 (3 primary + 3 replica)',
+            'for port in 7000 7001 7002 7003 7004 7005; do',
+            '  docker run -d --name redis-$port -p $port:6379 redis:7 \\',
+            '    redis-server \\',
+            '      --cluster-enabled yes \\',
+            '      --cluster-config-file nodes.conf \\',
+            '      --cluster-node-timeout 5000 \\',
+            '      --appendonly yes',
+            'done',
+            '',
+            '# Cluster 생성 — 3 primary + 각각 1 replica',
+            'redis-cli --cluster create \\',
+            '  127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \\',
+            '  127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005 \\',
+            '  --cluster-replicas 1 \\',
+            '  --cluster-yes',
+            '',
+            '# 자동 slot 분배',
+            '# N1 (7000): 0-5460     primary',
+            '# N2 (7001): 5461-10922 primary',
+            '# N3 (7002): 10923-16383 primary',
+            '# N4 (7003): N1 replica',
+            '# N5 (7004): N2 replica',
+            '# N6 (7005): N3 replica',
+            '',
+            '# 상태 확인',
+            'redis-cli -p 7000 CLUSTER NODES',
+            'redis-cli -p 7000 CLUSTER INFO',
+            '#   cluster_state:ok',
+            '#   cluster_slots_assigned:16384',
+            '#   cluster_known_nodes:6',
+            '',
+            '# 특정 키의 slot 계산',
+            'redis-cli -p 7000 CLUSTER KEYSLOT mykey',
+            '# (integer) 14687',
+            '',
+            '# 슬롯 담당 노드 확인',
+            'redis-cli -p 7000 CLUSTER COUNTKEYSINSLOT 14687',
+            '',
+            '# 클라이언트 — cluster 인식 라이브러리 사용',
+            '# python: from redis.cluster import RedisCluster',
+            '# rc = RedisCluster(host="127.0.0.1", port=7000)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 34, 35, 36, 38, 39, 41, 42, 43],
+        },
+      },
+      {
+        title: 'Step 3. CRC16(key) % 16384 — slot 매핑',
+        desc: '클라이언트가 키 보내면 CRC16 해시 → 16384로 나눈 나머지 = slot 번호. 같은 키는 항상 같은 slot. {hashtag} 안 부분만 해싱 옵션 — 관련 키 같은 노드에 두기 (multi-key 연산).',
+        viz: {
+          kind: 'crc-mapping',
+          examples: [
+            { key: 'user:1', crc: 23457, slot: 7073, node: 'N2' },
+            { key: 'user:2', crc: 41892, slot: 9508, node: 'N2' },
+            { key: 'cart:1', crc: 65123, slot: 16035, node: 'N3' },
+            { key: '{user:1}:profile', crc: 23457, slot: 7073, node: 'N2', hashtag: true },
+            { key: '{user:1}:cart', crc: 23457, slot: 7073, node: 'N2', hashtag: true },
+          ],
+        },
+        verdict: 'CRC16 매핑',
+        verdictTone: 'good',
+        keyPoint: '{tag} 사용하면 같은 노드 보장. multi-key 명령 (MGET/MSET)이 필요한 키들은 hashtag로 묶기.',
+        code: {
+          lang: 'python',
+          filename: 'cluster-hashtag.py',
+          lines: [
+            '# Step 3. CRC16 + Hashtag',
+            '',
+            'from redis.cluster import RedisCluster',
+            '',
+            'rc = RedisCluster(host="127.0.0.1", port=7000, decode_responses=True)',
+            '',
+            '# 일반 키 — 노드 분산',
+            'rc.set("user:1", "Alice")     # slot 7073 → N2',
+            'rc.set("user:2", "Bob")       # slot 9508 → N2',
+            'rc.set("cart:1", "[...]")     # slot 16035 → N3 (다른 노드)',
+            '',
+            '# 문제: multi-key 연산 (같은 노드여야 함)',
+            'rc.mget("user:1", "cart:1")   # ❌ CROSSSLOT error',
+            '',
+            '# 해결: {hashtag} 로 같은 slot 강제',
+            'rc.set("{user:1}:profile", "...")',
+            'rc.set("{user:1}:cart",    "...")',
+            'rc.set("{user:1}:wishlist", "...")',
+            '# 모두 같은 slot (user:1 만 해싱)',
+            '',
+            'rc.mget("{user:1}:profile", "{user:1}:cart")  # ✅ OK',
+            '',
+            '# 적용 패턴 — 도메인 객체 그룹',
+            '# user:1 의 모든 데이터를 한 노드에',
+            'rc.hset("{user:1}:hash", "name", "Alice")',
+            'rc.lpush("{user:1}:queue", "task1")',
+            'rc.sadd("{user:1}:tags", "premium")',
+            '# user:1 의 모든 키 = 한 슬롯 = 한 노드',
+            '',
+            '# 주의 — 한 키 너무 핫하면',
+            '# hashtag 로 묶으면 그 노드 부하 집중',
+            '# 균형 잘 보고 사용',
+            '',
+            '# 슬롯 직접 계산 (디버깅)',
+            'from rediscluster.crc import key_slot',
+            'print(key_slot("user:1"))           # 7073',
+            'print(key_slot("{user:1}:profile")) # 7073 (같음)',
+          ],
+          highlight: [3, 4, 5, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 19, 21, 23, 24, 25, 26, 27, 28, 30, 31, 32, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 4. 노드 추가 — slot 이동',
+        desc: '새 노드 추가 시 기존 노드들로부터 slot을 일부씩 받아온다. 키도 같이 이동. 이동 중에도 클러스터는 동작 — MIGRATING/IMPORTING 상태로 일시 표시. 무중단 확장 가능.',
+        viz: {
+          kind: 'slot-migration',
+          before: [
+            { id: 'N1', slots: '0-5460' },
+            { id: 'N2', slots: '5461-10922' },
+            { id: 'N3', slots: '10923-16383' },
+          ],
+          after: [
+            { id: 'N1', slots: '0-4095', migrated: 1366 },
+            { id: 'N2', slots: '5461-9557', migrated: 1366 },
+            { id: 'N3', slots: '10923-15018', migrated: 1366 },
+            { id: 'N4', slots: '4096-5460, 9558-10922, 15019-16383', isNew: true },
+          ],
+        },
+        verdict: '무중단 확장',
+        verdictTone: 'good',
+        keyPoint: '노드 추가 = slot 일부 이동. 무중단. resharding 명령 한 줄로 자동화.',
+        code: {
+          lang: 'bash',
+          filename: 'cluster-resharding.sh',
+          lines: [
+            '# Step 4. 노드 추가 + slot 이동',
+            '',
+            '# 1) 새 노드 시작 (cluster mode)',
+            'docker run -d --name redis-7006 -p 7006:6379 redis:7 \\',
+            '  redis-server --cluster-enabled yes \\',
+            '    --cluster-config-file nodes.conf',
+            '',
+            '# 2) 클러스터에 추가 (replica 없이 primary 로)',
+            'redis-cli --cluster add-node 127.0.0.1:7006 127.0.0.1:7000',
+            '',
+            '# 3) Slot 이동 (resharding)',
+            'redis-cli --cluster reshard 127.0.0.1:7000 \\',
+            '  --cluster-from <node_id1>,<node_id2>,<node_id3> \\',
+            '  --cluster-to <new_node_id> \\',
+            '  --cluster-slots 4096 \\         # 16384 / 4 = 4096',
+            '  --cluster-yes',
+            '',
+            '# 4) Balance — 자동 재배치',
+            'redis-cli --cluster rebalance 127.0.0.1:7000',
+            '',
+            '# 진행 상태 확인',
+            'redis-cli -p 7000 CLUSTER NODES',
+            '',
+            '# Slot 이동 중 — MIGRATING / IMPORTING',
+            '# Source 노드: slot 5000 [migrating]',
+            '# Dest 노드:   slot 5000 [importing]',
+            '# 그동안 키 조회는 정상 (redirect 처리)',
+            '',
+            '# 키도 같이 이동',
+            '# 내부 명령:',
+            '#   CLUSTER GETKEYSINSLOT 5000 100   # slot 의 키 100개',
+            '#   MIGRATE host port key ...        # 키 이동',
+            '#   CLUSTER SETSLOT 5000 NODE <new>  # slot 소유 변경',
+            '',
+            '# 운영 팁',
+            '# - 한 번에 1000~4000 slot 단위로 이동 권장',
+            '# - 트래픽 적은 시간에 진행',
+            '# - 큰 키(bigkey) 있으면 이동 느림 — 사전 정리',
+            '',
+            '# 노드 제거',
+            'redis-cli --cluster del-node 127.0.0.1:7000 <node_id>',
+            '# 단 빈 노드여야 함 (사전에 reshard 로 비우기)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34, 35, 36, 37, 38, 40, 41, 42],
+        },
+      },
+      {
+        title: 'Step 5. MOVED / ASK — redirect 처리',
+        desc: '클라이언트가 잘못된 노드에 요청하면 MOVED 응답 (영구 이동). slot 이동 중이면 ASK 응답 (일시적). 똑똑한 클라이언트(redis-py-cluster 등)는 알아서 redirect 처리. 직접 호출하면 응답 디코딩 필요.',
+        viz: {
+          kind: 'redirect',
+          examples: [
+            { req: 'GET user:1 → N1', resp: 'MOVED 7073 N2', meaning: '영구: N2 로 가라' },
+            { req: 'GET user:1 → N2', resp: 'OK Alice', meaning: '정상' },
+            { req: 'GET in-flight → N1', resp: 'ASK 5000 N4', meaning: '일시: 이번 요청만 N4 로' },
+          ],
+        },
+        verdict: 'Redirect',
+        verdictTone: 'good',
+        summary: {
+          title: 'IV-2-2 Cluster 정리',
+          rows: [
+            { metric: '한계', before: '단일 노드 256GB', after: 'Cluster 무제한', delta: '수평 확장' },
+            { metric: 'Slot', before: '단일 키공간', after: '16384 slot 분산', delta: '균등' },
+            { metric: '매핑', before: '해싱 X', after: 'CRC16 % 16384', delta: 'O(1)' },
+            { metric: '확장', before: '재구축', after: 'reshard 무중단', delta: 'live' },
+            { metric: 'Redirect', before: '클라이언트 모름', after: 'MOVED/ASK 자동', delta: '투명' },
+          ],
+        },
+        keyPoint: 'Cluster = 무한 수평 확장 + 무중단 운영. 단 multi-key 제약 (hashtag로 해결). Part V 보안/운영.',
+        code: {
+          lang: 'python',
+          filename: 'cluster-client.py',
+          lines: [
+            '# Step 5. MOVED/ASK 처리 — Cluster client',
+            '',
+            'from redis.cluster import RedisCluster',
+            '',
+            '# 똑똑한 클라이언트 — 자동 redirect',
+            'rc = RedisCluster(',
+            '    startup_nodes=[',
+            '        {"host": "127.0.0.1", "port": 7000},',
+            '        {"host": "127.0.0.1", "port": 7001},',
+            '        {"host": "127.0.0.1", "port": 7002},',
+            '    ],',
+            '    decode_responses=True,',
+            ')',
+            '',
+            '# 사용 — 단일 노드와 동일',
+            'rc.set("user:1", "Alice")',
+            'rc.get("user:1")',
+            '',
+            '# 내부 동작',
+            '# 1) CRC16("user:1") % 16384 = 7073 (slot)',
+            '# 2) slot 7073 담당 노드 = N2 (캐시된 매핑 참조)',
+            '# 3) N2 로 SET 보냄',
+            '',
+            '# 만약 매핑이 오래됐으면',
+            '# 4) N2 가 "MOVED 7073 N3" 반환 (slot 이동된 경우)',
+            '# 5) 클라이언트가 매핑 캐시 갱신 + N3 로 재요청',
+            '',
+            '# 직접 호출 시 redirect 디코딩',
+            'import redis',
+            'r = redis.Redis(host="127.0.0.1", port=7000)',
+            'try:',
+            '    r.set("user:1", "Alice")',
+            'except redis.exceptions.ResponseError as e:',
+            '    if "MOVED" in str(e):',
+            '        _, slot, target = str(e).split()',
+            '        host, port = target.split(":")',
+            '        # 새 노드로 재요청',
+            '',
+            '# 운영 가이드',
+            '# 1) 항상 cluster-aware 클라이언트 사용',
+            '# 2) startup_nodes 는 3개 이상 (한 노드 다운 대비)',
+            '# 3) 매핑 캐시 TTL 짧게 (slot 이동 후 갱신)',
+            '# 4) hashtag 적극 사용 (multi-key 연산)',
+            '# 5) bigkey 모니터링 (slot 이동 느리게 함)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43, 44],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function SingleLimitViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-1.5">
+            {viz.metrics.map((m, i) => (
+              <div key={i} className={`bg-${m.tone}-50 border border-${m.tone}-300 rounded p-2`}>
+                <div className="flex justify-between items-baseline">
+                  <span className="text-xs font-bold text-neutral-800">{m.name}</span>
+                  <span className="text-sm font-mono font-bold">{m.value}</span>
+                </div>
+                <div className="text-[10px] text-neutral-600 mt-0.5">{m.limit}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function SlotsViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">16384 slots → 3 노드 균등 분배</div>
+          <div className="flex h-8 rounded overflow-hidden border border-neutral-300">
+            {viz.nodes.map((n) => (
+              <div key={n.id} className={`bg-${n.color}-500 flex items-center justify-center text-white text-[10px] font-mono`}
+                   style={{ width: `${(n.count/viz.total)*100}%` }}>
+                {n.id}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 space-y-1">
+            {viz.nodes.map((n) => (
+              <div key={n.id} className="flex items-center gap-2 text-[11px]">
+                <span className={`w-3 h-3 rounded bg-${n.color}-500`}></span>
+                <span className="font-bold w-8">{n.id}</span>
+                <span className="font-mono text-neutral-700">slots {n.slots}</span>
+                <span className="ml-auto text-neutral-500">{n.count}개</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function CrcMappingViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">CRC16(key) % 16384 → slot → node</div>
+          <div className="space-y-1">
+            {viz.examples.map((e, i) => (
+              <div key={i} className={`flex items-center gap-1 text-[10px] font-mono p-1.5 rounded border ${
+                e.hashtag ? 'bg-purple-50 border-purple-300' : 'bg-white border-neutral-200'
+              }`}>
+                <span className="flex-1 text-neutral-800">{e.key}</span>
+                <span className="text-neutral-400">→</span>
+                <span className="text-amber-700 w-12 text-center">{e.crc}</span>
+                <span className="text-neutral-400">→</span>
+                <span className="text-emerald-700 w-12 text-center">slot {e.slot}</span>
+                <span className="text-neutral-400">→</span>
+                <span className="bg-neutral-700 text-white px-1.5 py-0.5 rounded">{e.node}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-purple-700">⚛ {'{tag}'} 같은 키들은 같은 slot</div>
+        </div>
+      );
+    }
+
+    function SlotMigrationViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4 space-y-3">
+          <div>
+            <div className="text-xs text-neutral-500 mb-1">Before (3 노드)</div>
+            {viz.before.map((n) => (
+              <div key={n.id} className="bg-white border border-neutral-300 rounded p-1.5 flex items-center gap-2 text-[10px] font-mono mb-1">
+                <span className="bg-neutral-700 text-white px-2 py-0.5 rounded">{n.id}</span>
+                <span>{n.slots}</span>
+              </div>
+            ))}
+          </div>
+          <div className="text-center text-xs text-neutral-500">↓ + N4 추가 / reshard ↓</div>
+          <div>
+            <div className="text-xs text-neutral-500 mb-1">After (4 노드 — 무중단)</div>
+            {viz.after.map((n) => (
+              <div key={n.id} className={`rounded p-1.5 flex items-center gap-2 text-[10px] font-mono mb-1 ${
+                n.isNew ? 'bg-emerald-50 border border-emerald-300' : 'bg-white border border-neutral-300'
+              }`}>
+                <span className={`px-2 py-0.5 rounded ${n.isNew ? 'bg-emerald-600 text-white' : 'bg-neutral-700 text-white'}`}>{n.id}</span>
+                <span className="flex-1">{n.slots}</span>
+                {n.migrated && <span className="text-rose-600">−{n.migrated}</span>}
+                {n.isNew && <span className="text-emerald-700">✨ NEW</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function RedirectViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-2">
+            {viz.examples.map((e, i) => (
+              <div key={i} className="bg-white border border-neutral-300 rounded p-2">
+                <div className="flex items-center gap-2 text-[10px] font-mono mb-1">
+                  <span className="bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded">→</span>
+                  <span>{e.req}</span>
+                </div>
+                <div className="flex items-center gap-2 text-[10px] font-mono mb-1">
+                  <span className="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">←</span>
+                  <span className="text-amber-800 font-bold">{e.resp}</span>
+                </div>
+                <div className="text-[10px] text-neutral-500 italic">{e.meaning}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-neutral-400 bg-white p-3">
+          <div className="text-sm font-bold text-neutral-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <th className="py-1 pr-2">분류</th><th className="py-1 pr-2">전</th><th className="py-1 pr-2">후</th><th className="py-1">효과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-neutral-100">
+                  <td className="py-1 pr-2 font-medium text-neutral-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-neutral-800 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-neutral-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-neutral-800">Cluster 시각화</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'single-limit' && <SingleLimitViz viz={viz} />}
+          {viz?.kind === 'slots' && <SlotsViz viz={viz} />}
+          {viz?.kind === 'crc-mapping' && <CrcMappingViz viz={viz} />}
+          {viz?.kind === 'slot-migration' && <SlotMigrationViz viz={viz} />}
+          {viz?.kind === 'redirect' && <RedirectViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-neutral-800 bg-neutral-100 border border-neutral-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-neutral-500/25 border-l-2 border-neutral-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-neutral-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-neutral-700 text-white font-bold">R</span>
+              <div>
+                <h1 className="text-2xl font-bold text-neutral-900">Chapter IV-2-2. Cluster 16384 slot</h1>
+                <p className="text-sm text-neutral-700/80">단일 한계 → Cluster sharding → CRC16 매핑 → 무중단 확장</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-neutral-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-neutral-700' : 'bg-neutral-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-neutral-800 text-neutral-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-neutral-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-neutral-900 text-white' : 'bg-neutral-700 text-white hover:bg-neutral-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-neutral-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-neutral-400 bg-white px-4 py-3 text-sm text-neutral-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Cluster = 16384 slot 분산 + CRC16 매핑 + 무중단 reshard + MOVED/ASK redirect. 단일 노드 한계 너머의 정답. 다음 Part V.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Cluster', 'Slot', 'CRC16', 'Hashtag', 'Resharding', 'MOVED'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-800 border border-neutral-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-neutral-700">
+              <a href="./IV-2-1.html" className="underline hover:no-underline">← IV-2-1 Stream + Consumer Group</a>
+              <a href="../part5/V-1-1.html" className="underline hover:no-underline">다음: V-1-1 캐시 함정 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

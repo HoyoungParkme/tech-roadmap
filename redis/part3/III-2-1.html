@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Redis 학습 — III-2-1. Persistence RDB vs AOF</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Redis Chapter III-2-1 — Persistence RDB vs AOF
+    학습 목표: RDB snapshot vs AOF log. 재시작 후 데이터 복구. 둘의 트레이드오프.
+    패턴: fastapi v1 — 좌(LiveDataPane: 디스크 기록 시뮬레이션) / 우(VSCode CodeViewer)
+    색상: neutral (redis 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. RDB — 주기적 snapshot',
+        desc: 'Redis Database snapshot. 일정 주기마다 메모리 전체를 dump.rdb 파일로 저장. fork() 사용 → 메인 스레드 거의 안 막음. 복구가 빠르고 파일이 작다. 단 마지막 snapshot 이후 데이터는 손실.',
+        viz: {
+          kind: 'rdb-timeline',
+          events: [
+            { time: '0', action: 'SAVE — dump.rdb 생성', state: 'snap' },
+            { time: '60s', action: 'SET key1 val1', state: 'write' },
+            { time: '120s', action: 'SET key2 val2', state: 'write' },
+            { time: '300s', action: 'BGSAVE — 새 snapshot', state: 'snap' },
+            { time: '320s', action: 'SET key3 val3', state: 'write' },
+            { time: '325s', action: '💥 crash — key3 손실', state: 'crash' },
+          ],
+        },
+        verdict: '주기 백업',
+        verdictTone: 'good',
+        keyPoint: 'RDB = "사진찍기". 빠른 복구 + 작은 파일 + 일부 손실 허용.',
+        code: {
+          lang: 'bash',
+          filename: 'rdb-config.sh',
+          lines: [
+            '# Step 1. RDB snapshot 설정',
+            '',
+            '# redis.conf — 자동 저장 조건',
+            'save 3600 1      # 3600초 동안 1번 이상 변경 → 저장',
+            'save 300 100     # 300초 동안 100번 이상',
+            'save 60  10000   # 60초 동안 10000번 이상',
+            '',
+            '# 출력 위치',
+            'dir /var/lib/redis/',
+            'dbfilename dump.rdb',
+            '',
+            '# 압축 (기본 ON)',
+            'rdbcompression yes',
+            '',
+            '# RDB 비활성화 (캐시 전용 인스턴스)',
+            "# save '' (모든 조건 제거)",
+            '',
+            '# 수동 저장',
+            'redis-cli SAVE          # ❌ 블로킹 — 운영 X',
+            'redis-cli BGSAVE        # ✅ 백그라운드 (fork)',
+            '',
+            '# 마지막 저장 시각',
+            'redis-cli LASTSAVE      # UNIX timestamp',
+            '',
+            '# 복구',
+            '# 1. Redis 종료',
+            '# 2. dump.rdb 를 dir 위치에 복사',
+            '# 3. Redis 재시작 → 자동 로드',
+            '',
+            '# 장점',
+            '# - 파일 작음 (메모리 50% 정도)',
+            '# - 로딩 빠름 (단순 deserialize)',
+            '# - fork() 사용 — 메인 스레드 거의 안 막힘',
+            '',
+            '# 단점',
+            '# - 마지막 snapshot 이후 변경분 손실 (예: 최대 5분)',
+            '# - fork() 시 메모리 일시 2배 사용 가능',
+            '# - 큰 인스턴스(50GB+) 에서 fork latency 영향',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 12, 14, 17, 18, 19, 20, 22, 23, 26, 27, 28, 31, 32, 33, 34, 36, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 2. AOF — 모든 쓰기 로그',
+        desc: 'Append-Only File. 모든 쓰기 명령(SET/HSET/INCR ...)을 텍스트로 파일 끝에 추가. 마지막 변경분까지 거의 안전. 단 파일이 크고 복구가 RDB 대비 느림.',
+        viz: {
+          kind: 'aof-log',
+          entries: [
+            '*3\\r\\n$3\\r\\nSET\\r\\n$3\\r\\nfoo\\r\\n$3\\r\\nbar',
+            '*3\\r\\n$4\\r\\nINCR\\r\\n$7\\r\\ncounter',
+            '*4\\r\\n$5\\r\\nLPUSH\\r\\n$4\\r\\nlist\\r\\n$1\\r\\na',
+            '*2\\r\\n$3\\r\\nDEL\\r\\n$3\\r\\nfoo',
+          ],
+          syncs: ['fsync everysec', 'fsync everysec', 'fsync everysec'],
+        },
+        verdict: '쓰기 로그',
+        verdictTone: 'good',
+        keyPoint: 'AOF = "일기쓰기". 모든 쓰기 기록 → 데이터 손실 최소화. 단 파일 큼.',
+        code: {
+          lang: 'bash',
+          filename: 'aof-config.sh',
+          lines: [
+            '# Step 2. AOF 설정',
+            '',
+            '# 활성화',
+            'appendonly yes',
+            'appendfilename "appendonly.aof"',
+            '',
+            '# fsync 정책 (디스크 동기화)',
+            'appendfsync always       # 매 쓰기마다 fsync — 안전하지만 느림',
+            'appendfsync everysec     # 1초마다 fsync — 균형 (default)',
+            'appendfsync no           # OS 결정 — 빠르지만 위험',
+            '',
+            '# everysec 가 99% 정답',
+            '# - 데이터 손실 최대 1초분',
+            '# - 성능 영향 최소',
+            '',
+            '# AOF 파일 예시 (RESP 프로토콜 텍스트)',
+            '# *3\\r\\n$3\\r\\nSET\\r\\n$3\\r\\nfoo\\r\\n$3\\r\\nbar\\r\\n',
+            '# 이게 SET foo bar 명령 1개',
+            '',
+            '# rewrite — 파일 압축',
+            '# AOF 가 메모리의 3배 넘으면 자동 rewrite',
+            'auto-aof-rewrite-percentage 100',
+            'auto-aof-rewrite-min-size 64mb',
+            '',
+            '# 수동 rewrite',
+            'redis-cli BGREWRITEAOF',
+            '# 현재 메모리 상태를 새 AOF 로 다시 작성 → 파일 작아짐',
+            '',
+            '# 복구',
+            '# Redis 시작 시 자동으로 AOF 재생',
+            '# 100만 명령 재생 → 약 5~10초',
+            '',
+            '# 손상된 AOF 복구',
+            'redis-check-aof --fix appendonly.aof',
+            '',
+            '# 장점',
+            '# - 최대 1초 데이터 손실 (everysec)',
+            '# - 파일 손상 시 부분 복구 가능',
+            '# - 사람이 읽을 수 있는 텍스트',
+            '',
+            '# 단점',
+            '# - 파일 큼 (RDB 의 2~5배)',
+            '# - 복구 느림 (모든 명령 재생)',
+            '# - 디스크 I/O 부담',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 19, 20, 21, 22, 24, 25, 26, 28, 29, 30, 32, 33, 35, 36, 37, 38, 40, 41, 42, 43],
+        },
+      },
+      {
+        title: 'Step 3. RDB 빠른 복구 / 일부 손실',
+        desc: 'RDB만 사용하면 재시작 후 마지막 snapshot 시점으로 복구. 5분 주기면 최대 5분치 데이터 손실. 캐시 인스턴스에 적합 (재계산 가능한 데이터).',
+        viz: {
+          kind: 'recovery-compare',
+          rdb: { recovery: '15초', loss: '최대 5분', fileSize: '500MB' },
+          aof: { recovery: '90초', loss: '< 1초', fileSize: '2.5GB' },
+        },
+        verdict: 'RDB 우위',
+        verdictTone: 'good',
+        keyPoint: 'RDB 복구는 빠르고 단순. 로딩 = 단순 deserialize (AOF는 명령 재생).',
+        code: {
+          lang: 'markdown',
+          filename: 'rdb-recovery.md',
+          lines: [
+            '# RDB 복구 시나리오',
+            '',
+            '## 상황',
+            '- Redis 인스턴스 메모리: 1GB',
+            '- save 300 100 (5분 주기 snapshot)',
+            '- 12:00 SAVE → dump.rdb 생성',
+            '- 12:01~12:05 트래픽 진행 중',
+            '- 12:05 서버 crash',
+            '',
+            '## 재시작 후',
+            '```',
+            'Redis 시작',
+            '  ↓',
+            'dump.rdb 로드 (15초)',
+            '  ↓',
+            '12:00 시점 상태로 복구',
+            '  ↓',
+            '12:01~12:05 변경분 → 손실',
+            '```',
+            '',
+            '## 복구 시간',
+            '| 메모리 | RDB 파일 | 복구 시간 |',
+            '|:--|:--|:--|',
+            '| 1GB  | 500MB | 5초    |',
+            '| 8GB  | 4GB   | 30초   |',
+            '| 32GB | 16GB  | 2분    |',
+            '| 64GB | 32GB  | 5분    |',
+            '',
+            '## 캐시 시나리오 — RDB OK',
+            '- 캐시 미스 = DB 다시 조회 → 자연 복구',
+            '- 5분 손실 = 잠깐의 cache miss spike',
+            '- 운영 단순 + 복구 빠름 → 캐시는 RDB 만으로 충분',
+            '',
+            '## 영속 시나리오 — RDB 만으론 부족',
+            '- 사용자 세션 = 5분치 세션 손실',
+            '- 분산 락 = 5분치 락 상태 손실',
+            '- 큐 = 5분치 작업 손실',
+            '- → AOF 같이 사용',
+            '',
+            '## 결론',
+            '> "RDB 만 = 캐시 인스턴스의 정답."',
+            '> "영속 데이터 있으면 AOF 같이."',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 29, 30, 31, 32, 34, 35, 36, 37, 38, 41, 42, 43],
+        },
+      },
+      {
+        title: 'Step 4. AOF 안전 / 큰 파일',
+        desc: 'AOF는 1초 단위로 동기화 (everysec) → 최대 1초 데이터 손실. 단 파일 크기 큼 (메모리의 2~5배), 복구 시 모든 명령 재생해서 느림. 운영에선 RDB + AOF 둘 다 켜는 게 정석.',
+        viz: {
+          kind: 'aof-tradeoff',
+          fileSizes: [
+            { name: 'RDB만', size: 500, color: 'emerald' },
+            { name: 'AOF만', size: 2500, color: 'amber' },
+            { name: 'RDB+AOF', size: 3000, color: 'rose' },
+          ],
+          dataLoss: [
+            { name: 'RDB만', loss: 300, color: 'rose' },
+            { name: 'AOF만', loss: 1, color: 'emerald' },
+            { name: 'RDB+AOF', loss: 1, color: 'emerald' },
+          ],
+        },
+        verdict: 'AOF 안전',
+        verdictTone: 'good',
+        keyPoint: 'AOF 손실 < 1초. 단 파일 크고 복구 느림. BGREWRITEAOF로 주기 압축.',
+        code: {
+          lang: 'markdown',
+          filename: 'aof-deep.md',
+          lines: [
+            '# AOF 내부 동작',
+            '',
+            '## fsync 정책별 트레이드오프',
+            '| 정책 | 데이터 손실 | 성능 영향 |',
+            '|:--|:--|:--|',
+            '| always  | 0초 (안전 최대) | -50% (느림) |',
+            '| everysec | 최대 1초 | -5% (균형) ← 권장 |',
+            '| no      | OS 결정 (수분) | 0% |',
+            '',
+            '## 파일 성장',
+            '```',
+            '시작: 0 KB',
+            '1시간 후: 100 MB (SET 1만 개)',
+            '하루 후:  3 GB  (모든 변경 누적)',
+            '```',
+            '→ rewrite 필요',
+            '',
+            '## BGREWRITEAOF — 압축',
+            '```',
+            '현재 메모리 상태 분석',
+            '  ↓',
+            '같은 결과를 만드는 최소 명령 생성',
+            '  ↓',
+            '새 AOF 파일 작성 (이전 = 100k 명령, 새 = 10k 명령)',
+            '  ↓',
+            '원자 교체',
+            '```',
+            '',
+            '## 함정 — fsync 일시정지',
+            '- BGSAVE / BGREWRITEAOF 가 fork 후 메모리 압박',
+            '- 디스크 I/O 폭증 시 fsync 가 1초 넘게 걸림',
+            '- 메인 스레드 일시 정지 → 응답 시간 spike',
+            '- 해결: rewrite 시 fsync 일시 끄는 옵션',
+            '  no-appendfsync-on-rewrite yes',
+            '',
+            '## 복구 속도',
+            '| AOF 파일 | 복구 시간 |',
+            '|:--|:--|',
+            '| 100MB | 5초 |',
+            '| 1GB   | 30초 |',
+            '| 5GB   | 3분 |',
+            '| 20GB  | 15분 |',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44],
+        },
+      },
+      {
+        title: 'Step 5. 혼합 — RDB + AOF Rewrite (정답)',
+        desc: 'Redis 7+은 RDB+AOF 혼합 모드. AOF rewrite 시 RDB 형태로 base 생성 + 그 후 변경만 AOF로 append. RDB 빠른 복구 + AOF 안전성 둘 다. 운영급 추천 설정.',
+        viz: {
+          kind: 'hybrid',
+          parts: [
+            { name: 'base.rdb', size: 800, color: 'neutral', desc: '주기적 RDB 베이스' },
+            { name: 'incr.aof', size: 200, color: 'amber', desc: 'base 이후 변경분' },
+          ],
+        },
+        verdict: '혼합 권장',
+        verdictTone: 'good',
+        summary: {
+          title: 'III-2-1 Persistence 정리',
+          rows: [
+            { metric: 'RDB', before: '주기 snapshot', after: '빠른 복구', delta: '5분 손실' },
+            { metric: 'AOF', before: '쓰기 로그', after: '< 1초 손실', delta: '큰 파일' },
+            { metric: 'fsync', before: 'always (느림)', after: 'everysec (균형)', delta: '99% 정답' },
+            { metric: '복구 속도', before: 'AOF 90초', after: 'RDB 15초', delta: 'RDB 6x' },
+            { metric: '운영 정답', before: 'RDB or AOF', after: 'RDB + AOF', delta: '둘 다' },
+          ],
+        },
+        keyPoint: '운영 정답: appendonly yes + save 3600 1 + aof-use-rdb-preamble yes. 다음(III-2-2) Replication.',
+        code: {
+          lang: 'bash',
+          filename: 'production-config.sh',
+          lines: [
+            '# Step 5. 운영급 권장 설정 — RDB + AOF 혼합',
+            '',
+            '# redis.conf',
+            '',
+            '# === 메모리 ===',
+            'maxmemory 8gb',
+            'maxmemory-policy allkeys-lru',
+            '',
+            '# === RDB (snapshot) ===',
+            'save 3600 1            # 1시간에 1번 이상 변경 시',
+            'save 300 100           # 5분에 100번 이상',
+            'save 60 10000          # 1분에 10000번 이상',
+            'dbfilename dump.rdb',
+            'dir /var/lib/redis',
+            'rdbcompression yes',
+            '',
+            '# === AOF ===',
+            'appendonly yes',
+            'appendfilename "appendonly.aof"',
+            'appendfsync everysec   # 1초 손실 허용 + 균형',
+            '',
+            '# AOF rewrite 자동',
+            'auto-aof-rewrite-percentage 100',
+            'auto-aof-rewrite-min-size 64mb',
+            '',
+            '# === 혼합 — RDB preamble in AOF (Redis 4.0+) ===',
+            'aof-use-rdb-preamble yes',
+            '# AOF 파일이 [RDB binary base] + [incremental AOF] 형태',
+            '# → 복구 시 RDB 부분은 빠르게 deserialize',
+            '# → AOF 부분만 명령 재생',
+            '# → RDB 빠른 복구 + AOF 안전성 둘 다',
+            '',
+            '# === Rewrite 중 fsync 일시정지 ===',
+            'no-appendfsync-on-rewrite yes',
+            '# fork 중 디스크 부하 줄임',
+            '',
+            '# 확인',
+            'redis-cli CONFIG GET appendonly',
+            'redis-cli CONFIG GET aof-use-rdb-preamble',
+            'redis-cli INFO persistence',
+            '',
+            '# 백업 운영',
+            '# 매일 새벽 RDB 복사 → S3',
+            '# AOF 파일은 운영 중 동기화 X (재시작 후 자동 로드)',
+          ],
+          highlight: [5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 37, 38, 39, 40, 42, 43, 44],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function RDBTimelineViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="space-y-1.5">
+            {viz.events.map((e, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="text-[10px] font-mono text-neutral-500 w-12">{e.time}</span>
+                <div className={`flex-1 px-2 py-1.5 rounded border text-xs ${
+                  e.state === 'snap' ? 'bg-emerald-50 border-emerald-300 text-emerald-800' :
+                  e.state === 'write' ? 'bg-white border-neutral-300 text-neutral-700' :
+                  'bg-rose-50 border-rose-300 text-rose-800 font-bold'
+                }`}>
+                  <span className="font-mono">{e.action}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function AOFLogViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">appendonly.aof (텍스트 누적)</div>
+          <div className="bg-neutral-900 text-emerald-300 rounded p-2 space-y-1 text-[10px] font-mono max-h-32 overflow-auto">
+            {viz.entries.map((e, i) => (
+              <div key={i} className="break-all">{e}</div>
+            ))}
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-1">
+            {viz.syncs.map((s, i) => (
+              <div key={i} className="text-[10px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded text-center font-mono">{s}</div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function RecoveryCompareViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4 space-y-2">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="bg-white border border-emerald-300 rounded p-3">
+              <div className="font-bold text-sm text-emerald-800 mb-2">RDB</div>
+              <div className="space-y-1 text-[11px]">
+                <div className="flex justify-between"><span className="text-neutral-500">복구</span><span className="font-mono font-bold">{viz.rdb.recovery}</span></div>
+                <div className="flex justify-between"><span className="text-neutral-500">데이터 손실</span><span className="font-mono text-rose-600">{viz.rdb.loss}</span></div>
+                <div className="flex justify-between"><span className="text-neutral-500">파일</span><span className="font-mono">{viz.rdb.fileSize}</span></div>
+              </div>
+            </div>
+            <div className="bg-white border border-amber-300 rounded p-3">
+              <div className="font-bold text-sm text-amber-800 mb-2">AOF</div>
+              <div className="space-y-1 text-[11px]">
+                <div className="flex justify-between"><span className="text-neutral-500">복구</span><span className="font-mono font-bold">{viz.aof.recovery}</span></div>
+                <div className="flex justify-between"><span className="text-neutral-500">데이터 손실</span><span className="font-mono text-emerald-600">{viz.aof.loss}</span></div>
+                <div className="flex justify-between"><span className="text-neutral-500">파일</span><span className="font-mono">{viz.aof.fileSize}</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function AOFTradeoffViz({ viz }) {
+      const maxSize = Math.max(...viz.fileSizes.map(f => f.size));
+      const maxLoss = Math.max(...viz.dataLoss.map(d => d.loss));
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4 space-y-3">
+          <div>
+            <div className="text-xs text-neutral-600 mb-1">파일 크기 (MB)</div>
+            {viz.fileSizes.map((f, i) => (
+              <div key={i} className="mb-1">
+                <div className="flex justify-between text-[10px] mb-0.5">
+                  <span>{f.name}</span><span className="font-mono">{f.size}MB</span>
+                </div>
+                <div className="h-2 bg-white border border-neutral-200 rounded overflow-hidden">
+                  <div className={`h-full bg-${f.color}-500`} style={{ width: `${(f.size/maxSize)*100}%` }}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div>
+            <div className="text-xs text-neutral-600 mb-1">데이터 손실 (초)</div>
+            {viz.dataLoss.map((d, i) => (
+              <div key={i} className="mb-1">
+                <div className="flex justify-between text-[10px] mb-0.5">
+                  <span>{d.name}</span><span className="font-mono">{d.loss}s</span>
+                </div>
+                <div className="h-2 bg-white border border-neutral-200 rounded overflow-hidden">
+                  <div className={`h-full bg-${d.color}-500`} style={{ width: `${(d.loss/maxLoss)*100}%` }}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function HybridViz({ viz }) {
+      const total = viz.parts.reduce((a, p) => a + p.size, 0);
+      return (
+        <div className="rounded-lg bg-neutral-50 border border-neutral-300 p-4">
+          <div className="text-xs text-neutral-600 mb-2">appendonly.aof = RDB base + incremental AOF</div>
+          <div className="flex h-12 rounded overflow-hidden border border-neutral-300">
+            {viz.parts.map((p, i) => (
+              <div key={i} className={`bg-${p.color}-500 flex items-center justify-center text-white text-xs font-mono`} style={{ width: `${(p.size/total)*100}%` }}>
+                {p.name}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 space-y-1.5">
+            {viz.parts.map((p, i) => (
+              <div key={i} className="flex items-center gap-2 text-[11px]">
+                <span className={`w-2 h-2 rounded-full bg-${p.color}-500`}></span>
+                <span className="font-mono">{p.name}</span>
+                <span className="text-neutral-500">— {p.desc} ({p.size}MB)</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-neutral-400 bg-white p-3">
+          <div className="text-sm font-bold text-neutral-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-neutral-500 border-b border-neutral-200">
+                <th className="py-1 pr-2">방식</th><th className="py-1 pr-2">전</th><th className="py-1 pr-2">후</th><th className="py-1">효과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-neutral-100">
+                  <td className="py-1 pr-2 font-medium text-neutral-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-700 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-emerald-700 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-neutral-800 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-neutral-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-neutral-800">Persistence 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'rdb-timeline' && <RDBTimelineViz viz={viz} />}
+          {viz?.kind === 'aof-log' && <AOFLogViz viz={viz} />}
+          {viz?.kind === 'recovery-compare' && <RecoveryCompareViz viz={viz} />}
+          {viz?.kind === 'aof-tradeoff' && <AOFTradeoffViz viz={viz} />}
+          {viz?.kind === 'hybrid' && <HybridViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-neutral-800 bg-neutral-100 border border-neutral-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-neutral-500/25 border-l-2 border-neutral-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-neutral-50 to-stone-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-neutral-700 text-white font-bold">R</span>
+              <div>
+                <h1 className="text-2xl font-bold text-neutral-900">Chapter III-2-1. Persistence RDB vs AOF</h1>
+                <p className="text-sm text-neutral-700/80">snapshot vs 쓰기 로그 — 재시작 후 복구 전략</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-neutral-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-neutral-700' : 'bg-neutral-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-neutral-800 text-neutral-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-neutral-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-neutral-900 text-white' : 'bg-neutral-700 text-white hover:bg-neutral-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border border-neutral-300 bg-white text-neutral-700 hover:bg-neutral-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-neutral-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-neutral-400 bg-white px-4 py-3 text-sm text-neutral-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                RDB는 빠른 복구, AOF는 최소 손실. 운영급은 RDB+AOF 혼합 (aof-use-rdb-preamble yes). 캐시 전용이면 RDB만으로 충분.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Persistence', 'RDB', 'AOF', 'fsync', 'Recovery', 'Hybrid'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-800 border border-neutral-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-neutral-700">
+              <a href="./III-1-2.html" className="underline hover:no-underline">← III-1-2 Eviction</a>
+              <a href="./III-2-2.html" className="underline hover:no-underline">다음: III-2-2 Replication →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
