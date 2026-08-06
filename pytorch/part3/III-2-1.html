@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PyTorch 학습 — III-2-1. 체크포인트 — state_dict 저장·재개</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    PyTorch III-2-1 — 체크포인트 — state_dict 저장·재개
+    학습 목표: 12시간 학습이 11시간째에 죽었을 때 처음부터 다시 돌리지 않는 법.
+              (1) state_dict 는 이름→텐서 OrderedDict 라는 정체, (2) torch.save(model.state_dict())
+              가 왜 전체 저장보다 안전한 표준인가, (3) 인스턴스 생성→load_state_dict→eval() 3단계와
+              map_location·strict=False, (4) 모델+옵티마이저 state+에폭+스케줄러를 묶는 재개 체크포인트,
+              (5) best/last 이원 저장·안전 저장(임시→rename)·호환성 문서화까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: state_dict 열람 · 저장/로드 흐름도 · 크래시→재개 학습곡선 시뮬) /
+          우(VSCode CodeViewer: checkpoint.py 진화)
+    색상: orange (PyTorch 브랜드 #EE4C2C 감각)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — state_dict 정체 → 저장 정석 → 로드 3단계 → 재개 체크포인트 → 실무 체계
+    //   state.vis : 좌측 LiveDataPane 이 그릴 시각화 종류
+    //               'inspect'(state_dict 내용물) | 'save'(state_dict vs 전체 저장)
+    //               'load'(로드 3단계 흐름) | 'resume'(크래시→재개 학습곡선) | 'ops'(best/last 실무 표)
+    //   code      : 우측 CodeViewer 파일 (checkpoint.py 진화)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. state_dict의 정체 — 모델의 모든 파라미터를 담은 OrderedDict',
+        desc: '체크포인트를 이해하려면 먼저 "모델을 저장한다"가 실제로 무엇을 저장하는지 알아야 한다. nn.Module 의 학습된 지식은 전부 파라미터 텐서(가중치 weight·편향 bias)에 들어 있고, model.state_dict() 는 이걸 "레이어이름.파라미터 → 텐서"로 매핑한 OrderedDict 로 돌려준다. print 로 열어 보면 fc1.weight, fc1.bias, fc2.weight … 처럼 키가 계층 이름 그대로 찍힌다. 여기서 핵심 분리 구조가 나온다 — 모델의 "구조"는 파이썬 클래스 코드(nn.Module 정의)에 있고, "학습된 값"은 state_dict 에 있다. 즉 클래스 코드 + state_dict = 완전한 모델이다. 그래서 저장할 때는 무거운 클래스 전체가 아니라 값 뭉치(state_dict)만 챙기면 된다.',
+        actor: '📦 model.state_dict() — 이름→텐서 사전 열어보기',
+        engine: 'inspect',
+        vis: 'inspect',
+        engineDetail: 'OrderedDict[str, Tensor] · fc1.weight / fc1.bias …',
+        sdRows: [
+          { key: 'fc1.weight', shape: '[128, 784]', numel: '100,352' },
+          { key: 'fc1.bias', shape: '[128]', numel: '128' },
+          { key: 'fc2.weight', shape: '[10, 128]', numel: '1,280' },
+          { key: 'fc2.bias', shape: '[10]', numel: '10' },
+        ],
+        alert: { tone: 'info', text: '모델 클래스 코드(구조) + state_dict(학습된 값) = 완전한 모델. state_dict 는 값만 담은 OrderedDict 라, 저장 대상은 무거운 객체가 아니라 이 "값 뭉치" 하나면 충분하다.' },
+        code: {
+          lang: 'python',
+          filename: 'checkpoint.py (1/5 — state_dict 열어보기)',
+          lines: [
+            '"""',
+            'checkpoint.py — 학습을 저장하고 재개하는 정석',
+            'Step 1: model.state_dict() 의 정체를 눈으로 확인한다.',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            'class Net(nn.Module):',
+            '    def __init__(self):',
+            '        super().__init__()',
+            '        self.fc1 = nn.Linear(784, 128)',
+            '        self.fc2 = nn.Linear(128, 10)',
+            '    def forward(self, x):',
+            '        return self.fc2(torch.relu(self.fc1(x)))',
+            '',
+            'model = Net()',
+            '',
+            '# state_dict = "레이어이름.파라미터" → 텐서 로 이뤄진 OrderedDict',
+            'sd = model.state_dict()',
+            'for name, tensor in sd.items():',
+            '    print(name, tuple(tensor.shape))',
+            '# fc1.weight (128, 784)',
+            '# fc1.bias   (128,)',
+            '# fc2.weight (10, 128)',
+            '# fc2.bias   (10,)',
+            '',
+            'print(type(sd))          # <class "collections.OrderedDict">',
+            '',
+            '# 핵심 분리: 구조(=Net 클래스 코드) + 값(=state_dict).',
+            '# 저장할 때 챙기는 것은 무거운 객체가 아니라 이 값 뭉치뿐이다.',
+          ],
+          highlight: [8, 9, 10, 11, 12, 17, 18, 19, 20, 26],
+        },
+      },
+      {
+        title: 'Step 2. 저장의 정석 — torch.save(model.state_dict())가 표준인 이유',
+        desc: '저장하는 방법은 두 가지다. (A) torch.save(model.state_dict(), "m.pt") — 값 뭉치만 저장. (B) torch.save(model, "m.pt") — 모델 객체 전체를 pickle 로 통째 저장. B가 편해 보이지만 함정이 크다. B는 pickle 이 클래스의 "경로"(모듈·파일 위치)를 함께 굳혀 버려서, 나중에 파일을 옮기거나 클래스 이름을 바꾸거나 리팩터링하면 로드가 깨진다. 게다가 저장 당시의 PyTorch/파이썬 버전에 취약하고, 신뢰할 수 없는 pickle 을 여는 건 보안 위험이기도 하다. 반면 A는 순수한 텐서 값 사전이라 코드가 바뀌어도 "구조만 다시 만들어" 값을 부어 넣으면 되니 이식성·안정성이 높다. 그래서 PyTorch 공식 권장은 언제나 state_dict 방식(A)이다.',
+        actor: '⚖️ state_dict 저장(A) vs 전체 저장(B)',
+        engine: 'save',
+        vis: 'save',
+        engineDetail: 'torch.save(model.state_dict()) vs torch.save(model)',
+        alert: { tone: 'warn', text: 'torch.save(model) 전체 저장은 클래스 경로를 pickle 로 굳혀 버려 파일 이동·리네임·리팩터링·버전 변화에 깨진다. 표준은 항상 값만 담는 torch.save(model.state_dict()) 다.' },
+        code: {
+          lang: 'python',
+          filename: 'checkpoint.py (2/5 — 저장의 정석)',
+          lines: [
+            '"""',
+            'checkpoint.py — Step 2: 무엇을, 어떻게 저장하는가',
+            '표준: state_dict 만 저장한다 (전체 객체 저장 X).',
+            '"""',
+            'import torch',
+            '',
+            '# ✅ 표준 — 값(state_dict)만 저장한다',
+            'torch.save(model.state_dict(), "model.pt")',
+            '#   · 순수 텐서 사전이라 이식성·버전 안정성이 높다',
+            '#   · 로드하려면 같은 구조의 모델을 먼저 만들어야 한다 (Step 3)',
+            '',
+            '# ⚠️ 비표준 — 모델 객체 전체를 pickle 로 저장',
+            'torch.save(model, "whole.pt")',
+            '#   함정 1) pickle 이 클래스의 "위치(모듈 경로)" 를 함께 굳힌다',
+            '#          → 파일 이동 / 클래스 리네임 / 리팩터링 시 로드 실패',
+            '#   함정 2) 저장 당시 PyTorch·파이썬 버전에 취약',
+            '#   함정 3) 신뢰할 수 없는 pickle 로드는 보안 위험',
+            '',
+            '# 참고: 확장자는 관례일 뿐 (.pt / .pth 모두 zip 아카이브)',
+            '#       실제로는 내부가 텐서 직렬화 포맷이다.',
+            '',
+            '# 결론: "구조는 코드로, 값은 state_dict 로" 를 지키면',
+            '#        저장물은 코드 변화에 훨씬 강해진다.',
+          ],
+          highlight: [6, 7, 8, 9, 11, 12, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 3. 불러오기 3단계 — 인스턴스 생성 → load_state_dict → eval/train',
+        desc: 'state_dict 는 값만 있으므로, 로드는 항상 "빈 그릇을 먼저 만들고 값을 붓는" 3단계다. (1) 저장할 때와 똑같은 구조로 model = Net() 인스턴스를 만든다. (2) model.load_state_dict(torch.load("model.pt")) 로 값을 채운다. (3) 용도에 맞게 모드를 정한다 — 추론이면 model.eval(), 이어서 학습하면 model.train(). eval() 을 빼먹으면 Dropout·BatchNorm 이 학습 모드로 남아 추론 결과가 흔들리는 대표적 버그가 난다. 두 가지 옵션도 실무 필수다. map_location — GPU 에서 저장한 걸 GPU 없는 머신에서 열 때 torch.load(path, map_location="cpu") 로 디바이스를 다시 매핑한다. strict=False — 전이학습처럼 구조가 일부 바뀌어 키가 안 맞아도, 겹치는 파라미터만 부분 로드하고 나머지는 건너뛴다.',
+        actor: '🔧 Net() → load_state_dict → eval() 3단계',
+        engine: 'load',
+        vis: 'load',
+        engineDetail: 'load_state_dict · map_location · strict=False',
+        loadSteps: [
+          { n: '1', title: '빈 그릇 만들기', code: 'model = Net()', note: '저장 때와 같은 구조로 인스턴스 생성' },
+          { n: '2', title: '값 붓기', code: 'model.load_state_dict(torch.load("model.pt"))', note: 'state_dict 의 텐서를 파라미터에 채움' },
+          { n: '3', title: '모드 정하기', code: 'model.eval()  # 또는 .train()', note: '추론=eval / 재학습=train — 빼먹으면 결과 흔들림' },
+        ],
+        optRows: [
+          { opt: 'map_location="cpu"', why: 'GPU 저장 → GPU 없는 머신 로드', tone: 'good' },
+          { opt: 'strict=False', why: '구조 일부 변경 — 겹치는 키만 부분 로드', tone: 'warn' },
+        ],
+        alert: { tone: 'danger', text: '추론 전 model.eval() 을 빼먹으면 Dropout·BatchNorm 이 학습 모드로 남아 결과가 실행마다 흔들린다. GPU→CPU 로드는 map_location="cpu", 전이학습 부분 로드는 strict=False.' },
+        code: {
+          lang: 'python',
+          filename: 'checkpoint.py (3/5 — 불러오기 3단계)',
+          lines: [
+            '"""',
+            'checkpoint.py — Step 3: 저장한 값을 다시 모델에 붓는다',
+            '항상 3단계: 인스턴스 → load_state_dict → eval/train',
+            '"""',
+            'import torch',
+            '',
+            '# 1) 저장 때와 "같은 구조" 의 빈 그릇을 만든다',
+            'model = Net()',
+            '',
+            '# 2) state_dict 를 불러와 값을 채운다',
+            'state = torch.load("model.pt")',
+            'model.load_state_dict(state)',
+            '',
+            '# 3) 용도에 맞게 모드 설정',
+            'model.eval()     # 추론: Dropout·BatchNorm 고정 (필수!)',
+            '# model.train()  # 이어서 학습할 거면 train 모드',
+            '',
+            '# ── 옵션 1) GPU 에서 저장 → CPU 에서 로드 ──────',
+            'model.load_state_dict(',
+            '    torch.load("model.pt", map_location="cpu")',
+            ')',
+            '',
+            '# ── 옵션 2) 전이학습 — 구조가 바뀌어 키가 일부 안 맞을 때 ──',
+            '# strict=False: 겹치는 파라미터만 채우고 나머지는 건너뛴다',
+            'missing, unexpected = model.load_state_dict(',
+            '    pretrained_state, strict=False',
+            ')',
+            'print(missing)      # 새 모델에만 있는(안 채워진) 키',
+            'print(unexpected)   # 체크포인트에만 있는(안 쓰인) 키',
+          ],
+          highlight: [6, 7, 9, 10, 11, 13, 14, 17, 18, 19, 20, 22, 23, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 4. 학습 재개 체크포인트 — 옵티마이저 state까지 함께 굳혀라',
+        desc: '중간에 죽은 학습을 "이어서" 돌리려면 모델 값만으로는 부족하다. 진짜 재개에는 네 가지가 필요하다 — model.state_dict(), optimizer.state_dict(), 현재 epoch, 그리고 scheduler.state_dict(). 여기서 초보가 가장 많이 빠뜨리는 게 옵티마이저 상태다. Adam·SGD+momentum 같은 옵티마이저는 파라미터마다 모멘텀·2차 모멘트(v, m) 같은 "내부 상태"를 누적하며 학습을 부드럽게 이끈다. 재개할 때 이걸 빼먹고 옵티마이저를 새로 만들면, 그 누적이 0으로 리셋되어 학습률이 사실상 튀는 효과가 나 손실이 한동안 출렁이다가 회복된다. 그래서 모델·옵티마이저·에폭·스케줄러를 하나의 딕셔너리로 묶어 저장하고, 재개 시 각각 load_state_dict 로 복원한 뒤 start_epoch = ckpt["epoch"] + 1 부터 루프를 돈다.',
+        actor: '🔄 크래시 → 체크포인트에서 이어붙이기',
+        engine: 'resume',
+        vis: 'resume',
+        engineDetail: 'model + optimizer(모멘텀!) + epoch + scheduler',
+        alert: { tone: 'danger', text: '옵티마이저 state(Adam 모멘텀·2차 모멘트)를 빼먹고 재개하면 누적이 0으로 리셋 — 손실이 한동안 출렁이다 회복된다. 모델·옵티마이저·epoch·스케줄러를 한 딕셔너리로 묶어 저장하라.' },
+        code: {
+          lang: 'python',
+          filename: 'checkpoint.py (4/5 — 학습 재개)',
+          lines: [
+            '"""',
+            'checkpoint.py — Step 4: 학습을 "이어서" 돌리는 재개 체크포인트',
+            '핵심: 모델뿐 아니라 옵티마이저 내부 상태까지 함께 저장한다.',
+            '"""',
+            'import torch',
+            '',
+            '# ── 저장: 재개에 필요한 4가지를 한 딕셔너리로 묶는다 ──',
+            'def save_ckpt(path, model, optimizer, scheduler, epoch):',
+            '    torch.save({',
+            '        "epoch": epoch,',
+            '        "model": model.state_dict(),',
+            '        "optimizer": optimizer.state_dict(),   # 모멘텀·2차모멘트!',
+            '        "scheduler": scheduler.state_dict(),',
+            '    }, path)',
+            '',
+            '# ── 재개: 각각을 제자리에 복원하고 다음 epoch 부터 ──',
+            'def resume(path, model, optimizer, scheduler):',
+            '    ckpt = torch.load(path, map_location="cpu")',
+            '    model.load_state_dict(ckpt["model"])',
+            '    optimizer.load_state_dict(ckpt["optimizer"])',
+            '    scheduler.load_state_dict(ckpt["scheduler"])',
+            '    return ckpt["epoch"] + 1          # 다음 epoch 부터 재개',
+            '',
+            '# ── 학습 루프에 붙이기 ──',
+            'start_epoch = 0',
+            'if os.path.exists("last.pt"):',
+            '    start_epoch = resume("last.pt", model, optimizer, scheduler)',
+            '',
+            'for epoch in range(start_epoch, EPOCHS):',
+            '    train_one_epoch(model, optimizer, loader)',
+            '    scheduler.step()',
+            '    save_ckpt("last.pt", model, optimizer, scheduler, epoch)',
+          ],
+          highlight: [6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 28, 29, 30, 31],
+        },
+      },
+      {
+        title: 'Step 5. 실무 체계 — best/last 이원 저장 · 안전 저장 · 호환성 문서화',
+        desc: '마지막은 팀에서 실제로 굴러가는 체계다. (1) best/last 이원 저장 — last.pt 는 매 에폭 덮어써 언제든 재개할 수 있게 하고, best.pt 는 검증 지표가 갱신될 때만 따로 남겨 "가장 좋았던 순간"을 보존한다. 배포에는 best, 재개에는 last 를 쓴다. (2) 주기 저장과 용량 관리 — 매 에폭 남기면 디스크가 폭발하므로 N 에폭마다 저장하거나 오래된 파일을 지워 최근 k 개만 유지한다. (3) 안전한 저장 — 저장 도중 프로세스가 죽으면 파일이 반쯤 쓰이다 깨진다. 그래서 임시 파일(ckpt.tmp)에 먼저 쓰고 os.replace 로 원자적 rename 하면, 크래시가 나도 이전 정상 파일이 남는다. (4) 호환성 문서화 — 체크포인트에 코드/라이브러리 버전과 아키텍처 힌트를 함께 적어 두면, 몇 달 뒤 "이 파일이 어떤 구조였지?"로 헤매지 않는다. 다음 장에서는 이렇게 저장한 학습을 실시간으로 들여다보는 모니터링(TensorBoard·로깅)을 다룬다.',
+        actor: '🗂️ best/last · 임시→rename · 버전 태깅',
+        engine: 'ops',
+        vis: 'ops',
+        engineDetail: 'best vs last · atomic save · 호환성 메타',
+        opsRows: [
+          { file: 'last.pt', when: '매 에폭 덮어쓰기', use: '재개용 — 언제든 이어붙이기', tone: 'warn' },
+          { file: 'best.pt', when: 'val 지표 갱신 시만', use: '배포용 — 최고 성능 보존', tone: 'good' },
+          { file: 'epoch_N.pt', when: 'N 에폭 주기', use: '이력 — 최근 k 개만 유지', tone: 'info' },
+        ],
+        alert: { tone: 'good', text: '재개는 last, 배포는 best. 저장은 임시파일→os.replace 로 원자적 rename(중간 크래시에도 이전 정상본 보존). 코드·라이브러리 버전을 메타로 함께 남겨 호환성을 문서화하라.' },
+        code: {
+          lang: 'python',
+          filename: 'checkpoint.py (5/5 — 실무 체계)',
+          lines: [
+            '"""',
+            'checkpoint.py — Step 5: 팀에서 굴러가는 체크포인트 운영',
+            'best/last 이원 저장 · 안전 저장(임시→rename) · 버전 메타',
+            '"""',
+            'import os, torch, torch.__version__ as TORCH_VER',
+            '',
+            '# ── 안전한 저장: 임시파일에 먼저 쓰고 원자적 rename ──',
+            'def atomic_save(obj, path):',
+            '    tmp = path + ".tmp"',
+            '    torch.save(obj, tmp)',
+            '    os.replace(tmp, path)     # 원자적 — 중간에 죽어도 이전 정상본 보존',
+            '',
+            '# ── best/last 이원 저장 + 버전 메타 태깅 ──',
+            'def save_all(model, optimizer, epoch, val_acc, best_acc):',
+            '    payload = {',
+            '        "epoch": epoch,',
+            '        "model": model.state_dict(),',
+            '        "optimizer": optimizer.state_dict(),',
+            '        # 호환성 문서화 — 몇 달 뒤의 나를 구한다',
+            '        "torch_version": TORCH_VER,',
+            '        "arch": "Net(784-128-10)",',
+            '    }',
+            '    atomic_save(payload, "last.pt")            # 재개용: 항상 덮어씀',
+            '    if val_acc > best_acc:                      # 배포용: 갱신 시만',
+            '        atomic_save(payload, "best.pt")',
+            '        best_acc = val_acc',
+            '    return best_acc',
+            '',
+            '# 용량 관리: 오래된 주기 저장본은 최근 k 개만 남기고 삭제',
+            '# → 다음 장: 저장한 학습을 실시간으로 보는 "모니터링"',
+          ],
+          highlight: [6, 7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — state_dict 내용물 열람 (이름→텐서 shape 표)
+    // ─────────────────────────────────────────────────────
+    function InspectBox({ rows }) {
+      if (!rows) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">📦 model.state_dict() — 이름 → 텐서 OrderedDict</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-orange-900 border-b-2 border-orange-200">
+                <th className="text-left py-1">key (레이어.파라미터)</th>
+                <th className="text-left py-1 pl-1">shape</th>
+                <th className="text-right py-1 pl-1">파라미터 수</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.key} className="border-t border-orange-100">
+                  <td className="py-1 font-mono font-bold text-orange-800">{r.key}</td>
+                  <td className="py-1 pl-1 font-mono text-slate-700">{r.shape}</td>
+                  <td className="py-1 pl-1 font-mono text-slate-600 text-right">{r.numel}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-3 flex items-stretch gap-2">
+            <div className="flex-1 rounded border-2 border-sky-300 bg-sky-50 px-2 py-2 text-center">
+              <div className="text-[10px] font-bold text-sky-800">🏗️ 구조</div>
+              <div className="text-[9px] text-slate-600 font-mono mt-0.5">Net 클래스 코드</div>
+            </div>
+            <div className="flex items-center text-orange-500 text-lg font-bold">+</div>
+            <div className="flex-1 rounded border-2 border-orange-400 bg-orange-50 px-2 py-2 text-center">
+              <div className="text-[10px] font-bold text-orange-800">🔢 값</div>
+              <div className="text-[9px] text-slate-600 font-mono mt-0.5">state_dict</div>
+            </div>
+            <div className="flex items-center text-orange-500 text-lg font-bold">=</div>
+            <div className="flex-1 rounded border-2 border-emerald-400 bg-emerald-50 px-2 py-2 text-center">
+              <div className="text-[10px] font-bold text-emerald-800">✅ 완전한 모델</div>
+              <div className="text-[9px] text-slate-600 font-mono mt-0.5">복원 가능</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — state_dict 저장(A) vs 전체 저장(B) 비교
+    // ─────────────────────────────────────────────────────
+    function SaveBox() {
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">⚖️ 무엇을 저장하나 — 값만(A) vs 통째로(B)</div>
+          <div className="flex gap-2 items-stretch">
+            <div className="flex-1 rounded-lg border-2 border-emerald-400 bg-emerald-50 p-2">
+              <div className="text-[11px] font-bold text-emerald-800 mb-1">✅ A. state_dict 저장 (표준)</div>
+              <div className="text-[9px] font-mono text-slate-700 bg-white rounded px-1.5 py-1 border border-emerald-200">torch.save(model.state_dict(), "m.pt")</div>
+              <ul className="mt-1.5 text-[9px] text-emerald-900 space-y-0.5">
+                <li>· 순수 텐서 값 사전 → 이식성 높음</li>
+                <li>· 코드가 바뀌어도 구조만 다시 만들면 OK</li>
+                <li>· 버전 변화에 강함</li>
+              </ul>
+            </div>
+            <div className="flex-1 rounded-lg border-2 border-red-300 bg-red-50 p-2">
+              <div className="text-[11px] font-bold text-red-800 mb-1">⚠️ B. 전체 객체 저장 (함정)</div>
+              <div className="text-[9px] font-mono text-slate-700 bg-white rounded px-1.5 py-1 border border-red-200">torch.save(model, "m.pt")</div>
+              <ul className="mt-1.5 text-[9px] text-red-900 space-y-0.5">
+                <li>· pickle 이 클래스 경로를 굳힘</li>
+                <li>· 파일 이동·리네임·리팩터링 시 깨짐</li>
+                <li>· 버전 취약 + pickle 보안 위험</li>
+              </ul>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">공식 권장은 언제나 <span className="font-mono font-bold">state_dict</span> 방식. "구조는 코드로, 값은 사전으로".</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 로드 3단계 흐름 + 옵션 표
+    // ─────────────────────────────────────────────────────
+    const OPT_TONE = { good: 'text-emerald-700', warn: 'text-amber-700', bad: 'text-red-700', info: 'text-sky-700' };
+    function LoadBox({ loadSteps, optRows }) {
+      if (!loadSteps) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🔧 불러오기 — 빈 그릇 만들고 값 붓는 3단계</div>
+          <div className="space-y-1.5">
+            {loadSteps.map((s) => (
+              <div key={s.n} className="flex items-start gap-2 rounded border border-orange-200 bg-orange-50 px-2 py-1.5">
+                <span className="w-5 h-5 shrink-0 rounded-full bg-orange-600 text-white text-[11px] font-bold flex items-center justify-center">{s.n}</span>
+                <div className="min-w-0">
+                  <div className="text-[11px] font-bold text-orange-900">{s.title}</div>
+                  <div className="text-[9px] font-mono text-slate-700 break-all">{s.code}</div>
+                  <div className="text-[9px] text-slate-500">{s.note}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 rounded border-2 border-orange-300 bg-white">
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-orange-900 border-b-2 border-orange-200">
+                  <th className="text-left py-1 px-2">실무 옵션</th>
+                  <th className="text-left py-1 px-1">언제</th>
+                </tr>
+              </thead>
+              <tbody>
+                {optRows.map((r) => (
+                  <tr key={r.opt} className="border-t border-orange-100">
+                    <td className={`py-1 px-2 font-mono font-bold ${OPT_TONE[r.tone]}`}>{r.opt}</td>
+                    <td className="py-1 px-1 text-slate-700">{r.why}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 크래시 → 재개 학습곡선 시뮬 (옵티마이저 state 유무 비교)
+    //   epoch 0..11 정상 학습 → 11에서 크래시 → 12부터 재개
+    //   with-optimizer: 매끄럽게 이어짐 / without: 출렁이다 회복
+    // ─────────────────────────────────────────────────────
+    function ResumeBox() {
+      const W = 340, H = 150, PAD = 24;
+      const CRASH = 11, TOTAL = 20;
+      // 손실 곡선 (0..1 정규화, 낮을수록 좋음)
+      const base = (e) => 0.9 * Math.exp(-e / 6) + 0.06;         // 정상 하강
+      const withOpt = (e) => base(e);                            // 옵티마이저 복원 — 그대로 이어짐
+      const withoutOpt = (e) => {                                 // 옵티마이저 리셋 — 재개 후 출렁
+        if (e <= CRASH) return base(e);
+        const bump = 0.22 * Math.exp(-(e - CRASH) / 2.2);        // 재개 직후 튀었다 회복
+        return base(e) + bump;
+      };
+      const x = (e) => PAD + (e / (TOTAL - 1)) * (W - 2 * PAD);
+      const y = (v) => PAD + (1 - v) * (H - 2 * PAD);            // v: 0(하단) .. 1(상단)
+      const path = (fn, from, to) => {
+        let d = '';
+        for (let e = from; e <= to; e++) d += (e === from ? 'M' : 'L') + x(e).toFixed(1) + ',' + y(fn(e)).toFixed(1) + ' ';
+        return d.trim();
+      };
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🔄 12시간째 크래시 → 체크포인트에서 재개</div>
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+            {/* 축 */}
+            <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#cfc9ba" strokeWidth="1" />
+            <line x1={PAD} y1={PAD} x2={PAD} y2={H - PAD} stroke="#cfc9ba" strokeWidth="1" />
+            {/* 크래시 지점 */}
+            <line x1={x(CRASH)} y1={PAD} x2={x(CRASH)} y2={H - PAD} stroke="#ef4444" strokeWidth="1" strokeDasharray="3 3" />
+            <text x={x(CRASH)} y={PAD - 6} fontSize="8" fill="#dc2626" textAnchor="middle">💥 크래시 → 재개</text>
+            {/* 재개 전 (공통) */}
+            <path d={path(base, 0, CRASH)} fill="none" stroke="#57534a" strokeWidth="2" />
+            {/* 옵티마이저 리셋 (빨강, 출렁) */}
+            <path d={path(withoutOpt, CRASH, TOTAL - 1)} fill="none" stroke="#ef4444" strokeWidth="2" strokeDasharray="4 2" />
+            {/* 옵티마이저 복원 (초록, 매끄러움) */}
+            <path d={path(withOpt, CRASH, TOTAL - 1)} fill="none" stroke="#10b981" strokeWidth="2" />
+            {/* 라벨 */}
+            <text x={W - PAD} y={H - PAD + 10} fontSize="8" fill="#8a8578" textAnchor="end">epoch →</text>
+            <text x={PAD - 4} y={PAD + 4} fontSize="8" fill="#8a8578" textAnchor="end">loss</text>
+          </svg>
+          <div className="flex gap-3 justify-center mt-1 text-[9px]">
+            <span className="flex items-center gap-1"><span className="inline-block w-4 h-0.5 bg-emerald-500"></span>옵티마이저 state 복원 — 매끄럽게 이어짐</span>
+            <span className="flex items-center gap-1"><span className="inline-block w-4 h-0.5 bg-red-500"></span>state 빠뜨림 — 재개 후 출렁이다 회복</span>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">Adam·SGD 모멘텀 누적을 잃으면 학습률이 튄 것과 같은 효과 — 손실이 한동안 요동친다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — best/last 실무 운영 표
+    // ─────────────────────────────────────────────────────
+    const OPS_TONE = { good: 'text-emerald-700', warn: 'text-amber-700', info: 'text-sky-700', bad: 'text-red-700' };
+    function OpsBox({ opsRows }) {
+      if (!opsRows) return null;
+      return (
+        <div className="mt-1 space-y-3">
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🗂️ best / last 이원 저장 전략</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-orange-900 border-b-2 border-orange-200">
+                  <th className="text-left py-1">파일</th>
+                  <th className="text-left py-1 pl-1">저장 시점</th>
+                  <th className="text-left py-1 pl-1">쓰임</th>
+                </tr>
+              </thead>
+              <tbody>
+                {opsRows.map((r) => (
+                  <tr key={r.file} className="border-t border-orange-100">
+                    <td className={`py-1 font-mono font-bold ${OPS_TONE[r.tone]}`}>{r.file}</td>
+                    <td className="py-1 pl-1 text-slate-700">{r.when}</td>
+                    <td className="py-1 pl-1 text-slate-700">{r.use}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="rounded-lg border-2 border-orange-400 bg-gradient-to-br from-orange-50 to-amber-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🛟 안전한 저장 — 임시파일 → 원자적 rename</div>
+            <div className="flex items-center gap-1.5 text-[10px]">
+              <div className="flex-1 rounded border border-amber-300 bg-white px-2 py-1.5 text-center">
+                <div className="font-bold text-amber-800">1. ckpt.tmp 에 쓰기</div>
+                <div className="text-[9px] text-slate-500 font-mono">torch.save(obj, tmp)</div>
+              </div>
+              <div className="text-orange-600 text-lg">→</div>
+              <div className="flex-1 rounded border border-emerald-400 bg-emerald-50 px-2 py-1.5 text-center">
+                <div className="font-bold text-emerald-800">2. os.replace</div>
+                <div className="text-[9px] text-slate-500 font-mono">tmp → ckpt.pt (원자적)</div>
+              </div>
+            </div>
+            <div className="mt-2 text-[10px] text-orange-900">저장 도중 죽어도 반쯤 쓰인 파일이 원본을 덮지 않는다 — 이전 정상본이 살아남는다.</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-orange-50', border: 'border-orange-300', text: 'text-orange-900', icon: '💡' },
+      warn:   { bg: 'bg-amber-50',  border: 'border-amber-300',  text: 'text-amber-900',  icon: '⚠️' },
+      danger: { bg: 'bg-red-50',    border: 'border-red-300',    text: 'text-red-900',    icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 체크포인트 시각화 (orange 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      inspect: { icon: '📦', label: 'state_dict 정체' },
+      save:    { icon: '⚖️', label: '저장의 정석' },
+      load:    { icon: '🔧', label: '불러오기 3단계' },
+      resume:  { icon: '🔄', label: '학습 재개' },
+      ops:     { icon: '🗂️', label: '실무 체계' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.inspect;
+      return (
+        <div className="rounded-xl border border-orange-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-orange-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>체크포인트 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-orange-700 font-mono mb-2 px-2 py-1 rounded bg-orange-50 border border-orange-200">
+            {state.engineDetail}
+          </div>
+
+          {state.vis === 'inspect' && <InspectBox rows={state.sdRows} />}
+          {state.vis === 'save' && <SaveBox />}
+          {state.vis === 'load' && <LoadBox loadSteps={state.loadSteps} optRows={state.optRows} />}
+          {state.vis === 'resume' && <ResumeBox />}
+          {state.vis === 'ops' && <OpsBox opsRows={state.opsRows} />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-400/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-orange-600 text-white font-bold">🔥</span>
+              <div>
+                <h1 className="text-2xl font-bold text-orange-900">III-2-1. 체크포인트 — state_dict 저장·재개</h1>
+                <p className="text-sm text-orange-800/80">12시간 학습이 11시간째에 죽었다 — 다시는 처음부터 돌리지 않는 법</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-orange-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-orange-500' : 'bg-orange-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-orange-800 text-orange-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-orange-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-orange-800 text-white' : 'bg-orange-600 text-white hover:bg-orange-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-orange-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-500 bg-white px-4 py-3 text-sm text-orange-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                모델의 학습된 지식은 <span className="font-mono">state_dict</span>(이름→텐서 OrderedDict)에 있고, 구조는 클래스 코드에 있다 —
+                그래서 저장은 <span className="font-mono">torch.save(model.state_dict())</span> 가 표준이다(전체 저장은 pickle 경로 의존으로 깨진다).
+                로드는 인스턴스 생성 → <span className="font-mono">load_state_dict</span> → <span className="font-mono">eval()/train()</span> 3단계,
+                GPU→CPU 는 <span className="font-mono">map_location</span>, 부분 로드는 <span className="font-mono">strict=False</span>.
+                재개하려면 모델·옵티마이저(모멘텀!)·에폭·스케줄러를 한 딕셔너리로 묶고, 운영은 best/last 이원 저장 + 임시파일→rename 안전 저장으로 굳힌다.
+                다음 장에서는 이렇게 저장한 학습을 실시간으로 들여다보는 <span className="font-bold">모니터링</span>을 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['state_dict', 'torch.save', 'torch.load', 'load_state_dict', 'map_location', 'strict', 'optimizer', 'scheduler', 'resume', 'best/last', 'os.replace', 'eval'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-orange-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-2-2.html" className="underline hover:no-underline">다음: III-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

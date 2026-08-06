@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PyTorch 학습 — III-1-2. transforms·증강 파이프라인</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    PyTorch III-1-2 — transforms·증강 파이프라인
+    학습 목표: Dataset 과 모델 사이에 놓이는 "변환 조립 라인"을 손에 쥔다.
+              (1) transforms 는 __getitem__ 안에서 꺼낼 때마다 실행되는 함수이고 Compose 로 체인을 만든다
+              (2) ToTensor/Normalize 가 왜 필수인지(0~255→0~1, HWC→CHW, ImageNet 통계 궁합)
+              (3) 증강은 매 에폭 다른 변형을 만들고 train/val 은 파이프라인을 분리해야 한다
+              (4) v2 API 와 변환 위치(CPU 워커 vs GPU 배치) 성능 감각
+              (5) 분류 표준 레시피·커스텀 변환·역정규화 디버깅까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 조립 라인 · 정규화 분포 이동 · 에폭별 증강 그리드 · train/val 분리) /
+          우(VSCode CodeViewer: transforms_pipeline.py 진화)
+    색상: orange (PyTorch 브랜드 #EE4C2C 감각)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 변환의 자리 → ToTensor/Normalize → 증강 → v2·성능 → 실무 레시피
+    //   state.vis  : 좌측 LiveDataPane 이 그릴 시각화 종류
+    //                'compose'(조립 라인) | 'normalize'(분포 이동) | 'augment'(에폭 그리드)
+    //                'v2perf'(CPU 워커 vs GPU 배치) | 'recipe'(레시피·역정규화)
+    //   code       : 우측 CodeViewer 파일 (transforms_pipeline.py 진화)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. transforms의 자리 — Dataset과 모델 사이의 조립 라인',
+        desc: 'transforms 는 별도의 전처리 스크립트가 아니라, Dataset.__getitem__ 이 샘플 하나를 꺼낼 때마다 그 자리에서 호출되는 "변환 함수"다. 그래서 원본 이미지 파일은 디스크에 그대로 두고, 배치를 뽑을 때마다 즉석에서 PIL 이미지를 텐서로 바꿔 모델에 넣는다 — 원본을 미리 통째로 변환해 저장할 필요가 없다는 게 핵심 이점이다. 여러 변환을 순서대로 엮을 때는 transforms.Compose([...]) 로 체인을 조립하는데, 리스트 순서가 곧 실행 순서다. 이미지 분류의 표준 3종은 거의 항상 Resize/Crop → ToTensor → Normalize 순서로, "크기 맞추기 → 텐서화 → 정규화"의 조립 라인을 이룬다. 순서를 헷갈려 Normalize 를 ToTensor 앞에 두면 PIL 이미지에 뺄셈을 시도해 곧장 에러가 난다.',
+        actor: '🏭 __getitem__ 안에서 매번 실행되는 변환 함수',
+        engine: 'compose',
+        vis: 'compose',
+        engineDetail: 'transforms.Compose([Resize, ToTensor, Normalize])',
+        alert: { tone: 'info', text: 'Compose 의 리스트 순서 = 실행 순서. 표준은 크기 맞추기 → ToTensor → Normalize. Normalize 를 ToTensor 앞에 두면 PIL 이미지에 산술을 시도해 터진다.' },
+        code: {
+          lang: 'python',
+          filename: 'transforms_pipeline.py (1/5 — 변환의 자리)',
+          lines: [
+            '"""',
+            'transforms_pipeline.py — Dataset 과 모델 사이의 변환 조립 라인',
+            'transforms 는 __getitem__ 이 샘플을 꺼낼 때마다 그 자리에서 실행된다.',
+            '"""',
+            'from PIL import Image',
+            'from torch.utils.data import Dataset',
+            'from torchvision import transforms',
+            '',
+            '# Compose: 리스트 순서 = 실행 순서 (표준 3종 조립 라인)',
+            'pipeline = transforms.Compose([',
+            '    transforms.Resize((224, 224)),   # 1) 크기 맞추기 (PIL)',
+            '    transforms.ToTensor(),           # 2) PIL → Tensor',
+            '    transforms.Normalize(            # 3) 채널별 정규화',
+            '        mean=[0.485, 0.456, 0.406],',
+            '        std=[0.229, 0.224, 0.225]),',
+            '])',
+            '',
+            'class ImageDataset(Dataset):',
+            '    def __init__(self, paths, labels, transform):',
+            '        self.paths = paths',
+            '        self.labels = labels',
+            '        self.transform = transform   # 변환을 주입받는다',
+            '',
+            '    def __len__(self):',
+            '        return len(self.paths)',
+            '',
+            '    def __getitem__(self, idx):',
+            '        # 원본은 디스크에 그대로 — 꺼낼 때마다 즉석 변환',
+            '        img = Image.open(self.paths[idx]).convert("RGB")',
+            '        img = self.transform(img)    # 여기서 조립 라인 실행',
+            '        return img, self.labels[idx]',
+            '',
+            '# 배치를 뽑을 때마다 변환이 돌아간다 (원본 저장 불필요)',
+            'ds = ImageDataset(paths, labels, transform=pipeline)',
+            'x, y = ds[0]',
+            'print(x.shape)   # torch.Size([3, 224, 224])  (C, H, W)',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 14, 15, 26, 27, 28, 29],
+        },
+      },
+      {
+        title: 'Step 2. ToTensor와 Normalize — 왜 이 둘이 거의 항상 붙는가',
+        desc: 'ToTensor 는 두 가지 변환을 한 번에 한다. (1) 값 스케일을 [0,255] uint8 에서 [0,1] float32 로 내려 나누고, (2) PIL/numpy 의 HWC(높이·너비·채널) 축 순서를 PyTorch conv 가 기대하는 CHW(채널·높이·너비)로 바꾼다. 이어 Normalize 는 채널마다 (x-mean)/std 로 분포를 다시 맞춘다 — 값의 중심을 0 근처로, 퍼짐을 1 근처로 옮기는 것이다. 왜 필요한가? 학습이 안정되려면 입력 분포가 층마다 예측 가능해야 하고, 무엇보다 ImageNet 으로 사전학습한 백본을 전이학습할 때 그 백본은 mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225] 로 정규화된 입력에 맞춰 학습되었기 때문이다(dl II-2-2 전이학습 연결). 통계를 안 맞추거나 val 에만 빼먹으면, 겉보기엔 돌아가는데 성능만 조용히 무너지는 가장 찾기 힘든 버그가 된다.',
+        actor: '🎚️ [0,255] uint8 → [0,1] float → 채널 정규화',
+        engine: 'normalize',
+        vis: 'normalize',
+        engineDetail: 'ToTensor: /255 + HWC→CHW · Normalize: (x-μ)/σ',
+        alert: { tone: 'warn', text: 'ImageNet 사전학습 백본은 mean/std 로 정규화된 입력에 맞춰졌다. 통계를 안 맞추면 전이학습 성능이 조용히 무너진다 — 에러는 안 나서 가장 잡기 어렵다.' },
+        code: {
+          lang: 'python',
+          filename: 'transforms_pipeline.py (2/5 — ToTensor·Normalize)',
+          lines: [
+            '"""',
+            'transforms_pipeline.py — ToTensor 와 Normalize 가 하는 일',
+            'ToTensor: 스케일 [0,255]→[0,1] + 축 HWC→CHW / Normalize: (x-μ)/σ',
+            '"""',
+            'import torch',
+            'from PIL import Image',
+            'from torchvision import transforms',
+            '',
+            'img = Image.open("cat.jpg").convert("RGB")',
+            'print(img.size)                  # (W, H) — PIL 은 W,H 순',
+            '',
+            '# 1) ToTensor — 스케일 하강 + 축 재배치를 한 번에',
+            'to_tensor = transforms.ToTensor()',
+            't = to_tensor(img)',
+            'print(t.shape)                   # torch.Size([3, 224, 224]) = CHW',
+            'print(t.dtype)                   # torch.float32',
+            'print(t.min().item(), t.max().item())   # 0.0 ~ 1.0 (255 로 나뉨)',
+            '',
+            '# 2) Normalize — ImageNet 통계로 채널별 (x - mean) / std',
+            'IMAGENET_MEAN = [0.485, 0.456, 0.406]',
+            'IMAGENET_STD  = [0.229, 0.224, 0.225]',
+            'normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)',
+            'n = normalize(t)',
+            'print(n.mean(dim=(1, 2)))        # 채널 평균이 0 근처로 이동',
+            'print(n.min().item(), n.max().item())   # 대략 -2.1 ~ 2.6',
+            '',
+            '# 왜? 전이학습 백본은 이 통계로 학습됐다 (dl II-2-2 연결)',
+            '# → train 과 val 에 "똑같은" 통계를 반드시 적용해야 한다',
+            'assert not torch.isnan(n).any()  # 통계 누락 시 분포가 어긋난다',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 26, 27],
+        },
+      },
+      {
+        title: 'Step 3. 증강 변환 — 매 에폭 다른 변형으로 과적합을 막는다',
+        desc: '증강(augmentation)은 하나의 이미지를 매번 조금씩 다르게 보여 줘서 데이터가 실제보다 많은 것처럼 만들고, 모델이 위치·색·가림에 흔들리지 않게 훈련시키는 정규화 기법이다(dl V-1-2 이론 연결). RandomCrop 은 매번 다른 부분을 잘라 위치 불변성을, RandomHorizontalFlip 은 좌우 반전으로 대칭 클래스를, ColorJitter 는 밝기·대비·채도를 흔들어 조명 변화를, RandomErasing 은 일부를 지워 가림(occlusion)에 강하게 만든다. 핵심은 "랜덤"이라는 점 — transforms 는 __getitem__ 마다 새 난수를 뽑으므로, 같은 이미지라도 에폭 0 과 에폭 5 에서 서로 다른 변형이 나온다. 반드시 지킬 원칙 하나: 랜덤 증강은 train 파이프라인에만 넣고, val/test 에는 절대 넣지 않는다. 검증 세트가 매번 흔들리면 성능 지표를 신뢰할 수 없고, 같은 모델을 평가할 때마다 점수가 달라진다.',
+        actor: '🎲 같은 이미지, 에폭마다 다른 변형',
+        engine: 'augment',
+        vis: 'augment',
+        engineDetail: 'RandomCrop · Flip · ColorJitter · RandomErasing',
+        alert: { tone: 'danger', text: '랜덤 증강은 train 에만. val/test 에 넣으면 검증 점수가 매번 흔들려 모델 비교가 불가능해진다. val 은 결정적(deterministic) 파이프라인이어야 한다.' },
+        code: {
+          lang: 'python',
+          filename: 'transforms_pipeline.py (3/5 — 증강 · train/val 분리)',
+          lines: [
+            '"""',
+            'transforms_pipeline.py — 증강은 매 에폭 다른 변형 (train 전용)',
+            '랜덤 증강은 train 에만. val 은 결정적 파이프라인. (dl V-1-2 연결)',
+            '"""',
+            'from torchvision import transforms',
+            '',
+            'IMAGENET_MEAN = [0.485, 0.456, 0.406]',
+            'IMAGENET_STD  = [0.229, 0.224, 0.225]',
+            '',
+            '# ── train: 랜덤 증강 O ─────────────────────────',
+            'train_tf = transforms.Compose([',
+            '    transforms.RandomResizedCrop(224),      # 매번 다른 크롭',
+            '    transforms.RandomHorizontalFlip(p=0.5), # 좌우 반전',
+            '    transforms.ColorJitter(0.2, 0.2, 0.2),  # 밝기·대비·채도',
+            '    transforms.ToTensor(),',
+            '    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),',
+            '    transforms.RandomErasing(p=0.25),       # 일부 가림 (텐서 뒤)',
+            '])',
+            '',
+            '# ── val: 랜덤 X, 결정적 파이프라인 ─────────────',
+            'val_tf = transforms.Compose([',
+            '    transforms.Resize(256),                 # 고정',
+            '    transforms.CenterCrop(224),             # 항상 중앙',
+            '    transforms.ToTensor(),',
+            '    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),',
+            '])',
+            '',
+            '# 같은 이미지를 여러 번 꺼내면 train 은 매번 다르다',
+            'a = train_tf(img)',
+            'b = train_tf(img)',
+            'print((a - b).abs().sum() > 0)   # True — 서로 다른 변형',
+            '# val 은 항상 같다 → 검증 점수가 흔들리지 않는다',
+            'print((val_tf(img) - val_tf(img)).abs().sum())   # tensor(0.)',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32],
+        },
+      },
+      {
+        title: 'Step 4. v2 API와 성능 — 변환을 어디서(CPU 워커 vs GPU) 돌릴까',
+        desc: 'torchvision.transforms.v2 는 기존 API 의 상위 호환 재작성판이다. 가장 큰 실무 이점은 이미지뿐 아니라 bounding box·segmentation mask·keypoint 를 "함께" 변환해 준다는 것 — v1 에서는 크롭·플립할 때 이미지와 박스를 따로 손보다 좌표가 어긋나기 쉬웠는데, v2 는 하나의 호출로 동기화한다. 또 텐서를 바로 받아 uint8 텐서에서 동작이 더 빠르다. 성능에서 진짜 결정은 "변환을 어디서 돌리느냐"다. 기본은 DataLoader 의 CPU 워커(num_workers>0)가 배치를 준비하는 동안 GPU 는 이전 배치를 학습해 병렬로 겹친다. 그런데 변환이 무거워 CPU 가 못 따라가면 GPU 가 데이터를 기다리며 노는 입력 병목이 생긴다. 이때 선택지는 워커 수를 늘리거나, Kornia 같은 GPU 증강으로 변환을 배치 단위로 GPU 에서 한 줄에 돌리는 것이다. 무엇을 고를지는 프로파일링으로 정한다 — GPU 사용률이 낮고 데이터 대기가 길면 입력 병목이라는 신호다.',
+        actor: '⚙️ CPU 워커가 준비 · GPU가 학습 — 겹치거나, 병목이거나',
+        engine: 'v2perf',
+        vis: 'v2perf',
+        engineDetail: 'transforms.v2 (bbox 동시) · CPU worker vs GPU batch',
+        alert: { tone: 'info', text: 'GPU 사용률이 낮고 데이터 대기가 길면 입력 병목이다. 해결: num_workers↑ · pin_memory · 또는 Kornia 로 증강을 GPU 배치에서 처리. 먼저 프로파일링으로 확인하라.' },
+        code: {
+          lang: 'python',
+          filename: 'transforms_pipeline.py (4/5 — v2 API · 성능)',
+          lines: [
+            '"""',
+            'transforms_pipeline.py — v2 API 와 변환 위치(성능)',
+            'v2: 이미지+bbox 동시 변환 / 병목이면 GPU 증강(Kornia)으로 이동',
+            '"""',
+            'import torch',
+            'from torchvision.transforms import v2',
+            'from torch.utils.data import DataLoader',
+            '',
+            '# v2: 이미지와 bbox 를 한 번의 호출로 함께 변환 (좌표 동기화)',
+            'detect_tf = v2.Compose([',
+            '    v2.RandomResizedCrop(224, antialias=True),',
+            '    v2.RandomHorizontalFlip(0.5),',
+            '    v2.ToDtype(torch.float32, scale=True),   # uint8 → [0,1]',
+            '    v2.Normalize([0.485, 0.456, 0.406],',
+            '                 [0.229, 0.224, 0.225]),',
+            '])',
+            'img_out, boxes_out = detect_tf(img, boxes)   # 박스도 같이 변환',
+            '',
+            '# 위치 선택 1) CPU 워커 — 학습과 데이터 준비를 겹친다',
+            'loader = DataLoader(',
+            '    dataset, batch_size=64,',
+            '    num_workers=8,        # CPU 워커가 병렬로 변환 (병목이면 ↑)',
+            '    pin_memory=True,      # CPU→GPU 복사 가속',
+            '    persistent_workers=True,',
+            ')',
+            '',
+            '# 위치 선택 2) GPU 증강 — 배치 단위로 GPU 에서 한 줄에',
+            'import kornia.augmentation as K',
+            'gpu_aug = torch.nn.Sequential(',
+            '    K.RandomHorizontalFlip(p=0.5),',
+            '    K.ColorJitter(0.2, 0.2, 0.2, 0.1),',
+            ').cuda()',
+            '',
+            'for x, y in loader:',
+            '    x = x.cuda(non_blocking=True)',
+            '    x = gpu_aug(x)        # CPU 병목일 때 증강을 GPU 로 옮긴다',
+            '    # ... forward / backward ...',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 34, 35],
+        },
+      },
+      {
+        title: 'Step 5. 실무 레시피 — 표준 세트 · 커스텀 변환 · 역정규화 디버깅',
+        desc: '마지막은 매일 복붙하는 레시피와, 반드시 들여야 할 습관이다. 분류의 표준은 train(RandomResizedCrop+Flip+정규화)과 val(Resize+CenterCrop+정규화)을 짝으로 두고, 통계(mean/std)만 데이터셋에 맞춰 바꾸는 것이다. 내장 변환으로 부족하면 커스텀 변환 클래스를 만든다 — __call__(self, img) 하나만 구현하면 Compose 안에 그대로 끼워 넣을 수 있다(예: 특정 채널만 강조, 도메인 특화 노이즈). 그리고 가장 값진 습관: 학습을 돌리기 전에 변환 후 이미지를 눈으로 확인하라. 정규화된 텐서는 값이 음수라 그냥 화면에 그리면 새까맣게 보이므로, 학습에 쓴 것과 짝을 이루는 역정규화(denormalize) 함수 x*std+mean 을 통과시켜 사람이 볼 수 있는 이미지로 되돌린 뒤 저장해 확인한다. 크롭이 대상을 다 잘라내거나 색이 과하게 튀는 증강 실수는 이 한 번의 눈 확인으로 대부분 잡힌다. 다음 장에서는 이렇게 학습한 모델을 안전하게 저장·복원하는 체크포인트를 다룬다.',
+        actor: '🧾 표준 레시피 + 커스텀 변환 + 역정규화 눈 확인',
+        engine: 'recipe',
+        vis: 'recipe',
+        engineDetail: 'train/val 세트 · __call__ 커스텀 · denormalize',
+        recipeRows: [
+          { stage: 'train', tf: 'RandomResizedCrop → Flip → ToTensor → Normalize', rand: '랜덤 O', tone: 'good' },
+          { stage: 'val/test', tf: 'Resize → CenterCrop → ToTensor → Normalize', rand: '결정적', tone: 'warn' },
+        ],
+        habitRows: [
+          { fn: '커스텀 변환', how: '__call__(self, img) 구현 → Compose 에 삽입', tone: 'good' },
+          { fn: '역정규화', how: 'x * std + mean → 화면용 이미지로 복원', tone: 'warn' },
+          { fn: '눈 확인', how: '학습 전 변환 후 배치를 저장해 육안 검수', tone: 'bad' },
+        ],
+        alert: { tone: 'good', text: '학습 전에 변환 후 배치를 역정규화해 눈으로 봐라. 크롭이 대상을 다 잘랐거나 색이 튀는 실수는 이 한 번으로 대부분 잡힌다 — 다음 장: 체크포인트 저장·복원.' },
+        code: {
+          lang: 'python',
+          filename: 'transforms_pipeline.py (5/5 — 실무 레시피)',
+          lines: [
+            '"""',
+            'transforms_pipeline.py — 분류 표준 레시피 · 커스텀 변환 · 역정규화',
+            '습관: 학습 전 변환 후 이미지를 눈으로 확인한다.',
+            '"""',
+            'import torch',
+            'from torchvision import transforms',
+            'from torchvision.utils import save_image',
+            '',
+            'MEAN = torch.tensor([0.485, 0.456, 0.406])',
+            'STD  = torch.tensor([0.229, 0.224, 0.225])',
+            '',
+            '# 1) 커스텀 변환 — __call__ 하나만 구현하면 Compose 에 삽입 가능',
+            'class AddGaussianNoise:',
+            '    """텐서에 가우시안 노이즈를 더하는 도메인 특화 증강."""',
+            '    def __init__(self, std=0.05):',
+            '        self.std = std',
+            '',
+            '    def __call__(self, x):        # x: [C,H,W] 텐서',
+            '        return x + torch.randn_like(x) * self.std',
+            '',
+            'train_tf = transforms.Compose([',
+            '    transforms.RandomResizedCrop(224),',
+            '    transforms.RandomHorizontalFlip(),',
+            '    transforms.ToTensor(),',
+            '    transforms.Normalize(MEAN.tolist(), STD.tolist()),',
+            '    AddGaussianNoise(0.03),       # 커스텀을 그대로 끼운다',
+            '])',
+            '',
+            '# 2) 역정규화 — 정규화 텐서를 사람이 볼 수 있게 되돌린다',
+            'def denormalize(x):',
+            '    """x*std+mean 후 [0,1] 로 클램프 (화면·저장용)."""',
+            '    return (x * STD[:, None, None] + MEAN[:, None, None]).clamp(0, 1)',
+            '',
+            '# 3) 학습 전 눈 확인 습관 — 변환 결과를 저장해 육안 검수',
+            'x = train_tf(img)                 # 정규화된 텐서 (그냥 그리면 새까맘)',
+            'save_image(denormalize(x), "debug_aug.png")   # 되돌려 저장',
+            'print("변환 후 이미지 저장 — 크롭·색을 눈으로 확인!")',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 17, 18, 24, 25, 28, 29, 30, 31, 34, 35, 36],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 미니 이미지 아이콘 (SVG) — 변환 상태를 색/변형으로 표현
+    // ─────────────────────────────────────────────────────
+    function MiniImage({ tint = '#fb923c', flip = false, crop = 0, erase = false, size = 40 }) {
+      const s = size;
+      return (
+        <svg width={s} height={s} viewBox="0 0 40 40" style={{ transform: flip ? 'scaleX(-1)' : 'none' }}>
+          <rect x={crop} y={crop} width={40 - crop * 2} height={40 - crop * 2} rx="3" fill={tint} opacity="0.25" />
+          <circle cx={26} cy={14} r={5} fill={tint} />
+          <path d={`M${6 + crop} ${34 - crop} L16 20 L24 28 L30 22 L${34 - crop} ${34 - crop} Z`} fill={tint} opacity="0.85" />
+          {erase && <rect x={20} y={22} width={10} height={10} fill="#1f2937" />}
+        </svg>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — Compose 조립 라인 (원본 → 단계 박스들 → 텐서)
+    // ─────────────────────────────────────────────────────
+    function ComposeBox() {
+      const stages = [
+        { icon: '🖼️', name: 'PIL 이미지', sub: 'H×W×C · uint8', color: 'border-sky-300 bg-sky-50' },
+        { icon: '📐', name: 'Resize', sub: '224×224', color: 'border-orange-300 bg-orange-50' },
+        { icon: '🔢', name: 'ToTensor', sub: 'CHW · [0,1]', color: 'border-orange-400 bg-orange-50' },
+        { icon: '🎚️', name: 'Normalize', sub: '(x-μ)/σ', color: 'border-orange-500 bg-orange-100' },
+        { icon: '🔥', name: 'Tensor', sub: '[3,224,224]', color: 'border-emerald-400 bg-emerald-50' },
+      ];
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🏭 Compose 조립 라인 — 리스트 순서 = 실행 순서</div>
+          <div className="flex items-stretch gap-1 overflow-x-auto">
+            {stages.map((st, i) => (
+              <React.Fragment key={st.name}>
+                <div className={`flex-shrink-0 w-[74px] rounded-lg border-2 ${st.color} px-1 py-2 text-center`}>
+                  <div className="text-lg">{st.icon}</div>
+                  <div className="text-[10px] font-bold text-slate-800 leading-tight mt-0.5">{st.name}</div>
+                  <div className="text-[8px] text-slate-500 font-mono">{st.sub}</div>
+                </div>
+                {i < stages.length - 1 && <div className="flex items-center text-orange-500 font-bold">→</div>}
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="mt-3 rounded border-2 border-red-300 bg-red-50 p-2">
+            <div className="text-[10px] font-bold text-red-800 mb-1">💥 순서를 뒤집으면</div>
+            <div className="text-[10px] text-red-900 font-mono">Normalize → ToTensor : PIL 이미지에 뺄셈 시도 → TypeError</div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">원본은 디스크에 그대로. <span className="font-mono font-bold">__getitem__</span> 이 꺼낼 때마다 이 라인이 즉석 실행된다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 정규화 분포 이동 (막대 히스토그램 before/after)
+    // ─────────────────────────────────────────────────────
+    function NormalizeBox() {
+      // before: [0,1] 에 몰린 분포 / after: 0 중심으로 이동·확장
+      const before = [2, 5, 9, 14, 18, 15, 10, 6, 3, 1];
+      const after = [1, 3, 7, 12, 16, 17, 13, 9, 5, 2];
+      const Bars = ({ data, tone, zeroAt }) => (
+        <div className="flex items-end gap-[2px] h-16">
+          {data.map((v, i) => (
+            <div key={i} className="flex-1 flex flex-col justify-end">
+              <div className={`${tone} rounded-t`} style={{ height: `${v * 3}px` }} />
+            </div>
+          ))}
+        </div>
+      );
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🎚️ ToTensor + Normalize — 값의 분포가 이동한다</div>
+          {/* ToTensor 축/스케일 요약 */}
+          <div className="flex gap-2 mb-3">
+            <div className="flex-1 rounded border border-sky-300 bg-sky-50 px-2 py-1.5 text-center">
+              <div className="text-[9px] text-sky-800 font-bold">PIL (HWC)</div>
+              <div className="text-[11px] font-mono text-slate-800">[0,255] uint8</div>
+            </div>
+            <div className="flex items-center text-orange-500 font-bold text-sm">→ ÷255 →</div>
+            <div className="flex-1 rounded border border-orange-400 bg-orange-50 px-2 py-1.5 text-center">
+              <div className="text-[9px] text-orange-800 font-bold">Tensor (CHW)</div>
+              <div className="text-[11px] font-mono text-slate-800">[0,1] float32</div>
+            </div>
+          </div>
+          {/* 분포 이동 */}
+          <div className="grid grid-cols-2 gap-2">
+            <div className="rounded border border-orange-200 bg-orange-50 p-2">
+              <div className="text-[10px] font-bold text-orange-800 mb-1">정규화 전 — [0,1] 에 몰림</div>
+              <Bars data={before} tone="bg-orange-300" />
+              <div className="text-[8px] text-slate-500 text-center mt-0.5 font-mono">0 ────── 1</div>
+            </div>
+            <div className="rounded border border-emerald-200 bg-emerald-50 p-2">
+              <div className="text-[10px] font-bold text-emerald-800 mb-1">정규화 후 — 0 중심으로</div>
+              <Bars data={after} tone="bg-emerald-400" />
+              <div className="text-[8px] text-slate-500 text-center mt-0.5 font-mono">-2 ──0── +2.6</div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">ImageNet 통계로 맞춰야 <span className="font-bold">전이학습 백본</span>과 궁합이 맞는다 (dl II-2-2). train·val 에 <span className="font-bold">똑같이</span> 적용.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 에폭별 증강 그리드 + train/val 분리
+    // ─────────────────────────────────────────────────────
+    function AugmentBox() {
+      // 같은 원본을 에폭마다 다르게 변형 (색/플립/크롭/지움을 의사난수로)
+      const epochs = [
+        { ep: 0, flip: false, crop: 0, erase: false, tint: '#fb923c' },
+        { ep: 1, flip: true, crop: 3, erase: false, tint: '#f97316' },
+        { ep: 2, flip: false, crop: 5, erase: true, tint: '#fdba74' },
+        { ep: 3, flip: true, crop: 2, erase: false, tint: '#ea580c' },
+        { ep: 4, flip: false, crop: 4, erase: true, tint: '#fb923c' },
+        { ep: 5, flip: true, crop: 6, erase: false, tint: '#f59e0b' },
+      ];
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🎲 같은 이미지 — 에폭마다 다른 변형</div>
+          <div className="grid grid-cols-6 gap-1.5">
+            {epochs.map((e) => (
+              <div key={e.ep} className="rounded border border-orange-200 bg-orange-50 p-1 flex flex-col items-center">
+                <MiniImage tint={e.tint} flip={e.flip} crop={e.crop} erase={e.erase} size={34} />
+                <div className="text-[8px] text-orange-700 font-mono mt-0.5">ep{e.ep}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1 text-[9px] text-slate-500 text-center">RandomCrop · Flip · ColorJitter · RandomErasing — 매번 새 난수</div>
+          {/* train/val 파이프라인 분리 */}
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <div className="rounded-lg border-2 border-orange-400 bg-orange-50 p-2">
+              <div className="text-[10px] font-bold text-orange-800 mb-1">🚂 train — 랜덤 증강 O</div>
+              <div className="flex gap-1 justify-center">
+                <MiniImage tint="#f97316" flip crop={4} size={26} />
+                <MiniImage tint="#fb923c" crop={2} erase size={26} />
+                <MiniImage tint="#ea580c" flip crop={5} size={26} />
+              </div>
+              <div className="text-[8px] text-orange-700 text-center mt-1">매번 다르다 → 과적합 방지</div>
+            </div>
+            <div className="rounded-lg border-2 border-slate-300 bg-slate-50 p-2">
+              <div className="text-[10px] font-bold text-slate-700 mb-1">🧪 val — 결정적</div>
+              <div className="flex gap-1 justify-center">
+                <MiniImage tint="#64748b" size={26} />
+                <MiniImage tint="#64748b" size={26} />
+                <MiniImage tint="#64748b" size={26} />
+              </div>
+              <div className="text-[8px] text-slate-600 text-center mt-1">항상 같다 → 점수 안 흔들림</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — CPU 워커 vs GPU 배치 + 병목 게이지
+    // ─────────────────────────────────────────────────────
+    function V2PerfBox() {
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">⚙️ 변환을 어디서 돌릴까 — CPU 워커 vs GPU 배치</div>
+          {/* v2 동시 변환 */}
+          <div className="rounded border border-orange-200 bg-orange-50 p-2 mb-3">
+            <div className="text-[10px] font-bold text-orange-800 mb-1">🆕 transforms.v2 — 이미지 + bbox 동시 변환</div>
+            <div className="flex items-center justify-center gap-2 text-[10px]">
+              <span className="px-1.5 py-0.5 rounded bg-orange-200 text-orange-800 font-mono">🖼️ image</span>
+              <span className="text-orange-600 font-bold">+</span>
+              <span className="px-1.5 py-0.5 rounded bg-orange-200 text-orange-800 font-mono">▭ bbox</span>
+              <span className="text-orange-600 font-bold">→ 한 호출로 좌표 동기화</span>
+            </div>
+          </div>
+          {/* 두 위치 */}
+          <div className="grid grid-cols-2 gap-2">
+            <div className="rounded-lg border-2 border-sky-300 bg-sky-50 p-2">
+              <div className="text-[10px] font-bold text-sky-800 mb-1">🧵 CPU 워커 (기본)</div>
+              <div className="text-[9px] text-slate-600 font-mono">num_workers=8</div>
+              <div className="text-[9px] text-slate-700 mt-1">준비 ∥ 학습 겹침</div>
+            </div>
+            <div className="rounded-lg border-2 border-orange-400 bg-orange-50 p-2">
+              <div className="text-[10px] font-bold text-orange-800 mb-1">🎮 GPU 배치 (Kornia)</div>
+              <div className="text-[9px] text-slate-600 font-mono">gpu_aug(x)</div>
+              <div className="text-[9px] text-slate-700 mt-1">배치 단위 한 줄</div>
+            </div>
+          </div>
+          {/* 병목 게이지 */}
+          <div className="mt-3 rounded border-2 border-red-300 bg-red-50 p-2">
+            <div className="text-[10px] font-bold text-red-800 mb-1">📉 입력 병목 신호 — GPU 사용률</div>
+            <div className="h-3 rounded-full bg-slate-200 overflow-hidden">
+              <div className="h-full bg-red-400 flex items-center justify-end pr-1" style={{ width: '38%' }}>
+                <span className="text-[8px] text-white font-bold">38%</span>
+              </div>
+            </div>
+            <div className="text-[9px] text-red-900 mt-1">GPU 가 데이터를 기다리며 논다 → workers↑ 또는 GPU 증강으로 이동</div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">먼저 <span className="font-bold">프로파일링</span>. 대기가 길면 입력 병목이라는 신호다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 표준 레시피 표 + 습관(커스텀·역정규화·눈 확인)
+    // ─────────────────────────────────────────────────────
+    const TONE_TEXT = { good: 'text-emerald-700', warn: 'text-amber-700', bad: 'text-red-700' };
+    function RecipeBox({ recipeRows, habitRows }) {
+      return (
+        <div className="mt-1 space-y-3">
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🧾 분류 표준 레시피 — train/val 짝</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-orange-900 border-b-2 border-orange-200">
+                  <th className="text-left py-1 w-14">세트</th>
+                  <th className="text-left py-1 pl-1">파이프라인</th>
+                  <th className="text-left py-1 pl-1 w-12">랜덤</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recipeRows.map((r) => (
+                  <tr key={r.stage} className="border-t border-orange-100">
+                    <td className="py-1 font-mono font-bold text-orange-800">{r.stage}</td>
+                    <td className="py-1 pl-1 text-slate-700 text-[9px]">{r.tf}</td>
+                    <td className={`py-1 pl-1 font-bold ${TONE_TEXT[r.tone]}`}>{r.rand}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="rounded-lg border-2 border-orange-400 bg-gradient-to-br from-orange-50 to-amber-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🛠️ 들여야 할 습관 3종</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-orange-900 border-b-2 border-orange-300">
+                  <th className="text-left py-1 w-20">항목</th>
+                  <th className="text-left py-1 pl-1">방법</th>
+                </tr>
+              </thead>
+              <tbody>
+                {habitRows.map((r) => (
+                  <tr key={r.fn} className="border-t border-orange-200">
+                    <td className={`py-1 font-bold ${TONE_TEXT[r.tone]}`}>{r.fn}</td>
+                    <td className="py-1 pl-1 text-slate-700 font-mono text-[9px]">{r.how}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {/* 역정규화 눈 확인 미리보기 */}
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-[10px] font-bold text-orange-900 mb-2">👁️ 역정규화 — 새까만 텐서를 사람이 볼 수 있게</div>
+            <div className="flex items-center justify-center gap-3">
+              <div className="text-center">
+                <div className="w-10 h-10 rounded bg-slate-900 border border-slate-700" />
+                <div className="text-[8px] text-slate-500 mt-0.5 font-mono">정규화 텐서</div>
+              </div>
+              <div className="text-orange-600 text-center">
+                <div className="text-lg">→</div>
+                <div className="text-[8px] font-mono">x·σ+μ</div>
+              </div>
+              <div className="text-center">
+                <MiniImage tint="#f97316" size={40} />
+                <div className="text-[8px] text-slate-500 mt-0.5 font-mono">denormalize</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-orange-50', border: 'border-orange-300', text: 'text-orange-900', icon: '💡' },
+      warn:   { bg: 'bg-amber-50',  border: 'border-amber-300',  text: 'text-amber-900',  icon: '⚠️' },
+      danger: { bg: 'bg-red-50',    border: 'border-red-300',    text: 'text-red-900',    icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — transforms 시각화 (orange 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      compose:   { icon: '🏭', label: 'Compose 조립 라인' },
+      normalize: { icon: '🎚️', label: 'ToTensor·Normalize' },
+      augment:   { icon: '🎲', label: '증강 변환' },
+      v2perf:    { icon: '⚙️', label: 'v2 API·성능' },
+      recipe:    { icon: '🧾', label: '실무 레시피' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.compose;
+      return (
+        <div className="rounded-xl border border-orange-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-orange-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>transforms — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-orange-700 font-mono mb-2 px-2 py-1 rounded bg-orange-50 border border-orange-200">
+            {state.engineDetail}
+          </div>
+
+          {state.vis === 'compose' && <ComposeBox />}
+          {state.vis === 'normalize' && <NormalizeBox />}
+          {state.vis === 'augment' && <AugmentBox />}
+          {state.vis === 'v2perf' && <V2PerfBox />}
+          {state.vis === 'recipe' && <RecipeBox recipeRows={state.recipeRows} habitRows={state.habitRows} />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-400/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-orange-600 text-white font-bold">🔥</span>
+              <div>
+                <h1 className="text-2xl font-bold text-orange-900">III-1-2. transforms·증강 파이프라인</h1>
+                <p className="text-sm text-orange-800/80">Dataset과 모델 사이의 변환 조립 라인 — 전처리와 증강을 한 곳에서</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-orange-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-orange-500' : 'bg-orange-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-orange-800 text-orange-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-orange-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-orange-800 text-white' : 'bg-orange-600 text-white hover:bg-orange-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-orange-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-500 bg-white px-4 py-3 text-sm text-orange-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                transforms 는 Dataset 과 모델 사이의 변환 조립 라인이다 —
+                <span className="font-mono">Compose</span> 로 순서대로 엮고, <span className="font-mono">ToTensor</span>(0~255→0~1·HWC→CHW)와
+                <span className="font-mono">Normalize</span>(ImageNet 통계)로 전이학습 백본과 궁합을 맞춘다.
+                증강은 매 에폭 다른 변형으로 과적합을 막되 <span className="font-bold">train 에만</span> 넣고 val 은 결정적으로,
+                무거우면 <span className="font-mono">v2</span>·GPU 증강으로 병목을 푼다. 그리고 학습 전 <span className="font-bold">역정규화로 눈 확인</span>을 습관화하라.
+                다음 장에서는 이렇게 학습한 모델을 안전하게 저장·복원하는 체크포인트를 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Compose', 'ToTensor', 'Normalize', 'ImageNet', 'RandomResizedCrop', 'ColorJitter', 'RandomErasing', 'train/val', 'transforms.v2', 'Kornia', 'denormalize'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-orange-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-1-3.html" className="underline hover:no-underline">다음: III-1-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TensorFlow 학습 — IV-2-2. 혼합 정밀도·XLA</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔶</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    TensorFlow IV-2-2 — 혼합 정밀도·XLA
+    학습 목표: 같은 GPU에서 학습을 2~3배 빠르게 만드는 두 스위치 — 혼합 정밀도(AMP)와
+              XLA 컴파일 — 을 실전 TF API 중심으로 다룬다. mixed_float16 정책 한 줄이
+              연산을 fp16(텐서코어)으로 내리되 변수는 fp32로 지키는 구조, 출력층 float32와
+              손실 스케일링으로 언더플로를 막는 원리, jit_compile=True 의 연산 융합,
+              벤치마크 방법론과 함정, 그리고 tf.data+분산+AMP+XLA 를 쌓는 최적화 스택까지
+              5단계로 정리한다. (dl V-2-1 이론의 TF 실전판)
+    패턴: fastapi v1 — 좌(LiveDataPane: fp32/fp16 메모리·속도 게이지, 층별 dtype 표,
+          XLA 연산 융합 다이어그램, 최적화 스택 조립도) / 우(VSCode CodeViewer: amp_xla.py)
+    색상: orange (TF 브랜드 #FF6F00)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — mixed_float16 정책 → 출력층·손실스케일링 → XLA → 측정·함정 → 최적화 스택
+    //   mode      : 좌측 LiveDataPane 이 무엇을 그릴지 결정
+    //               'policy'(fp32 vs fp16 게이지 + 이득 조건)
+    //               'scaling'(층별 dtype 표 + 손실 스케일링 흐름)
+    //               'xla'(연산 융합 다이어그램)
+    //               'bench'(벤치마크 방법론 + 함정 체크)
+    //               'stack'(최적화 스택 조립도 + 기대 이득 표)
+    //   code      : 우측 CodeViewer 파일 (amp_xla.py 진화)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. mixed_float16 정책 — 한 줄로 연산은 fp16, 변수는 fp32',
+        desc: '혼합 정밀도(AMP)의 출발점은 딱 한 줄이다: keras.mixed_precision.set_global_policy("mixed_float16"). 이 정책을 켜면 이후 만드는 모든 Keras 층이 "연산은 fp16, 변수(가중치)는 fp32"라는 이중 구조로 동작한다. 왜 이렇게 나누는가? 행렬곱·합성곱 같은 무거운 연산은 fp16으로 내려야 NVIDIA 텐서코어가 켜져 처리량이 2~3배로 뛰고, 메모리도 절반이라 배치를 키울 수 있다. 하지만 가중치를 fp16으로 저장하면 작은 그래디언트가 반올림으로 사라져 학습이 망가진다 — 그래서 "마스터 가중치"는 fp32로 지킨다. 핵심 전제: 이 이득은 텐서코어가 있는 GPU(Volta 이후 — V100·T4·A100·RTX 20/30/40 등)에서만 크다. 텐서코어가 없는 옛 GPU나 CPU에서는 오히려 형변환 오버헤드로 느려질 수 있으니, 켜기 전에 하드웨어부터 확인해야 한다.',
+        mode: 'policy',
+        badge: 'AMP · mixed_float16',
+        engineDetail: 'compute=float16 · variable=float32',
+        gauges: {
+          title: 'fp32 순정 vs mixed_float16 (텐서코어 GPU 기준)',
+          rows: [
+            { metric: '메모리 사용', fp32: 100, fp16: 55, unit: '%', fp16Better: true, note: '활성값 fp16 → 배치 여유' },
+            { metric: '학습 처리량', fp32: 100, fp16: 250, unit: '%', fp16Better: true, note: '텐서코어 fp16 행렬곱' },
+            { metric: '가중치 정밀도', fp32: 100, fp16: 100, unit: '%', fp16Better: false, note: '마스터 가중치는 fp32 유지' },
+          ],
+        },
+        hw: [
+          { chip: 'A100 · V100 · T4', gain: '텐서코어 O — 2~3배', ok: true },
+          { chip: 'RTX 20/30/40', gain: '텐서코어 O — 큰 이득', ok: true },
+          { chip: 'GTX 10xx · CPU', gain: '텐서코어 X — 오히려 느림', ok: false },
+        ],
+        alert: { tone: 'warn', text: '텐서코어가 있는 GPU에서만 큰 이득이다. 켜기 전 nvidia-smi / compute capability(≥7.0)를 확인하라. 없는 하드웨어에선 형변환 비용만 늘어 느려질 수 있다.' },
+        code: {
+          lang: 'python',
+          filename: 'amp_xla.py — ① mixed_float16 정책 한 줄',
+          lines: [
+            '"""',
+            'amp_xla.py — ① 혼합 정밀도 정책 켜기 (AMP)',
+            '연산은 fp16(텐서코어), 변수는 fp32(마스터 가중치)',
+            '"""',
+            'import tensorflow as tf',
+            'from tensorflow import keras',
+            'from tensorflow.keras import mixed_precision',
+            '',
+            '# ── 전역 정책을 한 줄로 설정 ──',
+            '# 이후 만드는 모든 층이 이 정책을 따른다.',
+            'mixed_precision.set_global_policy("mixed_float16")',
+            '',
+            'policy = mixed_precision.global_policy()',
+            'print(policy.name)              # mixed_float16',
+            'print(policy.compute_dtype)    # float16  ← 연산',
+            'print(policy.variable_dtype)   # float32  ← 변수(가중치)',
+            '',
+            '# 왜 나누나?',
+            '#  - 연산 fp16: 텐서코어가 켜져 처리량 2~3배 · 메모리 절반',
+            '#  - 변수 fp32: 작은 그래디언트가 반올림으로 사라지는 것을 방지',
+            '#',
+            '# ── 하드웨어 확인 (텐서코어가 있어야 이득) ──',
+            'gpus = tf.config.list_physical_devices("GPU")',
+            'if gpus:',
+            '    details = tf.config.experimental.get_device_details(gpus[0])',
+            '    cc = details.get("compute_capability")',
+            '    print("compute capability:", cc)  # (7,0) 이상이면 텐서코어',
+            '# CPU/구형 GPU 라면 정책을 켜지 않는 편이 빠르다.',
+          ],
+          highlight: [5, 6, 7, 9, 10, 11, 13, 14, 15, 16, 18, 19, 20],
+        },
+      },
+      {
+        title: 'Step 2. 출력층 float32 + 손실 스케일링 — 언더플로를 막는 두 안전장치',
+        desc: '정책 한 줄만으로는 위험이 남는다. 두 곳을 손봐야 한다. 첫째, 마지막 출력층은 dtype="float32"로 명시한다 — softmax·손실 계산은 수치적으로 예민해서 fp16으로 하면 확률이 뭉개지거나 NaN이 나기 쉽다. 출력만 fp32로 올려도 안정성이 크게 좋아지고 속도 손해는 거의 없다. 둘째, 손실 스케일링(loss scaling)이 필요하다. fp16이 표현할 수 있는 가장 작은 값 아래로 그래디언트가 내려가면 그냥 0이 되어(언더플로) 학습이 멈춘다. 그래서 손실에 큰 수(예: 2^15)를 곱해 그래디언트를 fp16 표현 범위 안으로 끌어올린 뒤, 가중치를 갱신하기 직전에 같은 수로 나눠 원래대로 되돌린다. model.fit()을 쓰면 이 스케일링이 자동으로 적용되지만, GradientTape로 커스텀 루프를 짤 때는 손으로 해야 한다 — optimizer를 LossScaleOptimizer로 감싸고 get_scaled_loss / get_unscaled_gradients 를 호출한다(I-1-1의 방식 2 커스텀 루프에 이 두 줄이 추가되는 셈이다).',
+        mode: 'scaling',
+        badge: 'float32 출력 + Loss Scaling',
+        engineDetail: 'output dtype=float32 · scale→unscale',
+        layers: {
+          title: '층별 dtype — 출력층만 float32로 승격',
+          rows: [
+            { name: 'Conv2D / Dense (은닉)', compute: 'float16', out: 'float16', hot: true },
+            { name: 'BatchNorm · ReLU', compute: 'float16', out: 'float16', hot: true },
+            { name: 'Dense (logits)', compute: 'float16', out: 'float16', hot: true },
+            { name: 'Activation("softmax", dtype="float32")', compute: 'float32', out: 'float32', hot: false },
+          ],
+        },
+        scaleFlow: [
+          { step: 'loss', label: 'loss = loss_fn(y, pred)', detail: 'fp16 그래디언트는 언더플로 위험', kind: 'declare' },
+          { step: 'scale', label: 'scaled = opt.get_scaled_loss(loss)', detail: '손실에 2^15 곱 → 범위 위로', kind: 'run' },
+          { step: 'grad', label: 'g = tape.gradient(scaled, vars)', detail: '스케일된 그래디언트 (0 안 됨)', kind: 'run' },
+          { step: 'unscale', label: 'g = opt.get_unscaled_gradients(g)', detail: '갱신 직전 원래 크기로 복원', kind: 'result' },
+        ],
+        alert: { tone: 'good', text: 'fit()은 LossScaleOptimizer를 자동 적용한다. 커스텀 루프(방식 2)만 get_scaled_loss / get_unscaled_gradients 두 줄을 직접 넣으면 된다. 출력층 float32는 어느 쪽이든 명시하는 습관을 들이자.' },
+        code: {
+          lang: 'python',
+          filename: 'amp_xla.py — ② 출력층 float32 + 손실 스케일링',
+          lines: [
+            '"""',
+            'amp_xla.py — ② 수치 안정: 출력층 float32 + loss scaling',
+            '"""',
+            'import tensorflow as tf',
+            'from tensorflow import keras',
+            'from tensorflow.keras import layers, mixed_precision',
+            '',
+            'mixed_precision.set_global_policy("mixed_float16")',
+            '',
+            '# ── 모델: 마지막 활성화만 float32 로 승격 ──',
+            'inputs = keras.Input(shape=(32, 32, 3))',
+            'x = layers.Conv2D(32, 3, activation="relu")(inputs)',
+            'x = layers.GlobalAveragePooling2D()(x)',
+            'x = layers.Dense(10)(x)                    # logits (fp16)',
+            '# softmax·손실은 예민 → 출력만 float32 로',
+            'outputs = layers.Activation("softmax", dtype="float32")(x)',
+            'model = keras.Model(inputs, outputs)',
+            '',
+            '# ── 방식 1: fit() 이면 손실 스케일링이 자동 ──',
+            'model.compile(optimizer="adam",',
+            '              loss="sparse_categorical_crossentropy")',
+            '# model.fit(...) 내부에서 LossScaleOptimizer 자동 적용',
+            '',
+            '# ── 방식 2: 커스텀 루프면 수동 스케일링 (I-1-1 방식 2) ──',
+            'opt = mixed_precision.LossScaleOptimizer(',
+            '    keras.optimizers.Adam())',
+            '',
+            '@tf.function',
+            'def train_step(x, y):',
+            '    with tf.GradientTape() as tape:',
+            '        pred = model(x, training=True)',
+            '        loss = loss_fn(y, pred)',
+            '        scaled_loss = opt.get_scaled_loss(loss)   # ×2^15',
+            '    scaled_g = tape.gradient(scaled_loss,',
+            '                             model.trainable_variables)',
+            '    grads = opt.get_unscaled_gradients(scaled_g)  # ÷2^15',
+            '    opt.apply_gradients(',
+            '        zip(grads, model.trainable_variables))',
+            '    return loss',
+          ],
+          highlight: [13, 14, 15, 16, 24, 25, 26, 32, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 3. XLA 컴파일 — jit_compile=True로 작은 커널들을 하나로 융합',
+        desc: 'AMP가 "정밀도를 낮춰" 빠르게 한다면, XLA(Accelerated Linear Algebra)는 "연산을 합쳐" 빠르게 한다. 켜는 법은 두 가지다: model.compile(jit_compile=True) 또는 함수에 @tf.function(jit_compile=True). eager 실행이나 평범한 tf.function은 add·mul·relu 같은 작은 연산 하나하나를 개별 GPU 커널로 호출하는데, 커널마다 GPU 메모리(HBM)에서 값을 읽고 다시 쓰는 왕복이 생긴다. XLA는 이런 연산 여럿을 하나의 융합 커널(fused kernel)로 컴파일해 중간값을 레지스터에 두고 메모리 왕복과 커널 실행 오버헤드를 크게 줄인다. I-2-1의 tf.function이 파이썬 함수를 "그래프"로 바꾸는 단계였다면, XLA는 그 그래프를 한 번 더 최적화해 하드웨어에 맞는 기계어 커널로 컴파일하는 단계다 — tf.function 위에 얹히는 두 번째 최적화 층인 셈이다. AMP와 XLA는 서로 독립이라 함께 켜면 이득이 곱해진다.',
+        mode: 'xla',
+        badge: 'XLA · jit_compile=True',
+        engineDetail: 'op fusion · tf.function 위의 2차 최적화',
+        fusion: {
+          before: [
+            { op: 'mul', mem: true },
+            { op: 'add', mem: true },
+            { op: 'relu', mem: true },
+            { op: 'mul', mem: true },
+          ],
+          after: { op: 'fused_kernel', mem: false },
+          note: '4번의 커널 호출·메모리 왕복 → 1번으로',
+        },
+        layerStack: [
+          { name: '파이썬 함수 (eager)', detail: '연산마다 개별 커널 호출', tone: 'old' },
+          { name: '@tf.function (I-2-1)', detail: '그래프로 변환 — 1차 최적화', tone: 'mid' },
+          { name: 'jit_compile=True (XLA)', detail: '융합 커널로 컴파일 — 2차 최적화', tone: 'hot' },
+        ],
+        alert: { tone: 'info', text: 'XLA는 tf.function 그래프를 한 번 더 최적화한다. 여러 작은 연산을 하나의 융합 커널로 만들어 메모리 왕복·커널 오버헤드를 줄인다. AMP와 독립이라 함께 켜면 이득이 곱해진다.' },
+        code: {
+          lang: 'python',
+          filename: 'amp_xla.py — ③ XLA 연산 융합',
+          lines: [
+            '"""',
+            'amp_xla.py — ③ XLA 컴파일 (jit_compile)',
+            '작은 연산들을 하나의 "융합 커널" 로 컴파일',
+            '"""',
+            'import tensorflow as tf',
+            '',
+            '# ── 방법 A: fit() 경로 — compile 에 인자 하나 ──',
+            'model.compile(',
+            '    optimizer="adam",',
+            '    loss="sparse_categorical_crossentropy",',
+            '    jit_compile=True,        # ← XLA 켜기',
+            ')',
+            '',
+            '# ── 방법 B: 커스텀 루프 — 함수에 데코레이터 ──',
+            '@tf.function(jit_compile=True)   # ← 이 함수를 XLA 로',
+            'def train_step(x, y):',
+            '    with tf.GradientTape() as tape:',
+            '        pred = model(x, training=True)',
+            '        loss = loss_fn(y, pred)',
+            '    grads = tape.gradient(loss, model.trainable_variables)',
+            '    opt.apply_gradients(',
+            '        zip(grads, model.trainable_variables))',
+            '    return loss',
+            '',
+            '# 무슨 일이 일어나나?',
+            '#  eager:  y = relu(x*w + b)*s',
+            '#          → mul, add, relu, mul  (커널 4번 · 메모리 왕복 4번)',
+            '#  XLA :   → fused_kernel(x,w,b,s) (커널 1번 · 중간값은 레지스터)',
+            '#',
+            '# tf.function(I-2-1) = 그래프화(1차) → XLA = 융합 컴파일(2차)',
+            '# AMP 와 XLA 는 독립 → 같이 켜면 이득이 곱해진다.',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 14, 15, 16, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 4. 효과 측정과 함정 — 워밍업을 빼고, XLA가 느려지는 경우를 알자',
+        desc: '"켰더니 느려졌다"는 대부분 측정 실수다. 두 최적화 모두 첫 실행에 비용이 크다 — tf.function은 첫 호출에서 그래프를 추적(trace)하고, XLA는 첫 호출에서 컴파일한다. 그래서 벤치마크는 반드시 워밍업(첫 몇 스텝)을 버리고, 그 뒤 수십~수백 스텝의 평균 시간을 재야 한다. 단일 스텝을 time.time()으로 재는 건 거의 무의미하다. XLA가 실제로 느려지는 대표 상황도 알아둬야 한다: (1) 입력 shape이 매 스텝 달라지면(가변 시퀀스 길이 등) shape마다 다시 컴파일해 컴파일 비용이 이득을 잡아먹는다 — padding으로 shape을 고정하면 해결된다. (2) 스텝 수가 적은 짧은 실험은 첫 컴파일 비용을 못 뽑는다. 디버깅 중 형상 오류·NaN을 추적할 때는 XLA를 잠깐 꺼서 원인을 좁히는 게 편하다. 마지막으로, AMP로 메모리가 절반이 됐으니 배치 크기를 키워 남는 메모리를 처리량으로 바꾸는 것을 잊지 말자 — 이게 AMP의 숨은 이득이다.',
+        mode: 'bench',
+        badge: '벤치마크 · 함정',
+        engineDetail: 'warmup 제외 · 평균 · 재컴파일 주의',
+        method: [
+          { step: '1', label: '워밍업 스텝 버리기', detail: 'trace·컴파일이 일어나는 첫 몇 스텝 제외', kind: 'declare' },
+          { step: '2', label: '수십~수백 스텝 평균', detail: '단일 스텝 측정은 무의미 — 평균으로', kind: 'run' },
+          { step: '3', label: 'steps/sec · ms/step 비교', detail: 'fp32 baseline 대비 배율로 판단', kind: 'result' },
+        ],
+        traps: [
+          { case: '입력 shape이 매 스텝 다름', effect: 'shape마다 재컴파일 → 느려짐', fix: 'padding으로 shape 고정', bad: true },
+          { case: '스텝 수가 아주 적음', effect: '첫 컴파일 비용을 못 뽑음', fix: '긴 실행에서만 XLA 이득', bad: true },
+          { case: '디버깅 중 NaN·형상 오류', effect: '융합돼 원인 추적이 어려움', fix: 'jit_compile=False 로 잠깐 끄기', bad: true },
+          { case: 'AMP로 메모리 절반', effect: '남는 메모리 방치', fix: 'batch_size를 키워 처리량↑', bad: false },
+        ],
+        alert: { tone: 'warn', text: '느려졌다면 먼저 측정을 의심하라 — 워밍업(첫 trace·컴파일)을 안 뺐거나, 입력 shape이 매번 달라 재컴파일 중일 가능성이 높다. 디버깅 땐 XLA를 꺼서 원인을 좁히자.' },
+        code: {
+          lang: 'python',
+          filename: 'amp_xla.py — ④ 벤치마크 + 함정 회피',
+          lines: [
+            '"""',
+            'amp_xla.py — ④ 올바른 벤치마크와 함정 회피',
+            '"""',
+            'import time',
+            'import tensorflow as tf',
+            '',
+            'def benchmark(train_step, dataset, warmup=10, measure=100):',
+            '    it = iter(dataset)',
+            '',
+            '    # ── 워밍업: trace·컴파일이 일어나는 구간은 버린다 ──',
+            '    for _ in range(warmup):',
+            '        x, y = next(it)',
+            '        train_step(x, y)',
+            '',
+            '    # ── 측정: 여러 스텝 평균 (단일 측정은 무의미) ──',
+            '    t0 = time.perf_counter()',
+            '    for _ in range(measure):',
+            '        x, y = next(it)',
+            '        train_step(x, y)',
+            '    dt = (time.perf_counter() - t0) / measure',
+            '    print(f"{dt*1000:.2f} ms/step  ({1/dt:.1f} steps/s)")',
+            '',
+            '# 함정 1) 가변 shape → 재컴파일. padding 으로 고정하라.',
+            '#   ds = ds.padded_batch(32, padded_shapes=([256], []))',
+            '# 함정 2) 짧은 실험은 컴파일 비용을 못 뽑는다.',
+            '# 함정 3) 디버깅 중엔 XLA 를 끈다:',
+            '#   @tf.function(jit_compile=False) 로 원인 추적을 쉽게',
+            '#',
+            '# 숨은 이득) AMP 로 메모리 절반 → 배치를 키워 처리량으로 전환',
+            '#   global_batch = 128  →  256 (OOM 안 나는 선까지)',
+          ],
+          highlight: [7, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 22, 25, 28],
+        },
+      },
+      {
+        title: 'Step 5. 성능 최적화 스택 종합 — tf.data + 분산 + AMP + XLA 쌓는 순서',
+        desc: '성능은 한 스위치가 아니라 스택으로 쌓는다. 순서에는 이유가 있다. (1) 먼저 tf.data(IV-1-1)로 입력 파이프라인을 prefetch·병렬화해 GPU가 데이터를 굶지 않게 한다 — 여기가 병목이면 아래 최적화는 다 헛수고다. (2) 그다음 GradientTape/fit이 도는 계산 그래프를 XLA로 융합하고, (3) mixed_float16으로 텐서코어를 켠다. (4) 마지막으로 분산 전략(IV-2-1, MirroredStrategy 등)으로 여러 GPU에 펼친다. 각 층의 기대 이득은 독립적이라 대체로 곱해진다. 실무 체크리스트: 프로파일러(TensorBoard)로 병목이 입력인지 계산인지 먼저 확인 → 입력이면 tf.data부터, 계산이면 AMP+XLA부터. 켤 때마다 손실 곡선이 fp32 baseline과 같은지 확인해 정확도 회귀가 없는지 검증한다. 이것으로 Part Ⅳ(성능)를 마치고, 다음 Part Ⅴ에서는 이렇게 빠르게 학습시킨 모델을 SavedModel로 저장하고 서빙·배포하는 과정으로 넘어간다.',
+        mode: 'stack',
+        badge: '최적화 스택 종합',
+        engineDetail: 'tf.data → XLA → AMP → 분산',
+        stack: [
+          { layer: '① tf.data 파이프라인', ref: 'IV-1-1', gain: 'GPU 유휴 제거', why: 'prefetch·병렬 map — 데이터 굶김 방지', tone: 'base' },
+          { layer: '② XLA 융합', ref: 'IV-2-2', gain: '커널·메모리 왕복↓', why: 'jit_compile=True', tone: 'mid' },
+          { layer: '③ mixed_float16', ref: 'IV-2-2', gain: '2~3배 처리량', why: '텐서코어 fp16 + 배치↑', tone: 'hot' },
+          { layer: '④ 분산 전략', ref: 'IV-2-1', gain: 'GPU 수만큼 확장', why: 'MirroredStrategy 등', tone: 'top' },
+        ],
+        checklist: [
+          { item: '프로파일러로 병목부터 확인', note: 'TensorBoard — 입력 vs 계산' },
+          { item: '입력 병목이면 tf.data 먼저', note: '계산 병목이면 AMP+XLA 먼저' },
+          { item: '손실 곡선 = fp32 baseline?', note: '정확도 회귀 없는지 검증' },
+        ],
+        alert: { tone: 'good', text: '순서 원칙: 입력을 안 굶기고(tf.data) → 계산을 융합(XLA) → 정밀도를 낮추고(AMP) → 여러 GPU로 확장(분산). 각 이득은 대체로 곱해진다. 다음 Part Ⅴ에서 SavedModel·배포로 이어진다.' },
+        code: {
+          lang: 'python',
+          filename: 'amp_xla.py — ⑤ 최적화 스택 종합',
+          lines: [
+            '"""',
+            'amp_xla.py — ⑤ 성능 최적화 스택 총정리',
+            'tf.data → XLA → AMP → 분산 순으로 쌓는다',
+            '"""',
+            'import tensorflow as tf',
+            'from tensorflow import keras',
+            'from tensorflow.keras import mixed_precision',
+            '',
+            '# ④ 분산 전략 (IV-2-1) — 가장 바깥에서 GPU 들에 펼친다',
+            'strategy = tf.distribute.MirroredStrategy()',
+            '',
+            '# ③ AMP — 텐서코어 켜기',
+            'mixed_precision.set_global_policy("mixed_float16")',
+            '',
+            '# ① tf.data (IV-1-1) — GPU 가 데이터를 굶지 않게',
+            'ds = (make_dataset()',
+            '      .batch(256)                       # AMP 메모리 여유로 배치↑',
+            '      .prefetch(tf.data.AUTOTUNE))',
+            'ds = strategy.experimental_distribute_dataset(ds)',
+            '',
+            'with strategy.scope():',
+            '    model = build_model()             # 출력층 dtype="float32"',
+            '    # ② XLA — 계산 그래프 융합',
+            '    model.compile(optimizer="adam",',
+            '                  loss="sparse_categorical_crossentropy",',
+            '                  jit_compile=True)',
+            '',
+            '# 체크리스트',
+            '#  1) 프로파일러로 병목 확인 (입력 vs 계산)',
+            '#  2) 입력 병목 → tf.data / 계산 병목 → AMP+XLA',
+            '#  3) 손실 곡선이 fp32 baseline 과 같은지 검증',
+            '#',
+            '# → Part Ⅴ: 이렇게 빠르게 학습한 모델을 SavedModel 로 저장·배포',
+          ],
+          highlight: [9, 10, 12, 13, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 실행 스텝 배지 스타일 — 선언 / 스케일 / 실행 / 결과
+    // ─────────────────────────────────────────────────────
+    const KIND_STYLE = {
+      declare: { bg: 'bg-slate-50',   border: 'border-slate-300',   text: 'text-slate-700',   icon: '📐', tag: '준비' },
+      stuck:   { bg: 'bg-red-50',     border: 'border-red-400',     text: 'text-red-800',     icon: '🚧', tag: '위험' },
+      run:     { bg: 'bg-orange-50',  border: 'border-orange-400',  text: 'text-orange-800',  icon: '⚡', tag: '처리' },
+      result:  { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800', icon: '✓',  tag: '완료' },
+    };
+
+    function FlowRow({ item, idx }) {
+      const s = KIND_STYLE[item.kind] || KIND_STYLE.declare;
+      return (
+        <div className={`rounded border ${s.bg} ${s.border} px-2.5 py-1.5 flex items-start gap-2`}>
+          <span className="text-[10px] font-mono text-slate-400 mt-0.5 w-4 text-right">{idx + 1}</span>
+          <span className="text-sm leading-none mt-0.5">{s.icon}</span>
+          <div className="min-w-0 flex-1">
+            <div className="text-[11px] font-mono font-bold text-slate-800 truncate">{item.label}</div>
+            <div className="text-[10px] text-slate-500">{item.detail}</div>
+          </div>
+          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap ${s.text} bg-white/70 border border-current/20`}>
+            {item.step}
+          </span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — fp32 vs fp16 게이지 비교 + 하드웨어 조건
+    // ─────────────────────────────────────────────────────
+    function PolicyPane({ state }) {
+      const g = state.gauges;
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-800 mb-2">📊 {g.title}</div>
+            <div className="space-y-2.5">
+              {g.rows.map((r, i) => (
+                <div key={i}>
+                  <div className="flex items-center justify-between text-[10px] mb-1">
+                    <span className="font-bold text-slate-700">{r.metric}</span>
+                    <span className="text-slate-500">{r.note}</span>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[9px] font-mono text-slate-500 w-16">fp32</span>
+                      <div className="flex-1 h-3 rounded bg-slate-100 overflow-hidden">
+                        <div className="h-full bg-slate-400" style={{ width: Math.min(100, r.fp32) + '%' }}></div>
+                      </div>
+                      <span className="text-[9px] font-mono text-slate-600 w-10 text-right">{r.fp32}{r.unit}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[9px] font-mono text-orange-600 w-16">fp16</span>
+                      <div className="flex-1 h-3 rounded bg-orange-100 overflow-hidden">
+                        <div className={`h-full ${r.fp16Better ? 'bg-orange-500' : 'bg-emerald-500'}`} style={{ width: Math.min(100, r.fp16) + '%' }}></div>
+                      </div>
+                      <span className="text-[9px] font-mono font-bold text-orange-700 w-10 text-right">{r.fp16}{r.unit}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-orange-400 bg-orange-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🖥 이득은 텐서코어 GPU에서만 크다</div>
+            <div className="space-y-1">
+              {state.hw.map((h, i) => (
+                <div key={i} className="flex items-center gap-2 text-[10px]">
+                  <span className="font-mono font-bold text-slate-700 w-32">{h.chip}</span>
+                  <span className={`flex-1 font-bold ${h.ok ? 'text-emerald-700' : 'text-red-700'}`}>{h.ok ? '✓' : '✗'} {h.gain}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 층별 dtype 표 + 손실 스케일링 흐름
+    // ─────────────────────────────────────────────────────
+    function ScalingPane({ state }) {
+      const L = state.layers;
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-800 mb-2">🧱 {L.title}</div>
+            <div className="space-y-1">
+              {L.rows.map((r, i) => (
+                <div key={i} className={`flex items-center gap-2 rounded border px-2 py-1.5 ${r.hot ? 'bg-orange-50 border-orange-300' : 'bg-emerald-50 border-emerald-400'}`}>
+                  <span className="text-[10px] font-mono flex-1 text-slate-700 truncate">{r.name}</span>
+                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${r.hot ? 'bg-orange-200 text-orange-900' : 'bg-emerald-200 text-emerald-900'}`}>{r.compute}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-1.5 text-[10px] text-slate-500 text-center">🔥 은닉층은 fp16(빠름) · 출력층만 fp32(안정)</div>
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-orange-400 bg-orange-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">⚖️ 손실 스케일링 — 언더플로 방지 (커스텀 루프)</div>
+            <div className="space-y-1.5">
+              {state.scaleFlow.map((it, i) => <FlowRow key={i} item={it} idx={i} />)}
+            </div>
+            <div className="mt-2 flex items-center justify-center gap-1.5 text-[9px] text-slate-500">
+              <span className="px-2 py-0.5 rounded bg-white border border-orange-300 text-orange-800">×2¹⁵ 스케일</span>
+              <span className="text-orange-500">→ grad 계산 →</span>
+              <span className="px-2 py-0.5 rounded bg-white border border-orange-300 text-orange-800">÷2¹⁵ 복원</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — XLA 연산 융합 다이어그램 + 최적화 층 스택
+    // ─────────────────────────────────────────────────────
+    const XLA_TONE = {
+      old: 'border-slate-300 bg-slate-50 text-slate-700',
+      mid: 'border-amber-400 bg-amber-50 text-amber-900',
+      hot: 'border-orange-500 bg-orange-50 text-orange-900',
+    };
+
+    function XlaPane({ state }) {
+      const f = state.fusion;
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-800 mb-2">🔗 연산 융합 — 작은 커널들이 하나로</div>
+            <div className="flex items-center gap-2">
+              <div className="flex-1">
+                <div className="text-[9px] text-slate-500 mb-1 text-center">eager / 순정 그래프</div>
+                <div className="space-y-1">
+                  {f.before.map((b, i) => (
+                    <div key={i} className="rounded border border-slate-300 bg-slate-50 px-2 py-1 flex items-center justify-between">
+                      <span className="text-[10px] font-mono font-bold text-slate-700">{b.op}</span>
+                      <span className="text-[8px] text-red-500">↕ HBM 왕복</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="text-orange-500 text-lg font-bold px-1">▶</div>
+              <div className="flex-1">
+                <div className="text-[9px] text-orange-600 mb-1 text-center">XLA 융합</div>
+                <div className="rounded-lg border-2 border-orange-500 bg-orange-100 px-2 py-6 flex flex-col items-center justify-center">
+                  <span className="text-[11px] font-mono font-bold text-orange-900">{f.after.op}</span>
+                  <span className="text-[8px] text-emerald-600 mt-1">중간값은 레지스터</span>
+                </div>
+              </div>
+            </div>
+            <div className="mt-2 text-[10px] text-center text-orange-800 font-bold bg-orange-100 rounded px-2 py-1 border border-orange-300">{f.note}</div>
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-orange-400 bg-white p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🏗 최적화 층 — tf.function 위에 XLA</div>
+            <div className="space-y-1">
+              {state.layerStack.map((s, i) => (
+                <div key={i}>
+                  <div className={`rounded border-2 px-2.5 py-1.5 ${XLA_TONE[s.tone]}`}>
+                    <div className="text-[11px] font-bold">{s.name}</div>
+                    <div className="text-[9px] opacity-80">{s.detail}</div>
+                  </div>
+                  {i < state.layerStack.length - 1 && <div className="text-center text-orange-400 text-[10px] leading-none">↓</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 벤치마크 방법론 + 함정 표
+    // ─────────────────────────────────────────────────────
+    function BenchPane({ state }) {
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-800 mb-2">⏱ 올바른 벤치마크 방법</div>
+            <div className="space-y-1.5">
+              {state.method.map((it, i) => <FlowRow key={i} item={it} idx={i} />)}
+            </div>
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-orange-400 bg-orange-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🕳 XLA가 느려지는 경우 · 숨은 이득</div>
+            <div className="space-y-1.5">
+              {state.traps.map((t, i) => (
+                <div key={i} className={`rounded border px-2 py-1.5 ${t.bad ? 'bg-red-50 border-red-300' : 'bg-emerald-50 border-emerald-400'}`}>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className="text-[10px]">{t.bad ? '⚠️' : '💰'}</span>
+                    <span className="text-[10px] font-bold text-slate-800 flex-1">{t.case}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-[9px] pl-4">
+                    <span className={`flex-1 ${t.bad ? 'text-red-700' : 'text-slate-600'}`}>{t.effect}</span>
+                    <span className="text-orange-500">→</span>
+                    <span className="flex-1 font-bold text-emerald-700">{t.fix}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 최적화 스택 조립도 + 체크리스트
+    // ─────────────────────────────────────────────────────
+    const STACK_TONE = {
+      base: 'border-slate-400 bg-slate-50',
+      mid:  'border-amber-400 bg-amber-50',
+      hot:  'border-orange-500 bg-orange-50',
+      top:  'border-orange-600 bg-orange-100',
+    };
+
+    function StackPane({ state }) {
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-orange-400 bg-white p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🧰 최적화 스택 — 쌓는 순서와 기대 이득</div>
+            <div className="space-y-1">
+              {state.stack.map((s, i) => (
+                <div key={i}>
+                  <div className={`rounded border-2 px-2.5 py-1.5 flex items-center gap-2 ${STACK_TONE[s.tone]}`}>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11px] font-bold text-slate-800">{s.layer}</div>
+                      <div className="text-[9px] text-slate-500 font-mono">{s.why}</div>
+                    </div>
+                    <span className="text-[8px] font-mono text-slate-400 whitespace-nowrap">{s.ref}</span>
+                    <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-white border border-orange-300 text-orange-800 whitespace-nowrap">{s.gain}</span>
+                  </div>
+                  {i < state.stack.length - 1 && <div className="text-center text-orange-400 text-[10px] leading-none">↑ 그 위에</div>}
+                </div>
+              ))}
+            </div>
+            <div className="mt-1.5 text-[10px] text-center text-orange-700">각 층의 이득은 독립 → 대체로 곱해진다 (×)</div>
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-orange-300 bg-gradient-to-br from-orange-50 to-amber-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">✅ 실무 체크리스트</div>
+            <div className="space-y-1">
+              {state.checklist.map((c, i) => (
+                <div key={i} className="flex items-center gap-2 text-[10px]">
+                  <span className="text-emerald-600">☑</span>
+                  <span className="flex-1 font-bold text-slate-700">{c.item}</span>
+                  <span className="flex-1 text-slate-500">{c.note}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-orange-50',  border: 'border-orange-300',  text: 'text-orange-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 모드에 따라 게이지/dtype표/융합/벤치/스택 (orange 톤)
+    // ─────────────────────────────────────────────────────
+    const MODE_BADGE = {
+      policy:  { icon: '🎚', label: 'mixed_float16 정책' },
+      scaling: { icon: '⚖️', label: '출력층·손실 스케일링' },
+      xla:     { icon: '🔗', label: 'XLA 연산 융합' },
+      bench:   { icon: '⏱', label: '측정과 함정' },
+      stack:   { icon: '🧰', label: '최적화 스택' },
+    };
+
+    function LiveDataPane({ state }) {
+      const md = MODE_BADGE[state.mode] || MODE_BADGE.policy;
+      return (
+        <div className="rounded-xl border border-orange-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-orange-900 flex items-center gap-1.5">
+              <span>{md.icon}</span>
+              <span>가속 스위치 — {md.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.badge}</span>
+          </div>
+          <div className="text-[10px] text-orange-700 font-mono mb-2 px-2 py-1 rounded bg-orange-50 border border-orange-200">
+            엔진: {state.engineDetail}
+          </div>
+
+          {state.mode === 'policy' && <PolicyPane state={state} />}
+          {state.mode === 'scaling' && <ScalingPane state={state} />}
+          {state.mode === 'xla' && <XlaPane state={state} />}
+          {state.mode === 'bench' && <BenchPane state={state} />}
+          {state.mode === 'stack' && <StackPane state={state} />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-400/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-orange-600 text-white font-bold">TF</span>
+              <div>
+                <h1 className="text-2xl font-bold text-orange-900">IV-2-2. 혼합 정밀도·XLA</h1>
+                <p className="text-sm text-orange-800/80">같은 GPU에서 2~3배 — 정밀도 정책 한 줄과 컴파일러 한 줄의 합공</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-orange-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-orange-500' : 'bg-orange-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-orange-800 text-orange-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-orange-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-orange-800 text-white' : 'bg-orange-600 text-white hover:bg-orange-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-orange-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-500 bg-white px-4 py-3 text-sm text-orange-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                혼합 정밀도(mixed_float16)는 연산을 fp16(텐서코어)으로 내려 2~3배 빠르게 하되 변수는 fp32로 지킨다 — 텐서코어 GPU에서만 이득이 크다.
+                출력층은 float32로 명시하고, 커스텀 루프에선 LossScaleOptimizer로 손실을 스케일링해 언더플로를 막는다.
+                XLA(jit_compile=True)는 작은 연산들을 하나의 융합 커널로 컴파일해 메모리 왕복을 줄인다 — tf.function 위에 얹히는 2차 최적화다.
+                벤치마크는 워밍업을 빼고 평균으로 재며, 가변 shape의 재컴파일을 조심한다.
+                최종 스택은 tf.data(입력) → XLA(융합) → AMP(정밀도) → 분산(확장) 순으로 쌓고, 각 이득은 대체로 곱해진다. 다음 Part Ⅴ는 SavedModel·배포다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['TensorFlow', '혼합정밀도', 'mixed_float16', '텐서코어', 'LossScaleOptimizer', '손실스케일링', 'float32출력', 'XLA', 'jit_compile', '연산융합', '벤치마크', 'tf.data', '분산전략'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-orange-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./IV-2-1.html" className="underline hover:no-underline">이전: IV-2-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

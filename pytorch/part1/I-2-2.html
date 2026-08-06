@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PyTorch 학습 — I-2-2. GPU로 보내기 — device·메모리 관리</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    PyTorch I-2-2 — GPU로 보내기 — device·메모리 관리
+    학습 목표: .to('cuda') 한 줄로 끝나지 않는다. (1) device-agnostic 패턴으로 어디서든 도는 코드를 짜고,
+              (2) "모델과 데이터는 같은 디바이스에 있어야 한다"는 원칙을 mismatch 에러로 몸에 새기고,
+              (3) H2D 전송이 공짜가 아님을(pin_memory·non_blocking·루프 안 .cpu() 병목) 이해하고,
+              (4) allocated/reserved/nvidia-smi 3단 메모리 관점과 empty_cache 의 진실을 알고,
+              (5) 전역 device 상수·멀티GPU·mps·CPU 폴백까지 실무 습관을 손에 쥔다.
+    패턴: fastapi v1 — 좌(LiveDataPane: CPU↔GPU 이동 애니메이션 · mismatch 에러 · 메모리 3단 게이지 · 전송 파이프라인) /
+          우(VSCode CodeViewer: device_management.py 진화)
+    색상: orange (PyTorch 브랜드 #EE4C2C 감각)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — device 기본기 → 같은 디바이스 원칙 → 전송 비용 → 메모리 관리 → 실무 패턴
+    //   state.vis : 좌측 LiveDataPane 이 그릴 시각화 종류
+    //               'basic'(device-agnostic 이동) | 'mismatch'(디바이스 불일치 에러)
+    //               'transfer'(전송 병목 파이프라인) | 'memory'(메모리 3단 게이지) | 'patterns'(실무 패턴 카탈로그)
+    //   code      : 우측 CodeViewer 파일 (device_management.py 진화)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. device 기본기 — cuda.is_available()과 device-agnostic 패턴',
+        desc: '텐서와 모델은 각자 "어디에 사는지(device)"를 들고 다닌다. 기본은 CPU고, GPU가 있으면 그리로 옮겨서 병렬 연산을 시킨다. 그런데 GPU가 없는 노트북·CI 서버에서도 같은 코드가 돌아야 하므로, 실무는 절대 .to("cuda")를 하드코딩하지 않는다. 대신 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")를 파일 맨 위에 한 번 정의하고, 이후 모든 텐서와 모델을 .to(device)로 옮긴다. 이게 "어디서든 도는 코드"(device-agnostic)의 핵심이다. 참고로 "cuda"는 "cuda:0"과 같은 0번 GPU를 가리키고, 여러 장이면 "cuda:1"처럼 인덱스로 지목한다.',
+        actor: '🧭 device 객체 정의 → 모델·텐서를 각각 이동',
+        engine: 'basic',
+        vis: 'basic',
+        engineDetail: 'torch.device(...) · .to(device) · cuda:0',
+        alert: { tone: 'info', text: '.to("cuda")를 하드코딩하지 마라. device 를 한 번 정의하고 모두 .to(device) — GPU 없는 환경(노트북·CI)에서도 같은 코드가 그대로 돈다.' },
+        code: {
+          lang: 'python',
+          filename: 'device_management.py (1/5 — device 기본기)',
+          lines: [
+            '"""',
+            'device_management.py — GPU 로 보내기: 기본기',
+            '어디서든 도는 코드(device-agnostic): device 를 한 번 정하고 모두 .to(device)',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            '# 1) 있으면 GPU, 없으면 CPU — 파일 맨 위에서 딱 한 번 정의',
+            'device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+            'print(device)                 # cuda 또는 cpu',
+            '',
+            '# 얼마나 있고, 지금 몇 번을 쓰는지도 확인 가능',
+            'if torch.cuda.is_available():',
+            '    print(torch.cuda.device_count())      # 예: 2 (장 수)',
+            '    print(torch.cuda.current_device())    # 0',
+            '    print(torch.cuda.get_device_name(0))  # "NVIDIA A100 ..."',
+            '',
+            '# 2) 텐서를 옮긴다 — .to() 는 (기본적으로) 새 텐서를 반환',
+            'x = torch.randn(3, 4)         # CPU 에서 생성',
+            'x = x.to(device)              # 반환값을 다시 받아야 한다!',
+            'print(x.device)               # cuda:0  ("cuda" == "cuda:0")',
+            '',
+            '# 3) 모델을 옮긴다 — 모델은 in-place 로 이동한다 (파라미터가 GPU 로)',
+            'model = nn.Linear(4, 2)',
+            'model.to(device)              # 모델은 반환값 안 받아도 됨',
+            'print(next(model.parameters()).device)   # cuda:0',
+            '',
+            '# 텐서와 모델을 "각각" 옮기는 게 관행 — 자동으로 따라가지 않는다',
+            'y = model(x)                  # 둘 다 같은 device 라 OK',
+            'print(y.device)               # cuda:0',
+          ],
+          highlight: [7, 8, 9, 17, 18, 19, 20, 22, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 2. "같은 디바이스" 원칙 — 모델은 GPU, 입력은 CPU면 RuntimeError',
+        desc: '가장 자주 데는 벽이다. 연산에 들어가는 텐서들은 모두 같은 device에 있어야 한다. 모델을 GPU로 올려 놓고 입력 배치는 CPU에 둔 채 model(x)를 부르면 곧장 RuntimeError: Expected all tensors to be on the same device가 터진다. 그래서 학습 루프는 DataLoader가 CPU로 뱉어 주는 배치를 매번 xb, yb = xb.to(device), yb.to(device)로 옮긴 뒤 모델에 넣는다 — 데이터는 매 스텝 새로 오므로 한 번 옮겨 두는 걸로 끝나지 않기 때문이다. 에러 메시지는 친절하게 "found cuda:0 and cpu"처럼 어느 쪽이 남았는지 알려 주니, 옮기지 않은 텐서(입력 x, 라벨 y, 손실 가중치 등)를 거기서 되짚어 찾으면 된다.',
+        actor: '⚠️ GPU 모델 + CPU 입력 = same-device 위반',
+        engine: 'mismatch',
+        vis: 'mismatch',
+        engineDetail: 'RuntimeError · 배치마다 .to(device) · 범인 찾기',
+        alert: { tone: 'danger', text: 'Expected all tensors to be on the same device, but found cuda:0 and cpu — 모델은 GPU인데 입력/라벨을 안 옮긴 것. 학습 루프는 배치마다 xb, yb = xb.to(device), yb.to(device).' },
+        code: {
+          lang: 'python',
+          filename: 'device_management.py (2/5 — 같은 디바이스 원칙)',
+          lines: [
+            '"""',
+            'device_management.py — 원칙: 연산에 들어가는 텐서는 모두 같은 device',
+            '모델은 GPU 인데 배치는 CPU → RuntimeError. 배치마다 옮겨라.',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            'device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+            'model = nn.Linear(4, 2).to(device)     # 모델은 GPU 로',
+            '',
+            '# ── 초보가 반드시 만나는 벽 ──────────────────',
+            'xb = torch.randn(8, 4)        # DataLoader 는 보통 CPU 텐서를 준다',
+            'try:',
+            '    out = model(xb)           # 모델=GPU, 입력=CPU → 충돌!',
+            'except RuntimeError as e:',
+            '    print(e)',
+            '    # Expected all tensors to be on the same device,',
+            '    # but found cuda:0 and cpu   ← "cpu" 가 안 옮긴 범인',
+            '',
+            '# ── device-agnostic 학습 루프의 정석 ──────────',
+            'loss_fn = nn.MSELoss()',
+            'opt = torch.optim.SGD(model.parameters(), lr=0.01)',
+            '',
+            'for xb, yb in train_loader:            # 배치는 매 스텝 새로 온다',
+            '    xb = xb.to(device)                 # 그래서 매번 옮긴다',
+            '    yb = yb.to(device)                 # 라벨도 잊지 말 것!',
+            '',
+            '    pred = model(xb)                   # 이제 전부 GPU — OK',
+            '    loss = loss_fn(pred, yb)',
+            '',
+            '    opt.zero_grad()',
+            '    loss.backward()',
+            '    opt.step()',
+            '',
+            '# 팁: 에러가 나면 메시지의 "found A and B" 로 어느 쪽이 남았는지 본다',
+            '# 흔한 범인 — 입력 x, 라벨 y, 직접 만든 상수 텐서(가중치·마스크)',
+          ],
+          highlight: [7, 8, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 3. 전송 비용 — H2D 복사는 공짜가 아니다',
+        desc: 'CPU(호스트) 메모리에서 GPU(디바이스) 메모리로 옮기는 H2D 복사는 PCIe 버스를 타고 오가는 실제 비용이다. 큰 데이터를 매 스텝 옮기면 GPU가 그 복사를 기다리느라 놀게 된다. 완화책 셋. (1) 상주 — 크기가 감당되면 데이터를 처음에 GPU로 올려 두고 계속 쓴다. (2) 겹치기 — DataLoader(pin_memory=True)로 페이지 고정 메모리를 쓰면 .to(device, non_blocking=True)가 복사를 다음 연산과 비동기로 겹칠 수 있다. (3) 왕복 금지 — 학습 루프 안에서 loss.item() 대신 loss를 GPU에 누적하거나, .cpu().numpy()를 매 스텝 부르지 마라. GPU→CPU 왕복은 동기화를 강제해 파이프라인을 멈춰 세운다. 로깅은 몇 스텝에 한 번만 CPU로 내려서 찍는다.',
+        actor: '🚚 CPU→GPU 파이프라인 — pin_memory·non_blocking',
+        engine: 'transfer',
+        vis: 'transfer',
+        engineDetail: 'H2D 복사 · pin_memory · non_blocking · 왕복 금지',
+        alert: { tone: 'warn', text: '루프 안 .cpu().numpy() / loss.item() 남발은 GPU→CPU 동기화를 강제해 학습을 늦춘다. 로깅은 N스텝마다 한 번. 큰 데이터는 GPU 상주 + pin_memory + non_blocking 으로 겹쳐라.' },
+        code: {
+          lang: 'python',
+          filename: 'device_management.py (3/5 — 전송 비용)',
+          lines: [
+            '"""',
+            'device_management.py — H2D 복사는 공짜가 아니다',
+            'pin_memory + non_blocking 으로 겹치고, 루프 안 GPU→CPU 왕복을 없앤다.',
+            '"""',
+            'import torch',
+            'from torch.utils.data import DataLoader',
+            '',
+            'device = torch.device("cuda" if torch.cuda.is_available() else "cpu")',
+            '',
+            '# 1) pin_memory=True — 페이지 고정 메모리로 H2D 를 빠르고 비동기 가능하게',
+            'loader = DataLoader(',
+            '    dataset, batch_size=64, shuffle=True,',
+            '    num_workers=4,',
+            '    pin_memory=True,          # CPU 쪽을 "고정" → non_blocking 전송 가능',
+            ')',
+            '',
+            'for xb, yb in loader:',
+            '    # 2) non_blocking=True — 복사를 다음 연산과 겹친다 (pin_memory 필수)',
+            '    xb = xb.to(device, non_blocking=True)',
+            '    yb = yb.to(device, non_blocking=True)',
+            '    pred = model(xb)',
+            '    loss = loss_fn(pred, yb)',
+            '    loss.backward(); opt.step(); opt.zero_grad()',
+            '',
+            '    # 3) ❌ 나쁜 습관 — 매 스텝 GPU→CPU 왕복 (동기화 강제 → 느림)',
+            '    # print(loss.cpu().numpy())     # 파이프라인을 멈춰 세운다',
+            '    # running += loss.item()        # .item() 도 동기화 지점',
+            '',
+            '# ✅ 로깅은 N스텝마다 한 번만 CPU 로 내린다',
+            'if step % 50 == 0:',
+            '    print(f"loss={loss.item():.4f}")   # 가끔이면 비용이 무시할 만',
+            '',
+            '# 크기가 감당되면 아예 GPU 에 상주시켜 반복 전송을 없앤다',
+            'X = X.to(device)              # 한 번 올려 두고 계속 재사용',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 23, 24, 25, 26, 28, 29, 30, 33],
+        },
+      },
+      {
+        title: 'Step 4. GPU 메모리 관리 — allocated vs reserved vs nvidia-smi',
+        desc: 'GPU 메모리는 세 개의 숫자가 서로 다르게 보여서 헷갈린다. memory_allocated()는 텐서가 실제로 쓰는 양, memory_reserved()는 PyTorch의 캐싱 할당자가 OS로부터 미리 받아 쥐고 있는(재사용하려고) 양이다. 그래서 텐서를 지워도 reserved는 잘 안 줄고, nvidia-smi는 그 reserved에 CUDA 컨텍스트까지 더한 더 큰 값을 보여 준다 — 셋이 다른 건 정상이다. OOM(Out Of Memory)이 나면 흔히 empty_cache()를 떠올리지만, 이건 "이미 비어 있는 reserved 블록을 OS로 반납"할 뿐 실제 메모리를 늘려 주지 않는다. 진짜 해법은 배치 크기·모델 크기를 줄이고, 필요 없어진 큰 텐서를 del 한 뒤(참조를 끊고) 파이썬 GC가 회수하게 하는 것이다. 추론 때 torch.no_grad()로 그래프 저장을 끄는 것도 큰 절약이다.',
+        actor: '📊 allocated / reserved / nvidia-smi 3단 비교',
+        engine: 'memory',
+        vis: 'memory',
+        engineDetail: 'memory_allocated · reserved · empty_cache · del',
+        memGauges: [
+          { label: 'allocated', sub: '텐서가 실제 쓰는 양', pct: 42, val: '3.4 GB', tone: 'good' },
+          { label: 'reserved', sub: 'PyTorch 캐시 할당자가 쥔 양', pct: 68, val: '5.5 GB', tone: 'warn' },
+          { label: 'nvidia-smi', sub: 'reserved + CUDA 컨텍스트', pct: 82, val: '6.6 GB', tone: 'bad' },
+        ],
+        alert: { tone: 'danger', text: 'OOM 만능 해결책 아님: empty_cache()는 "빈 reserved"를 OS 반납할 뿐 메모리를 늘리지 않는다. 진짜 해법은 배치↓ · del 큰 텐서 + GC · no_grad(). 셋의 숫자가 다른 건 정상.' },
+        code: {
+          lang: 'python',
+          filename: 'device_management.py (4/5 — 메모리 진단)',
+          lines: [
+            '"""',
+            'device_management.py — GPU 메모리 3단 관점과 OOM 대응',
+            'allocated(실사용) < reserved(캐시 보유) < nvidia-smi(+CUDA 컨텍스트)',
+            '"""',
+            'import gc',
+            'import torch',
+            '',
+            'def gpu_report(tag=""):',
+            '    """세 숫자를 한 번에 찍는 진단 함수 (MB 단위)."""',
+            '    a = torch.cuda.memory_allocated() / 1024**2   # 텐서 실사용',
+            '    r = torch.cuda.memory_reserved() / 1024**2    # 캐시 할당자 보유',
+            '    print(f"[{tag}] allocated={a:.0f}MB  reserved={r:.0f}MB")',
+            '    # nvidia-smi 값은 여기에 CUDA 컨텍스트(수백 MB)가 더 붙는다',
+            '',
+            'big = torch.randn(4096, 4096, device="cuda")   # 큰 텐서 생성',
+            'gpu_report("생성 후")        # allocated↑ reserved↑',
+            '',
+            '# ── OOM 대응 순서 (empty_cache 는 만능이 아니다) ──',
+            '# 1) 필요 없어진 텐서의 참조를 끊는다',
+            'del big',
+            '# 2) 파이썬 GC 로 실제 객체를 회수',
+            'gc.collect()',
+            'gpu_report("del 후")        # allocated↓ 그러나 reserved 는 그대로!',
+            '',
+            '# 3) 그래도 정 필요하면 빈 reserved 블록을 OS 로 반납',
+            'torch.cuda.empty_cache()',
+            'gpu_report("empty_cache 후")  # reserved↓ (없던 메모리가 생기진 않음)',
+            '',
+            '# 진짜 OOM 해법 — 근본 원인을 줄인다',
+            '# · batch_size 를 줄인다 (가장 효과적)',
+            '# · 추론은 torch.no_grad() 로 계산 그래프 저장을 끈다',
+            '# · gradient checkpointing / mixed precision(amp) 도입',
+            'with torch.no_grad():',
+            '    pred = model(x)          # 활성값 그래프 미저장 → 메모리 절약',
+          ],
+          highlight: [7, 8, 9, 10, 11, 14, 15, 18, 19, 21, 22, 25, 26, 29, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 5. 실무 패턴 — 전역 device 상수 · 멀티GPU · mps · CPU 폴백',
+        desc: '마지막은 매일 쓰는 습관 모음이다. (1) device를 config나 모듈 상단의 전역 상수로 한 번 정하고, 모든 코드가 그것만 참조하게 한다 — 흩뿌린 "cuda" 문자열이 버그의 근원이다. (2) 멀티GPU: 특정 장을 쓰려면 .to("cuda:1")로 지목하고, 여러 장을 진짜로 병렬 학습하려면 DistributedDataParallel(DDP)을 쓴다 — DDP는 주제가 커서 dl V-2-1에서 따로 다룬다. (3) Apple Silicon(M1~)은 torch.device("mps")로 GPU 가속을 받는다 — 일부 연산은 아직 미지원이라 폴백이 필요할 수 있다. (4) 좋은 습관: 코드가 CPU에서도 돌아가는지 가끔 device="cpu"로 테스트하라 — device 하드코딩·형 변환 버그가 CI에서 조기에 잡힌다. 아래 pick_device()처럼 cuda→mps→cpu 우선순위로 고르는 헬퍼 하나면 어느 환경에서든 같은 코드가 돈다.',
+        actor: '🧰 전역 상수 · cuda:1 · mps · CPU 폴백',
+        engine: 'patterns',
+        vis: 'patterns',
+        engineDetail: '전역 device · 멀티GPU(DDP→dl V-2-1) · mps · cpu 테스트',
+        patternRows: [
+          { fn: 'device = torch.device(...)', desc: '모듈 상단 전역 상수 — 모두 이것만 참조', tag: '기본', tone: 'good' },
+          { fn: 't.to("cuda:1")', desc: '2번째 GPU 지목 (0부터 인덱스)', tag: '멀티GPU', tone: 'warn' },
+          { fn: 'DistributedDataParallel', desc: '진짜 다중 GPU 병렬 학습 → dl V-2-1 참고', tag: '멀티GPU', tone: 'warn' },
+          { fn: 'torch.device("mps")', desc: 'Apple Silicon GPU 가속 (M1~)', tag: 'mac', tone: 'good' },
+          { fn: 'device="cpu" 테스트', desc: 'CPU 폴백 확인 — 하드코딩 버그 조기 발견', tag: '습관', tone: 'good' },
+        ],
+        alert: { tone: 'good', text: 'pick_device()로 cuda→mps→cpu 우선순위 한 곳에서 결정하고, 전역 상수로 공유하라. 멀티GPU 병렬은 DDP(dl V-2-1). 가끔 CPU 폴백으로 돌려 device 하드코딩 버그를 CI에서 잡아라.' },
+        code: {
+          lang: 'python',
+          filename: 'device_management.py (5/5 — 실무 패턴)',
+          lines: [
+            '"""',
+            'device_management.py — 실무 습관: 한 곳에서 device 를 정하고 공유',
+            'cuda → mps(Apple) → cpu 폴백. 멀티GPU 병렬은 DDP(dl V-2-1).',
+            '"""',
+            'import torch',
+            '',
+            '# 1) device 를 고르는 헬퍼 — 우선순위: cuda → mps → cpu',
+            'def pick_device() -> torch.device:',
+            '    if torch.cuda.is_available():',
+            '        return torch.device("cuda")            # NVIDIA GPU',
+            '    if torch.backends.mps.is_available():',
+            '        return torch.device("mps")             # Apple Silicon',
+            '    return torch.device("cpu")                 # 폴백',
+            '',
+            '# 2) 전역 상수로 딱 한 번 정하고 — 모든 코드가 이것만 참조',
+            'DEVICE = pick_device()',
+            'print(DEVICE)                 # cuda / mps / cpu',
+            '',
+            'model = MyModel().to(DEVICE)',
+            'x = x.to(DEVICE)',
+            '',
+            '# 3) 멀티GPU — 특정 장을 지목하려면 인덱스로',
+            'if torch.cuda.device_count() > 1:',
+            '    x1 = x.to("cuda:1")       # 2번째 GPU',
+            '    # 진짜 병렬 학습은 DistributedDataParallel — 주제가 커서',
+            '    # 여기선 지도만: 자세한 셋업은 dl V-2-1(DDP) 참고',
+            '',
+            '# 4) 좋은 습관 — 가끔 CPU 로 강제해 폴백이 도는지 테스트',
+            '#    (device 하드코딩 · dtype 버그를 CI 에서 조기에 잡는다)',
+            '#    $ CUDA_VISIBLE_DEVICES="" python train.py',
+            'DEVICE_TEST = torch.device("cpu")',
+            'assert MyModel().to(DEVICE_TEST)(x.to(DEVICE_TEST)) is not None',
+            '',
+            '# 요약: device 는 한 곳에서 결정 → 전역 공유 → 모두 .to(DEVICE)',
+          ],
+          highlight: [6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 21, 22, 23, 27, 28, 29, 30, 31],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — device-agnostic 이동 다이어그램 (모델·텐서를 각각 GPU로)
+    // ─────────────────────────────────────────────────────
+    function BasicBox() {
+      const Chip = ({ label, on }) => (
+        <div className={`rounded-lg border-2 px-3 py-2 text-center ${on ? 'border-orange-500 bg-orange-100' : 'border-slate-300 bg-slate-50'}`}>
+          <div className="text-[10px] font-bold text-slate-800">{label}</div>
+          <div className="text-[9px] font-mono text-slate-500">{on ? 'cuda:0' : 'cpu'}</div>
+        </div>
+      );
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🧭 device 를 한 번 정하고 — 모델·텐서를 각각 옮긴다</div>
+          <div className="rounded border border-orange-200 bg-orange-50 px-2 py-1.5 mb-3 text-center font-mono text-[10px] text-orange-900">
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="text-center">
+              <div className="text-[10px] text-slate-500 mb-1">🖥️ CPU (생성 직후)</div>
+              <div className="space-y-1.5">
+                <Chip label="model" on={false} />
+                <Chip label="x (입력)" on={false} />
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-[10px] text-orange-700 mb-1">🎮 .to(device) 후</div>
+              <div className="space-y-1.5">
+                <Chip label="model" on={true} />
+                <Chip label="x (입력)" on={true} />
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">둘을 <span className="font-mono font-bold">각각</span> 옮겨야 한다 — 모델을 옮겨도 입력이 자동으로 따라가지 않는다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 디바이스 불일치 에러 재현
+    // ─────────────────────────────────────────────────────
+    function MismatchBox() {
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">⚠️ 같은 디바이스 원칙 — 어긋나면 즉시 터진다</div>
+          <div className="flex items-center justify-center gap-2">
+            <div className="rounded-lg border-2 border-orange-500 bg-orange-100 px-3 py-2 text-center">
+              <div className="text-[10px] font-bold text-orange-900">🎮 model</div>
+              <div className="text-[9px] font-mono text-orange-700">cuda:0</div>
+            </div>
+            <div className="text-center text-red-600">
+              <div className="text-lg font-bold">(</div>
+            </div>
+            <div className="rounded-lg border-2 border-slate-300 bg-slate-50 px-3 py-2 text-center">
+              <div className="text-[10px] font-bold text-slate-800">🖥️ xb</div>
+              <div className="text-[9px] font-mono text-slate-500">cpu</div>
+            </div>
+            <div className="text-center text-red-600">
+              <div className="text-lg font-bold">)</div>
+            </div>
+          </div>
+          <div className="mt-3 rounded border-2 border-red-300 bg-red-50 p-2">
+            <div className="text-[10px] font-bold text-red-800 mb-1">💥 RuntimeError</div>
+            <div className="text-[9px] text-red-900 text-center font-mono leading-4">
+              Expected all tensors to be on the same device,<br/>but found <span className="font-bold">cuda:0</span> and <span className="font-bold bg-red-200 px-1 rounded">cpu</span> ← 안 옮긴 범인
+            </div>
+          </div>
+          <div className="mt-3 rounded border-2 border-emerald-300 bg-emerald-50 p-2">
+            <div className="text-[10px] font-bold text-emerald-800 mb-1">✅ 학습 루프의 정석 — 배치마다 옮긴다</div>
+            <div className="text-[10px] font-mono text-emerald-900 text-center">
+              for xb, yb in loader:<br/>
+              &nbsp;&nbsp;xb, yb = xb.to(device), yb.to(device)
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">데이터는 매 스텝 새로 오므로 <span className="font-bold">한 번 옮겨 두는 걸로 끝나지 않는다.</span></div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 전송 병목 파이프라인
+    // ─────────────────────────────────────────────────────
+    function TransferBox() {
+      const Stage = ({ icon, name, sub, color }) => (
+        <div className={`flex-1 rounded-lg border-2 ${color} px-2 py-2 text-center`}>
+          <div className="text-lg">{icon}</div>
+          <div className="text-[10px] font-bold text-slate-800">{name}</div>
+          <div className="text-[9px] text-slate-500 font-mono">{sub}</div>
+        </div>
+      );
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🚚 H2D 파이프라인 — 복사는 PCIe 버스를 탄다</div>
+          <div className="flex items-center gap-1.5">
+            <Stage icon="🖥️" name="CPU" sub="배치 준비" color="border-slate-300 bg-slate-50" />
+            <div className="text-center text-orange-600">
+              <div className="text-lg">→</div>
+              <div className="text-[8px] font-mono">H2D 복사</div>
+            </div>
+            <Stage icon="🔒" name="pin_memory" sub="고정 메모리" color="border-amber-300 bg-amber-50" />
+            <div className="text-center text-orange-600">
+              <div className="text-lg">→</div>
+              <div className="text-[8px] font-mono">non_blocking</div>
+            </div>
+            <Stage icon="🎮" name="GPU" sub="연산 (겹침)" color="border-orange-400 bg-orange-50" />
+          </div>
+          <div className="mt-3 rounded border-2 border-red-300 bg-red-50 p-2">
+            <div className="text-[10px] font-bold text-red-800 mb-1">🐢 루프 안 GPU→CPU 왕복 = 병목</div>
+            <div className="flex items-center justify-center gap-1.5 text-[10px] font-mono">
+              <span className="px-1.5 py-0.5 rounded bg-orange-200 text-orange-800">GPU</span>
+              <span className="text-red-600 font-bold">→</span>
+              <span className="px-1.5 py-0.5 rounded bg-red-200 text-red-800 font-bold">.cpu().numpy()</span>
+              <span className="text-red-600 font-bold">→</span>
+              <span className="px-1.5 py-0.5 rounded bg-slate-200 text-slate-700">동기화!</span>
+            </div>
+            <div className="mt-1 text-[9px] text-red-900 text-center">매 스텝 왕복하면 GPU 가 멈춰 기다린다 — 로깅은 N스텝마다</div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">큰 데이터는 <span className="font-mono font-bold">GPU 상주</span>, 전송은 <span className="font-mono font-bold">pin_memory + non_blocking</span> 으로 연산과 겹친다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 메모리 3단 게이지 (allocated / reserved / nvidia-smi)
+    // ─────────────────────────────────────────────────────
+    const GAUGE_TONE = {
+      good: 'bg-emerald-500', warn: 'bg-amber-500', bad: 'bg-red-500',
+    };
+    function MemoryBox({ gauges }) {
+      if (!gauges) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">📊 GPU 메모리 3단 — 셋이 다른 건 정상이다</div>
+          <div className="space-y-2.5">
+            {gauges.map((g) => (
+              <div key={g.label}>
+                <div className="flex items-center justify-between text-[10px] mb-0.5">
+                  <span className="font-mono font-bold text-slate-800">{g.label}</span>
+                  <span className="text-slate-500">{g.sub}</span>
+                  <span className="font-mono font-bold text-orange-800">{g.val}</span>
+                </div>
+                <div className="h-3 rounded-full bg-slate-100 border border-slate-200 overflow-hidden">
+                  <div className={`h-full rounded-full ${GAUGE_TONE[g.tone]}`} style={{ width: g.pct + '%' }}></div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 rounded border-2 border-red-300 bg-red-50 p-2 text-[10px] text-red-900">
+            <span className="font-bold">empty_cache() 의 진실:</span> reserved 의 "빈 블록"만 OS 로 반납할 뿐, 없던 메모리를 만들지 않는다. OOM 진짜 해법은 <span className="font-mono font-bold">배치↓ · del + GC · no_grad()</span>.
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">
+            allocated(실사용) &lt; reserved(캐시 보유) &lt; nvidia-smi(+CUDA 컨텍스트) — 텐서를 지워도 reserved 는 잘 안 줄어든다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 실무 패턴 카탈로그
+    // ─────────────────────────────────────────────────────
+    const PATTERN_TONE = { good: 'text-emerald-700 bg-emerald-100', warn: 'text-amber-700 bg-amber-100', bad: 'text-red-700 bg-red-100' };
+    function PatternsBox({ rows }) {
+      if (!rows) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">🧰 실무 device 패턴 — 한 곳에서 정하고 공유</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-orange-900 border-b-2 border-orange-200">
+                <th className="text-left py-1">패턴</th>
+                <th className="text-left py-1 pl-1">설명</th>
+                <th className="text-left py-1 pl-1 w-14">분류</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.fn} className="border-t border-orange-100">
+                  <td className="py-1 font-mono font-bold text-orange-800">{r.fn}</td>
+                  <td className="py-1 pl-1 text-slate-700">{r.desc}</td>
+                  <td className="py-1 pl-1">
+                    <span className={`px-1.5 py-0.5 rounded-full font-bold ${PATTERN_TONE[r.tone]}`}>{r.tag}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-2 text-[10px] text-orange-900">
+            우선순위 <span className="font-mono font-bold">cuda → mps → cpu</span> 를 <span className="font-mono">pick_device()</span> 한 곳에서 결정하면 어느 환경에서든 같은 코드가 돈다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-orange-50', border: 'border-orange-300', text: 'text-orange-900', icon: '💡' },
+      warn:   { bg: 'bg-amber-50',  border: 'border-amber-300',  text: 'text-amber-900',  icon: '⚠️' },
+      danger: { bg: 'bg-red-50',    border: 'border-red-300',    text: 'text-red-900',    icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — device·메모리 시각화 (orange 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      basic:    { icon: '🧭', label: 'device 기본기' },
+      mismatch: { icon: '⚠️', label: '같은 디바이스 원칙' },
+      transfer: { icon: '🚚', label: '전송 비용' },
+      memory:   { icon: '📊', label: '메모리 관리' },
+      patterns: { icon: '🧰', label: '실무 패턴' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.basic;
+      return (
+        <div className="rounded-xl border border-orange-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-orange-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>GPU 보내기 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-orange-700 font-mono mb-2 px-2 py-1 rounded bg-orange-50 border border-orange-200">
+            {state.engineDetail}
+          </div>
+
+          {state.vis === 'basic' && <BasicBox />}
+          {state.vis === 'mismatch' && <MismatchBox />}
+          {state.vis === 'transfer' && <TransferBox />}
+          {state.vis === 'memory' && <MemoryBox gauges={state.memGauges} />}
+          {state.vis === 'patterns' && <PatternsBox rows={state.patternRows} />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-400/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-orange-600 text-white font-bold">🔥</span>
+              <div>
+                <h1 className="text-2xl font-bold text-orange-900">I-2-2. GPU로 보내기 — device·메모리 관리</h1>
+                <p className="text-sm text-orange-800/80">.to('cuda') 한 줄로 끝나지 않는다 — 데이터와 모델이 같은 곳에 있어야 하는 이유</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-orange-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-orange-500' : 'bg-orange-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-orange-800 text-orange-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-orange-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-orange-800 text-white' : 'bg-orange-600 text-white hover:bg-orange-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-orange-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-500 bg-white px-4 py-3 text-sm text-orange-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                GPU로 보내기는 <span className="font-mono">.to("cuda")</span> 한 줄이 아니다 —
+                (1) <span className="font-mono">device</span> 를 한 번 정해 어디서든 도는 코드를 짜고,
+                (2) 모델과 데이터를 <span className="font-bold">같은 device</span> 에 두며(배치마다 <span className="font-mono">.to(device)</span>),
+                (3) H2D 전송 비용을 <span className="font-mono">pin_memory·non_blocking</span> 과 왕복 금지로 줄이고,
+                (4) <span className="font-mono">allocated/reserved/nvidia-smi</span> 3단으로 메모리를 읽고 <span className="font-mono">empty_cache</span> 의 한계를 알며,
+                (5) 전역 상수·멀티GPU·mps·CPU 폴백까지 손에 쥐는 것이다.
+                진짜 다중 GPU 병렬 학습(DDP)은 dl V-2-1에서 이어 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['torch.device', 'cuda.is_available', 'to(device)', 'same-device', 'pin_memory', 'non_blocking', 'memory_allocated', 'memory_reserved', 'empty_cache', 'mps', 'DDP'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-orange-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-2-3.html" className="underline hover:no-underline">다음: I-2-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

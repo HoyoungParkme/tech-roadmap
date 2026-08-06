@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PyTorch 학습 — I-2-1. autograd 해부 — 동적 계산 그래프</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    PyTorch I-2-1 — autograd 해부 — 동적 계산 그래프
+    학습 목표: backward() 한 줄 뒤에서 실제로 무슨 일이 벌어지는가.
+              dl I-2-1에서 손으로 한 체인룰이 어떻게 코드가 되는지,
+              (1) 자동 미분과 수치 미분 대조, (2) grad_fn 체인이 동적으로 자라는 define-by-run,
+              (3) backward가 그래프를 거꾸로 타며 leaf.grad에 누적(zero_grad의 진짜 이유),
+              (4) detach / no_grad / requires_grad_(False) 로 그래프에서 내리기,
+              (5) grad=None 3원인·NaN grad 추적(anomaly detection)·커스텀 Function 까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 계산 그래프 forward/backward 애니메이션 · grad 누적 비교 · detach 가위) /
+          우(VSCode CodeViewer: autograd_demo.py 진화)
+    색상: orange (PyTorch 브랜드 #EE4C2C 감각)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 자동 미분 → 그래프가 자란다 → backward의 여정 → 그래프에서 내리기 → 실무 디버깅
+    //   state.vis  : 좌측 LiveDataPane 이 그릴 시각화 종류
+    //                'diff'(자동 vs 수치 미분) | 'grow'(그래프 동적 생성 애니메이션)
+    //                'backward'(역류 + zero_grad 누적 비교) | 'detach'(detach/no_grad/freeze 표 + 가위)
+    //                'debug'(grad=None 3원인 · NaN 추적)
+    //   code       : 우측 CodeViewer 파일 (autograd_demo.py 진화)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 미분의 자동화 — 손으로 하던 체인룰을 PyTorch가 대신한다',
+        desc: 'dl I-2-1에서 우리는 y=x²+3x의 도함수를 손으로 dy/dx=2x+3 이라 구했다. PyTorch는 이 과정을 대신해 준다 — x에 requires_grad=True 를 켜고 y를 계산한 뒤 y.backward() 한 줄이면 x.grad 에 정확히 2x+3 값이 들어온다. x=2 라면 2·2+3=7, 실제로 x.grad=7.0 이 나온다. 그런데 이게 정말 맞는지 어떻게 믿나 — 수치 미분(numerical gradient)으로 대조하면 된다. (f(x+h)−f(x−h))/(2h) 를 아주 작은 h로 계산하면 7.0000... 이 나와 자동 미분과 일치한다. 자동 미분은 수치 미분처럼 근사가 아니라 체인룰을 정확히 적용한 해석적(analytic) 값이라 오차도 없고 훨씬 빠르다. 이 "공짜 정확한 미분"이 신경망 학습 전체를 떠받친다.',
+        actor: '✍️ 손 계산 2x+3 vs backward() 자동',
+        engine: 'diff',
+        vis: 'diff',
+        engineDetail: 'y = x²+3x · backward() · 수치 미분 대조',
+        diff: {
+          expr: 'y = x² + 3x',
+          hand: 'dy/dx = 2x + 3',
+          xval: 2,
+          auto: '7.0',
+          numeric: '6.99999...',
+        },
+        alert: { tone: 'good', text: 'x=2 에서 손 계산 2x+3 = 7, backward() 의 x.grad = 7.0, 수치 미분 ≈ 6.99999 — 셋이 일치한다. autograd 는 근사가 아니라 체인룰을 그대로 적용한 정확한 해석적 미분이다.' },
+        code: {
+          lang: 'python',
+          filename: 'autograd_demo.py (1/5 — 자동 미분)',
+          lines: [
+            '"""',
+            'autograd_demo.py — backward() 한 줄이 대신하는 체인룰',
+            'dl I-2-1 에서 손으로 구한 dy/dx = 2x+3 을 autograd 로 검증한다.',
+            '"""',
+            'import torch',
+            '',
+            '# 미분을 추적할 입력 — 스위치를 켠다',
+            'x = torch.tensor(2.0, requires_grad=True)',
+            '',
+            '# y = x**2 + 3x  — 연산이 그래프에 기록된다',
+            'y = x ** 2 + 3 * x',
+            'print(y)                 # tensor(10., grad_fn=<AddBackward0>)',
+            '',
+            '# 역전파 — 그래프를 거꾸로 타며 dy/dx 를 계산',
+            'y.backward()',
+            'print(x.grad)            # tensor(7.)  = 2*2 + 3',
+            '',
+            '# ── 정말 맞나? 수치 미분으로 대조한다 ──────────',
+            'def f(v):',
+            '    return v ** 2 + 3 * v',
+            '',
+            'h = 1e-4',
+            'xv = 2.0',
+            'numeric = (f(xv + h) - f(xv - h)) / (2 * h)',
+            'print(numeric)           # 6.99999...  ≈ 7  (근사)',
+            '',
+            '# autograd(7.0) 는 근사가 아니라 정확한 해석적 값이다.',
+            '# 수치 미분은 h 를 골라야 하고 오차·비용이 크다 —',
+            '# 파라미터가 수백만 개면 수치 미분은 사실상 불가능.',
+          ],
+          highlight: [7, 8, 10, 11, 14, 15, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 2. 계산 그래프가 자란다 — 연산할 때마다 grad_fn이 붙는다 (define-by-run)',
+        desc: 'PyTorch의 계산 그래프는 미리 선언하는 게 아니라, 파이썬 코드를 "실행하는 순간" 한 연산씩 만들어진다 — 이게 define-by-run(동적 그래프)이다. z=(x+y)*w 를 계산하면 먼저 x+y 가 AddBackward 노드를, 그 결과에 *w 가 MulBackward 노드를 그래프에 이어 붙인다. 각 중간 텐서는 자신을 만든 연산을 grad_fn 으로 기억하고, 부모 텐서로 가는 링크(next_functions)를 들고 있다. 이 "동적"이라는 성질이 왜 중요하냐면 — 파이썬 if/for 가 그대로 그래프가 되기 때문이다. 반복 횟수가 입력마다 다른 RNN, 조건에 따라 경로가 갈리는 모델도 별도 그래프 언어 없이 그냥 파이썬으로 짜면 된다. 실행할 때마다 그래프를 새로 그리므로 디버깅도 파이썬 그대로(print, pdb) 가능하다. TensorFlow 1.x의 정적 그래프가 어려웠던 지점을 PyTorch가 뒤집은 핵심이다.',
+        actor: '🌱 z=(x+y)*w — 노드가 하나씩 자란다',
+        engine: 'grow',
+        vis: 'grow',
+        engineDetail: 'grad_fn · next_functions · define-by-run',
+        alert: { tone: 'info', text: '그래프는 미리 그리지 않는다 — 연산을 실행하는 순간 grad_fn 노드가 한 개씩 붙는다(define-by-run). 그래서 파이썬 if/for 가 그대로 그래프가 되고, RNN 같은 가변 구조도 그냥 파이썬으로 짜면 된다.' },
+        code: {
+          lang: 'python',
+          filename: 'autograd_demo.py (2/5 — 동적 그래프)',
+          lines: [
+            '"""',
+            'autograd_demo.py — 그래프는 실행하면서 자란다 (define-by-run)',
+            'z = (x + y) * w 를 만들면 노드가 순서대로 이어 붙는다.',
+            '"""',
+            'import torch',
+            '',
+            'x = torch.tensor(2.0, requires_grad=True)',
+            'y = torch.tensor(3.0, requires_grad=True)',
+            'w = torch.tensor(4.0, requires_grad=True)',
+            '',
+            '# 연산할 때마다 grad_fn 노드가 하나씩 붙는다',
+            's = x + y                # AddBackward 노드 생성',
+            'z = s * w                # MulBackward 노드가 이어 붙음',
+            'print(s.grad_fn)         # <AddBackward0>',
+            'print(z.grad_fn)         # <MulBackward0>',
+            '',
+            '# grad_fn 은 부모로 가는 링크를 들고 있다',
+            'print(z.grad_fn.next_functions)',
+            '# ((<AddBackward0>, 0), (<AccumulateGrad>, 0))',
+            '#   └ s 로 가는 링크        └ w(leaf) 로 가는 링크',
+            '',
+            '# ── 동적이라 파이썬 제어문이 그대로 그래프가 된다 ──',
+            'def dynamic(x, n):',
+            '    out = x',
+            '    for _ in range(n):   # n 은 입력마다 달라도 된다!',
+            '        out = out * x    # 매번 MulBackward 가 추가됨',
+            '    return out',
+            '',
+            'a = torch.tensor(2.0, requires_grad=True)',
+            'dynamic(a, 3).backward() # x^4 → d/dx = 4x^3 = 32',
+            'print(a.grad)            # tensor(32.)',
+          ],
+          highlight: [11, 12, 13, 14, 15, 17, 18, 22, 23, 24, 25, 26, 29, 30, 31],
+        },
+      },
+      {
+        title: 'Step 3. backward의 여정 — 그래프를 거꾸로 타며 leaf의 .grad에 누적한다',
+        desc: 'backward() 는 스칼라 loss 에서 출발해 grad_fn 체인을 거꾸로 따라간다. 각 노드는 자기 연산의 국소 미분(local gradient)을 알고 있어서, 흘러온 gradient에 곱해(체인룰!) 부모로 전달한다. 이 여정의 종착지가 leaf 텐서(우리가 만든 requires_grad 텐서)이고, 도착한 값이 .grad 에 쌓인다. 여기서 초보가 반드시 데는 함정 — .grad 는 덮어쓰기가 아니라 "누적(+=)"이다. 같은 그래프에서 backward() 를 두 번 부르면 grad 가 두 배가 된다. 그래서 학습 루프는 매 스텝 optimizer.zero_grad() 로 grad 를 0으로 비운 뒤 backward() 를 부른다 — 이걸 빼먹으면 이전 배치의 gradient가 계속 더해져 학습이 망가진다. 또 하나: backward() 는 기본적으로 그래프를 한 번 쓰고 버린다(메모리 회수). 같은 그래프로 두 번 미분해야 하면 retain_graph=True 를 줘야 한다. zero_grad 가 "왜" 필요한지는 이 누적 규칙 하나로 전부 설명된다.',
+        actor: '⬅️ loss → 체인룰 역류 → leaf.grad 누적',
+        engine: 'backward',
+        vis: 'backward',
+        engineDetail: 'backward() · grad 누적(+=) · zero_grad · retain_graph',
+        alert: { tone: 'danger', text: '.grad 는 덮어쓰기가 아니라 누적(+=) 이다. zero_grad() 없이 매 스텝 backward() 하면 이전 배치 gradient 가 계속 더해져 학습이 폭주한다. 학습 루프의 zero_grad → backward → step 순서에는 이유가 있다.' },
+        code: {
+          lang: 'python',
+          filename: 'autograd_demo.py (3/5 — backward · zero_grad)',
+          lines: [
+            '"""',
+            'autograd_demo.py — backward 의 여정과 grad 누적',
+            'grad 는 덮어쓰지 않고 "더한다". 그래서 zero_grad 가 필요하다.',
+            '"""',
+            'import torch',
+            '',
+            'w = torch.tensor(2.0, requires_grad=True)',
+            '',
+            '# ── grad 는 누적된다 — 직접 확인 ──────────────',
+            'loss1 = w ** 2           # dloss/dw = 2w = 4',
+            'loss1.backward()',
+            'print(w.grad)            # tensor(4.)',
+            '',
+            'loss2 = w ** 2',
+            'loss2.backward()         # zero_grad 없이 또 backward',
+            'print(w.grad)            # tensor(8.)  ← 4+4, 누적됐다!',
+            '',
+            '# 비우고 다시 하면 정상',
+            'w.grad.zero_()           # grad 를 0 으로',
+            'loss3 = w ** 2',
+            'loss3.backward()',
+            'print(w.grad)            # tensor(4.)  ← 이번엔 정확',
+            '',
+            '# ── 실전 학습 루프의 정석 순서 ──────────────',
+            'x = torch.randn(100, 3)',
+            'y = torch.randn(100, 1)',
+            'W = torch.zeros(3, 1, requires_grad=True)',
+            'opt = torch.optim.SGD([W], lr=0.01)',
+            '',
+            'for epoch in range(50):',
+            '    pred = x @ W',
+            '    loss = ((pred - y) ** 2).mean()',
+            '    opt.zero_grad()      # 1) 이전 grad 를 비운다 (필수!)',
+            '    loss.backward()      # 2) 새 grad 를 채운다',
+            '    opt.step()           # 3) W 를 갱신한다',
+            '',
+            '# 같은 그래프로 두 번 미분해야 하면:',
+            '# loss.backward(retain_graph=True)  # 그래프 보존',
+          ],
+          highlight: [9, 10, 11, 13, 14, 15, 18, 19, 20, 21, 30, 31, 32, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 4. 그래프에서 내리기 — detach · no_grad · requires_grad_(False)',
+        desc: '항상 그래프를 기록하고 싶은 건 아니다. 목적에 따라 세 가지로 "그래프에서 내린다". (1) detach() — 특정 텐서를 계산 그래프에서 잘라낸다. 값은 그대로 쓰되 그 지점 아래로 gradient가 흐르지 않는다. 예: loss 로그를 남길 때 loss.detach() 하거나, GAN에서 한쪽 네트워크로 gradient가 새지 않게 막을 때. (2) torch.no_grad() — 블록 전체에서 그래프 기록 자체를 끈다. 추론(예측)·검증 루프에서 필수 — 그래프를 안 만드니 메모리가 줄고 속도가 빨라진다. (3) requires_grad_(False) — 파라미터를 "동결"한다. 전이학습에서 사전학습된 backbone은 얼리고 새 head만 학습할 때 쓴다(다음에 배울 fine-tuning의 핵심). 세 가지를 헷갈리면 안 된다: detach는 "이 텐서만" 끊고, no_grad는 "블록 전체"를 끄고, requires_grad_(False)는 "파라미터를 영구 동결"한다. 흔한 실수 하나 — 검증 loss를 total += loss 처럼 텐서째로 누적하면 그래프가 통째로 살아남아 메모리가 폭발한다. 반드시 total += loss.item() 으로 파이썬 float 만 꺼내 더해야 한다.',
+        actor: '✂️ detach / no_grad / freeze — 용도가 다르다',
+        engine: 'detach',
+        vis: 'detach',
+        engineDetail: 'detach() · torch.no_grad() · requires_grad_(False) · .item()',
+        detachRows: [
+          { fn: 'x.detach()', scope: '이 텐서만', effect: '그래프에서 잘라냄', use: 'loss 로깅 · GAN gradient 차단', tone: 'warn' },
+          { fn: 'with torch.no_grad():', scope: '블록 전체', effect: '그래프 기록 OFF', use: '추론·검증 (메모리↓ 속도↑)', tone: 'good' },
+          { fn: 'p.requires_grad_(False)', scope: '파라미터 영구', effect: '동결 (안 배움)', use: '전이학습 backbone 얼리기', tone: 'bad' },
+        ],
+        alert: { tone: 'warn', text: '흔한 메모리 누수 — 검증 루프에서 total += loss 로 텐서를 통째 누적하면 그래프가 안 죽고 쌓인다. 반드시 total += loss.item() 으로 파이썬 float 만 꺼내 더하라.' },
+        code: {
+          lang: 'python',
+          filename: 'autograd_demo.py (4/5 — 그래프에서 내리기)',
+          lines: [
+            '"""',
+            'autograd_demo.py — detach / no_grad / requires_grad_ 구분',
+            '목적: 언제 그래프를 끊고, 끄고, 얼리는가.',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            'x = torch.tensor(2.0, requires_grad=True)',
+            '',
+            '# 1) detach() — 이 텐서만 그래프에서 잘라낸다',
+            'y = x ** 2',
+            'y_cut = y.detach()       # 값은 4.0, grad 추적은 없음',
+            'print(y_cut.requires_grad)   # False',
+            '',
+            '# 2) no_grad() — 블록 전체에서 그래프 기록 OFF (추론)',
+            'model = nn.Linear(3, 1)',
+            'val = torch.randn(10, 3)',
+            'with torch.no_grad():',
+            '    out = model(val)     # grad_fn 없음 → 메모리↓ 속도↑',
+            'print(out.requires_grad)     # False',
+            '',
+            '# 3) requires_grad_(False) — 파라미터 동결 (전이학습)',
+            'backbone = nn.Linear(3, 8)',
+            'for p in backbone.parameters():',
+            '    p.requires_grad_(False)  # 이 층은 더 이상 안 배운다',
+            '',
+            '# ── 흔한 메모리 누수 — 텐서째 누적하지 마라 ──',
+            'total = 0.0',
+            'for _ in range(3):',
+            '    loss = (x ** 2).mean()',
+            '    total += loss.item()  # ✅ float 만 꺼낸다',
+            '    # total += loss       # ❌ 그래프가 통째로 살아남음',
+            'print(total)',
+          ],
+          highlight: [10, 11, 12, 13, 15, 18, 19, 20, 22, 23, 24, 25, 28, 29, 30, 31, 32],
+        },
+      },
+      {
+        title: 'Step 5. 실무 디버깅 — grad=None 3원인 · NaN 추적 · 커스텀 Function',
+        desc: 'autograd를 실무에서 쓰면 가장 자주 만나는 증상이 "x.grad가 None" 이다. 원인은 대개 셋 중 하나다. (1) leaf가 아니다 — 연산 중간에 나온 텐서는 기본적으로 grad를 저장하지 않는다. 중간값의 grad가 필요하면 t.retain_grad() 를 붙여야 한다. (2) no_grad 블록 안이었다 / requires_grad를 안 켰다 — 그래프가 아예 안 만들어졌다. (3) 정수형이라 미분 대상이 아니다 — grad는 float에만 흐른다. 두 번째 골칫거리는 grad가 NaN으로 터지는 경우다 — 0으로 나누기, log(0), sqrt(음수), exp 오버플로가 forward에서는 조용히 지나가다 backward에서 NaN을 만든다. 이때 torch.autograd.set_detect_anomaly(True) 를 켜면 NaN을 만든 바로 그 연산에서 스택트레이스를 띄워 범인을 콕 집어 준다(느리므로 디버깅 때만). 마지막으로, 정 필요하면 torch.autograd.Function 을 상속해 forward/backward를 직접 정의한 커스텀 연산도 만들 수 있다 — 대부분은 필요 없지만 특수한 gradient를 손으로 넣어야 할 때의 탈출구다. 다음 장에서는 이 모든 연산을 GPU로 올려 병렬로 돌리는 이야기로 넘어간다.',
+        actor: '🐛 grad=None 3원인 · NaN 추적 · custom Function',
+        engine: 'debug',
+        vis: 'debug',
+        engineDetail: 'retain_grad · set_detect_anomaly · autograd.Function',
+        noneRows: [
+          { cause: '① leaf 가 아님', detail: '중간 텐서는 grad 미저장', fix: 't.retain_grad()' },
+          { cause: '② 그래프 없음', detail: 'no_grad / requires_grad 안 켬', fix: 'requires_grad=True' },
+          { cause: '③ 정수형', detail: 'grad 는 float 에만 흐름', fix: '.float()' },
+        ],
+        alert: { tone: 'info', text: 'grad 가 None 이면 leaf 인지·requires_grad 켰는지·float 인지 셋을 먼저 확인하라. grad 가 NaN 이면 set_detect_anomaly(True) 로 범인 연산을 잡는다(디버깅 때만 — 느리다).' },
+        code: {
+          lang: 'python',
+          filename: 'autograd_demo.py (5/5 — 실무 디버깅)',
+          lines: [
+            '"""',
+            'autograd_demo.py — grad=None 3원인 · NaN 추적 · 커스텀 Function',
+            '실무에서 가장 자주 만나는 autograd 증상과 해결.',
+            '"""',
+            'import torch',
+            '',
+            '# ── 증상 1: 중간 텐서의 grad 는 None 이다 ──────',
+            'x = torch.tensor(2.0, requires_grad=True)',
+            'h = x * 3                # 중간 텐서 (leaf 아님)',
+            'y = h ** 2',
+            'y.backward()',
+            'print(x.grad)            # tensor(36.)  leaf 라 OK',
+            'print(h.grad)            # None + 경고 — 중간값은 미저장',
+            '',
+            '# 해결: 중간값 grad 가 필요하면 retain_grad()',
+            'x = torch.tensor(2.0, requires_grad=True)',
+            'h = x * 3; h.retain_grad()',
+            '(h ** 2).backward()',
+            'print(h.grad)            # tensor(12.)  이제 저장됨',
+            '',
+            '# ── 증상 2: grad 가 NaN 으로 터질 때 ──────────',
+            'torch.autograd.set_detect_anomaly(True)  # 디버깅 때만!',
+            'a = torch.tensor(0.0, requires_grad=True)',
+            'try:',
+            '    loss = torch.log(a)  # log(0) = -inf → backward 에서 NaN',
+            '    loss.backward()      # 범인 연산에서 스택트레이스 발생',
+            'except RuntimeError as e:',
+            '    print("anomaly:", type(e).__name__)',
+            '',
+            '# ── 커스텀 Function — 특수 gradient 를 직접 정의 ──',
+            'class MyReLU(torch.autograd.Function):',
+            '    @staticmethod',
+            '    def forward(ctx, x):',
+            '        ctx.save_for_backward(x)',
+            '        return x.clamp(min=0)',
+            '    @staticmethod',
+            '    def backward(ctx, g):',
+            '        (x,) = ctx.saved_tensors',
+            '        return g * (x > 0).float()   # x>0 에서만 통과',
+            '',
+            '# 다음 장: 이 연산들을 GPU 로 올려 병렬로 돌린다 →',
+          ],
+          highlight: [7, 8, 9, 12, 13, 16, 17, 18, 19, 21, 22, 25, 26, 30, 31, 36, 37, 38],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 자동 미분 vs 손 계산 vs 수치 미분 대조 카드
+    // ─────────────────────────────────────────────────────
+    function DiffBox({ diff }) {
+      if (!diff) return null;
+      const Chip = ({ label, val, color }) => (
+        <div className={`flex-1 rounded-lg border-2 ${color} px-2 py-2 text-center`}>
+          <div className="text-[10px] font-bold text-slate-700">{label}</div>
+          <div className="text-base font-mono font-bold text-slate-800 mt-0.5">{val}</div>
+        </div>
+      );
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">✍️ 손 계산 → autograd → 수치 미분, 셋을 대조</div>
+          <div className="rounded-lg border-2 border-orange-400 bg-orange-50 px-3 py-2 text-center mb-2">
+            <div className="text-[11px] text-orange-800">함수</div>
+            <div className="text-lg font-mono font-bold text-orange-900">{diff.expr}</div>
+            <div className="text-[10px] text-orange-700 mt-0.5">손으로 미분: <span className="font-mono font-bold">{diff.hand}</span> · x={diff.xval}</div>
+          </div>
+          <div className="flex items-stretch gap-2">
+            <Chip label="✍️ 손 계산 2x+3" val="7.0" color="border-slate-300 bg-slate-50" />
+            <div className="flex items-center text-orange-500 text-lg font-bold">=</div>
+            <Chip label="🔥 x.grad" val={diff.auto} color="border-orange-400 bg-orange-50" />
+            <div className="flex items-center text-orange-500 text-lg font-bold">≈</div>
+            <Chip label="🔢 수치 미분" val={diff.numeric} color="border-sky-300 bg-sky-50" />
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">autograd 는 수치 미분처럼 근사가 아니라 체인룰을 그대로 적용한 <span className="font-bold">정확한</span> 값 — 오차도 없고 파라미터가 수백만 개여도 한 번에 흐른다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 계산 그래프가 자라는 애니메이션 (z=(x+y)*w)
+    //   실계산: x=2, y=3, w=4 → s=5 → z=20
+    // ─────────────────────────────────────────────────────
+    function GrowBox() {
+      const [phase, setPhase] = React.useState(0); // 0:x,y,w  1:+s  2:*z
+      React.useEffect(() => {
+        setPhase(0);
+        const t1 = setTimeout(() => setPhase(1), 700);
+        const t2 = setTimeout(() => setPhase(2), 1500);
+        return () => { clearTimeout(t1); clearTimeout(t2); };
+      }, []);
+      const Node = ({ label, val, sub, on, color }) => (
+        <div className={`rounded-lg border-2 px-2.5 py-1.5 text-center transition-all duration-500 ${on ? color + ' opacity-100 scale-100' : 'border-slate-200 bg-slate-50 opacity-30 scale-90'}`}>
+          <div className="text-[11px] font-mono font-bold text-slate-800">{label}</div>
+          {val !== undefined && <div className="text-[10px] font-mono text-slate-600">{val}</div>}
+          {sub && <div className="text-[9px] text-orange-700">{sub}</div>}
+        </div>
+      );
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-orange-900">🌱 z = (x + y) * w — 노드가 순서대로 자란다</div>
+            <button onClick={() => { setPhase(0); setTimeout(() => setPhase(1), 400); setTimeout(() => setPhase(2), 1000); }}
+              className="text-[10px] px-2 py-0.5 rounded border border-orange-300 bg-orange-50 text-orange-800 hover:bg-orange-100">↻ 다시</button>
+          </div>
+          {/* leaf 텐서 */}
+          <div className="flex items-center justify-center gap-2">
+            <Node label="x=2" sub="leaf" on={phase >= 0} color="border-orange-400 bg-orange-50" />
+            <Node label="y=3" sub="leaf" on={phase >= 0} color="border-orange-400 bg-orange-50" />
+            <Node label="w=4" sub="leaf" on={phase >= 0} color="border-orange-400 bg-orange-50" />
+          </div>
+          <div className={`text-center text-orange-500 transition-opacity duration-500 ${phase >= 1 ? 'opacity-100' : 'opacity-0'}`}>
+            <div className="text-sm">↓ x + y</div>
+          </div>
+          {/* Add 노드 */}
+          <div className="flex justify-center">
+            <Node label="s = 5" sub="AddBackward" on={phase >= 1} color="border-amber-500 bg-amber-100" />
+          </div>
+          <div className={`text-center text-orange-500 transition-opacity duration-500 ${phase >= 2 ? 'opacity-100' : 'opacity-0'}`}>
+            <div className="text-sm">↓ s * w</div>
+          </div>
+          {/* Mul 노드 */}
+          <div className="flex justify-center">
+            <Node label="z = 20" sub="MulBackward" on={phase >= 2} color="border-emerald-500 bg-emerald-100" />
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900">각 노드는 자신을 만든 연산(<span className="font-mono">grad_fn</span>)과 부모로 가는 링크(<span className="font-mono">next_functions</span>)를 기억한다. 실행하면서 붙으므로 <span className="font-bold">파이썬 for/if</span> 가 그대로 그래프가 된다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — backward 역류 애니메이션 + zero_grad 누적 비교
+    //   loss = w²,  w=2 → dloss/dw = 2w = 4
+    // ─────────────────────────────────────────────────────
+    function BackwardBox() {
+      const [flow, setFlow] = React.useState(false);
+      React.useEffect(() => {
+        setFlow(false);
+        const t = setTimeout(() => setFlow(true), 500);
+        return () => clearTimeout(t);
+      }, []);
+      return (
+        <div className="mt-1 rounded-lg border-2 border-orange-300 bg-white p-3">
+          <div className="text-xs font-bold text-orange-900 mb-2">⬅️ backward — loss 에서 leaf 로 gradient 가 역류한다</div>
+          {/* forward 위, backward 아래 */}
+          <div className="flex items-center justify-center gap-1.5 text-[11px]">
+            <div className="rounded-lg border-2 border-orange-400 bg-orange-50 px-3 py-2 text-center">
+              <div className="font-mono font-bold text-orange-900">w = 2</div>
+              <div className="text-[9px] text-orange-700">leaf</div>
+            </div>
+            <div className="text-slate-400 text-center"><div>→ w²</div></div>
+            <div className="rounded-lg border-2 border-orange-500 bg-orange-100 px-3 py-2 text-center">
+              <div className="font-mono font-bold text-orange-900">loss = 4</div>
+              <div className="text-[9px] text-orange-700">PowBackward</div>
+            </div>
+          </div>
+          {/* backward 화살표 */}
+          <div className="mt-2 flex items-center justify-center gap-1.5 text-[11px]">
+            <div className={`rounded-lg border-2 px-3 py-2 text-center transition-all duration-700 ${flow ? 'border-emerald-500 bg-emerald-50 opacity-100' : 'border-slate-200 bg-slate-50 opacity-40'}`}>
+              <div className="font-mono font-bold text-emerald-900">w.grad = 4</div>
+              <div className="text-[9px] text-emerald-700">dloss/dw = 2w</div>
+            </div>
+            <div className="text-center text-emerald-600">
+              <div className="text-lg">←</div>
+              <div className="text-[9px] font-mono font-bold">backward()</div>
+            </div>
+            <div className="rounded-lg border-2 border-emerald-400 bg-emerald-50 px-3 py-2 text-center">
+              <div className="font-mono font-bold text-emerald-900">loss = 4</div>
+              <div className="text-[9px] text-emerald-700">역전파 시작(g=1)</div>
+            </div>
+          </div>
+          {/* zero_grad 누적 비교 */}
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <div className="rounded-lg border-2 border-red-300 bg-red-50 p-2">
+              <div className="text-[10px] font-bold text-red-800 mb-1">❌ zero_grad 없이 2번</div>
+              <div className="text-[10px] font-mono text-red-900">backward → 4<br/>backward → <span className="font-bold">8</span> (4+4)</div>
+              <div className="text-[9px] text-red-700 mt-1">grad 가 누적돼 폭주</div>
+            </div>
+            <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 p-2">
+              <div className="text-[10px] font-bold text-emerald-800 mb-1">✅ zero_grad 후 backward</div>
+              <div className="text-[10px] font-mono text-emerald-900">zero_() → 0<br/>backward → <span className="font-bold">4</span> (정확)</div>
+              <div className="text-[9px] text-emerald-700 mt-1">매 스텝 비우면 정상</div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-orange-900"><span className="font-mono font-bold">.grad</span> 는 덮어쓰기가 아니라 <span className="font-bold">+= 누적</span> — 이 한 줄이 zero_grad 가 필요한 이유의 전부다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — detach/no_grad/freeze 구분표 + 가위 시각화
+    // ─────────────────────────────────────────────────────
+    const DETACH_TONE = { good: 'text-emerald-700', warn: 'text-amber-700', bad: 'text-red-700' };
+    function DetachBox({ rows }) {
+      if (!rows) return null;
+      return (
+        <div className="mt-1 space-y-3">
+          {/* 가위 시각화 */}
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">✂️ detach — 그래프를 여기서 자른다</div>
+            <div className="flex items-center justify-center gap-1 text-[11px]">
+              <div className="rounded border-2 border-orange-400 bg-orange-50 px-2 py-1.5 text-center">
+                <div className="font-mono font-bold text-orange-900">x</div>
+                <div className="text-[9px] text-orange-700">grad 흐름</div>
+              </div>
+              <span className="text-emerald-600">→</span>
+              <div className="rounded border-2 border-orange-400 bg-orange-50 px-2 py-1.5 text-center">
+                <div className="font-mono font-bold text-orange-900">y=x²</div>
+              </div>
+              <span className="text-red-500 text-lg font-bold">✂</span>
+              <div className="rounded border-2 border-slate-300 bg-slate-100 px-2 py-1.5 text-center">
+                <div className="font-mono font-bold text-slate-600">y.detach()</div>
+                <div className="text-[9px] text-slate-500">grad 끊김</div>
+              </div>
+            </div>
+            <div className="mt-1.5 text-[9px] text-orange-800 text-center">가위(✂) 아래로는 gradient 가 흐르지 않는다 — 값은 그대로 쓴다.</div>
+          </div>
+          {/* 구분표 */}
+          <div className="rounded-lg border-2 border-orange-400 bg-gradient-to-br from-orange-50 to-amber-50 p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🔀 세 가지 — 범위와 목적이 다르다</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-orange-900 border-b-2 border-orange-300">
+                  <th className="text-left py-1">방법</th>
+                  <th className="text-left py-1 pl-1">범위</th>
+                  <th className="text-left py-1 pl-1">효과</th>
+                  <th className="text-left py-1 pl-1">언제</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.fn} className="border-t border-orange-200 align-top">
+                    <td className="py-1 font-mono font-bold text-slate-800">{r.fn}</td>
+                    <td className="py-1 pl-1 text-slate-700">{r.scope}</td>
+                    <td className={`py-1 pl-1 font-bold ${DETACH_TONE[r.tone]}`}>{r.effect}</td>
+                    <td className="py-1 pl-1 text-slate-700">{r.use}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — grad=None 3원인 표 + NaN 추적
+    // ─────────────────────────────────────────────────────
+    function DebugBox({ rows }) {
+      if (!rows) return null;
+      return (
+        <div className="mt-1 space-y-3">
+          <div className="rounded-lg border-2 border-orange-300 bg-white p-3">
+            <div className="text-xs font-bold text-orange-900 mb-2">🐛 x.grad 가 None — 원인은 셋 중 하나</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-orange-900 border-b-2 border-orange-200">
+                  <th className="text-left py-1">원인</th>
+                  <th className="text-left py-1 pl-1">설명</th>
+                  <th className="text-left py-1 pl-1">해결</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.cause} className="border-t border-orange-100">
+                    <td className="py-1 font-bold text-slate-800">{r.cause}</td>
+                    <td className="py-1 pl-1 text-slate-700">{r.detail}</td>
+                    <td className="py-1 pl-1 font-mono text-emerald-700">{r.fix}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="rounded-lg border-2 border-red-300 bg-red-50 p-3">
+            <div className="text-xs font-bold text-red-800 mb-1">💥 grad 가 NaN 으로 터질 때</div>
+            <div className="text-[10px] text-red-900">forward 는 조용히 지나간 <span className="font-mono">log(0) · 0/0 · sqrt(-x)</span> 가 backward 에서 NaN 을 만든다.</div>
+            <div className="mt-1.5 rounded bg-white border border-red-200 px-2 py-1.5 font-mono text-[10px] text-red-800">torch.autograd.set_detect_anomaly(True)</div>
+            <div className="mt-1 text-[9px] text-red-700">→ NaN 을 만든 <span className="font-bold">바로 그 연산</span>에서 스택트레이스. 느리니 디버깅 때만 켠다.</div>
+          </div>
+          <div className="rounded-lg border-2 border-orange-400 bg-orange-50 p-2">
+            <div className="text-[10px] text-orange-900"><span className="font-bold">커스텀 Function</span> — <span className="font-mono">torch.autograd.Function</span> 을 상속해 forward/backward 를 손으로 정의하면 특수한 gradient 도 넣을 수 있다(대부분은 불필요한 탈출구).</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-orange-50', border: 'border-orange-300', text: 'text-orange-900', icon: '💡' },
+      warn:   { bg: 'bg-amber-50',  border: 'border-amber-300',  text: 'text-amber-900',  icon: '⚠️' },
+      danger: { bg: 'bg-red-50',    border: 'border-red-300',    text: 'text-red-900',    icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — autograd 시각화 (orange 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      diff:     { icon: '✍️', label: '자동 미분' },
+      grow:     { icon: '🌱', label: '동적 그래프' },
+      backward: { icon: '⬅️', label: 'backward 여정' },
+      detach:   { icon: '✂️', label: '그래프에서 내리기' },
+      debug:    { icon: '🐛', label: '실무 디버깅' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.diff;
+      // grow/backward 는 단계 진입 시 애니메이션을 재생하려 key 로 리마운트
+      return (
+        <div className="rounded-xl border border-orange-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-orange-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>autograd — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-orange-700 font-mono mb-2 px-2 py-1 rounded bg-orange-50 border border-orange-200">
+            {state.engineDetail}
+          </div>
+
+          {state.vis === 'diff' && <DiffBox diff={state.diff} />}
+          {state.vis === 'grow' && <GrowBox key={state.engine} />}
+          {state.vis === 'backward' && <BackwardBox key={state.engine} />}
+          {state.vis === 'detach' && <DetachBox rows={state.detachRows} />}
+          {state.vis === 'debug' && <DebugBox rows={state.noneRows} />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-400/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-orange-600 text-white font-bold">🔥</span>
+              <div>
+                <span className="inline-block text-[10px] font-bold text-orange-700 bg-orange-100 border border-orange-200 rounded px-1.5 py-0.5 mb-1">PyTorch · Part I</span>
+                <h1 className="text-2xl font-bold text-orange-900">I-2-1. autograd 해부 — 동적 계산 그래프</h1>
+                <p className="text-sm text-orange-800/80">backward() 한 줄 뒤에서 벌어지는 일 — dl에서 배운 역전파가 코드가 되는 순간</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-orange-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-orange-500' : 'bg-orange-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-orange-800 text-orange-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-orange-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-orange-800 text-white' : 'bg-orange-600 text-white hover:bg-orange-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white text-orange-800 hover:bg-orange-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-orange-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-500 bg-white px-4 py-3 text-sm text-orange-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                backward() 한 줄은 dl에서 손으로 하던 체인룰을 대신한다 —
+                연산할 때마다 <span className="font-mono">grad_fn</span> 노드가 붙어 그래프가 동적으로 자라고(define-by-run),
+                backward() 는 그 그래프를 거꾸로 타며 leaf 의 <span className="font-mono">.grad</span> 에 <span className="font-bold">누적</span>한다(그래서 <span className="font-mono">zero_grad</span> 가 필요).
+                필요에 따라 <span className="font-mono">detach</span>(끊기)·<span className="font-mono">no_grad</span>(끄기)·<span className="font-mono">requires_grad_(False)</span>(동결)로 그래프에서 내리고,
+                grad=None 3원인과 <span className="font-mono">set_detect_anomaly</span> 로 디버깅하면 autograd 는 손에 잡힌다.
+                다음 장에서는 이 연산들을 GPU로 올려 병렬로 돌린다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['backward', 'grad_fn', 'requires_grad', 'define-by-run', 'zero_grad', 'retain_graph', 'detach', 'no_grad', 'retain_grad', 'set_detect_anomaly', 'autograd.Function'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-orange-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-2-2.html" className="underline hover:no-underline">다음: I-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
