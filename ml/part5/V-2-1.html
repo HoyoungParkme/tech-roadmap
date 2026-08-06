@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Machine Learning 학습 — V-2-1. 모델 해석 — SHAP·피처 중요도</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧠</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    ML V-2-1 — 모델 해석 — SHAP·피처 중요도
+    학습 목표: "왜 이 고객의 대출을 거절했나요?" 라는 질문 앞에서 정확도 91% XGBoost가
+              침묵하는 상황에서 출발 → 내장 중요도의 함정 → Shapley value의 직관 →
+              waterfall/beeswarm 읽는 법 → 거절 사유 자동 생성·누수 디버깅까지 5단계.
+    패턴: fastapi v1 — 좌(LiveDataPane: 고객 #7 예측 waterfall 애니메이션 + beeswarm 요약)
+          / 우(VSCode CodeViewer: shap_demo.py 진화)
+    색상: violet (ml 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 공유 데이터 — 고객 #7 의 대출 부도 확률 예측 분해
+    //   baseValue : 학습 데이터 평균 예측(부도 확률) — 아무 정보도 없을 때의 출발점
+    //   features  : SHAP 기여도. + 는 부도 확률을 밀어 올림(거절 방향, 빨강),
+    //               − 는 끌어 내림(승인 방향, 파랑)
+    //   합계: 0.22 + 0.31 + 0.18 + 0.09 − 0.07 − 0.02 = 0.71 → 거절
+    // ─────────────────────────────────────────────────────
+    const CUSTOMER = {
+      id: '고객 #7',
+      baseValue: 0.22,
+      finalProb: 0.71,
+      threshold: 0.5,
+      features: [
+        { name: 'delinq_count',      label: '연체 이력',   value: '2회',        shap: +0.31 },
+        { name: 'debt_ratio',        label: '부채비율',    value: '62%',        shap: +0.18 },
+        { name: 'recent_inquiries',  label: '최근 신용조회', value: '5회',      shap: +0.09 },
+        { name: 'annual_income',     label: '연봉',        value: '5,200만원',  shap: -0.07 },
+        { name: 'years_employed',    label: '근속연수',    value: '6년',        shap: -0.02 },
+      ],
+    };
+
+    // beeswarm 요약용 가짜 표본 — 각 피처의 SHAP 분포 (x: SHAP값, v: 피처값 높낮이 0~1)
+    const BEESWARM = [
+      { label: '연체 이력',   dots: [ {x:-.05,v:.1},{x:-.04,v:.15},{x:-.03,v:.2},{x:-.02,v:.1},{x:.08,v:.6},{x:.14,v:.7},{x:.22,v:.8},{x:.28,v:.9},{x:.31,v:.95},{x:.36,v:1} ] },
+      { label: '부채비율',    dots: [ {x:-.12,v:.05},{x:-.08,v:.15},{x:-.05,v:.25},{x:-.02,v:.35},{x:.03,v:.55},{x:.07,v:.6},{x:.12,v:.75},{x:.16,v:.85},{x:.18,v:.9},{x:.24,v:1} ] },
+      { label: '연봉',        dots: [ {x:-.16,v:1},{x:-.11,v:.9},{x:-.07,v:.8},{x:-.05,v:.7},{x:-.02,v:.55},{x:.01,v:.4},{x:.05,v:.3},{x:.08,v:.2},{x:.11,v:.1},{x:.13,v:.05} ] },
+      { label: '최근 신용조회', dots: [ {x:-.04,v:.1},{x:-.03,v:.2},{x:-.01,v:.3},{x:.01,v:.45},{x:.03,v:.55},{x:.05,v:.65},{x:.07,v:.75},{x:.09,v:.85},{x:.11,v:.95},{x:.12,v:1} ] },
+      { label: '근속연수',    dots: [ {x:-.06,v:1},{x:-.05,v:.85},{x:-.03,v:.7},{x:-.02,v:.6},{x:-.01,v:.5},{x:0,v:.45},{x:.01,v:.35},{x:.02,v:.25},{x:.03,v:.15},{x:.04,v:.05} ] },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계: 왜 필요한가 → 내장 중요도 함정 → Shapley 원리
+    //         → 플롯 읽기 → 실무 운용(거절 사유·누수·한계)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 설명이 필요한 순간 — 정확도 91%로는 답할 수 없는 질문',
+        desc: '대출 심사 XGBoost가 홀드아웃 정확도 91%를 찍고 배포됐다. 그런데 첫 주부터 답 못하는 질문이 쏟아진다 — 고객센터의 "왜 이 고객은 거절인가요?", 금융감독 규제의 "거절 사유를 서면으로 제시하라"(금융·의료는 설명이 법적 의무다), 그리고 팀 내부의 "모델이 정말 제대로 배운 게 맞나?". 마지막 질문이 제일 무섭다: 유명한 늑대 vs 허스키 실험에서 모델은 동물이 아니라 배경의 눈(snow)을 보고 늑대를 맞히고 있었다 — 정확도만 보면 절대 발견 못하는 버그다. 정확도는 "얼마나 맞히는가"만 말할 뿐 "무엇을 보고 맞히는가"는 말해주지 않는다. 그래서 해석 도구가 필요하다.',
+        panel: 'why',
+        actor: '🏦 loan_model v1 배포 첫 주 — 질문 3연타',
+        alert: { tone: 'danger', text: '정확도 91%는 "무엇을 보고 판단했는가"에 대해 아무것도 말해주지 않는다. 규제·디버깅·신뢰 — 세 방향 모두에서 설명이 요구된다.' },
+        code: {
+          lang: 'python',
+          filename: 'shap_demo.py (v1 — 모델 학습)',
+          lines: [
+            '"""',
+            'shap_demo.py — 대출 부도 예측 모델과 해석',
+            '1단계: XGBoost 학습. 정확도는 좋다. 설명은 못 한다.',
+            '"""',
+            'import pandas as pd',
+            'import xgboost as xgb',
+            'from sklearn.model_selection import train_test_split',
+            'from sklearn.metrics import accuracy_score',
+            '',
+            'df = pd.read_csv("loan_applications.csv")',
+            '',
+            'FEATURES = [',
+            '    "annual_income",     # 연봉',
+            '    "debt_ratio",        # 부채비율',
+            '    "delinq_count",      # 연체 이력 횟수',
+            '    "years_employed",    # 근속연수',
+            '    "recent_inquiries",  # 최근 3개월 신용조회 수',
+            ']',
+            'X, y = df[FEATURES], df["default"]  # default: 1=부도',
+            '',
+            'X_train, X_test, y_train, y_test = train_test_split(',
+            '    X, y, test_size=0.2, random_state=42, stratify=y)',
+            '',
+            'model = xgb.XGBClassifier(',
+            '    n_estimators=300, max_depth=5,',
+            '    learning_rate=0.05, eval_metric="logloss")',
+            'model.fit(X_train, y_train)',
+            '',
+            'acc = accuracy_score(y_test, model.predict(X_test))',
+            'print(f"accuracy: {acc:.2f}")  # 0.91 — 배포!',
+            '',
+            '# ── 배포 첫 주에 날아온 질문들 ──────────────',
+            '# 고객센터: "고객 #7 은 왜 거절인가요?"      → ...?',
+            '# 감독기관: "거절 사유를 서면 제시하시오"     → ...?',
+            '# 팀 리드 : "늑대vs허스키처럼 엉뚱한 걸 보고',
+            '#            맞히는 건 아닌지 확인했나?"     → ...?',
+            '# 트리 300개의 앙상블 — 사람이 따라 읽을 수 없다',
+          ],
+          highlight: [10, 12, 13, 14, 15, 16, 17, 18, 24, 25, 26, 27, 29, 30, 32, 33, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 2. 내장 중요도의 함정 — 방향이 없고, 관점이 다르다',
+        desc: '제일 먼저 손이 가는 건 model.feature_importances_다 — 공짜니까. 하지만 두 가지 함정이 있다. 첫째, 이건 "학습 중 트리 분기에서 얼마나 자주·크게 쓰였나"(gain)라는 학습 관점이지 "이 예측에 얼마나 기여했나"가 아니다. 카디널리티 높은 피처가 과대평가되는 편향도 알려져 있다. 둘째, 방향이 없다 — "연봉이 중요하다"까지만 말하고 연봉이 확률을 올렸는지 내렸는지는 말하지 못하므로 거절 사유로는 쓸 수 없다. 대안인 순열 중요도(permutation)는 "이 피처를 섞으면 성능이 얼마나 떨어지나"를 재니 예측 성능 관점으로는 더 정직하지만, 여전히 전역 순위일 뿐 개별 고객 한 명의 "왜"에는 답하지 못한다.',
+        panel: 'importance',
+        actor: '📊 feature_importances_ vs permutation — 둘 다 "방향" 없음',
+        importance: {
+          builtin: [
+            { label: '부채비율',    v: 0.34 },
+            { label: '연체 이력',   v: 0.27 },
+            { label: '연봉',        v: 0.19 },
+            { label: '최근 신용조회', v: 0.12 },
+            { label: '근속연수',    v: 0.08 },
+          ],
+          permutation: [
+            { label: '연체 이력',   v: 0.09 },
+            { label: '부채비율',    v: 0.07 },
+            { label: '연봉',        v: 0.04 },
+            { label: '최근 신용조회', v: 0.02 },
+            { label: '근속연수',    v: 0.01 },
+          ],
+        },
+        alert: { tone: 'warn', text: '두 방법이 1위조차 다르게 말한다(gain: 부채비율 / permutation: 연체 이력). 그리고 둘 다 전역 순위일 뿐 — "고객 #7이 왜 거절인가"에는 여전히 답이 없다.' },
+        code: {
+          lang: 'python',
+          filename: 'shap_demo.py (v2 — 중요도 두 가지)',
+          lines: [
+            '"""',
+            '2단계: 내장 중요도 vs 순열 중요도',
+            '결론: 둘 다 전역 순위 + 방향 없음 → 거절 사유 불가',
+            '"""',
+            'import numpy as np',
+            'from sklearn.inspection import permutation_importance',
+            '',
+            '# ── (a) 내장 중요도: gain 기반 — 학습 관점 ──',
+            'builtin = pd.Series(',
+            '    model.feature_importances_, index=FEATURES,',
+            ').sort_values(ascending=False)',
+            'print(builtin)',
+            '# debt_ratio         0.34   ← 학습 때 분기에 많이 쓰임',
+            '# delinq_count       0.27',
+            '# annual_income      0.19   ← 올렸나? 내렸나? 모른다',
+            '',
+            '# 함정 1: "예측 기여" 가 아니라 "분기 기여" (관점이 다름)',
+            '# 함정 2: 부호가 없다 — 사유서에 못 쓴다',
+            '# 함정 3: 고유값 많은 피처가 과대평가되는 편향',
+            '',
+            '# ── (b) 순열 중요도: 섞으면 성능이 얼마나 깨지나 ──',
+            'r = permutation_importance(',
+            '    model, X_test, y_test,',
+            '    n_repeats=10, random_state=42,',
+            '    scoring="roc_auc",  # 학습이 아닌 "예측 성능" 관점',
+            ')',
+            'perm = pd.Series(r.importances_mean, index=FEATURES,',
+            '                 ).sort_values(ascending=False)',
+            'print(perm)',
+            '# delinq_count       0.09   ← 1위가 바뀌었다!',
+            '# debt_ratio         0.07',
+            '',
+            '# 순열이 더 정직하지만(테스트셋 성능 기준),',
+            '# 여전히 "전체 평균" 이야기다.',
+            '# 우리가 필요한 건: 고객 #7 "한 명" 의 예측 분해.',
+          ],
+          highlight: [6, 9, 10, 11, 13, 14, 15, 17, 18, 19, 22, 23, 24, 25, 26, 30, 31, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 3. SHAP의 원리 — "이 피처가 팀에 기여한 공정한 몫"',
+        desc: 'SHAP은 게임이론의 Shapley value를 예측에 적용한 것이다. 예측을 하나의 팀플레이로 보고, 각 피처를 팀원으로 본다 — 그러면 질문이 "이 팀원이 최종 성과(예측값과 base value의 차이)에 얼마나 기여했나"가 된다. 계산의 직관은 넣고-빼기다: 피처를 아무것도 모를 때(base value 0.22)에서 시작해, "연체 이력 2회"를 알려주면 예측이 얼마나 움직이는지, 이미 다른 피처를 아는 상태에서 알려주면 또 얼마나 움직이는지 — 가능한 모든 참여 순서에 대해 평균낸 것이 그 피처의 SHAP값이다. 순서를 전부 평균내기 때문에 "공정"하고, 모든 피처의 SHAP값을 더하면 정확히 최종 예측이 되는 것(가법성)이 보장된다. 이 가법성 덕분에 "base 0.22 + 연체 +0.31 + … = 0.71" 같은 사유서 문장이 성립한다.',
+        panel: 'shapley',
+        actor: '🎲 base 0.22 에서 피처를 하나씩 팀에 투입',
+        alert: { tone: 'info', text: '모든 피처의 SHAP값 합 = 최종 예측 − base value. 이 "가법성"이 지켜지기 때문에 예측 하나를 회계장부처럼 감사할 수 있다.' },
+        code: {
+          lang: 'python',
+          filename: 'shap_demo.py (v3 — TreeExplainer)',
+          lines: [
+            '"""',
+            '3단계: SHAP — Shapley value 를 예측에 적용',
+            '아이디어: 피처 = 팀원, 예측 = 팀 성과.',
+            '모든 참여 순서를 평균한 "공정한 기여 몫" 을 계산한다.',
+            '"""',
+            'import shap',
+            '',
+            '# TreeExplainer: 트리 모델 전용 — 정확한 SHAP 을',
+            '# 다항 시간에 계산 (모델 불문 KernelExplainer 는 느림)',
+            'explainer = shap.TreeExplainer(model)',
+            '',
+            '# 테스트셋 전체의 SHAP (뒤의 beeswarm 에서 사용)',
+            'shap_values = explainer(X_test)',
+            '',
+            '# ── 고객 #7 한 명의 예측 분해 ──────────────',
+            'customer = X_test.iloc[[7]]',
+            'sv = explainer(customer)',
+            '',
+            'print("base value :", sv.base_values[0])   # 0.22',
+            'print("prediction :", model.predict_proba(',
+            '    customer)[0, 1])                       # 0.71',
+            '',
+            'for name, val in zip(FEATURES, sv.values[0]):',
+            '    sign = "+" if val >= 0 else ""',
+            '    print(f"  {name:18s} {sign}{val:.2f}")',
+            '# delinq_count       +0.31  ← 부도 확률을 밀어 올림',
+            '# debt_ratio         +0.18',
+            '# recent_inquiries   +0.09',
+            '# annual_income      -0.07  ← 끌어 내림 (승인 방향)',
+            '# years_employed     -0.02',
+            '',
+            '# 가법성 검증: base + 기여 합 = 최종 예측',
+            'assert abs(sv.base_values[0] + sv.values[0].sum()',
+            '           - 0.71) < 1e-6',
+            '# 0.22 + (0.31+0.18+0.09-0.07-0.02) = 0.71  ✓',
+          ],
+          highlight: [6, 10, 13, 16, 17, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 32, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 4. SHAP 플롯 읽는 법 — waterfall(한 명)과 beeswarm(전체)',
+        desc: '실무에서 쓰는 플롯은 사실상 두 개다. waterfall은 "한 명"의 예측 분해 — base value에서 출발해 피처별 화살표가 예측을 밀고(빨강, +) 당기며(파랑, −) 최종 확률에 도달하는 그림이다. 왼쪽 패널이 정확히 그 그림이고, 고객 #7의 사유서가 그대로 읽힌다: 연체 이력이 +0.31로 압도적 1요인이다. beeswarm은 "전체"의 요약 — 피처마다 모든 고객의 SHAP값을 점으로 뿌리고 점 색으로 피처값의 높낮이(빨강=높음, 파랑=낮음)를 표시한다. 읽는 법: 점이 좌우로 넓게 퍼진 피처일수록 영향력이 크고, "빨간 점이 오른쪽"이면 그 피처값이 높을수록 부도 확률을 올린다는 뜻이다. 연봉 행은 반대로 빨간 점(고연봉)이 왼쪽 — 연봉이 높을수록 확률을 내린다. 방향까지 읽히는 것, 이것이 내장 중요도와의 결정적 차이다.',
+        panel: 'waterfall',
+        actor: '📈 waterfall(개별) → beeswarm(전역) 순서로 읽기',
+        alert: { tone: 'good', text: 'waterfall = 개별 예측의 회계장부, beeswarm = 전역 경향 + 방향. "빨간 점이 어느 쪽에 몰리는가"로 피처값과 예측의 관계를 읽는다.' },
+        code: {
+          lang: 'python',
+          filename: 'shap_demo.py (v4 — 플롯 2종)',
+          lines: [
+            '"""',
+            '4단계: 실무 플롯 2종 — waterfall / beeswarm',
+            '"""',
+            'import matplotlib.pyplot as plt',
+            '',
+            '# ── (a) waterfall: 고객 한 명의 예측 분해 ──',
+            '# base value 에서 출발해 피처가 예측을 밀고 당겨',
+            '# 최종 확률에 도달하는 과정을 그대로 그린다',
+            'shap.plots.waterfall(sv[0], max_display=8)',
+            'plt.savefig("waterfall_customer7.png",',
+            '            bbox_inches="tight")',
+            '',
+            '# 읽는 법:',
+            '#  E[f(X)] = 0.22        ← base: 평균 고객의 부도 확률',
+            '#  delinq_count = 2      +0.31  ← 최대 거절 요인',
+            '#  debt_ratio = 0.62     +0.18',
+            '#  recent_inquiries = 5  +0.09',
+            '#  annual_income = 5200  -0.07  ← 승인 방향으로 저항',
+            '#  years_employed = 6    -0.02',
+            '#  f(x) = 0.71           ← 임계값 0.5 초과 → 거절',
+            '',
+            '# ── (b) beeswarm: 테스트셋 전체 요약 ──────',
+            'shap.plots.beeswarm(shap_values, max_display=8)',
+            '',
+            '# 읽는 법 3가지:',
+            '#  1) 세로 순서 = 평균 |SHAP| 순 → 전역 중요도',
+            '#  2) 가로 퍼짐 = 영향력의 크기 분포',
+            '#  3) 점 색 = 피처값 (빨강=높음, 파랑=낮음)',
+            '#     빨간 점이 오른쪽 → 값이 클수록 부도 확률 ↑',
+            '#     연봉은 빨간 점이 왼쪽 → 클수록 확률 ↓ (상식과 일치)',
+            '',
+            '# 상식과 어긋나는 방향이 보이면?',
+            '#  → 데이터 누수 or 잘못된 피처를 의심 (Step 5)',
+          ],
+          highlight: [9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 23, 25, 26, 27, 28, 29, 30, 32, 33],
+        },
+      },
+      {
+        title: 'Step 5. 실무 운용 — 사유 자동화, 누수 탐지, 그리고 한계',
+        desc: '해석은 플롯 감상이 아니라 파이프라인이 되어야 한다. 첫째, 거절 사유 자동 생성 — SHAP 상위 양(+)의 기여 top-3를 템플릿 문장으로 변환해 심사 결과에 첨부한다. 둘째, 모델 디버깅 — 배포 전 beeswarm에서 "말이 안 되게" 압도적인 피처는 누수 신호다(V-1-1의 누수 피처는 SHAP 1위로 튀어나와서 잡혔다: 심사 결과 이후에나 알 수 있는 값이 최상단에 있으면 백발백중이다). 셋째, 한계를 알고 쓰기 — 상관 높은 피처들 사이에서는 기여가 나뉘어 개별 값이 흔들리고, TreeExplainer는 빠르지만 모델 불문 KernelExplainer는 표본을 줄여야 할 만큼 느리며, SHAP은 어디까지나 "모델이 그렇게 판단했다"는 설명이지 인과가 아니다. 그리고 원칙 하나 — 이해관계가 큰 문제라면 블랙박스+SHAP보다 처음부터 해석 가능한 모델(로지스틱 회귀·소형 트리)로 충분한지 먼저 검토하라.',
+        panel: 'ops',
+        actor: '🏭 사유서 자동화 + 누수 게이트 + 한계 숙지',
+        reasons: [
+          { rank: 1, label: '연체 이력 2회', shap: '+0.31', text: '최근 연체 이력이 심사 기준을 초과했습니다' },
+          { rank: 2, label: '부채비율 62%', shap: '+0.18', text: '소득 대비 부채 비율이 높습니다' },
+          { rank: 3, label: '신용조회 5회', shap: '+0.09', text: '최근 3개월 신용조회가 잦습니다' },
+        ],
+        limits: [
+          { name: '상관 피처', desc: '상관 높은 피처끼리 기여가 분산 — 개별 값이 흔들림', level: '주의' },
+          { name: '계산 비용', desc: 'TreeExplainer 빠름 / KernelExplainer 는 표본 축소 필요', level: '주의' },
+          { name: '인과 아님', desc: '"모델의 판단 근거" 설명이지 현실의 인과가 아님', level: '중요' },
+          { name: '우선 원칙', desc: '고위험 문제는 해석 가능 모델(선형·소형 트리) 먼저 검토', level: '원칙' },
+        ],
+        alert: { tone: 'good', text: '베이스라인 게이트: 배포 전 beeswarm 1위 피처가 "심사 시점에 알 수 없는 값"이면 누수다 — V-1-1에서 배운 누수가 여기서 눈에 보이는 형태로 잡힌다.' },
+        code: {
+          lang: 'python',
+          filename: 'shap_demo.py (v5 — 사유 자동 생성)',
+          lines: [
+            '"""',
+            '5단계: 거절 사유 top-3 자동 생성 + 누수 게이트',
+            '"""',
+            'REASON_TEMPLATES = {',
+            '    "delinq_count":     "최근 연체 이력이 기준을 초과했습니다",',
+            '    "debt_ratio":       "소득 대비 부채 비율이 높습니다",',
+            '    "recent_inquiries": "최근 신용조회가 잦습니다",',
+            '    "annual_income":    "소득 수준이 기준에 미달합니다",',
+            '    "years_employed":   "근속 기간이 짧습니다",',
+            '}',
+            '',
+            '',
+            'def top_rejection_reasons(explainer, customer,',
+            '                          k: int = 3) -> list[dict]:',
+            '    """거절 고객의 SHAP 상위 양(+) 기여 k개 → 사유 문장.',
+            '',
+            '    Args:',
+            '        explainer: shap.TreeExplainer',
+            '        customer: 피처 1행 DataFrame',
+            '        k: 사유 개수 (규제 서식은 보통 3개)',
+            '    Returns:',
+            '        [{"feature", "shap", "reason"}] — 기여 내림차순',
+            '    """',
+            '    sv = explainer(customer)',
+            '    contrib = pd.Series(sv.values[0],',
+            '                        index=customer.columns)',
+            '    pushed_up = contrib[contrib > 0]  # 거절 방향만',
+            '    top = pushed_up.sort_values(ascending=False).head(k)',
+            '    return [',
+            '        {"feature": f, "shap": round(float(s), 2),',
+            '         "reason": REASON_TEMPLATES[f]}',
+            '        for f, s in top.items()',
+            '    ]',
+            '',
+            '',
+            'print(top_rejection_reasons(explainer, customer))',
+            '# [{"feature": "delinq_count", "shap": 0.31, ...},',
+            '#  {"feature": "debt_ratio",   "shap": 0.18, ...},',
+            '#  {"feature": "recent_inquiries", "shap": 0.09, ...}]',
+            '',
+            '# ── 배포 전 누수 게이트 (V-1-1 연결) ──────',
+            'top1 = shap_values.abs.mean(0).values.argmax()',
+            'assert FEATURES[top1] not in FUTURE_ONLY_FIELDS, (',
+            '    "심사 시점에 알 수 없는 피처가 SHAP 1위 = 누수!")',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 13, 14, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 36, 41, 42, 43],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-violet-50',  border: 'border-violet-300',  text: 'text-violet-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 설명이 필요한 세 방향 카드
+    // ─────────────────────────────────────────────────────
+    function WhyPanel() {
+      const cards = [
+        { icon: '⚖️', title: '규제 — 설명 의무', body: '금융(대출 거절 사유서)·의료(진단 근거)는 법이 설명을 요구한다. "모델이 그렇게 판단했습니다"는 답변이 아니다.', tone: 'border-red-300 bg-red-50 text-red-900' },
+        { icon: '🐺', title: '디버깅 — 늑대 vs 허스키', body: '분류기가 동물이 아니라 배경의 눈(snow)을 보고 늑대를 맞히고 있었다. 정확도 지표로는 절대 발견 못하는 종류의 버그.', tone: 'border-amber-300 bg-amber-50 text-amber-900' },
+        { icon: '🤝', title: '신뢰 — 심사역의 채택', body: '근거를 못 보여주는 모델은 현업이 쓰지 않는다. "왜"에 답해야 사람이 결과를 믿고 업무에 태운다.', tone: 'border-sky-300 bg-sky-50 text-sky-900' },
+      ];
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-violet-300 bg-white p-2.5 flex items-center justify-between">
+            <div className="text-xs font-bold text-violet-900">🤖 loan_model v1 (XGBoost, 트리 300개)</div>
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300">accuracy 0.91</span>
+          </div>
+          <div className="text-center text-violet-400 text-xs my-1.5">▼ 그런데…</div>
+          <div className="space-y-2">
+            {cards.map((c) => (
+              <div key={c.title} className={`rounded-lg border-2 p-2.5 ${c.tone}`}>
+                <div className="text-[11px] font-bold mb-0.5">{c.icon} {c.title}</div>
+                <div className="text-[10px] leading-relaxed">{c.body}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-dashed border-violet-400 bg-violet-50 p-2 text-[11px] text-violet-900 text-center font-bold">
+            "{CUSTOMER.id}, 부도 확률 0.71 → 거절" … 근데 왜? 🤷
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 내장 vs 순열 중요도 비교 (방향 없음 강조)
+    // ─────────────────────────────────────────────────────
+    function ImportancePanel({ data }) {
+      const Chart = ({ title, rows, unit, tone }) => {
+        const max = Math.max(...rows.map((r) => r.v));
+        return (
+          <div className={`flex-1 rounded-lg border-2 p-2 ${tone}`}>
+            <div className="text-[10px] font-bold mb-1.5">{title}</div>
+            {rows.map((r) => (
+              <div key={r.label} className="flex items-center gap-1 mb-1">
+                <span className="text-[9px] w-16 text-right text-slate-700 shrink-0">{r.label}</span>
+                <div className="flex-1 h-2.5 rounded bg-white border border-slate-200 overflow-hidden">
+                  <div className="h-full bg-slate-500 transition-all duration-700" style={{ width: `${(r.v / max) * 100}%` }} />
+                </div>
+                <span className="text-[9px] font-mono w-8 text-slate-600">{r.v.toFixed(2)}</span>
+              </div>
+            ))}
+            <div className="text-[9px] text-slate-500 mt-1">{unit}</div>
+          </div>
+        );
+      };
+      return (
+        <div>
+          <div className="flex gap-2">
+            <Chart title="(a) feature_importances_ — gain" rows={data.builtin} unit="학습 중 분기 기여 (관점: 학습)" tone="border-slate-300 bg-slate-50" />
+            <Chart title="(b) permutation — 성능 하락" rows={data.permutation} unit="섞었을 때 AUC 하락 (관점: 예측 성능)" tone="border-sky-300 bg-sky-50" />
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-amber-400 bg-amber-50 p-2.5">
+            <div className="text-[11px] font-bold text-amber-900 mb-1">🧭 회색 막대의 공통 결함 — 방향이 없다</div>
+            <div className="text-[10px] text-amber-900 leading-relaxed">
+              "연봉이 중요함(0.19)"까지만 말한다. 연봉이 확률을 <b>올렸는지 내렸는지</b> 없으므로
+              거절 사유서에 쓸 수 없다. 게다가 1위조차 서로 다르다(부채비율 vs 연체 이력).
+              필요한 것: <b>고객 한 명</b> 단위 + <b>부호 있는</b> 기여도.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Shapley 직관 — 피처를 하나씩 팀에 투입 (Step 3)
+    //   revealCount 로 순차 공개 (넣고-빼기 애니메이션)
+    // ─────────────────────────────────────────────────────
+    function ShapleyPanel({ reveal }) {
+      let running = CUSTOMER.baseValue;
+      const rows = CUSTOMER.features.map((f, i) => {
+        const from = running;
+        running = +(running + f.shap).toFixed(2);
+        return { ...f, from, to: running, shown: i < reveal };
+      });
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-violet-300 bg-white p-2.5 mb-2">
+            <div className="text-[11px] font-bold text-violet-900 mb-0.5">🎲 게임의 규칙 — Shapley value</div>
+            <div className="text-[10px] text-slate-700 leading-relaxed">
+              팀 성과 = 최종 예측 − base value. 피처(팀원)를 <b>모든 순서</b>로 넣고 빼며
+              "그 피처가 합류할 때 예측이 얼마나 움직였나"를 평균 → <b>공정한 기여 몫</b>.
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-violet-400 bg-violet-50 p-2.5">
+            <div className="flex items-center justify-between text-[10px] font-bold text-violet-900 mb-1.5">
+              <span>아무 정보 없음 (base)</span>
+              <span className="font-mono px-1.5 rounded bg-white border border-violet-300">P(부도) = {CUSTOMER.baseValue.toFixed(2)}</span>
+            </div>
+            {rows.map((r) => (
+              <div key={r.name} className={`transition-all duration-500 ${r.shown ? 'opacity-100' : 'opacity-25'}`}>
+                <div className="text-center text-[9px] text-violet-400 leading-3">▼ 팀에 투입</div>
+                <div className={`rounded border-2 px-2 py-1 mb-0.5 flex items-center justify-between ${r.shap >= 0 ? 'border-red-300 bg-red-50' : 'border-sky-300 bg-sky-50'}`}>
+                  <span className="text-[10px] font-bold text-slate-800">{r.label} = {r.value}</span>
+                  <span className={`text-[10px] font-mono font-bold ${r.shap >= 0 ? 'text-red-700' : 'text-sky-700'}`}>
+                    {r.shap >= 0 ? '+' : ''}{r.shap.toFixed(2)} → {r.shown ? r.to.toFixed(2) : '?'}
+                  </span>
+                </div>
+              </div>
+            ))}
+            <div className={`mt-1.5 rounded border-2 border-violet-600 bg-white px-2 py-1.5 flex items-center justify-between transition-opacity duration-500 ${reveal >= rows.length ? 'opacity-100' : 'opacity-30'}`}>
+              <span className="text-[11px] font-bold text-violet-900">최종 예측 (합계 보장 — 가법성)</span>
+              <span className="text-[11px] font-mono font-bold text-red-700">P(부도) = {CUSTOMER.finalProb.toFixed(2)} → 거절</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // waterfall 애니메이션 + beeswarm 요약 (Step 4)
+    //   phase: reveal 인덱스가 features 를 넘으면 beeswarm 표시
+    // ─────────────────────────────────────────────────────
+    function WaterfallPanel({ reveal }) {
+      const scale = (p) => `${p * 100}%`;
+      let cum = CUSTOMER.baseValue;
+      const rows = CUSTOMER.features.map((f, i) => {
+        const from = cum;
+        cum = +(cum + f.shap).toFixed(2);
+        const left = Math.min(from, cum);
+        return { ...f, from, to: cum, left, width: Math.abs(f.shap), shown: i < reveal };
+      });
+      const showBees = reveal > CUSTOMER.features.length;
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-violet-400 bg-white p-2.5 mb-2">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-bold text-violet-900">📈 waterfall — {CUSTOMER.id} 예측 분해</span>
+              <span className="text-[9px] text-slate-500">x축: P(부도) 0 → 1</span>
+            </div>
+            {/* 축 + 기준선 */}
+            <div className="relative h-4 mb-1">
+              <div className="absolute inset-x-0 bottom-0 h-px bg-slate-300" />
+              <div className="absolute bottom-0 h-4 border-l border-dashed border-slate-400" style={{ left: scale(CUSTOMER.baseValue) }}>
+                <span className="absolute -top-0.5 left-0.5 text-[8px] text-slate-500 whitespace-nowrap">base 0.22</span>
+              </div>
+              <div className="absolute bottom-0 h-4 border-l border-dashed border-red-400" style={{ left: scale(CUSTOMER.threshold) }}>
+                <span className="absolute -top-0.5 left-0.5 text-[8px] text-red-500 whitespace-nowrap">거절선 0.5</span>
+              </div>
+            </div>
+            {rows.map((r) => (
+              <div key={r.name} className={`flex items-center gap-1 mb-1 transition-opacity duration-500 ${r.shown ? 'opacity-100' : 'opacity-20'}`}>
+                <span className="text-[9px] w-24 text-right shrink-0 text-slate-700">{r.label} = {r.value}</span>
+                <div className="relative flex-1 h-3.5 rounded bg-slate-50 border border-slate-200 overflow-hidden">
+                  <div
+                    className={`absolute top-0 h-full transition-all duration-700 flex items-center ${r.shap >= 0 ? 'bg-red-400 justify-end pr-0.5' : 'bg-sky-400 justify-start pl-0.5'}`}
+                    style={{ left: scale(r.left), width: r.shown ? scale(r.width) : '0%' }}
+                  >
+                    <span className="text-[8px] text-white font-bold">{r.shap >= 0 ? '→' : '←'}</span>
+                  </div>
+                </div>
+                <span className={`text-[9px] font-mono w-10 shrink-0 font-bold ${r.shap >= 0 ? 'text-red-600' : 'text-sky-600'}`}>{r.shap >= 0 ? '+' : ''}{r.shap.toFixed(2)}</span>
+              </div>
+            ))}
+            <div className={`mt-1 flex items-center gap-1 transition-opacity duration-500 ${reveal >= rows.length ? 'opacity-100' : 'opacity-20'}`}>
+              <span className="text-[9px] w-24 text-right shrink-0 font-bold text-violet-900">f(x) 최종</span>
+              <div className="relative flex-1 h-3.5">
+                <div className="absolute top-0 h-full border-l-2 border-violet-700" style={{ left: scale(CUSTOMER.finalProb) }}>
+                  <span className="absolute -top-0.5 left-1 text-[9px] font-mono font-bold text-violet-900 whitespace-nowrap">0.71 → ⛔ 거절</span>
+                </div>
+              </div>
+              <span className="w-10 shrink-0" />
+            </div>
+          </div>
+
+          {/* beeswarm 요약 뷰 */}
+          <div className={`rounded-lg border-2 border-violet-300 bg-white p-2.5 transition-opacity duration-700 ${showBees ? 'opacity-100' : 'opacity-25'}`}>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-bold text-violet-900">🐝 beeswarm — 테스트셋 전체 요약</span>
+              <span className="text-[9px]"><span className="text-sky-500">● 낮은 값</span> · <span className="text-red-500">● 높은 값</span></span>
+            </div>
+            {BEESWARM.map((f) => (
+              <div key={f.label} className="flex items-center gap-1 mb-1">
+                <span className="text-[9px] w-20 text-right shrink-0 text-slate-700">{f.label}</span>
+                <div className="relative flex-1 h-3.5 rounded bg-slate-50 border border-slate-200">
+                  <div className="absolute top-0 h-full border-l border-slate-300" style={{ left: '50%' }} />
+                  {f.dots.map((d, i) => (
+                    <span
+                      key={i}
+                      className="absolute w-1.5 h-1.5 rounded-full transition-all duration-700"
+                      style={{
+                        left: `calc(${50 + d.x * 120}% - 3px)`,
+                        top: `${3 + (i % 3) * 3}px`,
+                        backgroundColor: `rgb(${Math.round(56 + d.v * 183)}, ${Math.round(130 - d.v * 62)}, ${Math.round(246 - d.v * 178)})`,
+                        opacity: showBees ? 1 : 0,
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))}
+            <div className="flex items-center gap-1">
+              <span className="w-20 shrink-0" />
+              <div className="flex-1 flex justify-between text-[8px] text-slate-500"><span>← 확률 내림 (승인)</span><span>SHAP 0</span><span>확률 올림 (거절) →</span></div>
+            </div>
+            <div className="mt-1 text-[9px] text-violet-800">연체·부채·조회: 빨간 점이 오른쪽 = 값↑ → 부도↑ / 연봉·근속: 빨간 점이 왼쪽 = 값↑ → 부도↓</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 사유 자동화 + 누수 게이트 + 한계표
+    // ─────────────────────────────────────────────────────
+    function OpsPanel({ step }) {
+      const LEVEL_TONE = { '주의': 'bg-amber-100 text-amber-800', '중요': 'bg-red-100 text-red-800', '원칙': 'bg-violet-100 text-violet-800' };
+      return (
+        <div>
+          <div className="rounded-lg border-2 border-emerald-400 bg-white p-2.5 mb-2">
+            <div className="text-[11px] font-bold text-emerald-900 mb-1.5">📄 자동 생성된 거절 사유서 — {CUSTOMER.id}</div>
+            {step.reasons.map((r) => (
+              <div key={r.rank} className="flex items-center gap-2 rounded border border-emerald-200 bg-emerald-50 px-2 py-1 mb-1">
+                <span className="w-4 h-4 rounded-full bg-emerald-600 text-white text-[9px] font-bold flex items-center justify-center shrink-0">{r.rank}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[10px] font-bold text-slate-800">{r.text}</div>
+                  <div className="text-[9px] text-slate-500">{r.label}</div>
+                </div>
+                <span className="text-[9px] font-mono font-bold text-red-600">{r.shap}</span>
+              </div>
+            ))}
+            <div className="text-[9px] text-emerald-800">top_rejection_reasons() 출력 그대로 — 규제 서식 3개 항목 충족</div>
+          </div>
+
+          <div className="rounded-lg border-2 border-red-400 bg-red-50 p-2.5 mb-2">
+            <div className="text-[11px] font-bold text-red-900 mb-1">🕵️ 누수 게이트 — beeswarm이 잡아낸 사고 (V-1-1 연결)</div>
+            <div className="flex items-center gap-1 mb-1">
+              <span className="text-[9px] w-24 text-right shrink-0 font-bold text-red-800">approval_flag</span>
+              <div className="flex-1 h-2.5 rounded bg-white border border-red-200 overflow-hidden">
+                <div className="h-full bg-red-500" style={{ width: '96%' }} />
+              </div>
+              <span className="text-[9px] text-red-700 font-bold shrink-0">SHAP 1위 🚨</span>
+            </div>
+            <div className="text-[10px] text-red-900 leading-relaxed">
+              "심사 결과 이후에나 채워지는 컬럼"이 SHAP 압도적 1위 = 데이터 누수.
+              내장 중요도로는 흘려보냈던 것이, 방향·크기가 보이는 순간 바로 이상하게 읽힌다.
+            </div>
+          </div>
+
+          <div className="rounded-lg border-2 border-violet-300 bg-white p-2.5">
+            <div className="text-[11px] font-bold text-violet-900 mb-1.5">⚠️ 한계와 운용 원칙</div>
+            {step.limits.map((l) => (
+              <div key={l.name} className="flex items-start gap-2 mb-1">
+                <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold shrink-0 ${LEVEL_TONE[l.level]}`}>{l.level}</span>
+                <div className="text-[10px] text-slate-700"><b className="text-slate-800">{l.name}</b> — {l.desc}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 단계별 패널 라우팅 + reveal 애니메이션
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ step, stepIdx }) {
+      const [reveal, setReveal] = useState(0);
+      // 단계 진입 시 waterfall/shapley 피처를 500ms 간격으로 순차 공개
+      useEffect(() => {
+        setReveal(0);
+        if (step.panel !== 'shapley' && step.panel !== 'waterfall') return;
+        const maxReveal = CUSTOMER.features.length + 1; // +1 = beeswarm 페이즈
+        const timer = setInterval(() => {
+          setReveal((r) => {
+            if (r >= maxReveal) { clearInterval(timer); return r; }
+            return r + 1;
+          });
+        }, 500);
+        return () => clearInterval(timer);
+      }, [stepIdx, step.panel]);
+
+      return (
+        <div className="rounded-xl border border-violet-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-violet-900 flex items-center gap-1.5">
+              <span>🔍</span>
+              <span>대출 심사 모델 — 해석 보드</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{step.actor}</span>
+          </div>
+          {step.panel === 'why' && <WhyPanel />}
+          {step.panel === 'importance' && <ImportancePanel data={step.importance} />}
+          {step.panel === 'shapley' && <ShapleyPanel reveal={reveal} />}
+          {step.panel === 'waterfall' && <WaterfallPanel reveal={reveal} />}
+          {step.panel === 'ops' && <OpsPanel step={step} />}
+          <AlertBox alert={step.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-violet-400/15 border-l-2 border-violet-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-violet-50 to-fuchsia-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-violet-600 text-white font-bold">ML</span>
+              <div>
+                <h1 className="text-2xl font-bold text-violet-900">V-2-1. 모델 해석 — SHAP·피처 중요도</h1>
+                <p className="text-sm text-violet-800/80">"왜 이 고객의 대출을 거절했나요?" — 블랙박스에게 설명을 요구하는 법</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-violet-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-violet-500' : 'bg-violet-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-violet-800 text-violet-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-violet-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-violet-400 bg-white text-violet-800 hover:bg-violet-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-violet-400 bg-white text-violet-800 hover:bg-violet-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-violet-800 text-white' : 'bg-violet-600 text-white hover:bg-violet-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-violet-400 bg-white text-violet-800 hover:bg-violet-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-violet-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-violet-500 bg-white px-4 py-3 text-sm text-violet-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                내장 중요도(gain)는 학습 관점의 전역 순위일 뿐 방향이 없어 "왜"에 답하지 못한다.
+                SHAP은 Shapley value로 "이 피처가 이 예측에 기여한 공정한 몫"을 부호까지 계산하고,
+                가법성(base + 기여 합 = 최종 예측) 덕분에 예측 하나를 회계장부처럼 분해할 수 있다.
+                waterfall로 개별 사유를, beeswarm으로 전역 경향과 방향을 읽고,
+                거절 사유 자동 생성·누수 게이트로 파이프라인에 태운다.
+                단, 상관 피처·계산 비용·"인과 아님"의 한계를 알고 쓰되,
+                고위험 문제라면 해석 가능한 모델을 먼저 검토하는 것이 원칙이다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['SHAP', 'Shapley value', 'TreeExplainer', 'waterfall', 'beeswarm', 'feature_importances_', 'permutation importance', '가법성', '거절사유', '데이터누수'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-violet-100 text-violet-900 border border-violet-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-violet-800">
+              <a href="./V-1-2.html" className="underline hover:no-underline">← 이전: V-1-2</a>
+              <a href="../index.html" className="underline hover:no-underline">챕터 목록</a>
+              <a href="./V-2-2.html" className="underline hover:no-underline">다음: V-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

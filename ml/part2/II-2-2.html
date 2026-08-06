@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Machine Learning 학습 — II-2-2. 앙상블 — 배깅(RF) vs 부스팅(XGBoost)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧠</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    ML II-2-2 — 앙상블 — 배깅(RF) vs 부스팅(XGBoost)
+    학습 목표: 단일 트리의 고분산 문제 → 배깅(부트스트랩+투표=분산 축소) →
+              부스팅(잔차 순차 보정=편향 축소) → XGBoost가 승자가 된 공학적 이유 →
+              RF vs XGBoost 실무 선택 기준까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 병렬 숲 투표 vs 순차 잔차 게이지 시뮬레이션)
+          / 우(VSCode CodeViewer: ensemble_demo.py 진화)
+    색상: violet (ml 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 단일 트리 불안정 → 배깅/RF → 부스팅 → XGBoost → 선택 기준
+    //   도메인: 카드사 연체 예측 (테이블 데이터 — 앙상블의 주 전장)
+    //   각 step 의 좌측 패널 데이터:
+    //     treePair    : Step 1 — 데이터 5% 차이로 갈라지는 트리 두 그루
+    //     forest      : Step 2 — 병렬 트리들의 투표 + 분산 감소 게이지
+    //     boost       : Step 3 — 순차 트리 + 잔차 감소 게이지
+    //     xgbFeatures : Step 4 — XGBoost 공학 4종 + lr/n_estimators 트레이드오프
+    //     duel        : Step 5 — 배깅 vs 부스팅 나란히 비교 + 선택표
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 단일 트리의 문제 — 데이터 몇 줄에 통째로 흔들린다',
+        desc: '결정 트리는 해석이 쉽고 빠르지만 치명적 약점이 있다 — 학습 데이터가 조금만 바뀌어도 트리 구조가 통째로 바뀐다. 트리는 "가장 잘 나누는 분기"를 위에서부터 탐욕적으로 고르는데, 최상단 분기가 근소한 차이로 갈리면 그 아래 전체가 연쇄적으로 달라지기 때문이다. 아래 시뮬레이션에서 전체 10,000건 중 겨우 5%를 바꿔 다시 학습했더니, 루트 분기가 "이용액"에서 "연체이력"으로 바뀌고 같은 고객 8명 중 3명의 예측이 뒤집혔다. 이것이 통계 용어로 고분산(high variance) — 모델이 데이터의 우연한 요동까지 외워버리는 상태다. 여기서 집단지성 아이디어가 나온다: 불안정한 모델 하나를 믿지 말고, 여러 개를 만들어 평균을 내면 요동이 상쇄되지 않을까?',
+        actor: '🌳 같은 문제, 데이터 5%만 교체 → 트리가 딴판',
+        mode: 'single',
+        treePair: {
+          treeA: { name: '트리 A (원본 10,000건)', root: 'root: 이용액 > 320만?', depth: 9, leaves: 214 },
+          treeB: { name: '트리 B (5% 교체본)', root: 'root: 연체이력 ≥ 1회?', depth: 11, leaves: 251 },
+          customers: [
+            { id: 'c-01', name: '고객 #1024 (이용액 350만·연체 0회)', a: '연체', b: '정상', flip: true },
+            { id: 'c-02', name: '고객 #2211 (이용액 80만·연체 2회)', a: '연체', b: '연체', flip: false },
+            { id: 'c-03', name: '고객 #3307 (이용액 290만·연체 1회)', a: '정상', b: '연체', flip: true },
+            { id: 'c-04', name: '고객 #4090 (이용액 40만·연체 0회)', a: '정상', b: '정상', flip: false },
+            { id: 'c-05', name: '고객 #5152 (이용액 500만·연체 0회)', a: '연체', b: '정상', flip: true },
+            { id: 'c-06', name: '고객 #6688 (이용액 120만·연체 3회)', a: '연체', b: '연체', flip: false },
+          ],
+        },
+        alert: { tone: 'danger', text: '데이터 5% 교체로 예측 6건 중 3건이 뒤집혔다. 이 트리 하나를 프로덕션에 올리면, 다음 달 재학습 때마다 심사 결과가 널뛴다.' },
+        code: {
+          lang: 'python',
+          filename: 'ensemble_demo.py (v1 — 단일 트리)',
+          lines: [
+            '"""',
+            'ensemble_demo.py — v1: 단일 결정 트리의 분산 문제 관찰',
+            '데이터를 살짝 바꿔 재학습하면 예측이 얼마나 흔들리는가?',
+            '"""',
+            'import numpy as np',
+            'from sklearn.tree import DecisionTreeClassifier',
+            'from sklearn.model_selection import train_test_split',
+            '',
+            'from dataset import load_card_default  # (X: 고객 특성, y: 연체 여부)',
+            '',
+            'X, y = load_card_default()          # 10,000건',
+            'X_tr, X_te, y_tr, y_te = train_test_split(',
+            '    X, y, test_size=0.2, random_state=42, stratify=y)',
+            '',
+            '# 같은 문제를 "데이터 5%만 다르게 뽑아" 두 번 학습한다',
+            'preds = []',
+            'for seed in (0, 1):',
+            '    idx = np.random.RandomState(seed).choice(',
+            '        len(X_tr), size=int(len(X_tr) * 0.95), replace=False)',
+            '    tree = DecisionTreeClassifier(random_state=0)',
+            '    tree.fit(X_tr.iloc[idx], y_tr.iloc[idx])',
+            '    preds.append(tree.predict(X_te))',
+            '    print(f"seed={seed} root:",',
+            '          X.columns[tree.tree_.feature[0]])',
+            '',
+            '# seed=0 root: monthly_usage   ← 루트 분기부터 다르다',
+            '# seed=1 root: overdue_count',
+            '',
+            'flip_rate = (preds[0] != preds[1]).mean()',
+            'print(f"예측 뒤집힘 비율: {flip_rate:.1%}")   # 약 12%',
+            '',
+            '# 진단: 고분산(high variance)',
+            '#  - 트리는 탐욕적 분기 선택 → 최상단이 근소한 차이로 갈리면',
+            '#    아래 전체가 연쇄적으로 달라진다',
+            '#  - 깊은 트리일수록 데이터의 "우연" 까지 외운다 (과적합)',
+            '# 아이디어: 흔들리는 모델 여러 개의 "평균" 은 덜 흔들리지 않을까?',
+          ],
+          highlight: [6, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 29, 30, 32, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 2. 배깅과 랜덤 포레스트 — 서로 다른 트리 100그루의 투표 = 분산 축소',
+        desc: '배깅(Bagging = Bootstrap Aggregating)의 통계적 본질은 한 문장이다 — 독립인 추정치 n개를 평균 내면 분산이 σ²/n으로 줄어든다. 문제는 같은 데이터로 키운 트리들은 서로 닮아서(상관되어) 평균의 효과가 죽는다는 것. 그래서 두 겹의 무작위성을 넣는다: ① 부트스트랩 — 각 트리에게 원본에서 복원추출한 "조금씩 다른" 데이터를 주고, ② 피처 무작위 선택 — 각 분기에서 특성 일부(보통 √p개)만 후보로 준다. 이 둘을 합친 것이 랜덤 포레스트다. 아래 게이지를 보라 — 트리 1그루의 예측 요동(±0.19)이 100그루 투표에서는 ±0.03으로 준다. 각 트리는 여전히 과적합된 채로 두는 게 포인트다: 개별 편향은 낮게 유지하고, 앙상블이 분산만 걷어낸다.',
+        actor: '🌲×100 병렬 학습 → 다수결 투표 (고객 #1024)',
+        mode: 'bagging',
+        forest: {
+          target: '고객 #1024 — 연체할까?',
+          trees: [
+            { id: 't1', boot: 'B₁ (63% 중복표본)', feat: '이용액·연령', vote: '연체' },
+            { id: 't2', boot: 'B₂', feat: '연체이력·소득', vote: '연체' },
+            { id: 't3', boot: 'B₃', feat: '소득·카드수', vote: '정상' },
+            { id: 't4', boot: 'B₄', feat: '이용액·연체이력', vote: '연체' },
+            { id: 't5', boot: 'B₅', feat: '연령·거주기간', vote: '정상' },
+            { id: 't6', boot: 'B₆', feat: '카드수·이용액', vote: '연체' },
+            { id: 't7', boot: '… B₁₀₀', feat: '(트리마다 다름)', vote: '연체' },
+          ],
+          tally: { spam: 71, ham: 29, spamLabel: '연체 71표', hamLabel: '정상 29표', verdict: '최종: 연체 (p=0.71)' },
+          variance: {
+            title: '분산 축소 게이지 — 같은 고객, 재학습 100번의 예측 요동',
+            rows: [
+              { name: '트리 1그루', spread: 100, sd: '±0.19', tone: 'bad' },
+              { name: '트리 10그루 평균', spread: 42, sd: '±0.08', tone: 'mid' },
+              { name: '트리 100그루 평균 (RF)', spread: 16, sd: '±0.03', tone: 'good' },
+            ],
+            note: '독립 추정치 평균의 분산 = σ²/n. 트리끼리 덜 닮을수록(무작위성↑) n의 효과가 산다.',
+          },
+        },
+        alert: { tone: 'good', text: '개별 트리는 여전히 틀리고 흔들린다(3·5번은 소수의견). 하지만 "서로 다르게" 틀리기 때문에 투표에서 요동이 상쇄된다 — 이것이 분산 축소의 실체다.' },
+        code: {
+          lang: 'python',
+          filename: 'ensemble_demo.py (v2 — RandomForest)',
+          lines: [
+            '"""',
+            'ensemble_demo.py — v2: 배깅 + 피처 무작위 = 랜덤 포레스트',
+            '통계적 본질: 독립 추정치 n개 평균의 분산은 sigma^2 / n',
+            '"""',
+            'from sklearn.ensemble import RandomForestClassifier',
+            'from sklearn.metrics import roc_auc_score',
+            '',
+            'rf = RandomForestClassifier(',
+            '    n_estimators=100,        # 트리 100그루 — 늘려도 과적합 안 함',
+            '    max_features="sqrt",     # 분기마다 특성 sqrt(p)개만 후보로',
+            '                             #  → 트리끼리 "덜 닮게" 만드는 장치',
+            '    bootstrap=True,          # 복원추출 표본 (각 트리 데이터가 다름)',
+            '    oob_score=True,          # 부트스트랩에 안 뽑힌 ~37% 로 공짜 검증',
+            '    n_jobs=-1,               # 트리는 서로 독립 → 전 코어 병렬 학습',
+            '    random_state=42,',
+            ')',
+            'rf.fit(X_tr, y_tr)',
+            '',
+            'print("OOB accuracy:", rf.oob_score_)              # 0.87',
+            'print("test AUC:", roc_auc_score(',
+            '    y_te, rf.predict_proba(X_te)[:, 1]))           # 0.91',
+            '',
+            '# 어떤 특성이 분기에 많이 기여했나 — 심사팀 설명용',
+            'for name, imp in sorted(zip(X.columns, rf.feature_importances_),',
+            '                        key=lambda t: -t[1])[:3]:',
+            '    print(f"{name:15s} {imp:.3f}")',
+            '# overdue_count   0.31',
+            '# monthly_usage   0.24',
+            '# income          0.17',
+            '',
+            '# 핵심 정리:',
+            '#  - 각 트리는 "깊게, 과적합된 채로" 둔다 → 개별 편향은 낮게',
+            '#  - 부트스트랩 + max_features 로 트리 간 상관을 깨고',
+            '#    투표(평균)가 분산만 걷어낸다',
+            '#  - n_estimators 는 크게 잡아도 손해가 없다 (수렴할 뿐)',
+            '#  - 약점: 편향은 그대로 → "평균 낸 트리들이 다 같이 틀리는"',
+            '#    미세한 패턴은 끝까지 못 잡는다 → Step 3 부스팅의 출발점',
+          ],
+          highlight: [5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 23, 24, 25, 30, 31, 32, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 3. 부스팅 — 틀린 것(잔차)만 순차 보정 = 편향 축소',
+        desc: '부스팅은 배깅과 발상이 정반대다. 배깅이 "강한 트리 100그루를 병렬로 키워 평균"이라면, 부스팅은 "약한 트리(깊이 3~6)를 순차로 쌓되, 다음 트리는 이전까지의 오차(잔차)만 배운다". 라운드 1의 얕은 트리는 대충 맞힌다 — 남은 오차를 라운드 2 트리가 배우고, 또 남은 오차를 라운드 3이 배우고… 예측은 f(x) = f₁(x) + η·f₂(x) + η·f₃(x) + … 로 정답에 계단식으로 다가간다. 아래 게이지에서 잔차가 라운드마다 줄어드는 것이 보인다. 통계적 본질은 편향 축소 — 약한 학습기 하나로는 표현 못 하는 복잡한 패턴을, 오차 방향으로 겹겹이 쌓아 근사하는 것이다. 대가도 정반대: 잔차를 계속 쫓으므로 노이즈까지 쫓아가면 과적합 — 그래서 배깅과 달리 트리 수를 무한정 늘리면 안 된다.',
+        actor: '🎯 라운드마다 잔차(남은 오차)가 줄어든다',
+        mode: 'boosting',
+        boost: {
+          target: '고객 #1024 실제 연체 확률(정답) = 0.80',
+          rounds: [
+            { r: 1, tree: 'f₁ 깊이3 트리', learns: '전체 평균부터', pred: 0.35, residual: 100 },
+            { r: 2, tree: 'f₂', learns: 'f₁의 잔차', pred: 0.52, residual: 62 },
+            { r: 3, tree: 'f₃', learns: 'f₁+f₂의 잔차', pred: 0.64, residual: 36 },
+            { r: 4, tree: 'f₄', learns: '누적 잔차', pred: 0.72, residual: 18 },
+            { r: 5, tree: 'f₅', learns: '누적 잔차', pred: 0.77, residual: 7 },
+          ],
+          formula: 'F(x) = f₁(x) + η·f₂(x) + η·f₃(x) + ⋯   (η = learning_rate)',
+          note: '각 트리는 "정답" 이 아니라 "지금까지 못 맞힌 만큼(잔차)" 을 배운다. 예측이 단계마다 정답 0.80에 다가간다.',
+        },
+        alert: { tone: 'warn', text: '배깅과 정반대의 약점: 잔차를 끝까지 쫓으면 노이즈(우연)까지 학습한다. 트리 수·학습률을 잘못 잡으면 과적합 — 그래서 부스팅은 "언제 멈출까"가 핵심 튜닝이다.' },
+        code: {
+          lang: 'python',
+          filename: 'ensemble_demo.py (v3 — 잔차 학습 원리)',
+          lines: [
+            '"""',
+            'ensemble_demo.py — v3: 부스팅의 원리를 손으로 구현',
+            '다음 트리는 "정답" 이 아니라 "이전까지의 잔차" 를 배운다',
+            '"""',
+            'import numpy as np',
+            'from sklearn.tree import DecisionTreeRegressor',
+            '',
+            'eta = 0.3                      # learning_rate: 한 걸음의 보폭',
+            'n_rounds = 5',
+            '',
+            '# 회귀로 원리 관찰 (분류도 로그오즈 공간에서 동일한 구조)',
+            'pred = np.full(len(y_tr), y_tr.mean())   # f1: 전체 평균에서 시작',
+            'trees = []',
+            '',
+            'for r in range(n_rounds):',
+            '    residual = y_tr - pred          # ① 지금까지 못 맞힌 만큼',
+            '    stump = DecisionTreeRegressor(max_depth=3)  # 약한 학습기',
+            '    stump.fit(X_tr, residual)       # ② 잔차를 "정답" 으로 학습',
+            '    pred += eta * stump.predict(X_tr)  # ③ 보폭만큼만 반영',
+            '    trees.append(stump)',
+            '    print(f"round {r+1}: 잔차 크기 {np.abs(residual).mean():.3f}")',
+            '',
+            '# round 1: 잔차 크기 0.412   ← 계단식으로 줄어든다',
+            '# round 2: 잔차 크기 0.255',
+            '# round 3: 잔차 크기 0.149',
+            '# round 4: 잔차 크기 0.074',
+            '# round 5: 잔차 크기 0.029',
+            '',
+            'def predict(X):',
+            '    """F(x) = f1 + eta*f2 + eta*f3 + ... — 트리들의 합"""',
+            '    out = np.full(len(X), y_tr.mean())',
+            '    for t in trees:',
+            '        out += eta * t.predict(X)',
+            '    return out',
+            '',
+            '# 배깅과의 결정적 차이:',
+            '#  - 배깅: 강한 트리를 "병렬" 로 → 평균 → 분산 축소',
+            '#  - 부스팅: 약한 트리를 "순차" 로 → 오차 방향으로 누적 → 편향 축소',
+            '#  - 순차 의존이라 트리 단위 병렬화 불가, 라운드 수는 과적합과 직결',
+          ],
+          highlight: [8, 12, 15, 16, 17, 18, 19, 23, 24, 25, 26, 27, 29, 30, 31, 32, 33, 36, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 4. XGBoost — 부스팅의 약점을 공학으로 틀어막은 승자',
+        desc: 'Step 3의 그래디언트 부스팅은 강력하지만 "과적합에 취약하고 느리다"는 약점이 있었다. XGBoost(2014)는 이걸 공학으로 하나씩 틀어막아 캐글 테이블 대회를 점령했다. ① 정규화 내장 — 목적 함수에 잎 개수(γ)와 잎 가중치(λ) 벌점을 넣어 트리가 스스로 자제하게 한다(잔차를 노이즈까지 쫓는 병의 치료제). ② 2차 근사 — 손실의 기울기뿐 아니라 곡률(2차 미분)까지 써서 한 라운드에 더 정확한 걸음을 딛는다. ③ 결측 자동 처리 — 결측값을 만나면 좌/우 어느 쪽으로 보낼지 학습으로 정한다(전처리 임퓨팅 없이 돌아간다). ④ 병렬화 — 트리 간은 순차여도 트리 안의 분기 후보 탐색은 병렬로. 핵심 튜닝은 learning_rate × n_estimators 트레이드오프다: 보폭을 줄이면 완만하고 안전하게 수렴하는 대신 트리가 많이 필요하다 — 그래서 "낮은 lr + early stopping으로 개수는 데이터가 정하게"가 실무 정석이다.',
+        actor: '🚀 GBM의 약점 4개 → 공학적 해결 4개',
+        mode: 'xgboost',
+        xgb: {
+          features: [
+            { icon: '🛡', name: '정규화 (γ·λ)', pain: '잔차를 노이즈까지 추적 → 과적합', fix: '잎 개수·잎 가중치에 벌점 → 트리가 스스로 가지치기' },
+            { icon: '📐', name: '2차 근사', pain: '기울기만으로는 보폭이 부정확', fix: '2차 미분(곡률)까지 사용 → 라운드당 더 정확한 스텝' },
+            { icon: '🕳', name: '결측 자동 처리', pain: '결측 임퓨팅 전처리 지옥', fix: '분기마다 결측의 default 방향을 학습 → 그냥 넣으면 됨' },
+            { icon: '⚡', name: '병렬·캐시 최적화', pain: '순차 학습이라 느림', fix: '트리 내부 분기 탐색 병렬화 + 히스토그램 근사' },
+          ],
+          tradeoff: {
+            title: 'learning_rate × n_estimators 트레이드오프',
+            rows: [
+              { lr: '0.3 (큰 보폭)', trees: '~100그루', speed: '빠름', risk: '최적점 지나침·과적합 위험 ↑', tone: 'bad' },
+              { lr: '0.1', trees: '~400그루', speed: '보통', risk: '균형점 — 흔한 기본값', tone: 'mid' },
+              { lr: '0.03 (작은 보폭)', trees: '~1500그루 + early stop', speed: '느림', risk: '완만·안전, 검증셋이 개수를 결정', tone: 'good' },
+            ],
+            note: '실무 정석: lr을 낮추고 n_estimators는 크게 잡되, early stopping으로 "데이터가 멈출 때"를 정하게 한다.',
+          },
+        },
+        alert: { tone: 'info', text: '이후 LightGBM(더 빠름)·CatBoost(범주형 강함)가 같은 계보를 이었지만, "정규화된 그래디언트 부스팅"이라는 설계는 XGBoost가 표준으로 만들었다.' },
+        code: {
+          lang: 'python',
+          filename: 'ensemble_demo.py (v4 — XGBoost)',
+          lines: [
+            '"""',
+            'ensemble_demo.py — v4: XGBoost — 낮은 lr + early stopping 정석',
+            'pip install xgboost',
+            '"""',
+            'from xgboost import XGBClassifier',
+            'from sklearn.metrics import roc_auc_score',
+            '',
+            'xgb = XGBClassifier(',
+            '    n_estimators=2000,        # 상한만 크게 — 실제 개수는 데이터가 정함',
+            '    learning_rate=0.03,       # 작은 보폭: 완만하고 안전한 수렴',
+            '    max_depth=5,              # 약한 학습기 유지 (RF처럼 깊게 X)',
+            '    subsample=0.8,            # 라운드마다 행 80% 샘플 — 과적합 억제',
+            '    colsample_bytree=0.8,     # 트리마다 열 80% — 배깅의 아이디어 차용',
+            '    reg_lambda=1.0,           # L2: 잎 가중치 벌점',
+            '    gamma=0.1,                # 잎 분기 최소 이득 — 스스로 가지치기',
+            '    eval_metric="auc",',
+            '    early_stopping_rounds=50, # 검증 AUC가 50라운드 정체 → 중단',
+            '    n_jobs=-1,',
+            '    random_state=42,',
+            ')',
+            '',
+            '# early stopping 용 검증셋 — 학습에 쓰면 안 되는 별도 데이터',
+            'xgb.fit(X_tr, y_tr,',
+            '        eval_set=[(X_val, y_val)],',
+            '        verbose=100)',
+            '',
+            'print("멈춘 지점:", xgb.best_iteration)             # 예: 812 그루',
+            'print("test AUC:", roc_auc_score(',
+            '    y_te, xgb.predict_proba(X_te)[:, 1]))          # 0.93 (RF 0.91)',
+            '',
+            '# 특성 중요도 — RF와 같은 인터페이스',
+            'for name, imp in sorted(zip(X.columns, xgb.feature_importances_),',
+            '                        key=lambda t: -t[1])[:3]:',
+            '    print(f"{name:15s} {imp:.3f}")',
+            '',
+            '# 결측 처리 코드가 한 줄도 없다 — XGBoost는 분기마다',
+            '# "결측이면 어느 쪽으로 보낼지" 를 학습해서 알아서 처리한다.',
+            '# 상한 2000그루를 걱정할 필요 없다 — 검증셋이 812에서 멈췄다.',
+          ],
+          highlight: [5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 22, 23, 24, 25, 27, 28, 29, 36, 37, 38],
+        },
+      },
+      {
+        title: 'Step 5. RF vs XGBoost — 분산 축소 vs 편향 축소, 실무 선택 기준',
+        desc: '두 앙상블의 차이는 결국 통계 한 줄로 정리된다 — RF는 강한 학습기들의 평균으로 분산을 줄이고, XGBoost는 약한 학습기들의 누적으로 편향을 줄인다. 그래서 실무 성격도 갈린다: RF는 기본값으로도 잘 돌고 튜닝 실수에 관대해서 "빠른 베이스라인·피처 중요도 확인·소규모 팀 운영"에 강하고, XGBoost는 튜닝에 시간을 쓰면 거의 항상 더 높은 점수를 주기에 "성능이 곧 돈인 문제(심사·부정탐지·수요예측·캐글)"에서 이긴다. 테이블(정형) 데이터에서 딥러닝이 아직도 부스팅을 못 이기는 이유도 여기 있다 — 표 데이터는 특성 간 불규칙한 상호작용과 이질적 스케일 투성이라, 매끄러운 함수를 가정하는 신경망보다 "축에 수직인 분기"를 쌓는 트리가 귀납 편향 면에서 유리하다. 캐글 정형 대회 우승 솔루션이 십 년째 부스팅(XGB/LGBM/CatBoost) 앙상블인 이유다. 시작은 RF로 베이스라인, 본선은 XGBoost — 이것이 기본 운영 공식이다.',
+        actor: '⚖️ 병렬 투표 vs 순차 보정 — 나란히 비교',
+        mode: 'duel',
+        duel: {
+          bagging: {
+            title: '🌲 배깅 (RF) — 병렬 + 투표',
+            votes: ['연체', '연체', '정상', '연체', '정상', '연체'],
+            tally: '연체 71 : 29 정상 → p=0.71',
+            essence: '분산 ↓ (요동 상쇄)',
+          },
+          boosting: {
+            title: '🚀 부스팅 (XGB) — 순차 + 잔차',
+            rounds: [100, 62, 36, 18, 7],
+            tally: '잔차 100 → 7, 예측 0.77 → 정답 0.80 근접',
+            essence: '편향 ↓ (오차 누적 보정)',
+          },
+        },
+        compareBox: {
+          title: 'RF vs XGBoost — 실무 선택표',
+          rows: [
+            { crit: '통계적 본질', rf: '분산 축소 (평균)', xgb: '편향 축소 (누적)' },
+            { crit: '학습 구조', rf: '병렬 (트리 독립)', xgb: '순차 (잔차 의존)' },
+            { crit: '기본값 강건성', rf: '◎ 거의 안 망함', xgb: '△ 튜닝 필요' },
+            { crit: '튜닝 시 최고 성능', rf: '△ 한계 있음', xgb: '◎ 정형 데이터 최강' },
+            { crit: '트리 수 늘리면', rf: '◎ 수렴 (안전)', xgb: '✗ 과적합 (early stop 필수)' },
+            { crit: '결측·전처리', rf: '△ 임퓨팅 필요', xgb: '◎ 결측 자동 처리' },
+            { crit: '어울리는 순간', rf: '베이스라인·중요도 탐색', xgb: '성능이 돈인 본선 모델' },
+          ],
+        },
+        alert: { tone: 'good', text: '운영 공식: ① RF로 30분 만에 베이스라인 + feature_importances_ 확인 → ② XGBoost를 낮은 lr + early stopping으로 튜닝 → ③ 점수 차가 미미하면 운영이 쉬운 RF를 남긴다.' },
+        code: {
+          lang: 'python',
+          filename: 'ensemble_demo.py (최종 — RF vs XGB 비교)',
+          lines: [
+            '"""',
+            'ensemble_demo.py — 최종: 같은 데이터, 두 앙상블 정면 비교',
+            'RF = 분산 축소(병렬 평균) / XGB = 편향 축소(순차 보정)',
+            '"""',
+            'from sklearn.ensemble import RandomForestClassifier',
+            'from xgboost import XGBClassifier',
+            'from sklearn.metrics import roc_auc_score',
+            'import time',
+            '',
+            'models = {',
+            '    "RF  (기본값 그대로)": RandomForestClassifier(',
+            '        n_estimators=300, n_jobs=-1, random_state=42),',
+            '    "XGB (튜닝: lr 0.03 + early stop)": XGBClassifier(',
+            '        n_estimators=2000, learning_rate=0.03, max_depth=5,',
+            '        subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,',
+            '        eval_metric="auc", early_stopping_rounds=50,',
+            '        n_jobs=-1, random_state=42),',
+            '}',
+            '',
+            'for name, m in models.items():',
+            '    t0 = time.time()',
+            '    if "XGB" in name:',
+            '        m.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)',
+            '    else:',
+            '        m.fit(X_tr, y_tr)',
+            '    auc = roc_auc_score(y_te, m.predict_proba(X_te)[:, 1])',
+            '    print(f"{name:32s} AUC {auc:.3f}  ({time.time()-t0:.1f}s)")',
+            '',
+            '# RF  (기본값 그대로)               AUC 0.912  (8.4s)',
+            '# XGB (튜닝: lr 0.03 + early stop)  AUC 0.934  (41.2s)',
+            '',
+            '# 선택 기준 요약:',
+            '#  - 오늘 안에 베이스라인 + 피처 중요도가 필요하다 → RF',
+            '#  - AUC 0.02가 연간 수억 원 차이인 문제다        → XGB 튜닝',
+            '#  - 재학습 파이프라인을 소규모 팀이 운영한다      → 강건한 RF',
+            '#  - 캐글/정형 데이터 리더보드                    → 부스팅 계열',
+            '#',
+            '# 테이블 데이터에서 부스팅이 딥러닝을 이기는 이유:',
+            '#  표는 이질적 스케일 + 불규칙한 특성 상호작용 투성이 →',
+            '#  매끄러운 함수(NN)보다 "축에 수직인 분기의 누적" 이 유리하다',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 16, 17, 18, 26, 27, 29, 30, 32, 33, 34, 35, 36, 38, 39, 40],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 단일 트리 불안정 비교 패널
+    // ─────────────────────────────────────────────────────
+    function SingleTreePane({ pair }) {
+      const TreeCard = ({ t, tone }) => (
+        <div className={`flex-1 rounded-lg border-2 p-2 ${tone === 'a' ? 'border-violet-400 bg-violet-50' : 'border-amber-400 bg-amber-50'}`}>
+          <div className={`text-[11px] font-bold ${tone === 'a' ? 'text-violet-900' : 'text-amber-900'}`}>{t.name}</div>
+          <div className="mt-1 rounded border border-slate-300 bg-white px-2 py-1 text-[10px] font-mono text-slate-800">{t.root}</div>
+          <div className="mt-1 text-[9px] text-slate-600">깊이 {t.depth} · 잎 {t.leaves}개</div>
+        </div>
+      );
+      return (
+        <div>
+          <div className="flex gap-2">
+            <TreeCard t={pair.treeA} tone="a" />
+            <div className="flex items-center text-slate-400 text-sm">≠</div>
+            <TreeCard t={pair.treeB} tone="b" />
+          </div>
+          <div className="mt-3 rounded-lg border-2 border-red-300 bg-white p-2.5">
+            <div className="text-[11px] font-bold text-red-800 mb-1.5">같은 고객, 두 트리의 예측 — 뒤집힌 판정 🔀</div>
+            <div className="space-y-1">
+              {pair.customers.map((c) => (
+                <div key={c.id} className={`flex items-center gap-2 rounded border px-2 py-1 ${c.flip ? 'border-red-400 bg-red-50' : 'border-slate-200 bg-slate-50'}`}>
+                  <span className="text-[10px] text-slate-700 flex-1 truncate">{c.name}</span>
+                  <span className={`text-[9px] font-mono px-1 rounded ${c.a === '연체' ? 'bg-violet-100 text-violet-800' : 'bg-emerald-100 text-emerald-800'}`}>A: {c.a}</span>
+                  <span className={`text-[9px] font-mono px-1 rounded ${c.b === '연체' ? 'bg-amber-100 text-amber-900' : 'bg-emerald-100 text-emerald-800'}`}>B: {c.b}</span>
+                  <span className={`text-[10px] font-bold ${c.flip ? 'text-red-700' : 'text-slate-400'}`}>{c.flip ? '🔀 뒤집힘' : '一 일치'}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-1.5 text-[10px] text-red-900">데이터 5% 교체 → 6건 중 3건 뒤집힘 = 고분산(high variance). 모델이 데이터의 "우연"까지 외운 상태.</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 배깅: 병렬 트리 투표 + 분산 감소 게이지
+    // ─────────────────────────────────────────────────────
+    function ForestPane({ forest }) {
+      const v = forest.variance;
+      const toneBar = { bad: 'bg-red-500', mid: 'bg-amber-500', good: 'bg-emerald-500' };
+      return (
+        <div>
+          <div className="text-[11px] font-bold text-violet-900 mb-1.5">🎯 {forest.target}</div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {forest.trees.map((t) => (
+              <div key={t.id} className="rounded border border-violet-200 bg-violet-50 px-2 py-1 flex items-center gap-1.5">
+                <span className="text-sm">🌲</span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[9px] font-mono text-slate-600 truncate">{t.boot}</div>
+                  <div className="text-[9px] text-slate-500 truncate">피처: {t.feat}</div>
+                </div>
+                <span className={`text-[9px] font-bold px-1 rounded ${t.vote === '연체' ? 'bg-violet-200 text-violet-900' : 'bg-emerald-100 text-emerald-800'}`}>{t.vote}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-violet-400 bg-white p-2">
+            <div className="flex items-center justify-between text-[11px] font-bold text-violet-900">
+              <span>🗳 다수결 집계</span>
+              <span className="font-mono">{forest.tally.verdict}</span>
+            </div>
+            <div className="mt-1 h-3 rounded-full overflow-hidden flex border border-violet-200">
+              <div className="bg-violet-500 h-full flex items-center justify-center text-[8px] text-white font-bold" style={{ width: `${forest.tally.spam}%` }}>{forest.tally.spamLabel}</div>
+              <div className="bg-emerald-400 h-full flex items-center justify-center text-[8px] text-white font-bold" style={{ width: `${forest.tally.ham}%` }}>{forest.tally.hamLabel}</div>
+            </div>
+          </div>
+          <div className="mt-3 rounded-lg border-2 border-emerald-400 bg-emerald-50 p-2.5">
+            <div className="text-[11px] font-bold text-emerald-900 mb-1.5">📉 {v.title}</div>
+            {v.rows.map((r) => (
+              <div key={r.name} className="flex items-center gap-2 mb-1">
+                <span className="text-[9px] text-slate-700 w-36">{r.name}</span>
+                <div className="flex-1 h-2 rounded-full bg-white border border-emerald-200 overflow-hidden">
+                  <div className={`h-full ${toneBar[r.tone]} transition-all duration-700`} style={{ width: `${r.spread}%` }} />
+                </div>
+                <span className="text-[9px] font-mono text-slate-700 w-12 text-right">{r.sd}</span>
+              </div>
+            ))}
+            <div className="mt-1 text-[9px] text-emerald-900">{v.note}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 부스팅: 순차 트리 + 잔차 감소 게이지
+    // ─────────────────────────────────────────────────────
+    function BoostPane({ boost }) {
+      return (
+        <div>
+          <div className="text-[11px] font-bold text-violet-900 mb-1.5">🎯 {boost.target}</div>
+          <div className="space-y-1.5">
+            {boost.rounds.map((r, i) => (
+              <div key={r.r}>
+                {i > 0 && <div className="text-center text-[9px] text-violet-400 leading-none">▼ 잔차 전달</div>}
+                <div className="rounded border border-violet-300 bg-white px-2 py-1 flex items-center gap-2">
+                  <span className="text-[9px] font-bold text-violet-900 w-14">R{r.r} {r.tree}</span>
+                  <span className="text-[8px] text-slate-500 w-20 truncate">배움: {r.learns}</span>
+                  <div className="flex-1">
+                    <div className="h-2 rounded-full bg-red-100 overflow-hidden">
+                      <div className="h-full bg-red-500 transition-all duration-700" style={{ width: `${r.residual}%` }} />
+                    </div>
+                  </div>
+                  <span className="text-[8px] font-mono text-red-700 w-14 text-right">잔차 {r.residual}</span>
+                  <span className="text-[9px] font-mono font-bold text-violet-800 w-16 text-right">예측 {r.pred.toFixed(2)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 rounded-lg border-2 border-violet-400 bg-violet-50 p-2">
+            <div className="text-[10px] font-mono text-violet-900 text-center">{boost.formula}</div>
+            <div className="mt-1 text-[9px] text-violet-800">{boost.note}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — XGBoost 공학 카드 + lr 트레이드오프
+    // ─────────────────────────────────────────────────────
+    function XgbPane({ xgb }) {
+      const toneText = { bad: 'text-red-700', mid: 'text-amber-700', good: 'text-emerald-700' };
+      return (
+        <div>
+          <div className="grid grid-cols-1 gap-1.5">
+            {xgb.features.map((f) => (
+              <div key={f.name} className="rounded border border-violet-300 bg-white px-2 py-1.5 flex items-start gap-2">
+                <span className="text-base">{f.icon}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[10px] font-bold text-violet-900">{f.name}</div>
+                  <div className="text-[9px] text-red-700">😖 {f.pain}</div>
+                  <div className="text-[9px] text-emerald-700">💊 {f.fix}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 rounded-lg border-2 border-amber-400 bg-amber-50 p-2.5">
+            <div className="text-[11px] font-bold text-amber-900 mb-1.5">⚖️ {xgb.tradeoff.title}</div>
+            <table className="w-full text-[9px]">
+              <thead>
+                <tr className="text-amber-900 border-b border-amber-300">
+                  <th className="text-left py-0.5">learning_rate</th>
+                  <th className="text-left py-0.5 pl-1">필요 트리 수</th>
+                  <th className="text-left py-0.5 pl-1">속도</th>
+                  <th className="text-left py-0.5 pl-1">특성</th>
+                </tr>
+              </thead>
+              <tbody>
+                {xgb.tradeoff.rows.map((r) => (
+                  <tr key={r.lr} className="border-t border-amber-200">
+                    <td className="py-1 font-mono font-bold text-slate-800">{r.lr}</td>
+                    <td className="py-1 pl-1 font-mono">{r.trees}</td>
+                    <td className="py-1 pl-1">{r.speed}</td>
+                    <td className={`py-1 pl-1 font-bold ${toneText[r.tone]}`}>{r.risk}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="mt-1 text-[9px] text-amber-900">{xgb.tradeoff.note}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 배깅 vs 부스팅 나란히 듀얼 비교
+    // ─────────────────────────────────────────────────────
+    function DuelPane({ duel }) {
+      const b = duel.bagging, x = duel.boosting;
+      return (
+        <div className="flex gap-2 items-stretch">
+          <div className="flex-1 rounded-lg border-2 border-emerald-400 bg-emerald-50 p-2">
+            <div className="text-[10px] font-bold text-emerald-900 mb-1.5">{b.title}</div>
+            <div className="flex flex-wrap gap-1">
+              {b.votes.map((v, i) => (
+                <span key={i} className={`text-[9px] px-1.5 py-0.5 rounded border ${v === '연체' ? 'bg-violet-100 border-violet-300 text-violet-900' : 'bg-white border-emerald-300 text-emerald-800'}`}>🌲{v}</span>
+              ))}
+              <span className="text-[9px] px-1 py-0.5 text-slate-500">…×100</span>
+            </div>
+            <div className="mt-1.5 text-[9px] font-mono text-slate-700">{b.tally}</div>
+            <div className="mt-1 text-[10px] font-bold text-emerald-800 rounded bg-white border border-emerald-300 px-1.5 py-0.5 text-center">{b.essence}</div>
+          </div>
+          <div className="flex items-center text-slate-400 text-sm font-bold">vs</div>
+          <div className="flex-1 rounded-lg border-2 border-violet-400 bg-violet-50 p-2">
+            <div className="text-[10px] font-bold text-violet-900 mb-1.5">{x.title}</div>
+            <div className="space-y-1">
+              {x.rounds.map((r, i) => (
+                <div key={i} className="flex items-center gap-1">
+                  <span className="text-[8px] text-slate-600 w-6">R{i + 1}</span>
+                  <div className="flex-1 h-1.5 rounded-full bg-white border border-violet-200 overflow-hidden">
+                    <div className="h-full bg-red-500" style={{ width: `${r}%` }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-1.5 text-[9px] font-mono text-slate-700">{x.tally}</div>
+            <div className="mt-1 text-[10px] font-bold text-violet-800 rounded bg-white border border-violet-300 px-1.5 py-0.5 text-center">{x.essence}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // RF vs XGB 선택표 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function CompareBox({ box }) {
+      if (!box) return null;
+      const cellTone = (s) => s.startsWith('◎') ? 'text-emerald-700' : s.startsWith('✗') ? 'text-red-700' : s.startsWith('△') ? 'text-amber-700' : 'text-slate-700';
+      return (
+        <div className="mt-3 rounded-xl border-2 border-violet-500 bg-gradient-to-br from-violet-50 to-emerald-50 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xl">⚖️</span>
+            <span className="text-sm font-bold text-violet-900">{box.title}</span>
+          </div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-violet-900 border-b-2 border-violet-300">
+                <th className="text-left py-1">기준</th>
+                <th className="text-left py-1 pl-2">RF (배깅)</th>
+                <th className="text-left py-1 pl-2">XGBoost (부스팅)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.crit} className="border-t border-violet-200">
+                  <td className="py-1 text-slate-800 font-bold">{r.crit}</td>
+                  <td className={`py-1 pl-2 ${cellTone(r.rf)}`}>{r.rf}</td>
+                  <td className={`py-1 pl-2 ${cellTone(r.xgb)}`}>{r.xgb}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-violet-50',  border: 'border-violet-300',  text: 'text-violet-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 앙상블 시뮬레이션 (violet 톤)
+    // ─────────────────────────────────────────────────────
+    const MODE_BADGE = {
+      single:   { icon: '🌳', label: '단일 트리 — 불안정' },
+      bagging:  { icon: '🌲', label: '배깅 · 랜덤 포레스트' },
+      boosting: { icon: '🎯', label: '부스팅 — 잔차 학습' },
+      xgboost:  { icon: '🚀', label: 'XGBoost 공학' },
+      duel:     { icon: '⚖️', label: '배깅 vs 부스팅' },
+    };
+
+    function LiveDataPane({ state }) {
+      const badge = MODE_BADGE[state.mode] || MODE_BADGE.single;
+      return (
+        <div className="rounded-xl border border-violet-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-violet-900 flex items-center gap-1.5">
+              <span>{badge.icon}</span>
+              <span>연체 예측 랩 — {badge.label}</span>
+            </h3>
+          </div>
+          <div className="text-[10px] text-violet-700 font-mono mb-2 px-2 py-1 rounded bg-violet-50 border border-violet-200">
+            {state.actor}
+          </div>
+          {state.mode === 'single'   && <SingleTreePane pair={state.treePair} />}
+          {state.mode === 'bagging'  && <ForestPane forest={state.forest} />}
+          {state.mode === 'boosting' && <BoostPane boost={state.boost} />}
+          {state.mode === 'xgboost'  && <XgbPane xgb={state.xgb} />}
+          {state.mode === 'duel'     && <DuelPane duel={state.duel} />}
+          <CompareBox box={state.compareBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-violet-400/15 border-l-2 border-violet-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-violet-50 to-fuchsia-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-violet-600 text-white font-bold">ML</span>
+              <div>
+                <h1 className="text-2xl font-bold text-violet-900">II-2-2. 앙상블 — 배깅(RF) vs 부스팅(XGBoost)</h1>
+                <p className="text-sm text-violet-800/80">나무 100그루를 심는 두 가지 방법 — 분산을 줄이나, 편향을 줄이나 (통계적 차이의 핵심)</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-violet-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-violet-500' : 'bg-violet-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-violet-800 text-violet-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-violet-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-violet-400 bg-white text-violet-800 hover:bg-violet-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-violet-400 bg-white text-violet-800 hover:bg-violet-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-violet-800 text-white' : 'bg-violet-600 text-white hover:bg-violet-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-violet-400 bg-white text-violet-800 hover:bg-violet-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-violet-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-violet-500 bg-white px-4 py-3 text-sm text-violet-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                단일 트리는 데이터의 우연까지 외우는 고분산 모델이다.
+                배깅(RF)은 부트스트랩 + 피처 무작위로 "서로 다른" 강한 트리들을 병렬로 키워 투표시켜 분산을 줄이고,
+                부스팅(XGBoost)은 약한 트리를 순차로 쌓아 이전까지의 잔차를 보정하며 편향을 줄인다.
+                XGBoost는 정규화·2차 근사·결측 자동 처리·병렬화로 부스팅의 과적합·속도 약점을 틀어막아 정형 데이터의 표준이 됐다.
+                실무 공식: RF로 베이스라인과 피처 중요도를 빠르게 확보하고, 성능이 돈인 본선에서는 낮은 learning_rate + early stopping의 XGBoost로 승부한다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['앙상블', '배깅', '부트스트랩', '랜덤포레스트', '분산축소', '부스팅', '잔차학습', '편향축소', 'XGBoost', 'learning_rate', 'early_stopping', 'feature_importances'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-violet-100 text-violet-900 border border-violet-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-violet-800">
+              <a href="./II-2-1.html" className="underline hover:no-underline">← 이전: II-2-1</a>
+              <a href="../index.html" className="underline hover:no-underline">챕터 목록</a>
+              <a href="../part3/III-1-1.html" className="underline hover:no-underline">다음: III-1-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
