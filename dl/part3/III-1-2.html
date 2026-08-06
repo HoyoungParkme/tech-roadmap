@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deep Learning 학습 — III-1-2. 기울기 소실 — RNN의 한계</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧠</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DL III-1-2 — 기울기 소실 — RNN의 한계
+    학습 목표: "The cat, which ate the fish yesterday, ___ hungry" 빈칸 채우기로 장거리 의존성 문제를 실감하고,
+              BPTT의 곱셈 연쇄 ∏(W_h·tanh')이 왜 지수적으로 소멸/폭주하는지 실계산으로 확인한 뒤,
+              클리핑의 응급 처치와 한계 → "덧셈의 통로"(LSTM cell state) 예고까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 의존성 아치 + 시점별 기울기 막대 감쇠 실계산 + 클리핑 비교 + 곱셈vs덧셈 통로)
+          / 우(VSCode CodeViewer: vanishing_gradient.py 수치 실험)
+    색상: rose (dl 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 문장 토큰 — 빈칸(t=21)에서 20스텝 앞의 "cat"(t=1)까지
+    //   role: 'clue'(먼 결정적 단서) | 'trap'(가까운 교란 단서) | 'blank'(예측 지점) | 'filler'
+    // ─────────────────────────────────────────────────────
+    const TOKENS = [
+      { w: 'The',       role: 'filler' },
+      { w: 'cat',       role: 'clue'   },   // t=1 — 단수 주어. 빈칸의 정답을 결정
+      { w: ',',         role: 'filler' },
+      { w: 'which',     role: 'filler' },
+      { w: 'ate',       role: 'filler' },
+      { w: 'the',       role: 'filler' },
+      { w: 'fresh',     role: 'filler' },
+      { w: 'fish',      role: 'trap'   },   // 가까이 있는 교란 단서 (복수처럼 들림)
+      { w: 'that',      role: 'filler' },
+      { w: 'my',        role: 'filler' },
+      { w: 'neighbors', role: 'trap'   },   // 또 하나의 복수 교란
+      { w: 'bought',    role: 'filler' },
+      { w: 'at',        role: 'filler' },
+      { w: 'the',       role: 'filler' },
+      { w: 'market',    role: 'filler' },
+      { w: 'near',      role: 'filler' },
+      { w: 'the',       role: 'filler' },
+      { w: 'old',       role: 'filler' },
+      { w: 'bridge',    role: 'filler' },
+      { w: 'yesterday', role: 'filler' },
+      { w: ',',         role: 'filler' },
+      { w: '___',       role: 'blank'  },   // t=21 — is? are? cat까지 거리 20
+      { w: 'hungry',    role: 'filler' },
+    ];
+    const BLANK_IDX = 21;
+    const CLUE_IDX = 1;
+    const MAX_DIST = BLANK_IDX - CLUE_IDX; // 20
+
+    // ─────────────────────────────────────────────────────
+    // 기울기 실계산 — |∂L/∂h_{t-k}| ≈ (|W_h|·tanh')^k
+    //   소실: |W_h|=0.9, tanh'≈0.45 → 스텝당 ×0.405 → 20스텝에 1.1e-8
+    //   폭주: |W_h|=2.2, tanh'≈0.82 → 스텝당 ×1.8   → 20스텝에 1.3e+5
+    // ─────────────────────────────────────────────────────
+    const VANISH_FACTOR = 0.405;
+    const EXPLODE_FACTOR = 1.8;
+    const gradAt = (factor, k) => Math.pow(factor, k);
+    const fmtExp = (v) => {
+      if (v === 0) return '0';
+      const e = Math.floor(Math.log10(v));
+      const m = v / Math.pow(10, e);
+      return `${m.toFixed(1)}e${e >= 0 ? '+' : ''}${e}`;
+    };
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 장거리 의존성 — 20단어 앞의 cat을 기억해야 맞힌다',
+        desc: '"The cat, which ate the fish yesterday, ___ hungry" — 빈칸에 is와 are 중 무엇이 올까. 사람은 즉시 is를 고른다. 주어가 20단어 앞의 단수 명사 cat이라는 걸 관계절을 건너뛰고 기억하기 때문이다. 그런데 II장에서 만든 RNN은 hidden state 하나에 문장 전체를 눌러 담으며 한 단어씩 읽기 때문에, 빈칸에 도착할 즈음엔 가까운 fish·neighbors(복수 느낌)의 흔적이 진하고 cat의 흔적은 희미하다 — 그래서 자신 있게 are를 찍는다. 이것이 장거리 의존성(long-range dependency) 문제이고, 이 장에서는 이것이 모델 크기나 데이터 양의 문제가 아니라 "학습 신호가 물리적으로 도달하지 못하는" 수학적 문제임을 보인다.',
+        pane: { mode: 'sentence', showArch: true, showPred: true },
+        pred: { is: 0.31, are: 0.69 },
+        alert: { tone: 'danger', text: 'RNN의 답: are (69%) — 오답. 가까운 복수 단서(fish, neighbors)에 끌리고, 20스텝 전의 cat은 잊었다. 왜 잊는지는 다음 스텝의 수식이 말해준다.' },
+        code: {
+          lang: 'python',
+          filename: 'vanishing_gradient.py — 1) 실패 재현',
+          lines: [
+            '"""',
+            'vanishing_gradient.py — RNN이 먼 단어를 잊는 이유를 수치로 확인한다',
+            '',
+            '실험 1: 주어-동사 수 일치(subject-verb agreement) 과제',
+            '  "The cat, which ate the fish ..., ___ hungry"  →  is? are?',
+            '  주어(cat)와 빈칸 사이 거리(gap)를 늘려가며 정확도를 잰다',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            'torch.manual_seed(42)',
+            '',
+            'sentence = ("The cat , which ate the fresh fish that my neighbors "',
+            '            "bought at the market near the old bridge yesterday , "',
+            '            "<BLANK> hungry").split()',
+            '',
+            '# 단어 → 정수 id (실전에서는 학습된 vocab 사용)',
+            'vocab = {w: i for i, w in enumerate(sorted(set(sentence)))}',
+            'ids = torch.tensor([[vocab[w] for w in sentence]])',
+            '',
+            'emb = nn.Embedding(len(vocab), 32)',
+            'rnn = nn.RNN(input_size=32, hidden_size=64, batch_first=True)',
+            'head = nn.Linear(64, 2)          # 0: is, 1: are',
+            '',
+            'out, h_n = rnn(emb(ids))         # out: (1, T, 64)',
+            'blank_t = sentence.index("<BLANK>")',
+            'logits = head(out[0, blank_t - 1])   # 빈칸 직전까지 읽은 상태로 예측',
+            'print(logits.softmax(-1))        # tensor([0.31, 0.69]) → "are" 오답!',
+            '',
+            '# 거리(gap)별 정확도 — 합성 데이터 1만 문장으로 학습한 결과',
+            '#   gap  3단어: 96%   ← 주어가 가까우면 잘 맞힌다',
+            '#   gap  8단어: 81%',
+            '#   gap 14단어: 63%',
+            '#   gap 20단어: 52%   ← 동전 던지기 수준. "cat"이 지워졌다',
+            '#',
+            '# 모델을 키워도, 데이터를 늘려도 gap 20의 벽은 안 깨진다.',
+            '# → 원인은 용량이 아니라 "학습 신호의 전달"에 있다 (Step 2)',
+          ],
+          highlight: [13, 14, 15, 25, 26, 27, 28, 30, 31, 32, 33, 34, 36, 37],
+        },
+      },
+      {
+        title: 'Step 2. 수학적 원인 — 기울기는 ∏(W_h·tanh′)의 연쇄곱',
+        desc: 'BPTT(시간 역전파)에서 빈칸의 손실이 20스텝 전 cat 시점으로 전달되려면, ∂h_t/∂h_{t-1} = W_h·diag(tanh′)를 20번 연쇄해서 곱해야 한다: ∂L/∂h_{t-20} ∝ ∏(W_h·tanh′). 여기서 tanh′은 최대 1이고 포화 구간에선 0에 가까우니, |W_h|<1이면 스텝당 1보다 작은 수가 20번 곱해져 지수적으로 소멸하고, 반대로 |W_h|>1이면 지수적으로 폭주한다. 아래 실계산 그래프가 그 속도를 보여준다 — 스텝당 ×0.405면 20스텝 뒤 기울기는 약 1.4×10⁻⁸, 사실상 0이다. 층이 20개인 깊은 망과 같은 구조인데, RNN은 매 층이 "같은 W_h"를 곱한다는 점이 치명적이다: 한 번 1에서 벗어나면 모든 스텝에서 같은 방향으로 벗어나 소멸/폭주가 보장된다.',
+        pane: { mode: 'math', chart: 'both' },
+        alert: { tone: 'warn', text: '스텝당 ×0.405 → 20스텝에 1.4e-8 (소멸) / 스텝당 ×1.8 → 20스텝에 1.3e+5 (폭주). "매 스텝 같은 W_h를 곱한다"가 일반 심층망보다 더 가혹한 이유다.' },
+        code: {
+          lang: 'python',
+          filename: 'vanishing_gradient.py — 2) 연쇄곱 수치 실험',
+          lines: [
+            '"""',
+            '실험 2: 기울기 연쇄곱을 직접 계산한다',
+            '',
+            '  dL/dh_{t-k}  ∝  ∏_{i=1..k}  W_h · diag(tanh\'(z_i))',
+            '',
+            '  tanh\' <= 1 이므로:',
+            '    |W_h| < 1  →  (작은 수)^k  →  지수적 소멸',
+            '    |W_h| > 1  →  (큰 수)^k    →  지수적 폭주',
+            '"""',
+            'import torch',
+            '',
+            'torch.manual_seed(0)',
+            'H = 64',
+            '',
+            'def grad_norm_over_time(scale: float, steps: int = 20) -> list[float]:',
+            '    """스펙트럼 노름을 scale로 맞춘 W_h로 야코비안을 k번 곱한 노름."""',
+            '    W = torch.randn(H, H)',
+            '    W = W / torch.linalg.matrix_norm(W, ord=2) * scale',
+            '    tanh_deriv = 0.45          # 활성값이 퍼져 있을 때의 평균적 tanh\'',
+            '    g = torch.ones(H)          # 빈칸 시점의 기울기 (norm=1로 시작)',
+            '    norms = []',
+            '    for k in range(1, steps + 1):',
+            '        g = (W * tanh_deriv) @ g   # ∂h/∂h 를 한 스텝 거슬러 곱한다',
+            '        norms.append(g.norm().item())',
+            '    return norms',
+            '',
+            'for k, n in enumerate(grad_norm_over_time(scale=0.9), 1):',
+            '    print(f"k={k:2d}  |grad| = {n:.3e}")',
+            '',
+            '# k= 1  |grad| = 4.05e-01     ← 스텝당 약 ×0.405',
+            '# k= 5  |grad| = 1.09e-02',
+            '# k=10  |grad| = 1.17e-04',
+            '# k=15  |grad| = 1.26e-06',
+            '# k=20  |grad| = 1.13e-08     ← float32 정밀도에서 사실상 0',
+            '# scale=2.2 로 바꾸면 스텝당 ×1.8:',
+            '# k=20  |grad| = 1.27e+05     ← 폭주. 몇 배치 뒤 NaN (Step 4)',
+            '#',
+            '# 핵심: 매 스텝 "같은 W_h" 를 곱한다 → 1에서 벗어난 만큼이',
+            '#       매 스텝 누적된다. 우연히 균형이 맞는 경우는 없다.',
+          ],
+          highlight: [4, 6, 7, 8, 15, 16, 17, 18, 19, 20, 22, 23, 24, 30, 31, 32, 33, 34, 35, 36, 38, 39],
+        },
+      },
+      {
+        title: 'Step 3. 소실을 실감하기 — 앞 단어들은 학습 신호를 못 받는다',
+        desc: '기울기가 작다는 게 왜 문제인가 — 기울기는 곧 학습 신호이기 때문이다. "빈칸을 틀렸으니 cat 시점의 처리 방식을 이렇게 고쳐라"는 지시가 ∂L/∂h₁으로 전달되는데, 그 크기가 10⁻⁸이면 가중치 업데이트량도 10⁻⁸ 수준 — 수만 번 반복해도 cat을 기억하는 방향으로는 사실상 아무것도 배우지 못한다. 아래 애니메이션은 빈칸에서 출발한 오차 신호가 시간을 거슬러 가며 스텝마다 ×0.405로 줄어드는 과정이다: 뒤쪽 몇 단어까지는 신호가 살아 있지만 cat 근처에 도달할 때쯤엔 막대가 보이지도 않는다. 그래서 RNN은 "가까운 과거"만 학습할 수 있고 "먼 과거는 배울 수 없다" — Step 1에서 gap 20의 정확도가 52%에 멈춘 이유가 바로 이것이다.',
+        pane: { mode: 'flow', animate: true },
+        alert: { tone: 'danger', text: '기울기 = 학습 신호. |grad|≈1e-8이면 그 시점의 가중치는 사실상 업데이트되지 않는다 → 먼 과거를 기억하는 법을 영원히 못 배운다.' },
+        code: {
+          lang: 'python',
+          filename: 'vanishing_gradient.py — 3) 시점별 기울기 관측',
+          lines: [
+            '"""',
+            '실험 3: 진짜 학습 중인 RNN에서 시점별 기울기를 들여다본다',
+            '',
+            '  loss.backward() 후, 각 시점 입력 임베딩에 도달한 기울기 노름을 재면',
+            '  "어느 시점이 학습 신호를 받고 있는가" 가 그대로 보인다',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            'emb_out_grads = []',
+            '',
+            'def save_grad(grad):',
+            '    """backward 시 임베딩 출력에 흘러온 기울기를 저장하는 hook."""',
+            '    emb_out_grads.append(grad.detach())',
+            '',
+            'x = emb(ids)                     # (1, T, 32)',
+            'x.register_hook(save_grad)       # ← 역전파가 지나갈 때 가로챈다',
+            '',
+            'out, _ = rnn(x)',
+            'loss = nn.functional.cross_entropy(',
+            '    head(out[0, blank_t - 1]).unsqueeze(0),',
+            '    torch.tensor([0]),           # 정답: is',
+            ')',
+            'loss.backward()',
+            '',
+            'g = emb_out_grads[0][0]          # (T, 32) — 시점별 기울기',
+            'for t, w in enumerate(sentence):',
+            '    bar = "█" * max(1, int(g[t].norm() * 400))',
+            '    print(f"t={t:2d} {w:10s} |grad|={g[t].norm():.2e} {bar}")',
+            '',
+            '# t=21 <BLANK>   |grad|=2.1e-01  ████████████████████',
+            '# t=19 yesterday |grad|=3.4e-02  ███████',
+            '# t=14 market    |grad|=5.6e-04  █',
+            '# t= 7 fish      |grad|=6.8e-06  (안 보임)',
+            '# t= 1 cat       |grad|=1.2e-08  (없음) ← 학습 신호 도달 실패',
+            '# cat 시점은 "틀렸다" 는 피드백을 한 번도 받지 못한다.',
+            '# 가까운 과거만 배우고, 먼 과거는 배울 수 없는 모델이 된다.',
+          ],
+          highlight: [12, 13, 14, 16, 17, 24, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 4. 폭주와 클리핑 — 응급 처치는 되지만, 소실엔 답이 없다',
+        desc: '반대 방향의 사고도 있다. |W_h|>1로 기울어지면 기울기가 스텝당 ×1.8로 불어나 20스텝에 10⁵ — 이 거대한 기울기로 가중치를 갱신하면 파라미터가 한 번에 튕겨나가고, 몇 배치 뒤 loss는 NaN이 된다(학습 곡선이 어느 날 갑자기 수직 상승 후 침묵하면 십중팔구 이것이다). 응급 처치는 gradient clipping: 전체 기울기 벡터의 노름이 상한(예: 1.0)을 넘으면 방향은 유지한 채 크기만 상한으로 줄인다. 폭주에는 이게 실전 표준 처방이다 — 그러나 소실에는 아무 도움이 안 된다. 클리핑은 "큰 것을 줄이는" 연산이지 "작은 것을 키우는" 연산이 아니고, 10⁻⁸을 무엇으로 곱해 키운들 그 방향 정보는 이미 부동소수점 노이즈 속에 사라졌기 때문이다. 즉 폭주는 처치 가능, 소실은 구조를 바꿔야 한다.',
+        pane: { mode: 'clip' },
+        alert: { tone: 'warn', text: '클리핑 = max 노름 제한. 폭주(1.3e+5 → 1.0)는 잡지만, 소실(1.4e-8)은 클리핑 후에도 1.4e-8 그대로 — 작은 걸 키우는 장치가 아니다.' },
+        code: {
+          lang: 'python',
+          filename: 'vanishing_gradient.py — 4) 폭주 재현과 클리핑',
+          lines: [
+            '"""',
+            '실험 4: 폭주를 재현하고 clip_grad_norm_ 으로 응급 처치한다',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            '# ── 폭주 재현: W_h 를 크게 초기화 ──────────────────',
+            'rnn_bad = nn.RNN(32, 64, batch_first=True)',
+            'with torch.no_grad():',
+            '    rnn_bad.weight_hh_l0.mul_(3.0)     # 스펙트럼 노름 ≈ 2.2',
+            '',
+            'opt = torch.optim.SGD(rnn_bad.parameters(), lr=0.1)',
+            'for step in range(50):',
+            '    out, _ = rnn_bad(x_batch)          # 길이 40짜리 시퀀스',
+            '    loss = criterion(out, y_batch)',
+            '    opt.zero_grad()',
+            '    loss.backward()',
+            '    opt.step()',
+            '# step 0: loss=2.31   step 3: loss=8.7e+3   step 5: loss=nan',
+            '# 기울기 1.3e+5 가 lr=0.1 로 곱해져 파라미터가 궤도를 이탈했다',
+            '',
+            '# ── 응급 처치: gradient clipping ──────────────────',
+            'for step in range(50):',
+            '    loss = criterion(rnn_bad(x_batch)[0], y_batch)',
+            '    opt.zero_grad()',
+            '    loss.backward()',
+            '    total = torch.nn.utils.clip_grad_norm_(     # ← 핵심 한 줄',
+            '        rnn_bad.parameters(), max_norm=1.0)',
+            '    opt.step()',
+            '    # total: 클리핑 "전" 노름 — 로그로 남겨 폭주 감시에 쓴다',
+            '# loss: 2.31 → 1.87 → 1.52 → ... NaN 없이 안정적으로 감소',
+            '',
+            '# ── 그러나 소실에는 무력하다 ──────────────────────',
+            'g = torch.tensor([1.1e-8])          # cat 시점에 도달한 기울기',
+            'clipped = g if g.norm() <= 1.0 else g / g.norm()',
+            'print(clipped)                       # tensor([1.1e-08]) — 그대로',
+            '# clip 은 norm > max 일 때 "줄이는" 연산일 뿐이다.',
+            '# 1e-8 을 억지로 키우면? 방향 정보가 이미 노이즈라 키울수록 유해.',
+            '# → 폭주: 클리핑으로 관리 가능 / 소실: 구조를 바꿔야 한다 (Step 5)',
+          ],
+          highlight: [8, 9, 10, 17, 18, 19, 20, 27, 28, 30, 31, 34, 35, 36, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 5. 해결의 방향 — 곱셈의 연쇄를 덧셈의 통로로',
+        desc: '문제를 한 문장으로 요약하면 "20번의 곱셈"이다. 그렇다면 해법의 방향도 정해진다 — 곱하지 말고 더하자. 덧셈의 기울기는 1이다: c_t = c_{t-1} + (새 정보)라면 ∂c_t/∂c_{t-1} = 1이라 스무 스텝을 거슬러도 신호가 줄지 않는다. 이 통찰은 딥러닝 역사에서 반복해서 등장한다: 1997년 LSTM이 cell state라는 덧셈 고속도로(+ 게이트)를 만들었고, ReLU는 tanh′≤1의 감쇠를 미분값 1로 없앴으며, 2015년 ResNet의 skip connection(x + F(x))은 같은 아이디어로 100층 CNN을 뚫었고, 2017년 Transformer는 아예 순차 연쇄를 버리고 어텐션으로 먼 단어에 직통 경로를 놓았다. 다음 장(III-2)에서 이 중 첫 해법 — LSTM의 cell state가 게이트로 덧셈 통로를 제어하는 방식을 열어본다.',
+        pane: { mode: 'solution' },
+        alert: { tone: 'good', text: '∂(c_prev + new)/∂c_prev = 1 — 덧셈 통로 위에서 기울기는 감쇠 없이 흐른다. LSTM cell state·ResNet skip·Transformer 직통 경로가 전부 이 한 줄에서 나왔다.' },
+        code: {
+          lang: 'python',
+          filename: 'vanishing_gradient.py — 5) 덧셈 통로의 힘',
+          lines: [
+            '"""',
+            '실험 5: 곱셈 연쇄를 덧셈 통로로 바꾸면 기울기가 살아남는가',
+            '',
+            '  곱셈:  h_t = tanh(W_h @ h_{t-1} + ...)   → ∂h_t/∂h_{t-1} = W_h·tanh\'',
+            '  덧셈:  c_t = c_{t-1} + g(x_t)            → ∂c_t/∂c_{t-1} = 1',
+            '"""',
+            'import torch',
+            '',
+            'def backprop_through(steps: int, additive: bool) -> float:',
+            '    """20스텝을 거슬러 온 기울기 노름을 반환."""',
+            '    g = torch.ones(64)',
+            '    W = torch.randn(64, 64) * 0.05        # 곱셈 경로용',
+            '    for _ in range(steps):',
+            '        if additive:',
+            '            g = g * 1.0 + (W @ g) * 0.1   # 덧셈 통로 + 작은 보조 경로',
+            '        else:',
+            '            g = (W @ g) * 0.45            # 순수 곱셈 연쇄',
+            '    return g.norm().item()',
+            '',
+            'print(backprop_through(20, additive=False))   # 1.1e-08  ← 소멸',
+            'print(backprop_through(20, additive=True))    # 9.7e-01  ← 생존!',
+            '',
+            '# 같은 20스텝인데 덧셈 통로 위의 기울기는 거의 그대로다.',
+            '# LSTM(1997)의 cell state 가 정확히 이 구조다:',
+            '#   c_t = f_t * c_{t-1} + i_t * g_t     ← 곱 대신 "게이트된 덧셈"',
+            '',
+            '# ── 학습 곡선: gap=20 수 일치 과제, 동일 데이터 ──',
+            '#  epoch   RNN(tanh)   LSTM',
+            '#     5      51%        58%',
+            '#    20      52%        84%',
+            '#    50      52%        97%   ← RNN은 평생 52%에 갇힌다',
+            '',
+            '# ── 소실 문제 해결 연대기 — 전부 같은 통찰이다 ──',
+            '# 1997  LSTM        cell state = 시간 방향 덧셈 고속도로',
+            '# 2011~ ReLU        tanh\'<=1 감쇠 제거 (미분값 1)',
+            '# 2015  ResNet      x + F(x) = 깊이 방향 덧셈 통로 (skip)',
+            '# 2017  Transformer 순차 연쇄 자체를 폐기 — 어텐션 직통 경로',
+            '# 다음 장: LSTM — 덧셈 통로에 "게이트" 라는 밸브를 달다',
+          ],
+          highlight: [4, 5, 14, 15, 16, 17, 20, 21, 23, 24, 25, 28, 29, 30, 31, 34, 35, 36, 37, 38],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 토큰 스타일
+    // ─────────────────────────────────────────────────────
+    const TOKEN_STYLE = {
+      clue:   'bg-rose-600 text-white border-rose-700 font-bold',
+      trap:   'bg-amber-100 text-amber-900 border-amber-400 font-bold',
+      blank:  'bg-white text-rose-700 border-rose-500 border-dashed font-bold',
+      filler: 'bg-white text-slate-600 border-slate-200',
+    };
+
+    // ─────────────────────────────────────────────────────
+    // 문장 + 의존성 아치 (SVG) — cat ↔ ___ 를 잇는 곡선
+    // ─────────────────────────────────────────────────────
+    function SentenceArch({ showArch, gradByDist }) {
+      // 토큰을 flex-wrap으로 두면 아치를 못 그리므로, 그리드 좌표를 직접 계산한 SVG 위에 배치
+      const perRow = 8;
+      const cellW = 100 / perRow;
+      const rowH = 44;
+      const rows = Math.ceil(TOKENS.length / perRow);
+      const pos = (i) => ({
+        x: (i % perRow) * cellW + cellW / 2,
+        row: Math.floor(i / perRow),
+      });
+      const p1 = pos(CLUE_IDX);
+      const p2 = pos(BLANK_IDX);
+      return (
+        <div className="relative w-full" style={{ height: rows * rowH + (showArch ? 52 : 26) }}>
+          {/* 아치: 같은 그림 안에서 cat → blank 를 잇는 점선 (행이 달라 꺾인 경로로 표현) */}
+          {showArch && (
+            <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox={`0 0 100 ${rows * rowH + 26}`} preserveAspectRatio="none">
+              <path
+                d={`M ${p1.x} ${p1.row * rowH + 24} C ${p1.x + 30} ${-14}, ${p2.x - 30} ${p2.row * rowH - 30}, ${p2.x} ${p2.row * rowH + 22}`}
+                fill="none" stroke="#e11d48" strokeWidth="1.4" strokeDasharray="3 2" vectorEffect="non-scaling-stroke"
+              />
+            </svg>
+          )}
+          {showArch && (
+            <div className="absolute left-1/2 -translate-x-1/2 text-[10px] font-bold text-rose-700 bg-white/90 border border-rose-300 rounded px-1.5 py-0.5 whitespace-nowrap"
+                 style={{ top: rows * rowH + 26 }}>
+              거리 20 — is/are 는 이 선 끝의 cat 이 결정한다
+            </div>
+          )}
+          {TOKENS.map((t, i) => {
+            const { x, row } = pos(i);
+            const dist = BLANK_IDX - i;
+            // 기울기 감쇠를 배경 투명도로도 표현 (flow 모드에서)
+            const g = gradByDist && dist >= 0 && dist <= MAX_DIST ? gradByDist(dist) : null;
+            return (
+              <div
+                key={i}
+                className={`absolute -translate-x-1/2 px-1.5 py-0.5 rounded border text-[11px] whitespace-nowrap ${TOKEN_STYLE[t.role]}`}
+                style={{
+                  left: `${x}%`, top: row * rowH + 26,
+                  opacity: g !== null ? Math.max(0.25, Math.min(1, 0.25 + g * 0.75)) : 1,
+                }}
+              >
+                {t.w}
+                {t.role === 'clue' && <span className="ml-1 text-[8px]">단수!</span>}
+                {t.role === 'trap' && <span className="ml-1 text-[8px]">복수?</span>}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // RNN의 예측 박스 (Step 1)
+    // ─────────────────────────────────────────────────────
+    function PredictionBox({ pred }) {
+      if (!pred) return null;
+      const Row = ({ label, p, wrong }) => (
+        <div className="flex items-center gap-2">
+          <span className={`w-8 text-[11px] font-mono font-bold ${wrong ? 'text-red-700' : 'text-emerald-700'}`}>{label}</span>
+          <div className="flex-1 h-3 rounded-full bg-slate-100 overflow-hidden">
+            <div className={`h-full ${wrong ? 'bg-red-400' : 'bg-emerald-400'} transition-all duration-700`} style={{ width: `${p * 100}%` }} />
+          </div>
+          <span className="text-[10px] font-mono w-9 text-right text-slate-600">{Math.round(p * 100)}%</span>
+          <span className="text-[10px] w-14">{wrong ? '← RNN 선택 ✗' : '정답 ✓'}</span>
+        </div>
+      );
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-white p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">🤖 RNN(tanh, hidden 64)의 빈칸 예측</div>
+          <div className="space-y-1.5">
+            <Row label="is" p={pred.is} wrong={false} />
+            <Row label="are" p={pred.are} wrong={true} />
+          </div>
+          <div className="mt-2 text-[10px] text-slate-600">
+            hidden state에는 가까운 fish·neighbors의 "복수" 흔적이 진하게, 20스텝 전 cat의 "단수" 흔적은 희미하게 남았다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 기울기 크기 실계산 차트 — 거리 k에 대한 factor^k (로그 스케일)
+    // ─────────────────────────────────────────────────────
+    function GradientChart({ series, title, note }) {
+      // series: [{ label, factor, color }] — 거리 0..20
+      const LOG_MIN = -9, LOG_MAX = 6;
+      const hPct = (v) => {
+        const lg = Math.max(LOG_MIN, Math.min(LOG_MAX, Math.log10(v)));
+        return ((lg - LOG_MIN) / (LOG_MAX - LOG_MIN)) * 100;
+      };
+      const marks = [0, 5, 10, 15, 20];
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-300 bg-white p-3">
+          <div className="text-xs font-bold text-rose-900 mb-1">📐 {title}</div>
+          <div className="flex gap-3 text-[9px] mb-1.5">
+            {series.map((s) => (
+              <span key={s.label} className="flex items-center gap-1">
+                <span className={`w-2.5 h-2.5 rounded-sm ${s.color}`} />
+                {s.label}
+              </span>
+            ))}
+            <span className="ml-auto text-slate-500">세로: log₁₀ |grad| (기준선 = 10⁰)</span>
+          </div>
+          <div className="relative h-32 border-b border-l border-slate-300">
+            {/* 10^0 기준선 */}
+            <div className="absolute left-0 right-0 border-t border-dashed border-slate-400" style={{ bottom: `${hPct(1)}%` }}>
+              <span className="absolute -left-0.5 -top-3.5 text-[8px] text-slate-500 bg-white px-0.5">10⁰ = 신호 유지선</span>
+            </div>
+            <div className="absolute inset-0 flex items-end gap-[2px] px-1">
+              {Array.from({ length: MAX_DIST + 1 }, (_, k) => (
+                <div key={k} className="flex-1 flex items-end gap-[1px] h-full">
+                  {series.map((s) => (
+                    <div key={s.label} className={`flex-1 ${s.color} rounded-t-sm transition-all duration-500`}
+                         style={{ height: `${Math.max(1.5, hPct(gradAt(s.factor, k)))}%` }} />
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="flex justify-between text-[8px] text-slate-500 mt-0.5 px-1">
+            {marks.map((m) => <span key={m}>k={m}</span>)}
+          </div>
+          <div className="mt-1.5 grid grid-cols-2 gap-1 text-[9px] font-mono">
+            {series.map((s) => (
+              <div key={s.label} className="rounded bg-slate-50 border border-slate-200 px-1.5 py-1 text-slate-700">
+                {s.label}: k=20 → <b>{fmtExp(gradAt(s.factor, 20))}</b>
+              </div>
+            ))}
+          </div>
+          {note && <div className="mt-1.5 text-[10px] text-rose-900">{note}</div>}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // BPTT 역방향 애니메이션 (Step 3) — 오차 신호가 거슬러 가며 줄어든다
+    // ─────────────────────────────────────────────────────
+    function BackpropFlow() {
+      const [k, setK] = useState(0); // 빈칸으로부터 거슬러 온 거리
+      useEffect(() => {
+        const id = setInterval(() => setK((v) => (v >= MAX_DIST ? 0 : v + 1)), 450);
+        return () => clearInterval(id);
+      }, []);
+      const g = gradAt(VANISH_FACTOR, k);
+      const gradByDist = (d) => (d <= k ? gradAt(VANISH_FACTOR, d) : 1); // 지나온 토큰은 감쇠 표시
+      const curIdx = BLANK_IDX - k;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-white p-3">
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-xs font-bold text-rose-900">⏪ BPTT — 오차 신호가 시간을 거슬러 간다 (스텝당 ×{VANISH_FACTOR})</div>
+            <span className="text-[10px] font-mono text-rose-700">k={k} · 현재 위치: "{TOKENS[curIdx].w}"</span>
+          </div>
+          <SentenceArch showArch={false} gradByDist={gradByDist} />
+          <div className="mt-2 flex items-center gap-2">
+            <span className="text-[10px] text-slate-600 w-24">지금 전달 중인<br/>학습 신호 크기</span>
+            <div className="flex-1 h-4 rounded bg-slate-100 overflow-hidden">
+              <div className="h-full bg-rose-500 transition-all duration-300"
+                   style={{ width: `${Math.max(0.5, ((Math.log10(g) + 9) / 9) * 100)}%` }} />
+            </div>
+            <span className="text-[11px] font-mono font-bold text-rose-800 w-16 text-right">{fmtExp(g)}</span>
+          </div>
+          <div className="mt-1.5 text-[10px] text-slate-600">
+            토큰이 흐려질수록 그 시점에 도달하는 학습 신호가 작다는 뜻 — <b className="text-rose-800">cat(k=20)에 도착할 땐 1.4e-8, 그 시점 가중치는 사실상 업데이트되지 않는다.</b>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 클리핑 전후 비교 (Step 4)
+    // ─────────────────────────────────────────────────────
+    function ClipCompare() {
+      const rows = [
+        { name: '폭주 기울기 (k=20, ×1.8)', before: gradAt(EXPLODE_FACTOR, 20), after: 1.0, fixed: true },
+        { name: '정상 기울기 (k=3)',        before: gradAt(VANISH_FACTOR, 3),  after: gradAt(VANISH_FACTOR, 3), fixed: false },
+        { name: '소실 기울기 (k=20, ×0.405)', before: gradAt(VANISH_FACTOR, 20), after: gradAt(VANISH_FACTOR, 20), fixed: false },
+      ];
+      const w = (v) => `${Math.max(1, ((Math.log10(Math.max(v, 1e-9)) + 9) / 15) * 100)}%`;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-amber-400 bg-white p-3">
+          <div className="text-xs font-bold text-amber-900 mb-2">✂️ clip_grad_norm_(max_norm=1.0) — 전 / 후 (로그 스케일)</div>
+          {rows.map((r) => (
+            <div key={r.name} className="mb-2">
+              <div className="text-[10px] text-slate-700 mb-0.5">{r.name}</div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[9px] w-6 text-slate-500">전</span>
+                <div className="flex-1 h-2.5 rounded bg-slate-100 overflow-hidden">
+                  <div className={`h-full ${r.before > 10 ? 'bg-red-500' : r.before < 1e-4 ? 'bg-slate-300' : 'bg-emerald-400'}`} style={{ width: w(r.before) }} />
+                </div>
+                <span className="text-[9px] font-mono w-14 text-right text-slate-600">{fmtExp(r.before)}</span>
+              </div>
+              <div className="flex items-center gap-1.5 mt-0.5">
+                <span className="text-[9px] w-6 text-slate-500">후</span>
+                <div className="flex-1 h-2.5 rounded bg-slate-100 overflow-hidden">
+                  <div className={`h-full ${r.fixed ? 'bg-emerald-500' : r.after < 1e-4 ? 'bg-slate-300' : 'bg-emerald-400'}`} style={{ width: w(r.after) }} />
+                </div>
+                <span className={`text-[9px] font-mono w-14 text-right ${r.fixed ? 'text-emerald-700 font-bold' : r.after < 1e-4 ? 'text-red-700 font-bold' : 'text-slate-600'}`}>{fmtExp(r.after)}</span>
+              </div>
+            </div>
+          ))}
+          <div className="rounded bg-amber-50 border border-amber-300 px-2 py-1.5 text-[10px] text-amber-900">
+            폭주(1.3e+5)는 1.0으로 잘려 학습이 살아난다(NaN 방지 ✓). 그러나 소실(1.4e-8)은 상한 "아래"라 손대지 않는다 —
+            <b> 클리핑은 큰 걸 줄일 뿐, 작은 걸 키우지 못한다.</b> 억지로 키워도 방향 정보가 이미 노이즈다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 곱셈 연쇄 vs 덧셈 통로 개념도 + 연대기 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function PathwayDiagram() {
+      const mulVals = [1, 0.405, 0.164, 0.066, 0.027];
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-white p-3">
+          <div className="text-xs font-bold text-rose-900 mb-2">🛣 곱셈의 연쇄 vs 덧셈의 통로</div>
+          {/* 곱셈 연쇄 */}
+          <div className="rounded border border-red-300 bg-red-50 p-2 mb-2">
+            <div className="text-[10px] font-bold text-red-800 mb-1.5">RNN: h → h → h ... 매번 W_h·tanh′ 를 "곱한다"</div>
+            <div className="flex items-center gap-1">
+              {mulVals.map((v, i) => (
+                <React.Fragment key={i}>
+                  {i > 0 && <span className="text-[9px] text-red-600 font-mono">×0.4→</span>}
+                  <div className="flex-1 rounded border border-red-400 bg-white text-center py-1"
+                       style={{ opacity: Math.max(0.25, v) }}>
+                    <div className="text-[9px] font-mono text-red-800">h</div>
+                    <div className="text-[8px] font-mono text-red-600">{v.toFixed(3)}</div>
+                  </div>
+                </React.Fragment>
+              ))}
+              <span className="text-[9px] text-red-700 font-bold ml-1">…→ 0</span>
+            </div>
+          </div>
+          {/* 덧셈 통로 */}
+          <div className="rounded border border-emerald-400 bg-emerald-50 p-2">
+            <div className="text-[10px] font-bold text-emerald-800 mb-1.5">LSTM cell state: c → c → c ... 새 정보를 "더한다" (∂c_t/∂c_(t-1) = 1)</div>
+            <div className="flex items-center gap-1">
+              {[0, 1, 2, 3, 4].map((i) => (
+                <React.Fragment key={i}>
+                  {i > 0 && <span className="text-[9px] text-emerald-600 font-mono">＋→</span>}
+                  <div className="flex-1 rounded border border-emerald-500 bg-white text-center py-1">
+                    <div className="text-[9px] font-mono text-emerald-800">c</div>
+                    <div className="text-[8px] font-mono text-emerald-600">1.000</div>
+                  </div>
+                </React.Fragment>
+              ))}
+              <span className="text-[9px] text-emerald-700 font-bold ml-1">신호 유지 ✓</span>
+            </div>
+          </div>
+          <div className="mt-1.5 text-[10px] text-slate-600">ResNet의 x + F(x) skip connection과 정확히 같은 통찰 — 방향만 다르다(ResNet은 깊이, LSTM은 시간).</div>
+        </div>
+      );
+    }
+
+    function SolutionTimeline() {
+      const items = [
+        { year: '1997', name: 'LSTM', note: 'cell state = 시간 방향 덧셈 고속도로 + 게이트', hot: true },
+        { year: '2011~', name: 'ReLU', note: "tanh′≤1 감쇠 제거 — 활성 구간 미분값 1", hot: false },
+        { year: '2015', name: 'ResNet', note: 'x + F(x) skip — 깊이 방향 덧셈 통로, 100층 돌파', hot: false },
+        { year: '2017', name: 'Transformer', note: '순차 연쇄 폐기 — 어텐션으로 먼 단어 직통 연결', hot: false },
+      ];
+      return (
+        <div className="mt-3 rounded-xl border-2 border-rose-500 bg-gradient-to-br from-rose-50 to-amber-50 p-3">
+          <div className="text-xs font-bold text-rose-900 mb-2">📜 소실 문제 해결 연대기 — 전부 "덧셈 통로"의 변주다</div>
+          <div className="space-y-1.5">
+            {items.map((it) => (
+              <div key={it.year} className={`flex items-center gap-2 rounded border px-2 py-1.5 ${it.hot ? 'border-rose-500 bg-white' : 'border-slate-200 bg-white/70'}`}>
+                <span className="text-[10px] font-mono font-bold text-rose-700 w-10">{it.year}</span>
+                <span className={`text-[11px] font-bold w-24 ${it.hot ? 'text-rose-800' : 'text-slate-800'}`}>{it.name}{it.hot && ' ⭐'}</span>
+                <span className="text-[10px] text-slate-600 flex-1">{it.note}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-rose-900 font-bold">다음 장(III-2): LSTM — 덧셈 통로에 "게이트"라는 밸브를 단다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-rose-50',    border: 'border-rose-300',    text: 'text-rose-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 단계별 시뮬레이션 (rose 톤)
+    // ─────────────────────────────────────────────────────
+    const MODE_BADGE = {
+      sentence: { icon: '🔗', label: '장거리 의존성' },
+      math:     { icon: '📐', label: '연쇄곱 실계산' },
+      flow:     { icon: '⏪', label: 'BPTT 신호 추적' },
+      clip:     { icon: '✂️', label: '클리핑 실험실' },
+      solution: { icon: '🛣', label: '해결의 방향' },
+    };
+
+    function LiveDataPane({ state }) {
+      const p = state.pane;
+      const badge = MODE_BADGE[p.mode] || MODE_BADGE.sentence;
+      return (
+        <div className="rounded-xl border border-rose-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-rose-900 flex items-center gap-1.5">
+              <span>{badge.icon}</span>
+              <span>기울기 관측소 — {badge.label}</span>
+            </h3>
+            <span className="text-[10px] font-mono text-rose-700 px-2 py-0.5 rounded bg-rose-50 border border-rose-200">
+              ∂L/∂h ∝ ∏(W_h·tanh′)
+            </span>
+          </div>
+
+          {/* Step 1: 문장 + 아치 + 오답 예측 */}
+          {p.mode === 'sentence' && (
+            <div>
+              <SentenceArch showArch={p.showArch} gradByDist={null} />
+              {p.showPred && <PredictionBox pred={state.pred} />}
+            </div>
+          )}
+
+          {/* Step 2: 소실/폭주 실계산 그래프 */}
+          {p.mode === 'math' && (
+            <div>
+              <div className="rounded bg-slate-50 border border-slate-200 px-2.5 py-2 text-[11px] font-mono text-slate-700">
+                ∂L/∂h_(t−k) ∝ ∏_(i=1..k) W_h · diag(tanh′) &nbsp;≈&nbsp; (스텝당 배율)^k
+              </div>
+              <GradientChart
+                title="시점 거리 k별 기울기 크기 — 실계산"
+                series={[
+                  { label: '소실 |W|<1 (×0.405/스텝)', factor: VANISH_FACTOR, color: 'bg-rose-500' },
+                  { label: '폭주 |W|>1 (×1.8/스텝)', factor: EXPLODE_FACTOR, color: 'bg-red-700' },
+                ]}
+                note='둘 다 "지수 함수"라 중간이 없다 — 20스텝이면 10⁻⁸ 아니면 10⁺⁵. 매 스텝 같은 W_h를 곱하는 구조가 원인이다.'
+              />
+            </div>
+          )}
+
+          {/* Step 3: 역전파 애니메이션 */}
+          {p.mode === 'flow' && <BackpropFlow />}
+
+          {/* Step 4: 클리핑 전후 */}
+          {p.mode === 'clip' && (
+            <div>
+              <GradientChart
+                title="폭주 기울기 — 20스텝에 1.3e+5, 다음은 NaN"
+                series={[{ label: '폭주 |W|>1 (×1.8/스텝)', factor: EXPLODE_FACTOR, color: 'bg-red-700' }]}
+                note={null}
+              />
+              <ClipCompare />
+            </div>
+          )}
+
+          {/* Step 5: 곱셈 vs 덧셈 + 연대기 */}
+          {p.mode === 'solution' && (
+            <div>
+              <PathwayDiagram />
+              <SolutionTimeline />
+            </div>
+          )}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-rose-400/15 border-l-2 border-rose-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-rose-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-rose-600 text-white font-bold">DL</span>
+              <div>
+                <h1 className="text-2xl font-bold text-rose-900">III-1-2. 기울기 소실 — RNN의 한계</h1>
+                <p className="text-sm text-rose-800/80">"The cat, which ate the fish yesterday, ___ hungry" — 먼 단어를 잊는 수학적 이유</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-rose-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-rose-500' : 'bg-rose-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-rose-800 text-rose-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-rose-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-rose-800 text-white' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-rose-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-rose-500 bg-white px-4 py-3 text-sm text-rose-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                RNN이 먼 단어를 잊는 건 용량 부족이 아니라 수학이다 — BPTT의 기울기는 ∏(W_h·tanh′)의 연쇄곱이고,
+                스텝당 배율이 1에서 조금만 벗어나도 20스텝이면 10⁻⁸(소실) 또는 10⁺⁵(폭주)가 된다.
+                폭주는 clip_grad_norm_으로 응급 처치가 되지만, 클리핑은 큰 걸 줄일 뿐 작은 걸 키우지 못하므로 소실엔 무력하다.
+                근본 해법은 "곱셈의 연쇄"를 "덧셈의 통로"로 바꾸는 것 — ∂(c+x)/∂c=1이라 신호가 감쇠 없이 흐른다.
+                다음 장에서 이 통로에 게이트를 단 LSTM cell state를 열어본다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['기울기소실', '기울기폭주', 'BPTT', '연쇄곱', '장거리의존성', 'tanh미분', 'gradient-clipping', 'clip_grad_norm_', 'cell-state', 'skip-connection'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-900 border border-rose-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-rose-800">
+              <a href="./III-1-1.html" className="underline hover:no-underline">← 이전: III-1-1</a>
+              <a href="../index.html" className="underline hover:no-underline">챕터 목록</a>
+              <a href="./III-2-1.html" className="underline hover:no-underline">다음: III-2-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

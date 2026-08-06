@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deep Learning 학습 — III-2-1. LSTM·GRU — 게이트 해부</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧠</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DL III-2-1 — LSTM·GRU — 게이트 해부
+    학습 목표: RNN의 "기억이 매 스텝 변환을 강제 통과" 문제에서 출발해,
+              cell state 고속도로 + 3개 게이트(forget/input/output)가 기억을
+              선택적으로 지우고·새기고·꺼내는 과정을 실계산으로 추적하고,
+              덧셈 갱신이 기울기 소실을 우회하는 원리(ResNet skip과 동일)와
+              GRU 단순화·실무 선택 기준까지 5단계로 해부한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: LSTM 셀 게이트 밸브 + cell state 컨베이어 실계산)
+          / 우(VSCode CodeViewer: lstm_gru.py — numpy 한 스텝 구현 → GRU → PyTorch)
+    색상: rose (dl 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 아이디어 → forget → input → output/소실 우회 → GRU
+    //   시뮬레이션 문장: "민수는 파리에 갔다. 지혜는 ___" — 새 주어 등장 순간
+    //   cell state 3칸 = [주어 성별, 시제, 장소] 기억 (개념 실험용 축소판)
+    //   gates : [{ sym, name, question, value, active, note }]
+    //   slots : cell state 컨베이어 위 기억 칸들 (단계별 필드 다름)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 아이디어 — 기억을 변환 없이 직진시키는 별도 통로',
+        desc: 'RNN이 긴 문맥을 잊는 근본 원인은 "기억이 저장된 h가 매 스텝 tanh(W·) 변환을 강제로 통과"하기 때문이다. 유지하고 싶은 기억까지 매번 행렬곱과 비선형에 뭉개지고, 역전파 기울기도 같은 길을 거꾸로 수십 번 곱해 지나가며 소실된다. LSTM의 발상은 구조 자체를 바꾸는 것 — 기억 전용의 별도 통로(cell state)를 만들어 변환 없이 직진시키고, 그 통로에 드나드는 것만 0~1 밸브(게이트)로 제어한다. 지울 때만 forget 문을, 새길 때만 input 문을, 꺼낼 때만 output 문을 여닫는다. 즉 "기억을 어떻게 잘 변환할까"가 아니라 "기억을 변환에서 어떻게 빼낼까"로 질문을 뒤집은 것이다.',
+        token: '설계 노트 — 아직 게이트는 예고편',
+        view: 'idea',
+        viewDetail: 'RNN 강제 통과 vs cell state 고속도로',
+        gates: [
+          { sym: 'f', name: 'forget 문', question: '얼마나 지울까', value: 0.5, active: false, note: 'Step 2' },
+          { sym: 'i', name: 'input 문', question: '얼마나 새길까', value: 0.5, active: false, note: 'Step 3' },
+          { sym: 'o', name: 'output 문', question: '얼마나 꺼낼까', value: 0.5, active: false, note: 'Step 4' },
+        ],
+        decay: {
+          title: '첫 단어의 기억, 스텝이 지나면? (개념 실험)',
+          rows: [
+            { t: 't=1', rnn: 0.90, cell: 1.00 },
+            { t: 't=5', rnn: 0.59, cell: 1.00 },
+            { t: 't=10', rnn: 0.35, cell: 1.00 },
+            { t: 't=20', rnn: 0.12, cell: 1.00 },
+          ],
+          note: 'RNN: 매 스텝 변환 통과로 뭉개짐 · cell state: 문을 안 열면 그대로 직진',
+        },
+        alert: { tone: 'info', text: '핵심 한 줄: 기억은 고속도로(cell state)로 직진시키고, 진입로·출구(게이트)만 열고 닫는다. 이제 문 하나씩 열어보자.' },
+        code: {
+          lang: 'python',
+          filename: 'lstm_gru.py — ① 문제와 발상',
+          lines: [
+            '"""',
+            'lstm_gru.py — 왜 RNN은 긴 기억을 못 지키나, LSTM은 어떻게 우회하나',
+            '',
+            'RNN : 기억(h)이 매 스텝 tanh(W @ ...) 변환을 강제로 통과',
+            'LSTM: 기억 전용 통로(cell state C)를 따로 두고 문(gate)으로만 제어',
+            '"""',
+            'import numpy as np',
+            '',
+            '',
+            'def rnn_step(h_prev, x, W_h, W_x, b):',
+            '    """RNN 한 스텝 — 기억 전체가 변환을 통과한다."""',
+            '    return np.tanh(W_h @ h_prev + W_x @ x + b)',
+            '    # 유지하고 싶은 기억도 예외 없이 행렬곱 + tanh 에 뭉개진다',
+            '    # 역전파도 같은 길: 기울기에 W_h 가 스텝 수만큼 곱해진다 → 소실',
+            '',
+            '',
+            '# 개념 실험: 첫 단어의 "기억 신호" 가 20 스텝 뒤 얼마나 남나',
+            'signal = 1.0',
+            'for t in range(20):',
+            '    signal *= 0.9        # 매 스텝 변환에서 조금씩 손실된다고 치면',
+            'print(f"{signal:.2f}")   # 0.12 — 12% 만 남는다 (0.5면 0.000001)',
+            '',
+            '',
+            '# ── LSTM 의 발상 전환 ──────────────────────────────',
+            '# 1) 기억을 "변환 없이 직진" 하는 별도 통로에 싣는다 = cell state C',
+            '# 2) 통로 출입은 0~1 밸브 3개로만 제어한다:',
+            '#      forget 문 f : 옛 기억을 얼마나 지울까     (Step 2)',
+            '#      input  문 i : 새 정보를 얼마나 새길까     (Step 3)',
+            '#      output 문 o : 기억을 얼마나 꺼내 쓸까     (Step 4)',
+            '#',
+            '# 질문이 바뀐다:',
+            '#   "기억을 어떻게 잘 변환할까" → "기억을 변환에서 어떻게 빼낼까"',
+          ],
+          highlight: [4, 5, 10, 11, 12, 13, 14, 18, 19, 20, 21, 25, 26, 27, 28, 29, 31, 32],
+        },
+      },
+      {
+        title: 'Step 2. forget 게이트 — 옛 기억을 얼마나 지울까',
+        desc: '첫 번째 문은 지우개다. f = sigmoid(W_f @ [h_prev, x] + b_f)는 cell state의 칸마다 0~1 값을 내고, 옛 기억에 원소별로 곱해진다 — 0이면 완전 삭제, 1이면 완전 보존. 중요한 건 이 값이 "현재 입력과 직전 문맥을 보고" 매 스텝 새로 계산된다는 점: 문장에서 새 주어 "지혜는"이 등장하는 순간, 옛 주어 성별 기억 칸의 f만 0.1로 닫혀 골라 지워지고, 시제·장소 기억은 0.8~0.9로 거의 그대로 통과한다. 시그모이드라서 지운다/안 지운다의 이분법이 아니라 연속적으로 조절되고, W_f 자체가 학습되므로 "언제 무엇을 잊을지"조차 데이터에서 배운다.',
+        token: '입력 토큰: "지혜는" — 새 주어 등장!',
+        view: 'forget',
+        viewDetail: 'f = sigmoid(W_f @ [h, x] + b_f) → C ⊙ f',
+        gates: [
+          { sym: 'f', name: 'forget 문', question: '얼마나 지울까', value: 0.6, active: true, note: '칸별로 다르게 열림' },
+          { sym: 'i', name: 'input 문', question: '얼마나 새길까', value: 0.5, active: false, note: '다음 단계' },
+          { sym: 'o', name: 'output 문', question: '얼마나 꺼낼까', value: 0.5, active: false, note: 'Step 4' },
+        ],
+        slots: [
+          { name: '주어 = 민수(남)', old: 0.90, f: 0.10, after: 0.09, wiped: true },
+          { name: '시제 = 과거', old: 0.80, f: 0.90, after: 0.72, wiped: false },
+          { name: '장소 = 파리', old: 0.70, f: 0.80, after: 0.56, wiped: false },
+        ],
+        slotMode: 'forget',
+        alert: { tone: 'warn', text: '새 주어가 나타나자 주어 칸만 f=0.10으로 닫혔다 — 0.90이던 "민수(남)" 기억이 0.09로 지워진다. 시제·장소는 문이 열린 채(0.8~0.9) 거의 그대로 통과.' },
+        code: {
+          lang: 'python',
+          filename: 'lstm_gru.py — ② forget 게이트',
+          lines: [
+            '"""',
+            'lstm_gru.py — forget 게이트: 옛 기억을 얼마나 지울까',
+            '"""',
+            'import numpy as np',
+            '',
+            '',
+            'def sigmoid(z: np.ndarray) -> np.ndarray:',
+            '    """0~1 밸브 — 게이트는 전부 시그모이드로 만든다."""',
+            '    return 1.0 / (1.0 + np.exp(-z))',
+            '',
+            '',
+            'def forget_gate(h_prev, x, W_f, b_f):',
+            '    """f_t = sigmoid(W_f @ [h_prev, x] + b_f).',
+            '',
+            '    게이트 입력은 항상 [직전 은닉 h_prev, 현재 입력 x] 연결 —',
+            '    "지금 무슨 단어가 왔고 직전 문맥이 무엇인지" 를 보고',
+            '    칸마다 0~1 을 새로 계산한다. W_f 는 학습된다.',
+            '    """',
+            '    z = np.concatenate([h_prev, x])',
+            '    return sigmoid(W_f @ z + b_f)',
+            '',
+            '',
+            '# 예: cell state 3칸 = [주어 성별, 시제, 장소] 기억 (축소판)',
+            'C_prev = np.array([0.90, 0.80, 0.70])',
+            '',
+            '# 토큰 "지혜는"(새 주어)이 들어온 순간의 forget 값 — 학습된 반응',
+            'f_t = np.array([0.10, 0.90, 0.80])   # 주어 칸만 거의 닫힘',
+            '',
+            'C_after_forget = f_t * C_prev         # 원소별 곱 (⊙)',
+            'print(C_after_forget)                 # [0.09 0.72 0.56]',
+            '',
+            '# 주어 기억만 "골라서" 지웠다 — 나머지는 거의 그대로',
+            '# 0/1 스위치가 아니라 연속 조절: 애매하면 0.5로 반쯤 지운다',
+            '# "언제 무엇을 잊을지" 도 W_f 가 데이터에서 배우는 것',
+          ],
+          highlight: [7, 8, 9, 12, 13, 19, 20, 24, 27, 29, 30, 32, 33, 34],
+        },
+      },
+      {
+        title: 'Step 3. input 게이트와 후보 — 새 정보를 얼마나 새길까',
+        desc: '지웠으면 새로 써야 한다. 새기기는 두 부품의 곱이다 — 후보 C̃ = tanh(W_c @ [h, x])가 "무엇을 쓸지"(-1~1 내용)를 만들고, input 게이트 i = sigmoid(W_i @ [h, x])가 "얼마나 쓸지"(0~1 세기)를 정한다. 내용과 세기를 분리한 덕에 "쓸 내용은 강하지만 지금은 조금만 반영"같은 미세 조절이 가능하다. 그리고 이 장의 심장인 갱신식: C_t = f⊙C_prev + i⊙C̃ — 지운 옛 기억에 새 정보를 더한다. 주어 칸은 0.09 + 0.86 = 0.95로 "지혜(여)"가 새겨지고, 시제·장소 칸은 i가 0.1~0.2로 닫혀 있어 거의 변하지 않는다. 곱셈 변환이 아니라 덧셈 갱신이라는 사실이 다음 단계의 복선이다.',
+        token: '입력 토큰: "지혜는" — 새 주어를 새긴다',
+        view: 'input',
+        viewDetail: 'C_t = f ⊙ C_prev + i ⊙ C̃ (덧셈 갱신!)',
+        gates: [
+          { sym: 'f', name: 'forget 문', question: '얼마나 지울까', value: 0.6, active: true, note: '지우기 완료' },
+          { sym: 'i', name: 'input 문', question: '얼마나 새길까', value: 0.4, active: true, note: '주어 칸만 크게 열림' },
+          { sym: 'o', name: 'output 문', question: '얼마나 꺼낼까', value: 0.5, active: false, note: '다음 단계' },
+        ],
+        slots: [
+          { name: '주어 칸', keep: 0.09, cand: '지혜(여)', candV: 0.95, i: 0.90, add: 0.86, next: 0.95, changed: true },
+          { name: '시제 칸', keep: 0.72, cand: '(과거 유지)', candV: 0.10, i: 0.20, add: 0.02, next: 0.74, changed: false },
+          { name: '장소 칸', keep: 0.56, cand: '(파리 유지)', candV: 0.05, i: 0.10, add: 0.01, next: 0.57, changed: false },
+        ],
+        slotMode: 'input',
+        alert: { tone: 'good', text: 'f⊙옛기억 + i⊙새정보 = 새 cell state. 주어 칸만 0.09+0.86=0.95로 갈아끼워지고 나머지는 유지 — "선택적 기억 교체"가 완성됐다.' },
+        code: {
+          lang: 'python',
+          filename: 'lstm_gru.py — ③ input 게이트 + 후보',
+          lines: [
+            '"""',
+            'lstm_gru.py — input 게이트 + 후보: 새 정보를 얼마나 새길까',
+            '',
+            '새기기 = "무엇을"(후보 C~, tanh -1~1) x "얼마나"(게이트 i, 0~1)',
+            '"""',
+            'import numpy as np',
+            '',
+            'z = np.concatenate([h_prev, x])       # 게이트 공통 입력',
+            '',
+            '# 부품 1) 후보 — 무엇을 쓸지 (내용, -1~1)',
+            'C_tilde = np.tanh(W_c @ z + b_c)',
+            '',
+            '# 부품 2) input 게이트 — 얼마나 쓸지 (세기, 0~1)',
+            'i_t = sigmoid(W_i @ z + b_i)',
+            '',
+            '# ★ cell state 갱신 — 이 한 줄이 LSTM 의 심장',
+            'C_t = f_t * C_prev + i_t * C_tilde',
+            '#     └ 지우기 ────┘   └ 새기기 ──┘   ← 곱셈 변환이 아니라 "덧셈"',
+            '',
+            '',
+            '# 숫자로 확인 — 토큰 "지혜는" 시점 (주어/시제/장소 3칸)',
+            'C_after_forget = np.array([0.09, 0.72, 0.56])  # Step 2 결과',
+            'C_tilde_now = np.array([0.95, 0.10, 0.05])     # 후보: 주어=지혜(여)',
+            'i_now = np.array([0.90, 0.20, 0.10])           # 주어 칸만 크게 열림',
+            '',
+            'C_t = C_after_forget + i_now * C_tilde_now',
+            'print(C_t)   # [0.95 0.74 0.57]',
+            '',
+            '# 주어 칸: 0.09 + 0.90*0.95 = 0.95  → "지혜(여)" 로 교체 완료',
+            '# 시제 칸: 0.72 + 0.20*0.10 = 0.74  → 거의 그대로',
+            '# 장소 칸: 0.56 + 0.10*0.05 = 0.57  → 거의 그대로',
+            '#',
+            '# 내용(C~)과 세기(i)를 분리한 이유:',
+            '#   "쓸 내용은 강하지만 지금은 조금만 반영" 같은 조절이 가능',
+            '# 그리고 복선: C 는 곱해지는 게 아니라 "더해진다" → Step 4',
+          ],
+          highlight: [4, 10, 11, 13, 14, 16, 17, 18, 26, 27, 29, 30, 31, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 4. output 게이트와 소실 우회 — 덧셈 통로로 기울기가 살아간다',
+        desc: '세 번째 문은 출구다. o = sigmoid(W_o @ [h, x])가 cell state에서 "지금 필요한 만큼만" 꺼내 h_t = o ⊙ tanh(C_t)로 내보낸다 — 다음 단어가 동사라면 주어·시제 칸은 크게 열고 장소 칸은 닫아두는 식이며, 덕분에 C에는 장기 기억을 통째로 보존하면서 h로는 당장 쓸 것만 노출한다. 그리고 이 구조의 진짜 보상은 역전파에 있다: C 경로의 갱신이 C_t = f⊙C_prev + (i⊙C̃)라는 덧셈이라, dC_t/dC_prev = f_t 하나뿐 — RNN처럼 W 행렬 곱셈 연쇄를 통과하지 않는다. f가 1에 가까운 칸은 기울기가 거의 그대로 수십 스텝을 거슬러 올라간다. ResNet의 skip connection이 덧셈으로 기울기 고속도로를 만든 것과 정확히 같은 원리다.',
+        token: '다음 토큰 예측 — 동사가 올 차례 (주어·시제 필요)',
+        view: 'output',
+        viewDetail: 'h_t = o ⊙ tanh(C_t) · 역전파는 dC/dC = f 뿐',
+        gates: [
+          { sym: 'f', name: 'forget 문', question: '얼마나 지울까', value: 0.6, active: true, note: '역전파의 통행료 = f 뿐' },
+          { sym: 'i', name: 'input 문', question: '얼마나 새길까', value: 0.4, active: true, note: '새기기 완료' },
+          { sym: 'o', name: 'output 문', question: '얼마나 꺼낼까', value: 0.65, active: true, note: '필요한 칸만 출력' },
+        ],
+        slots: [
+          { name: '주어 칸 (지혜·여)', c: 0.95, o: 0.85, h: 0.63, need: true },
+          { name: '시제 칸 (과거)', c: 0.74, o: 0.90, h: 0.57, need: true },
+          { name: '장소 칸 (파리)', c: 0.57, o: 0.20, h: 0.10, need: false },
+        ],
+        slotMode: 'output',
+        grad: {
+          title: '20 스텝 역전파 — 기울기 생존율 비교',
+          rows: [
+            { path: 'RNN: h 경로 (W 곱셈 연쇄 x20)', formula: '0.9^20', value: 0.12, ok: false },
+            { path: 'RNN: 나쁜 경우 (0.5^20)', formula: '0.5^20', value: 0.000001, ok: false },
+            { path: 'LSTM: C 경로 (f=0.98 곱 x20)', formula: '0.98^20', value: 0.67, ok: true },
+          ],
+          note: 'C 경로의 통행료는 f 원소곱뿐 — 문을 연 칸(f≈1)은 기울기가 살아서 멀리 간다. ResNet skip = 같은 덧셈 원리.',
+        },
+        alert: { tone: 'good', text: 'C에는 전부 보존, h로는 필요한 것만(장소 칸 o=0.20으로 잠금). 역전파는 덧셈 통로 덕분에 W 연쇄를 우회 — 이것이 "소실 우회"의 정체다.' },
+        code: {
+          lang: 'python',
+          filename: 'lstm_gru.py — ④ 한 스텝 완성 + 소실 우회',
+          lines: [
+            '"""',
+            'lstm_gru.py — LSTM 셀 한 스텝 전체 (numpy 완결판)',
+            '"""',
+            'import numpy as np',
+            '',
+            '',
+            'def lstm_step(h_prev, C_prev, x, p):',
+            '    """LSTM 한 스텝. p 는 게이트별 가중치 dict.',
+            '',
+            '    Args:',
+            '        h_prev: 직전 은닉 (단기·작업 기억)',
+            '        C_prev: 직전 cell state (장기 기억 고속도로)',
+            '        x: 현재 입력 토큰 벡터',
+            '    Returns:',
+            '        (h_t, C_t)',
+            '    """',
+            '    z = np.concatenate([h_prev, x])',
+            '',
+            '    f_t = sigmoid(p["W_f"] @ z + p["b_f"])   # ① 얼마나 지울까',
+            '    i_t = sigmoid(p["W_i"] @ z + p["b_i"])   # ② 얼마나 새길까',
+            '    C_tilde = np.tanh(p["W_c"] @ z + p["b_c"])  # ②b 무엇을 새길까',
+            '    o_t = sigmoid(p["W_o"] @ z + p["b_o"])   # ③ 얼마나 꺼낼까',
+            '',
+            '    C_t = f_t * C_prev + i_t * C_tilde       # 덧셈 갱신 (고속도로)',
+            '    h_t = o_t * np.tanh(C_t)                 # 필요한 만큼만 출력',
+            '    return h_t, C_t',
+            '',
+            '',
+            '# ── 왜 기울기가 살아남나 (소실 우회의 정체) ──────────',
+            '# C_t = f_t * C_prev + (i_t * C_tilde)  ← "덧셈" 갱신',
+            '# 역전파:  dC_t / dC_prev = f_t          ← 원소곱 하나뿐!',
+            '#   RNN 은 dh_t/dh_prev 에 W 행렬이 끼어 스텝마다 곱셈 연쇄,',
+            '#   LSTM 의 C 경로에는 W 가 없다 — 통행료는 f 뿐이다.',
+            '',
+            'grad = 1.0',
+            'for t in range(20):',
+            '    grad *= 0.98      # 문을 연 칸: f = 0.98',
+            'print(f"{grad:.2f}")  # 0.67 — 20 스텝을 거슬러도 67% 생존',
+            '                      # (RNN 0.9^20 = 0.12, 0.5^20 = 0.000001)',
+            '',
+            '# ResNet 의 skip connection( y = F(x) + x )과 같은 원리:',
+            '# "덧셈으로 이어진 통로" 는 기울기의 고속도로가 된다.',
+          ],
+          highlight: [7, 17, 19, 20, 21, 22, 24, 25, 26, 30, 31, 32, 33, 34, 36, 37, 38, 39, 42, 43],
+        },
+      },
+      {
+        title: 'Step 5. GRU와 선택 기준 — 문 2개로 줄여도 충분할 때',
+        desc: 'GRU는 LSTM의 문 3개를 2개로 줄인 실용주의 버전이다 — update 게이트 z가 forget과 input을 하나로 통합해 "z만큼 새 것, (1-z)만큼 옛 것"으로 보간하고, reset 게이트 r는 후보를 만들 때 옛 문맥을 얼마나 참조할지 정하며, cell state 없이 h 하나로 기억을 관리한다. 파라미터가 약 25% 적어 학습이 빠르고 데이터가 적을 때 과적합에 유리한데, 벤치마크 성능은 LSTM과 대체로 비슷하다 — 그래서 실무 기본기는 "GRU로 먼저, 아쉬우면 LSTM"이다. 센서 시계열 이상탐지·수요 예측·로그 시퀀스 분류처럼 순서가 본질인 문제에서 여전히 첫 선택지다. 다만 남는 문제가 있다: 게이트로 기억은 지켰지만 토큰을 하나씩 순차 처리하는 구조라 병렬화가 안 되고 길이가 길수록 느리다 — 이 병목을 부수는 것이 다음 장의 seq2seq와 attention이다.',
+        token: '실무 선택 — GRU 먼저, 아쉬우면 LSTM',
+        view: 'gru',
+        viewDetail: 'GRU: update(z)·reset(r) 2개 문 · C 없이 h 하나',
+        gates: [
+          { sym: 'z', name: 'update 문', question: 'forget+input 통합', value: 0.7, active: true, note: 'z만큼 새 것, 1-z만큼 옛 것' },
+          { sym: 'r', name: 'reset 문', question: '옛 문맥 참조량', value: 0.55, active: true, note: '후보 계산에만 관여' },
+          { sym: '—', name: 'output 문', question: '(없음 — h 그대로)', value: 0, active: false, note: 'GRU에는 출구 문이 없다' },
+        ],
+        gru: {
+          title: 'LSTM vs GRU — 무엇이 줄었나',
+          rows: [
+            { crit: '게이트 수', lstm: '3개 (f·i·o)', gru: '2개 (z·r)' },
+            { crit: '기억 통로', lstm: 'C와 h 두 줄', gru: 'h 한 줄' },
+            { crit: '파라미터 (hidden 128 기준)', lstm: '약 99K', gru: '약 74K (-25%)' },
+            { crit: '성능 (다수 벤치마크)', lstm: '대체로 비슷', gru: '대체로 비슷' },
+            { crit: '데이터가 적을 때', lstm: '과적합 주의', gru: '유리 (가벼움)' },
+            { crit: '아주 긴 의존성', lstm: '유리하다는 보고 있음', gru: '충분한 경우 다수' },
+          ],
+        },
+        remain: {
+          title: '그래도 남는 문제 — 순차 처리 병목',
+          items: [
+            't=1 → t=2 → t=3 → … 토큰을 하나씩 처리 — GPU 병렬화 불가',
+            '길이 1,000 문장 = 1,000번의 순차 연산 — 길수록 느리다',
+            '기억은 지켰지만 "속도의 벽" 은 그대로 → 다음 장: seq2seq와 attention',
+          ],
+        },
+        alert: { tone: 'info', text: '선택 기준 요약 — 시계열·로그·짧은 텍스트는 GRU 먼저. 아주 긴 의존성·대형 데이터면 LSTM도 비교. 그리고 긴 문서·번역급 문제는 다음 장의 attention이 답이 된다.' },
+        code: {
+          lang: 'python',
+          filename: 'lstm_gru.py — ⑤ GRU + PyTorch 실전',
+          lines: [
+            '"""',
+            'lstm_gru.py — GRU 셀 + PyTorch 실전 비교',
+            '"""',
+            'import numpy as np',
+            'import torch',
+            'import torch.nn as nn',
+            '',
+            '',
+            'def gru_step(h_prev, x, p):',
+            '    """GRU 한 스텝 — 문 2개, cell state 없음.',
+            '',
+            '    z_t: update 문 — forget + input 을 하나로 통합',
+            '    r_t: reset 문 — 후보를 만들 때 옛 문맥 참조량',
+            '    """',
+            '    zx = np.concatenate([h_prev, x])',
+            '    z_t = sigmoid(p["W_z"] @ zx + p["b_z"])',
+            '    r_t = sigmoid(p["W_r"] @ zx + p["b_r"])',
+            '',
+            '    # 후보: reset 으로 "걸러진 옛 문맥" + 현재 입력',
+            '    h_tilde = np.tanh(p["W_h"] @ np.concatenate([r_t * h_prev, x])',
+            '                      + p["b_h"])',
+            '',
+            '    # 보간 갱신: z만큼 새 것, (1-z)만큼 옛 것 — 역시 덧셈 계열',
+            '    return (1.0 - z_t) * h_prev + z_t * h_tilde',
+            '',
+            '',
+            '# ── 실전은 직접 구현이 아니라 PyTorch 내장 셀 ──────────',
+            'lstm = nn.LSTM(input_size=64, hidden_size=128, batch_first=True)',
+            'gru = nn.GRU(input_size=64, hidden_size=128, batch_first=True)',
+            '',
+            'x = torch.randn(32, 50, 64)          # (배치 32, 길이 50, 차원 64)',
+            'out_l, (h_n, c_n) = lstm(x)          # LSTM 은 (h, C) 두 상태 반환',
+            'out_g, h_g = gru(x)                  # GRU 는 h 하나만 반환',
+            '',
+            'n_lstm = sum(pm.numel() for pm in lstm.parameters())  # 99,328',
+            'n_gru = sum(pm.numel() for pm in gru.parameters())    # 74,496',
+            'print(n_lstm, n_gru)   # GRU 가 약 25% 가볍다',
+            '',
+            '# 선택 기준:',
+            '#   1) 기본기: GRU 먼저 — 빠르고 가볍고 성능 비슷',
+            '#   2) 아주 긴 의존성 · 데이터 풍부 → LSTM 도 비교 실험',
+            '#   3) 남는 문제: 토큰 순차 처리 = 병렬화 불가 · 긴 입력에 느림',
+            '#      → 다음 장 seq2seq + attention 이 이 병목을 부순다',
+          ],
+          highlight: [9, 15, 16, 17, 20, 21, 24, 28, 29, 32, 33, 35, 36, 37, 40, 41, 42, 43],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 게이트 밸브 — 0~1 열림 게이지
+    // ─────────────────────────────────────────────────────
+    function GateValve({ g }) {
+      const pct = Math.round(g.value * 100);
+      return (
+        <div className={`flex-1 rounded-lg border-2 p-2 ${g.active ? 'border-rose-400 bg-rose-50' : 'border-slate-200 bg-slate-50 opacity-60'}`}>
+          <div className="flex items-center justify-between">
+            <span className={`text-[11px] font-bold ${g.active ? 'text-rose-800' : 'text-slate-500'}`}>
+              🚪 {g.name} <span className="font-mono">({g.sym})</span>
+            </span>
+            {g.active && <span className="text-[10px] font-mono text-rose-700">{pct}%</span>}
+          </div>
+          <div className="text-[9px] text-slate-500 mb-1">{g.question}</div>
+          <div className="h-1.5 rounded-full bg-white border border-slate-200 overflow-hidden">
+            <div className={`h-full transition-all duration-700 ${g.active ? 'bg-rose-500' : 'bg-slate-300'}`} style={{ width: `${pct}%` }} />
+          </div>
+          <div className={`mt-1 text-[9px] ${g.active ? 'text-rose-700' : 'text-slate-400'}`}>{g.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 기억 세기 미니 바 (0~1)
+    // ─────────────────────────────────────────────────────
+    function MemBar({ v, tone }) {
+      const color = tone === 'bad' ? 'bg-red-400' : tone === 'good' ? 'bg-emerald-500' : 'bg-rose-400';
+      return (
+        <div className="w-12 h-1.5 rounded-full bg-slate-100 border border-slate-200 overflow-hidden inline-block align-middle">
+          <div className={`h-full ${color} transition-all duration-700`} style={{ width: `${Math.round(Math.min(1, Math.abs(v)) * 100)}%` }} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — RNN 감쇠 vs cell state 직진 비교
+    // ─────────────────────────────────────────────────────
+    function DecayBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-300 bg-white p-3">
+          <div className="text-xs font-bold text-rose-900 mb-2">📉 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-rose-800 border-b border-rose-200">
+                <th className="text-left py-0.5">스텝</th>
+                <th className="text-left py-0.5 pl-2">RNN (매번 변환 통과)</th>
+                <th className="text-left py-0.5 pl-2">cell state (문 닫고 직진)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.t} className="border-t border-rose-100">
+                  <td className="py-1 font-mono">{r.t}</td>
+                  <td className="py-1 pl-2">
+                    <MemBar v={r.rnn} tone={r.rnn < 0.4 ? 'bad' : 'mid'} />
+                    <span className="ml-1 font-mono">{r.rnn.toFixed(2)}</span>
+                  </td>
+                  <td className="py-1 pl-2">
+                    <MemBar v={r.cell} tone="good" />
+                    <span className="ml-1 font-mono text-emerald-700">{r.cell.toFixed(2)}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-1.5 text-[10px] text-rose-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // cell state 컨베이어 — 단계별 슬롯 표시
+    // ─────────────────────────────────────────────────────
+    function SlotBelt({ slots, mode }) {
+      if (!slots) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold text-rose-900">🛣 cell state 컨베이어 — 기억 칸 실계산</span>
+            <span className="text-[9px] text-slate-500 font-mono">
+              {mode === 'forget' ? 'C ⊙ f' : mode === 'input' ? 'f⊙C + i⊙C̃' : 'h = o ⊙ tanh(C)'}
+            </span>
+          </div>
+          <div className="space-y-1.5">
+            {mode === 'forget' && slots.map((s) => (
+              <div key={s.name} className={`rounded border px-2 py-1.5 flex items-center gap-2 text-[10px] ${s.wiped ? 'border-red-300 bg-red-50' : 'border-emerald-200 bg-emerald-50'}`}>
+                <span className="font-bold text-slate-800 w-24 truncate">{s.name}</span>
+                <span className="font-mono">{s.old.toFixed(2)}</span>
+                <span className={`px-1 rounded font-mono font-bold ${s.wiped ? 'bg-red-100 text-red-800' : 'bg-emerald-100 text-emerald-800'}`}>× f={s.f.toFixed(2)}</span>
+                <span>→</span>
+                <span className="font-mono font-bold">{s.after.toFixed(2)}</span>
+                <MemBar v={s.after} tone={s.wiped ? 'bad' : 'good'} />
+                <span className={`ml-auto text-[9px] font-bold ${s.wiped ? 'text-red-700' : 'text-emerald-700'}`}>{s.wiped ? '🧹 지워짐' : '✓ 보존'}</span>
+              </div>
+            ))}
+            {mode === 'input' && slots.map((s) => (
+              <div key={s.name} className={`rounded border px-2 py-1.5 text-[10px] ${s.changed ? 'border-rose-400 bg-rose-50' : 'border-slate-200 bg-slate-50'}`}>
+                <div className="flex items-center gap-2">
+                  <span className="font-bold text-slate-800 w-16">{s.name}</span>
+                  <span className="font-mono">{s.keep.toFixed(2)}</span>
+                  <span className="text-slate-500">+</span>
+                  <span className={`px-1 rounded font-mono ${s.changed ? 'bg-rose-100 text-rose-800 font-bold' : 'bg-white text-slate-500 border border-slate-200'}`}>
+                    i={s.i.toFixed(2)} × C̃={s.candV.toFixed(2)}
+                  </span>
+                  <span>=</span>
+                  <span className="font-mono font-bold">{s.next.toFixed(2)}</span>
+                  <MemBar v={s.next} tone={s.changed ? 'mid' : 'good'} />
+                </div>
+                <div className={`mt-0.5 text-[9px] ${s.changed ? 'text-rose-700 font-bold' : 'text-slate-500'}`}>
+                  {s.changed ? `✍ 새 기억 "${s.cand}" 새김 (+${s.add.toFixed(2)})` : `유지 ${s.cand} (+${s.add.toFixed(2)}뿐)`}
+                </div>
+              </div>
+            ))}
+            {mode === 'output' && slots.map((s) => (
+              <div key={s.name} className={`rounded border px-2 py-1.5 flex items-center gap-2 text-[10px] ${s.need ? 'border-emerald-300 bg-emerald-50' : 'border-slate-200 bg-slate-50'}`}>
+                <span className="font-bold text-slate-800 w-28 truncate">{s.name}</span>
+                <span className="font-mono">C={s.c.toFixed(2)}</span>
+                <span className={`px-1 rounded font-mono font-bold ${s.need ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-500'}`}>× o={s.o.toFixed(2)}</span>
+                <span>→</span>
+                <span className="font-mono font-bold">h={s.h.toFixed(2)}</span>
+                <MemBar v={s.h} tone={s.need ? 'good' : 'mid'} />
+                <span className={`ml-auto text-[9px] font-bold ${s.need ? 'text-emerald-700' : 'text-slate-500'}`}>{s.need ? '📤 출력' : '🔒 잠금 (C엔 보존)'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 기울기 생존율 비교
+    // ─────────────────────────────────────────────────────
+    function GradBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-emerald-400 bg-emerald-50 p-3">
+          <div className="text-xs font-bold text-emerald-900 mb-2">⚡ {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r) => (
+              <div key={r.path} className="flex items-center gap-2 text-[10px]">
+                <span className={`w-52 truncate ${r.ok ? 'text-emerald-900 font-bold' : 'text-slate-600'}`}>{r.path}</span>
+                <span className="font-mono text-slate-500 w-14">{r.formula}</span>
+                <div className="flex-1 h-2 rounded-full bg-white border border-emerald-200 overflow-hidden">
+                  <div className={`h-full transition-all duration-700 ${r.ok ? 'bg-emerald-500' : 'bg-red-400'}`} style={{ width: `${Math.max(1, Math.round(r.value * 100))}%` }} />
+                </div>
+                <span className={`font-mono font-bold w-16 text-right ${r.ok ? 'text-emerald-700' : 'text-red-700'}`}>{r.value < 0.001 ? '≈0' : r.value.toFixed(2)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-emerald-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — LSTM vs GRU 비교표 + 남는 문제
+    // ─────────────────────────────────────────────────────
+    function GruBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-rose-500 bg-gradient-to-br from-rose-50 to-amber-50 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xl">⚖️</span>
+            <span className="text-sm font-bold text-rose-900">{box.title}</span>
+          </div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-rose-900 border-b-2 border-rose-300">
+                <th className="text-left py-1">항목</th>
+                <th className="text-left py-1 pl-2 w-28">LSTM</th>
+                <th className="text-left py-1 pl-2 w-28">GRU</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.crit} className="border-t border-rose-200">
+                  <td className="py-1 text-slate-800">{r.crit}</td>
+                  <td className="py-1 pl-2 text-slate-700">{r.lstm}</td>
+                  <td className="py-1 pl-2 font-bold text-rose-800">{r.gru}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function RemainBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-amber-400 bg-amber-50 p-3">
+          <div className="text-xs font-bold text-amber-900 mb-1.5">⏳ {box.title}</div>
+          <ul className="space-y-1 text-[10px] text-amber-900">
+            {box.items.map((it, i) => (
+              <li key={i} className="flex gap-1.5"><span>•</span><span>{it}</span></li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-rose-50',    border: 'border-rose-300',    text: 'text-rose-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — LSTM 셀 해부실 (rose 톤)
+    // ─────────────────────────────────────────────────────
+    const VIEW_BADGE = {
+      idea:   { icon: '💡', label: '발상 — 고속도로 설계' },
+      forget: { icon: '🧹', label: 'forget 문 가동' },
+      input:  { icon: '✍️', label: 'input 문 가동' },
+      output: { icon: '📤', label: 'output 문 + 역전파' },
+      gru:    { icon: '⚖️', label: 'GRU 단순화' },
+    };
+
+    function LiveDataPane({ state }) {
+      const badge = VIEW_BADGE[state.view] || VIEW_BADGE.idea;
+      return (
+        <div className="rounded-xl border border-rose-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-rose-900 flex items-center gap-1.5">
+              <span>{badge.icon}</span>
+              <span>LSTM 셀 해부실 — {badge.label}</span>
+            </h3>
+          </div>
+          <div className="text-[10px] text-rose-700 font-mono mb-2 px-2 py-1 rounded bg-rose-50 border border-rose-200">
+            {state.viewDetail}
+          </div>
+          <div className="text-[10px] text-slate-600 mb-2 px-2 py-1 rounded bg-slate-50 border border-slate-200">
+            🎬 {state.token} — 문장: "민수는 파리에 갔다. <b>지혜는</b> ___"
+          </div>
+          {/* 게이트 밸브 3개 */}
+          <div className="flex gap-2">
+            {state.gates.map((g) => <GateValve key={g.name} g={g} />)}
+          </div>
+          <DecayBox box={state.decay} />
+          <SlotBelt slots={state.slots} mode={state.slotMode} />
+          <GradBox box={state.grad} />
+          <GruBox box={state.gru} />
+          <RemainBox box={state.remain} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-rose-400/15 border-l-2 border-rose-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-rose-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-rose-600 text-white font-bold">DL</span>
+              <div>
+                <h1 className="text-2xl font-bold text-rose-900">III-2-1. LSTM·GRU — 게이트 해부</h1>
+                <p className="text-sm text-rose-800/80">기억을 지키는 세 개의 문 — cell state 고속도로가 소실을 우회하는 방법</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-rose-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-rose-500' : 'bg-rose-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-rose-800 text-rose-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-rose-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-rose-800 text-white' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-rose-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-rose-500 bg-white px-4 py-3 text-sm text-rose-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                LSTM은 기억 전용 통로(cell state)를 만들어 변환 없이 직진시키고, forget(지우기)·input(새기기)·output(꺼내기)
+                세 개의 시그모이드 문으로만 출입을 제어한다. 갱신이 C = f⊙C_prev + i⊙C̃ 라는 덧셈이라
+                역전파의 통행료가 f 원소곱뿐 — W 곱셈 연쇄를 우회해 기울기가 살아서 멀리 간다 (ResNet skip과 같은 원리).
+                GRU는 문을 2개(update·reset)로 줄인 실용판으로 성능은 비슷하고 25% 가볍다 — 실무 기본기는 GRU 먼저.
+                남은 병목은 토큰 순차 처리 — 다음 장 seq2seq와 attention이 이 벽을 부순다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['LSTM', 'GRU', 'cellstate', 'forget게이트', 'input게이트', 'output게이트', '기울기소실', '덧셈갱신', 'skipconnection', 'update게이트'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-900 border border-rose-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-rose-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-2-2.html" className="underline hover:no-underline">다음: III-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

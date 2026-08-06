@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deep Learning 학습 — I-2-2. 손실 함수와 옵티마이저 — SGD→Adam</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⛰️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DL I-2-2 — 손실 함수와 옵티마이저 — SGD→Adam
+    학습 목표: 손실 함수 선택(MSE vs CE) → 경사하강과 학습률 → SGD/미니배치 →
+              모멘텀·RMSProp·Adam 경주 → 실무 기본값(AdamW·스케줄)까지 5단계.
+    패턴: fastapi v1 — 좌(LiveDataPane: 2D 등고선 손실 지형 위 실제 계산 시뮬레이션)
+          / 우(VSCode CodeViewer: optimizers.py — numpy 직접 구현 → PyTorch)
+    색상: rose (dl 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 손실 지형 — f(x,y) = 0.5(x² + 10y²)
+    //   y축 곡률(10)이 x축(1)보다 10배 가파른 "골짜기" 지형.
+    //   SGD 지그재그·모멘텀 가속·Adam의 축별 lr 조정을 모두 보여주는 표준 예제.
+    //   아래 경로들은 그림이 아니라 실제 업데이트 식을 그대로 계산한 결과다.
+    // ─────────────────────────────────────────────────────
+    const START = [-2.7, 1.3];
+    const lossF = (x, y) => 0.5 * (x * x + 10 * y * y);
+    const gradF = (x, y) => [x, 10 * y];
+
+    // 시드 고정 난수 (미니배치 노이즈 재현용)
+    function lcg(seed) {
+      let s = seed >>> 0;
+      return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    }
+    function gauss(rand) {
+      const u = Math.max(rand(), 1e-9), v = rand();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+
+    // 순수 (S)GD — sigma > 0 이면 미니배치 노이즈 포함
+    function runGD({ lr, steps = 60, sigma = 0, seed = 7 }) {
+      const rand = lcg(seed);
+      let [x, y] = START;
+      const pts = [[x, y]], losses = [lossF(x, y)];
+      let diverged = false;
+      for (let t = 0; t < steps; t++) {
+        let [gx, gy] = gradF(x, y);
+        if (sigma > 0) { gx += sigma * gauss(rand); gy += sigma * gauss(rand); }
+        x -= lr * gx; y -= lr * gy;
+        pts.push([x, y]); losses.push(lossF(x, y));
+        if (Math.abs(x) > 40 || Math.abs(y) > 40) { diverged = true; break; }
+      }
+      return { pts, losses, diverged };
+    }
+
+    // 4대 옵티마이저 — 논문 그대로의 업데이트 식
+    function runOptimizer(kind, lr, steps = 80) {
+      let [x, y] = START;
+      let vx = 0, vy = 0, sx = 0, sy = 0, mx = 0, my = 0;
+      const b1 = 0.9, b2 = 0.999, eps = 1e-8;
+      const pts = [[x, y]], losses = [lossF(x, y)];
+      for (let t = 1; t <= steps; t++) {
+        const [gx, gy] = gradF(x, y);
+        if (kind === 'sgd') {
+          x -= lr * gx; y -= lr * gy;
+        } else if (kind === 'momentum') {
+          vx = 0.9 * vx - lr * gx; vy = 0.9 * vy - lr * gy;
+          x += vx; y += vy;
+        } else if (kind === 'rmsprop') {
+          sx = 0.9 * sx + 0.1 * gx * gx; sy = 0.9 * sy + 0.1 * gy * gy;
+          x -= lr * gx / (Math.sqrt(sx) + eps); y -= lr * gy / (Math.sqrt(sy) + eps);
+        } else { // adam = momentum(1차) + rmsprop(2차) + 편향 보정
+          mx = b1 * mx + (1 - b1) * gx; my = b1 * my + (1 - b1) * gy;
+          sx = b2 * sx + (1 - b2) * gx * gx; sy = b2 * sy + (1 - b2) * gy * gy;
+          const mhx = mx / (1 - Math.pow(b1, t)), mhy = my / (1 - Math.pow(b1, t));
+          const shx = sx / (1 - Math.pow(b2, t)), shy = sy / (1 - Math.pow(b2, t));
+          x -= lr * mhx / (Math.sqrt(shx) + eps); y -= lr * mhy / (Math.sqrt(shy) + eps);
+        }
+        pts.push([x, y]); losses.push(lossF(x, y));
+      }
+      return { pts, losses };
+    }
+
+    // 단계별 시뮬레이션 결과 (모듈 로드 시 1회 계산 — 항상 동일 재현)
+    const LR_RUNS = [
+      { name: 'lr=0.02 (너무 작음)', color: '#d97706', ...runGD({ lr: 0.02 }) },
+      { name: 'lr=0.09 (적절)',      color: '#059669', ...runGD({ lr: 0.09 }) },
+      { name: 'lr=0.21 (발산!)',     color: '#dc2626', ...runGD({ lr: 0.21, steps: 30 }) },
+    ];
+    const BATCH_RUNS = [
+      { name: '전체 배치 (정확·느림)',   color: '#059669', ...runGD({ lr: 0.09, sigma: 0 }) },
+      { name: 'batch=1 (빠름·요동)',     color: '#dc2626', ...runGD({ lr: 0.09, sigma: 1.8, seed: 11 }) },
+      { name: 'batch=32 (실무 절충)',    color: '#0284c7', ...runGD({ lr: 0.09, sigma: 1.8 / Math.sqrt(32), seed: 5 }) },
+    ];
+    const RACE_RUNS = [
+      { name: 'SGD lr=0.16',      color: '#64748b', ...runOptimizer('sgd', 0.16) },
+      { name: 'Momentum lr=0.02', color: '#0284c7', ...runOptimizer('momentum', 0.02) },
+      { name: 'RMSProp lr=0.10',  color: '#d97706', ...runOptimizer('rmsprop', 0.10) },
+      { name: 'Adam lr=0.12',     color: '#e11d48', ...runOptimizer('adam', 0.12) },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계: 손실 선택 → GD/lr → SGD 배치 → 옵티마이저 경주 → 실무 기본값
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 손실 함수 선택 — 회귀는 MSE, 분류는 크로스엔트로피',
+        desc: '학습이란 "손실(loss)"이라는 숫자 하나를 줄이는 게임이고, 그 숫자를 어떻게 정의하느냐가 첫 설계 결정이다. 회귀(집값 예측)는 오차 제곱의 평균(MSE)이 자연스럽지만, 분류에 MSE를 쓰면 치명적인 함정이 있다 — sigmoid/softmax 확률 출력에 MSE를 붙이면 기울기에 p(1-p) 항이 곱해지는데, 모델이 "확신에 찬 오답"(정답 y=1인데 p≈0.002)을 낼수록 이 항이 0에 붙어 기울기가 죽는다. 즉 가장 크게 틀린 순간에 가장 배우지 못하는 역설이 생긴다. 크로스엔트로피는 이 항이 약분되어 기울기가 정확히 (p - y) — 틀린 만큼 정직하게 밀어주므로 분류의 표준이 됐다. 왼쪽 그래프에서 p→0 구간의 두 기울기 크기를 비교해 보라.',
+        paneTitle: '📉 확신에 찬 오답 구간 — MSE 기울기는 죽고 CE는 산다',
+        viz: 'gradDeath',
+        alert: { tone: 'danger', text: '정답 y=1, 예측 p=0.002 (완전히 틀림): MSE 기울기 ≈ -0.004 (거의 0, 학습 정지) vs CE 기울기 ≈ -0.998 (틀린 만큼 강하게 수정). 분류에 MSE 금지의 이유다.' },
+        code: {
+          lang: 'python',
+          filename: 'losses.py — MSE vs 크로스엔트로피',
+          lines: [
+            '"""',
+            'losses.py — 손실 함수 선택: 회귀=MSE, 분류=크로스엔트로피',
+            '왜 분류에 MSE를 쓰면 안 되는가 — "확신에 찬 오답"에서 기울기가 죽는다',
+            '"""',
+            'import numpy as np',
+            '',
+            '',
+            'def sigmoid(z: np.ndarray) -> np.ndarray:',
+            '    return 1.0 / (1.0 + np.exp(-z))',
+            '',
+            '',
+            'def mse_loss(y: np.ndarray, p: np.ndarray) -> float:',
+            '    """회귀용. 분류 확률 p에 쓰면 아래 실험처럼 기울기가 죽는다."""',
+            '    return float(np.mean((y - p) ** 2))',
+            '',
+            '',
+            'def bce_loss(y: np.ndarray, p: np.ndarray, eps: float = 1e-7) -> float:',
+            '    """이진 크로스엔트로피 — 분류의 표준."""',
+            '    p = np.clip(p, eps, 1 - eps)  # log(0) 방지',
+            '    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))',
+            '',
+            '',
+            '# 실험: 정답 y=1 인데 모델이 z=-6 → p≈0.0025 "확신에 찬 오답"',
+            'z = -6.0',
+            'p = sigmoid(z)',
+            '',
+            '# 로짓 z에 대한 기울기 (연쇄법칙을 손으로 전개한 결과)',
+            'grad_mse = 2 * (p - 1) * p * (1 - p)   # sigmoid 미분 p(1-p)가 곱해짐',
+            'grad_bce = p - 1                        # p(1-p)가 약분되어 사라짐!',
+            '',
+            'print(f"p        = {p:.4f}")',
+            'print(f"MSE grad = {grad_mse:+.5f}   <- 거의 0. 학습이 멈춘다")',
+            'print(f"BCE grad = {grad_bce:+.4f}   <- 틀린 만큼 강하게 수정")',
+            '',
+            '# 정리:',
+            '#  - MSE 기울기 = 2(p-y) * p(1-p)  → p가 0/1 근처면 p(1-p)→0',
+            '#    "크게 틀릴수록 기울기가 작아지는" 역설 → 분류에 쓰면 안 됨',
+            '#  - CE  기울기 = p - y            → 오차에 정비례, 항상 살아있음',
+            '#  - 다중 분류도 동일: softmax + cross_entropy 조합의 기울기 = p - y',
+          ],
+          highlight: [12, 13, 14, 17, 18, 19, 20, 23, 24, 25, 27, 28, 29, 35, 36, 37, 38],
+        },
+      },
+      {
+        title: 'Step 2. 경사하강 — 기울기 반대로 한 걸음, 보폭(lr)이 운명을 가른다',
+        desc: '안개 낀 산에서 하산할 때 지도가 없어도 발밑 경사는 느낄 수 있다 — 경사하강은 정확히 그 전략이다: 현재 위치의 기울기(∇L)를 재고, 그 반대 방향으로 학습률(lr)만큼 한 걸음(w ← w − lr·∇L). 문제는 보폭이다. 왼쪽은 같은 골짜기 지형에서 lr만 바꾼 실제 계산 결과인데, lr=0.02는 60걸음을 걸어도 골짜기 입구에 머물고(하세월), lr=0.21은 가파른 y축에서 반대편 벽으로 점프를 반복하다 튕겨 나간다(발산). 발산 경계는 우연이 아니다 — 가장 가파른 방향의 곡률이 10이면 임계 lr은 2/10=0.2로 정확히 계산되며, 그래서 "안전한 lr은 지형의 가장 가파른 축이 결정한다". 손실이 NaN으로 폭발하면 십중팔구 lr이 이 경계를 넘은 것이다.',
+        paneTitle: '⛰️ 등고선 위 하산 경로 — 학습률 3종 실측',
+        viz: 'contour',
+        runs: LR_RUNS,
+        legendNote: '같은 출발점(★ 반대편)·같은 지형. lr=0.21은 y축 임계값 2/10=0.2를 넘어 벽에 튕기며 발산한다.',
+        alert: { tone: 'warn', text: '학습률은 "적당히"가 아니라 지형이 결정한다. 가장 가파른 축의 곡률 λ 기준 lr < 2/λ 를 넘으면 반드시 발산 — 실무에서는 3배씩 올리며(3e-4→1e-3→3e-3) 발산 직전을 찾는다.' },
+        code: {
+          lang: 'python',
+          filename: 'gradient_descent.py — 학습률 실험',
+          lines: [
+            '"""',
+            'gradient_descent.py — 경사하강 한 걸음: w <- w - lr * grad(w)',
+            '골짜기 지형 f(x,y) = 0.5(x^2 + 10y^2) 에서 학습률 3종 실험',
+            '(왼쪽 등고선 그림과 완전히 같은 계산)',
+            '"""',
+            'import numpy as np',
+            '',
+            '',
+            'def loss(w: np.ndarray) -> float:',
+            '    x, y = w',
+            '    return 0.5 * (x**2 + 10 * y**2)   # y축이 10배 가파른 골짜기',
+            '',
+            '',
+            'def grad(w: np.ndarray) -> np.ndarray:',
+            '    x, y = w',
+            '    return np.array([x, 10 * y])',
+            '',
+            '',
+            'def gradient_descent(lr: float, steps: int = 60) -> np.ndarray:',
+            '    """시작점에서 steps번 하산한 경로를 반환."""',
+            '    w = np.array([-2.7, 1.3])',
+            '    history = [w.copy()]',
+            '    for _ in range(steps):',
+            '        w = w - lr * grad(w)      # 핵심 한 줄: 기울기 "반대"로 보폭 lr',
+            '        history.append(w.copy())',
+            '        if np.abs(w).max() > 1e6:',
+            '            print(f"  lr={lr}: 발산! (loss가 NaN으로 가는 중)")',
+            '            break',
+            '    return np.array(history)',
+            '',
+            '',
+            'for lr in [0.02, 0.09, 0.21]:',
+            '    h = gradient_descent(lr)',
+            '    print(f"lr={lr:<5} steps={len(h)-1:<3} final loss={loss(h[-1]):.6f}")',
+            '',
+            '# lr=0.02 -> 60걸음에도 골짜기 입구 (너무 작음: 하세월)',
+            '# lr=0.09 -> 부드럽게 바닥 도달 (적절)',
+            '# lr=0.21 -> 발산. y축 곡률 10의 임계 lr = 2/10 = 0.2 를 초과',
+            '#',
+            '# 교훈: 안전한 lr의 상한은 "가장 가파른 방향의 곡률"이 결정한다.',
+            '# 딥러닝에서는 곡률을 모르므로 -> 작게 시작해 3배씩 올리며 탐색',
+          ],
+          highlight: [9, 10, 11, 14, 15, 16, 21, 22, 23, 24, 25, 31, 32, 33, 35, 36, 37, 39, 40],
+        },
+      },
+      {
+        title: 'Step 3. SGD와 미니배치 — 정확한 한 걸음 vs 싸고 빠른 백 걸음',
+        desc: '진짜 기울기는 데이터 전체의 평균인데, 데이터가 5만 장이면 "한 걸음"마다 5만 번의 forward/backward가 필요하다 — 정확하지만 하루에 몇 걸음 못 걷는다. 반대로 딱 1개만 보고 걸으면(SGD의 원형) 한 걸음이 5만 배 싸지만, 왼쪽 빨간 경로처럼 기울기가 심하게 요동친다 — 표본 1개는 전체 평균의 아주 시끄러운 추정치이기 때문이다. 미니배치(32~256)는 이 절충이다: 노이즈의 표준편차는 배치 크기의 제곱근에 반비례하므로 batch=32면 노이즈가 약 1/5.7로 줄고, GPU는 32개를 거의 1개 비용으로 병렬 처리한다. 흥미롭게도 적당한 노이즈는 버그가 아니라 기능이기도 하다 — 얕은 지역 최소값이나 안장점에서 "튕겨" 나오게 도와준다. 그래서 실무는 거의 항상 미니배치다.',
+        paneTitle: '🎲 배치 크기별 하산 경로 — 노이즈 실측 (σ ∝ 1/√batch)',
+        viz: 'contour',
+        runs: BATCH_RUNS,
+        legendNote: '같은 lr=0.09. batch=1은 요동치지만 걸음당 비용이 1/50000, batch=32는 노이즈 1/√32로 감소 + GPU 병렬.',
+        alert: { tone: 'info', text: '"1 epoch = 전체 데이터 1회"의 걸음 수: 전체 배치 1걸음 vs batch=32 라면 1,562걸음. 같은 계산량으로 훨씬 많이 이동하는 것이 SGD가 이기는 진짜 이유다.' },
+        code: {
+          lang: 'python',
+          filename: 'sgd_minibatch.py — 배치 크기 실험',
+          lines: [
+            '"""',
+            'sgd_minibatch.py — 전체 배치 vs batch=1 vs 미니배치',
+            '배치 기울기 = 진짜 기울기 + 노이즈(표준편차 ~ 1/sqrt(batch))',
+            '"""',
+            'import numpy as np',
+            '',
+            'rng = np.random.default_rng(42)',
+            'N_TOTAL = 50_000                     # 전체 학습 데이터 수',
+            '',
+            '',
+            'def true_grad(w: np.ndarray) -> np.ndarray:',
+            '    return np.array([w[0], 10 * w[1]])',
+            '',
+            '',
+            'def minibatch_grad(w: np.ndarray, batch_size: int) -> np.ndarray:',
+            '    """미니배치 기울기 시뮬레이션.',
+            '',
+            '    표본 평균의 표준편차는 1/sqrt(n)으로 줄어든다 (중심극한정리).',
+            '    batch=1     -> 노이즈 원본 그대로 (요동)',
+            '    batch=32    -> 노이즈 1/5.7      (실무 절충)',
+            '    batch=N전체 -> 노이즈 0          (정확하지만 1걸음이 비쌈)',
+            '    """',
+            '    sigma = 1.8 / np.sqrt(batch_size)',
+            '    return true_grad(w) + rng.normal(0.0, sigma, size=2)',
+            '',
+            '',
+            'def sgd(batch_size: int, lr: float = 0.09, steps: int = 60):',
+            '    w = np.array([-2.7, 1.3])',
+            '    for _ in range(steps):',
+            '        w = w - lr * minibatch_grad(w, batch_size)',
+            '    return w',
+            '',
+            '',
+            'for bs in [N_TOTAL, 1, 32]:',
+            '    w = sgd(bs)',
+            '    cost = bs * 60                    # 총 forward/backward 횟수',
+            '    print(f"batch={bs:<6} 최종위치={np.round(w, 3)} 계산량={cost:,}")',
+            '',
+            '# 핵심 비교 (60걸음 기준):',
+            '#  batch=50000 -> 매끈한 경로, 계산량 300만 (하루 몇 걸음 못 걸음)',
+            '#  batch=1     -> 계산량 60. 요동치지만 같은 예산으로 5만 배 더 걸음',
+            '#  batch=32    -> 노이즈 1/5.7 + GPU 병렬로 사실상 공짜 -> 실무 표준',
+            '# 보너스: 적당한 노이즈는 얕은 지역 최소값/안장점 탈출을 돕는다',
+          ],
+          highlight: [15, 16, 18, 19, 20, 21, 23, 24, 27, 28, 29, 30, 31, 34, 35, 36, 37, 40, 41, 42, 43],
+        },
+      },
+      {
+        title: 'Step 4. 모멘텀 → RMSProp → Adam — 같은 지형, 4파전 경주',
+        desc: '골짜기에서 SGD(회색)는 가파른 y축 방향으로 지그재그하느라 정작 가야 할 골짜기 방향(x축)으로는 굼벵이처럼 간다. 모멘텀(파랑)은 이전 걸음의 속도를 관성으로 유지한다 — 지그재그하는 y방향 성분은 서로 상쇄되고, 꾸준한 x방향 성분은 누적 가속되어 골짜기를 미끄러져 내려간다. RMSProp(주황)은 다른 접근이다: 축마다 기울기 제곱의 이동평균을 추적해, 기울기가 큰 축(y)의 보폭은 줄이고 작은 축(x)의 보폭은 키운다 — 파라미터별 학습률 자동 조정. Adam은 이 둘의 결합(1차 모멘트=모멘텀 + 2차 모멘트=RMSProp)에 초기 편향 보정을 더한 것으로, 그래서 기본값으로 가장 무난하다. 아래 경주는 실제 업데이트 식을 계산한 애니메이션이다 — 손실 곡선에서 SGD의 계단과 Adam의 직진을 비교해 보라.',
+        paneTitle: '🏁 옵티마이저 4파전 — 실제 업데이트 식 계산 애니메이션',
+        viz: 'contour',
+        runs: RACE_RUNS,
+        animate: true,
+        legendNote: 'SGD는 y축 지그재그, Momentum은 관성으로 상쇄·가속, RMSProp/Adam은 축별 보폭 자동 조정으로 직진.',
+        alert: { tone: 'good', text: 'Adam = Momentum(방향의 이동평균) + RMSProp(보폭의 축별 조정) + 편향 보정. 지형을 모르는 상태에서 가장 실패 확률이 낮아 사실상의 기본값이 됐다.' },
+        code: {
+          lang: 'python',
+          filename: 'optimizers.py — numpy 직접 구현',
+          lines: [
+            '"""',
+            'optimizers.py — SGD/Momentum/RMSProp/Adam을 numpy로 직접 구현',
+            '(왼쪽 경주 애니메이션과 동일한 업데이트 식)',
+            '"""',
+            'import numpy as np',
+            '',
+            '',
+            'class SGD:',
+            '    def __init__(self, lr: float): self.lr = lr',
+            '    def step(self, w, g): return w - self.lr * g',
+            '',
+            '',
+            'class Momentum:',
+            '    """관성: 지그재그(부호 반전) 성분은 상쇄, 꾸준한 성분은 가속."""',
+            '    def __init__(self, lr: float, beta: float = 0.9):',
+            '        self.lr, self.beta, self.v = lr, beta, 0.0',
+            '    def step(self, w, g):',
+            '        self.v = self.beta * self.v - self.lr * g   # 속도 누적',
+            '        return w + self.v',
+            '',
+            '',
+            'class RMSProp:',
+            '    """축별 학습률: 기울기 큰 축은 보폭 축소, 작은 축은 확대."""',
+            '    def __init__(self, lr: float, beta: float = 0.9, eps: float = 1e-8):',
+            '        self.lr, self.beta, self.eps, self.s = lr, beta, eps, 0.0',
+            '    def step(self, w, g):',
+            '        self.s = self.beta * self.s + (1 - self.beta) * g**2',
+            '        return w - self.lr * g / (np.sqrt(self.s) + self.eps)',
+            '',
+            '',
+            'class Adam:',
+            '    """Momentum(1차 m) + RMSProp(2차 s) + 초기 편향 보정."""',
+            '    def __init__(self, lr, b1=0.9, b2=0.999, eps=1e-8):',
+            '        self.lr, self.b1, self.b2, self.eps = lr, b1, b2, eps',
+            '        self.m, self.s, self.t = 0.0, 0.0, 0',
+            '    def step(self, w, g):',
+            '        self.t += 1',
+            '        self.m = self.b1 * self.m + (1 - self.b1) * g        # 방향',
+            '        self.s = self.b2 * self.s + (1 - self.b2) * g**2     # 보폭',
+            '        m_hat = self.m / (1 - self.b1 ** self.t)  # 초기 0 편향 보정',
+            '        s_hat = self.s / (1 - self.b2 ** self.t)',
+            '        return w - self.lr * m_hat / (np.sqrt(s_hat) + self.eps)',
+            '',
+            '',
+            'def race(opt, steps: int = 80) -> list[float]:',
+            '    """같은 골짜기 f=0.5(x^2+10y^2)에서 손실 궤적을 기록."""',
+            '    w = np.array([-2.7, 1.3])',
+            '    hist = []',
+            '    for _ in range(steps):',
+            '        g = np.array([w[0], 10 * w[1]])',
+            '        w = opt.step(w, g)',
+            '        hist.append(0.5 * (w[0]**2 + 10 * w[1]**2))',
+            '    return hist',
+            '',
+            '',
+            'for name, opt in [("SGD", SGD(0.16)), ("Momentum", Momentum(0.02)),',
+            '                  ("RMSProp", RMSProp(0.10)), ("Adam", Adam(0.12))]:',
+            '    print(f"{name:<9} final loss = {race(opt)[-1]:.2e}")',
+          ],
+          highlight: [13, 14, 17, 18, 19, 22, 23, 26, 27, 28, 31, 32, 36, 37, 38, 39, 40, 41, 42],
+        },
+      },
+      {
+        title: 'Step 5. 실무 기본값 — "Adam(lr=3e-4)로 시작하라"',
+        desc: '이론을 알았으니 실무 기본값으로 압축하자. 첫 시도는 Adam(lr=3e-4)이다 — 유명한 "Karpathy 상수"로, 대부분의 아키텍처에서 발산하지 않으면서 충분히 빠른 안전 지대다. 학습률은 고정하지 않고 스케줄을 건다: 초반 워밍업(수백~수천 스텝 동안 0→목표 lr 선형 증가)은 초기 통계가 불안정한 Adam이 첫 걸음부터 이상한 방향으로 크게 튀는 사고를 막고, 이후 코사인 감쇠는 미세 조정 구간에서 보폭을 부드럽게 줄여 최종 성능을 끌어올린다. Transformer 계열이라면 Adam이 아니라 AdamW를 써라 — L2 정규화를 기울기에 섞으면 Adam의 축별 나눗셈에 의해 정규화 강도가 왜곡되는데, AdamW는 weight decay를 업데이트에서 분리해 이 문제를 고쳤고 그래서 표준이 됐다. 마지막으로 손실이 안 떨어질 때의 체크리스트를 왼쪽에 정리했다 — 대부분의 원인은 모델이 아니라 lr·데이터·손실 함수 연결부에 있다.',
+        paneTitle: '🧰 실무 기본값 — lr 스케줄 + 진단 체크리스트',
+        viz: 'practical',
+        alert: { tone: 'good', text: '요약: AdamW(lr=3e-4, weight_decay=0.01) + 워밍업 5% + 코사인 감쇠. 여기서 시작해 loss 곡선을 보며 lr만 3배 단위로 조정하는 것이 가장 승률 높은 루틴이다.' },
+        code: {
+          lang: 'python',
+          filename: 'train_practical.py — PyTorch 실전 설정',
+          lines: [
+            '"""',
+            'train_practical.py — 실무 기본값: AdamW + 워밍업 + 코사인 감쇠',
+            '+ 손실이 안 떨어질 때 진단 코드',
+            '"""',
+            'import math',
+            '',
+            'import torch',
+            'from torch import nn',
+            '',
+            'model = nn.Sequential(nn.Linear(784, 256), nn.ReLU(),',
+            '                      nn.Linear(256, 10))',
+            'criterion = nn.CrossEntropyLoss()   # 분류 -> CE (Step 1의 결론)',
+            '',
+            '# 1) 옵티마이저: AdamW — weight decay를 업데이트에서 분리',
+            '#    (Adam + L2는 축별 나눗셈에 정규화가 왜곡됨 -> Transformer 표준은 AdamW)',
+            'optimizer = torch.optim.AdamW(',
+            '    model.parameters(),',
+            '    lr=3e-4,              # "Karpathy 상수" — 첫 시도의 안전 지대',
+            '    weight_decay=0.01,',
+            ')',
+            '',
+            '# 2) 스케줄: 워밍업 5% -> 코사인 감쇠',
+            'TOTAL_STEPS, WARMUP = 10_000, 500',
+            '',
+            '',
+            'def lr_lambda(step: int) -> float:',
+            '    if step < WARMUP:                       # 초반: 0 -> 1 선형',
+            '        return step / WARMUP                #  (Adam 초기 통계 안정화)',
+            '    progress = (step - WARMUP) / (TOTAL_STEPS - WARMUP)',
+            '    return 0.5 * (1 + math.cos(math.pi * progress))  # 1 -> 0 코사인',
+            '',
+            '',
+            'scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)',
+            '',
+            '# 3) 학습 루프 — 순서 주의: zero_grad -> backward -> step -> step',
+            'for step, (xb, yb) in enumerate(loader):',
+            '    optimizer.zero_grad()',
+            '    loss = criterion(model(xb), yb)',
+            '    loss.backward()',
+            '    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 폭발 방지',
+            '    optimizer.step()',
+            '    scheduler.step()',
+            '',
+            '    # 4) 진단: 발산/정체 조기 감지',
+            '    if not torch.isfinite(loss):',
+            '        raise RuntimeError("loss가 NaN/Inf — lr을 1/3로 줄여라")',
+            '    if step % 100 == 0:',
+            '        gnorm = sum(p.grad.norm() ** 2 for p in model.parameters()',
+            '                    if p.grad is not None) ** 0.5',
+            '        print(f"step {step:>5}  loss {loss.item():.4f}  "',
+            '              f"lr {scheduler.get_last_lr()[0]:.2e}  gnorm {gnorm:.3f}")',
+            '        # gnorm이 ~0에 붙음 -> 기울기 소실(손실/활성함수 재점검)',
+            '        # loss가 계단 없이 평평 -> lr 3배 올려보기 / 데이터 셔플 확인',
+          ],
+          highlight: [12, 14, 15, 16, 17, 18, 19, 22, 26, 27, 28, 29, 30, 33, 36, 37, 38, 39, 40, 41, 44, 45, 48, 49, 50, 51],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌표 변환 — 월드 [-3.2,3.2]×[-1.7,1.7] → SVG 320×200
+    // ─────────────────────────────────────────────────────
+    const W = 320, H = 200;
+    const SX = (x) => (x + 3.2) * (W / 6.4);
+    const SY = (y) => H - (y + 1.7) * (H / 3.4);
+    const clampPt = ([x, y]) => [Math.max(-3.15, Math.min(3.15, x)), Math.max(-1.65, Math.min(1.65, y))];
+
+    // 등고선(레벨 c의 타원) — f=c ⟺ x²/(2c) + y²/(0.2c) = 1
+    const CONTOUR_LEVELS = [0.15, 0.6, 1.5, 3, 5, 8];
+
+    function ContourChart({ runs, frame }) {
+      return (
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded border border-rose-200 bg-white" role="img" aria-label="2차원 손실 지형 등고선 위 최적화 경로">
+          {CONTOUR_LEVELS.map((c) => (
+            <ellipse key={c} cx={SX(0)} cy={SY(0)} rx={Math.sqrt(2 * c) * (W / 6.4)} ry={Math.sqrt(0.2 * c) * (H / 3.4)}
+              fill="none" stroke="#fbcfe8" strokeWidth="1" />
+          ))}
+          <text x={SX(0)} y={SY(0) + 4} textAnchor="middle" fontSize="11" fill="#be123c">★</text>
+          <text x={SX(0) + 8} y={SY(0) + 4} fontSize="7" fill="#be123c">최소점</text>
+          {runs.map((r) => {
+            const upto = frame === undefined ? r.pts.length : Math.min(frame + 1, r.pts.length);
+            const pts = r.pts.slice(0, upto).map(clampPt);
+            const d = pts.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${SX(x).toFixed(1)},${SY(y).toFixed(1)}`).join(' ');
+            const last = pts[pts.length - 1];
+            return (
+              <g key={r.name}>
+                <path d={d} fill="none" stroke={r.color} strokeWidth="1.6" strokeOpacity="0.85" />
+                <circle cx={SX(last[0])} cy={SY(last[1])} r="3.2" fill={r.color} stroke="#fff" strokeWidth="1" />
+              </g>
+            );
+          })}
+          <circle cx={SX(START[0])} cy={SY(START[1])} r="3" fill="none" stroke="#57534a" strokeWidth="1.2" />
+          <text x={SX(START[0]) - 4} y={SY(START[1]) - 6} fontSize="7" fill="#57534a">출발</text>
+        </svg>
+      );
+    }
+
+    // 손실 곡선 비교 (log10 스케일)
+    function LossCurveChart({ runs, frame }) {
+      const CW = 320, CH = 92, PAD = 22;
+      const maxIter = Math.max(...runs.map((r) => r.losses.length));
+      const toLog = (v) => Math.log10(Math.max(v, 1e-8));
+      const allVals = runs.flatMap((r) => r.losses.map(toLog));
+      const lo = Math.min(...allVals), hi = Math.max(...allVals, toLog(lossF(...START)));
+      const X = (i) => PAD + (i / (maxIter - 1)) * (CW - PAD - 6);
+      const Y = (v) => 6 + (1 - (toLog(v) - lo) / (hi - lo || 1)) * (CH - 24);
+      return (
+        <svg viewBox={`0 0 ${CW} ${CH}`} className="w-full rounded border border-rose-200 bg-white mt-2" role="img" aria-label="반복 횟수에 따른 손실 곡선 비교 (로그 스케일)">
+          <text x={PAD} y={12} fontSize="7.5" fill="#8a8578">loss (log)</text>
+          <text x={CW - 8} y={CH - 4} textAnchor="end" fontSize="7.5" fill="#8a8578">iteration →</text>
+          <line x1={PAD} y1={CH - 16} x2={CW - 6} y2={CH - 16} stroke="#cfc9ba" strokeWidth="0.7" />
+          {runs.map((r) => {
+            const upto = frame === undefined ? r.losses.length : Math.min(frame + 1, r.losses.length);
+            const d = r.losses.slice(0, upto).map((v, i) => `${i === 0 ? 'M' : 'L'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+            return <path key={r.name} d={d} fill="none" stroke={r.color} strokeWidth="1.5" strokeOpacity="0.9" />;
+          })}
+        </svg>
+      );
+    }
+
+    function Legend({ runs }) {
+      return (
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px]">
+          {runs.map((r) => (
+            <span key={r.name} className="inline-flex items-center gap-1 text-slate-700">
+              <span className="w-3 h-1.5 rounded-full inline-block" style={{ backgroundColor: r.color }} />
+              {r.name}{r.diverged ? ' 💥' : ''}
+            </span>
+          ))}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — MSE vs CE 기울기 크기 비교 (정답 y=1, 로짓 기준)
+    // ─────────────────────────────────────────────────────
+    function GradDeathChart() {
+      const CW = 320, CH = 150, PAD = 26;
+      const N = 60;
+      const mseG = [], ceG = [];
+      for (let i = 0; i <= N; i++) {
+        const p = 0.002 + (i / N) * 0.996;
+        mseG.push([p, Math.abs(2 * (p - 1) * p * (1 - p))]);
+        ceG.push([p, Math.abs(p - 1)]);
+      }
+      const X = (p) => PAD + p * (CW - PAD - 8);
+      const Y = (g) => 10 + (1 - g) * (CH - 34);
+      const path = (arr) => arr.map(([p, g], i) => `${i === 0 ? 'M' : 'L'}${X(p).toFixed(1)},${Y(g).toFixed(1)}`).join(' ');
+      return (
+        <div>
+          <svg viewBox={`0 0 ${CW} ${CH}`} className="w-full rounded border border-rose-200 bg-white" role="img" aria-label="예측 확률에 따른 MSE와 크로스엔트로피의 기울기 크기 비교">
+            <rect x={X(0)} y={10} width={X(0.15) - X(0)} height={CH - 34} fill="#fee2e2" opacity="0.7" />
+            <text x={X(0.005)} y={22} fontSize="7.5" fill="#b91c1c">확신에 찬 오답 (y=1, p→0)</text>
+            <line x1={PAD} y1={CH - 24} x2={CW - 8} y2={CH - 24} stroke="#cfc9ba" strokeWidth="0.8" />
+            <line x1={PAD} y1={10} x2={PAD} y2={CH - 24} stroke="#cfc9ba" strokeWidth="0.8" />
+            <text x={PAD - 4} y={16} textAnchor="end" fontSize="7.5" fill="#8a8578">|기울기|</text>
+            <text x={CW - 10} y={CH - 12} textAnchor="end" fontSize="7.5" fill="#8a8578">예측 확률 p → (정답 y=1)</text>
+            <path d={path(ceG)} fill="none" stroke="#e11d48" strokeWidth="2" />
+            <path d={path(mseG)} fill="none" stroke="#64748b" strokeWidth="2" strokeDasharray="4 2" />
+            <circle cx={X(0.01)} cy={Y(Math.abs(2 * -0.99 * 0.01 * 0.99))} r="3.5" fill="#64748b" />
+            <text x={X(0.05)} y={Y(0.03)} fontSize="8" fill="#475569">MSE: 틀렸는데 기울기≈0 (죽음)</text>
+            <circle cx={X(0.01)} cy={Y(0.99)} r="3.5" fill="#e11d48" />
+            <text x={X(0.05)} y={Y(0.93)} fontSize="8" fill="#be123c" fontWeight="bold">CE: |p−y|≈1 (살아있음)</text>
+          </svg>
+          <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+            <div className="rounded border border-slate-300 bg-slate-50 p-2">
+              <div className="font-bold text-slate-700 mb-0.5">MSE + sigmoid</div>
+              <div className="font-mono text-slate-600">∂L/∂z = 2(p−y)·p(1−p)</div>
+              <div className="text-red-700 mt-0.5">p→0/1에서 p(1−p)→0 → 기울기 소멸</div>
+            </div>
+            <div className="rounded border border-rose-300 bg-rose-50 p-2">
+              <div className="font-bold text-rose-800 mb-0.5">CE + sigmoid</div>
+              <div className="font-mono text-rose-700">∂L/∂z = p − y</div>
+              <div className="text-emerald-700 mt-0.5">오차에 정비례 — 항상 학습 가능</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 워밍업+코사인 스케줄 차트 + 진단 체크리스트
+    // ─────────────────────────────────────────────────────
+    function ScheduleChart() {
+      const CW = 320, CH = 110, PAD = 26, TOTAL = 100, WARM = 8;
+      const lrAt = (s) => (s < WARM ? s / WARM : 0.5 * (1 + Math.cos(Math.PI * (s - WARM) / (TOTAL - WARM))));
+      const X = (s) => PAD + (s / TOTAL) * (CW - PAD - 8);
+      const Y = (v) => 12 + (1 - v) * (CH - 34);
+      const d = Array.from({ length: TOTAL + 1 }, (_, s) => `${s === 0 ? 'M' : 'L'}${X(s).toFixed(1)},${Y(lrAt(s)).toFixed(1)}`).join(' ');
+      return (
+        <svg viewBox={`0 0 ${CW} ${CH}`} className="w-full rounded border border-rose-200 bg-white" role="img" aria-label="워밍업 후 코사인 감쇠하는 학습률 스케줄">
+          <rect x={X(0)} y={12} width={X(WARM) - X(0)} height={CH - 34} fill="#fde68a" opacity="0.55" />
+          <text x={X(1)} y={CH - 12} fontSize="7.5" fill="#92400e">워밍업 5%</text>
+          <line x1={PAD} y1={CH - 22} x2={CW - 8} y2={CH - 22} stroke="#cfc9ba" strokeWidth="0.8" />
+          <text x={PAD - 4} y={18} textAnchor="end" fontSize="7.5" fill="#8a8578">lr</text>
+          <text x={X(4)} y={20} fontSize="7" fill="#8a8578">3e-4 (peak)</text>
+          <text x={CW - 10} y={CH - 12} textAnchor="end" fontSize="7.5" fill="#8a8578">코사인 감쇠 → 0</text>
+          <path d={d} fill="none" stroke="#e11d48" strokeWidth="2" />
+        </svg>
+      );
+    }
+
+    function PracticalPane() {
+      const checklist = [
+        { q: 'loss가 NaN/Inf로 폭발', a: 'lr을 1/3로 + gradient clipping(1.0)', tone: 'red' },
+        { q: 'loss가 처음부터 안 떨어짐', a: 'lr 3배 올려보기 · 데이터 셔플/라벨 매칭 확인', tone: 'amber' },
+        { q: '분류인데 loss 정체', a: '손실이 CE인지 확인 — MSE면 Step 1의 기울기 죽음', tone: 'amber' },
+        { q: 'train은 좋은데 val 나쁨', a: '과적합 — weight_decay·데이터 증강 (다음 챕터)', tone: 'sky' },
+        { q: 'Transformer 학습 불안정', a: 'AdamW + 워밍업 필수 (초기 Adam 통계 불안정)', tone: 'sky' },
+      ];
+      const toneCls = {
+        red: 'border-red-300 bg-red-50 text-red-900',
+        amber: 'border-amber-300 bg-amber-50 text-amber-900',
+        sky: 'border-sky-300 bg-sky-50 text-sky-900',
+      };
+      return (
+        <div>
+          <ScheduleChart />
+          <div className="mt-2 rounded-lg border-2 border-rose-400 bg-rose-50 p-2.5">
+            <div className="text-[11px] font-bold text-rose-900 mb-1">🥇 첫 시도 기본값 (외워라)</div>
+            <div className="font-mono text-[10px] text-rose-800 bg-white rounded border border-rose-200 px-2 py-1">
+              AdamW(lr=3e-4, weight_decay=0.01) + warmup 5% + cosine decay
+            </div>
+            <div className="text-[10px] text-rose-900 mt-1">막히면 아키텍처를 바꾸기 전에 lr부터 3배 단위(1e-4↔3e-4↔1e-3)로 움직여라 — 원인의 8할은 lr이다.</div>
+          </div>
+          <div className="mt-2 space-y-1.5">
+            <div className="text-[11px] font-bold text-slate-800">🩺 손실이 안 떨어질 때 체크리스트</div>
+            {checklist.map((c) => (
+              <div key={c.q} className={`rounded border px-2 py-1 text-[10px] flex gap-2 ${toneCls[c.tone]}`}>
+                <span className="font-bold whitespace-nowrap">{c.q}</span>
+                <span className="opacity-90">→ {c.a}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-rose-50',    border: 'border-rose-300',    text: 'text-rose-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 손실 지형 시뮬레이션 (rose 톤)
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ state, stepIdx }) {
+      const maxLen = state.runs ? Math.max(...state.runs.map((r) => r.pts.length)) : 0;
+      const [frame, setFrame] = useState(0);
+
+      // Step 4 경주 애니메이션 — 실측 경로를 프레임 단위로 재생, 끝나면 잠시 멈췄다 반복
+      useEffect(() => {
+        if (!state.animate) return;
+        setFrame(0);
+        const id = setInterval(() => {
+          setFrame((f) => (f >= maxLen + 14 ? 0 : f + 1));
+        }, 90);
+        return () => clearInterval(id);
+      }, [stepIdx, state.animate, maxLen]);
+
+      const frameProp = state.animate ? Math.min(frame, maxLen) : undefined;
+
+      return (
+        <div className="rounded-xl border border-rose-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-rose-900">{state.paneTitle}</h3>
+            {state.animate && (
+              <span className="text-[10px] font-mono text-rose-700 bg-rose-50 border border-rose-200 rounded px-1.5 py-0.5">
+                iter {Math.min(frameProp, maxLen - 1)} / {maxLen - 1}
+              </span>
+            )}
+          </div>
+
+          {state.viz === 'gradDeath' && <GradDeathChart />}
+
+          {state.viz === 'contour' && (
+            <div>
+              <ContourChart runs={state.runs} frame={frameProp} />
+              <Legend runs={state.runs} />
+              <div className="mt-1.5 text-[10px] text-slate-600">{state.legendNote}</div>
+              <div className="mt-2 text-[11px] font-bold text-slate-800">📈 손실 곡선 비교 (log 스케일)</div>
+              <LossCurveChart runs={state.runs} frame={frameProp} />
+            </div>
+          )}
+
+          {state.viz === 'practical' && <PracticalPane />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-rose-400/15 border-l-2 border-rose-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      style={{ whiteSpace: 'pre' }}
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-rose-50 to-orange-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-rose-600 text-white font-bold">DL</span>
+              <div>
+                <h1 className="text-2xl font-bold text-rose-900">I-2-2. 손실 함수와 옵티마이저 — SGD→Adam</h1>
+                <p className="text-sm text-rose-800/80">산에서 안개 속 하산하기 — 어느 방향으로, 얼마나 큰 보폭으로</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-rose-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-rose-500' : 'bg-rose-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-rose-800 text-rose-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-rose-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-rose-800 text-white' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-rose-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-rose-500 bg-white px-4 py-3 text-sm text-rose-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                학습 = 손실이라는 숫자를 줄이는 게임. 분류엔 크로스엔트로피(MSE는 확신에 찬 오답에서 기울기가 죽는다),
+                하강은 w ← w − lr·∇L 한 줄이며 lr의 상한은 가장 가파른 축의 곡률(2/λ)이 결정한다.
+                실무는 미니배치 SGD 위에 관성(모멘텀)과 축별 보폭 조정(RMSProp)을 합친 Adam을 얹고,
+                Transformer라면 weight decay를 분리한 AdamW + 워밍업 + 코사인 감쇠가 표준이다.
+                막히면 아키텍처보다 lr부터 의심하라 — 다음 챕터에서는 과적합과 정규화를 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['MSE', '크로스엔트로피', '경사하강', '학습률', '미니배치', 'SGD', '모멘텀', 'RMSProp', 'Adam', 'AdamW', '워밍업', 'cosine스케줄'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-900 border border-rose-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-rose-800">
+              <a href="./I-2-1.html" className="underline hover:no-underline">← 이전: I-2-1</a>
+              <a href="../index.html" className="underline hover:no-underline">챕터 목록</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

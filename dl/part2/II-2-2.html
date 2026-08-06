@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deep Learning 학습 — II-2-2. 전이학습·파인튜닝 실무</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DL II-2-2 — 전이학습·파인튜닝 실무
+    학습 목표: 불량품 분류 데이터 500장으로 밑바닥 학습이 과적합으로 무너지는 현실에서 출발,
+              ImageNet 백본의 특징 추출(동결) → 부분 해동 파인튜닝(판별적 학습률) →
+              실전 2단계 레시피 → 백본 지도·HF 허브·LoRA까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 층 스택 동결/해동 시각화 + 3곡선 성능 비교) / 우(VSCode CodeViewer: transfer_learning.py 진화)
+    색상: rose (dl 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 성능 곡선 데이터 (에폭 0~12, 검증 정확도 %)
+    //   scratch : 밑바닥 학습 — 55% 근처에서 과적합으로 정체
+    //   feat    : 특징 추출 — 빠르게 84~86% 도달
+    //   fine    : 파인튜닝 — 특징 추출 이후 이어서 92% 도달
+    // ─────────────────────────────────────────────────────
+    const CURVE_SCRATCH_TRAIN = [10, 34, 55, 72, 84, 91, 95, 97, 98, 99, 99, 99, 99];
+    const CURVE_SCRATCH_VAL   = [10, 22, 33, 42, 48, 52, 54, 55, 54, 53, 53, 52, 52];
+    const CURVE_FEAT          = [31, 58, 71, 78, 81, 83, 84, 85, 85, 86, 86, 86, 86];
+    const CURVE_FINE          = [31, 58, 71, 78, 81, 83, 84, 85, 87, 89, 90, 91, 92];
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 밑바닥 과적합 → 특징 추출 → 파인튜닝 → 실전 레시피 → 생태계 지도
+    //   layers : 백본 층 스택. state = 'random'(무작위 초기화) | 'frozen'(동결 🔒)
+    //            | 'thaw'(해동 학습 🔥) | 'new'(새로 교체 🆕)
+    //   curves : 성능 비교 그래프에 그릴 시리즈 키
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 현실의 벽 — 500장으로 밑바닥 학습은 과적합 지옥',
+        desc: '공장 불량품 분류 프로젝트. 확보한 라벨 데이터는 겨우 500장인데, ResNet50을 무작위 초기화로 밑바닥부터 학습시키면 참사가 난다 — 2,500만 개 파라미터가 500장을 통째로 외워버려서 학습 정확도는 99%인데 검증 정확도는 52%에서 멈춘다. 데이터를 늘리면 되지만 불량 샘플은 원래 희귀해서 몇 달을 모아도 수천 장이 안 된다. 여기서 통찰 하나: ImageNet 120만 장으로 학습된 백본의 아래쪽 층들은 엣지·질감·모양 같은 "어느 도메인에나 공통인 시각 문법"을 이미 배워 놓았다. 남이 배운 것을 이어받으면, 우리는 마지막 판단만 가르치면 된다 — 이것이 전이학습(transfer learning)이다.',
+        actor: '🏭 불량품 분류 — 라벨 데이터 500장뿐',
+        mode: 'scratch',
+        modeDetail: '무작위 초기화 · 전층 학습 (밑바닥)',
+        layers: [
+          { name: 'conv1', role: '엣지·색 경계', state: 'random' },
+          { name: 'layer1', role: '질감·코너', state: 'random' },
+          { name: 'layer2', role: '패턴·무늬', state: 'random' },
+          { name: 'layer3', role: '부품·형상', state: 'random' },
+          { name: 'layer4', role: '물체 수준 특징', state: 'random' },
+          { name: 'fc', role: '분류층 (1000종 → ?)', state: 'random' },
+        ],
+        curves: ['scratchTrain', 'scratchVal'],
+        chartNote: '학습 99% vs 검증 52% — 벌어진 틈이 곧 과적합. 500장을 "외운" 것이지 "배운" 것이 아니다.',
+        insightBox: {
+          title: 'ImageNet 백본이 이미 배운 것 — 층별 위계',
+          rows: [
+            { depth: '아래층 (conv1~layer1)', learned: '엣지·색 경계·질감', generic: '◎ 어느 도메인이나 공통' },
+            { depth: '중간층 (layer2~layer3)', learned: '무늬·부품·형상 조합', generic: '○ 대체로 재사용 가능' },
+            { depth: '위층 (layer4~fc)', learned: '개·고양이 등 물체 개념', generic: '△ 우리 도메인과 다름 → 교체 대상' },
+          ],
+        },
+        alert: { tone: 'danger', text: '2,500만 파라미터 vs 500장 — 모델이 데이터를 통째로 암기한다. 해법은 데이터 늘리기가 아니라 "배울 양 줄이기"다.' },
+        code: {
+          lang: 'python',
+          filename: 'transfer_learning.py (v0 — 밑바닥 학습, 실패)',
+          lines: [
+            '"""',
+            'transfer_learning.py — v0: 무작위 초기화로 밑바닥 학습',
+            '결과: train 99% / val 52% — 교과서적 과적합',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            'from torchvision import models',
+            '',
+            '# weights=None → ImageNet 지식 없이 무작위 초기화',
+            'model = models.resnet50(weights=None)',
+            'model.fc = nn.Linear(model.fc.in_features, 2)  # 양품/불량',
+            '',
+            'total = sum(p.numel() for p in model.parameters())',
+            'print(f"학습할 파라미터: {total:,}")  # 25,557,032',
+            'print("학습 데이터: 500장")           # ...압도적 열세',
+            '',
+            'optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)',
+            'criterion = nn.CrossEntropyLoss()',
+            '',
+            'for epoch in range(12):',
+            '    model.train()',
+            '    for x, y in train_loader:      # 500장 전부 학습',
+            '        optimizer.zero_grad()',
+            '        loss = criterion(model(x), y)',
+            '        loss.backward()',
+            '        optimizer.step()',
+            '',
+            '# epoch 12 성적표:',
+            '#   train acc 0.99  ← 500장을 전부 외웠다',
+            '#   val   acc 0.52  ← 처음 보는 사진은 반타작',
+            '',
+            '# 진단: 2,500만 파라미터가 배울 "일반 패턴" 이 500장엔 없다.',
+            '# 통찰: 엣지·질감·모양은 ImageNet 이 이미 배워 놓았다.',
+            '#       → 그 지식을 이어받고, 마지막 판단만 가르치자.',
+          ],
+          highlight: [9, 10, 11, 13, 14, 15, 28, 29, 30, 32, 33, 34],
+        },
+      },
+      {
+        title: 'Step 2. 특징 추출 — 백본은 동결, 마지막 분류층만 교체·학습',
+        desc: '작은 데이터의 기본 전략은 특징 추출(feature extraction)이다. 백본 전체를 requires_grad=False로 동결(🔒)하고, ImageNet 1000종용이던 마지막 fc층만 우리 문제(양품/불량 2종)용 새 층으로 교체(🆕)해서 그것만 학습한다. 이러면 학습할 파라미터가 2,500만 개에서 4,098개로 줄어든다 — 500장으로도 충분히 배울 수 있는 크기다. 백본은 "사진 → 2048차원 특징 벡터" 변환기로만 쓰이고, 우리는 그 위에 얹은 얇은 분류기만 가르치는 셈이다. 검증 정확도가 52%에서 86%로 뛴다. 덤으로 역전파가 fc층에서 끝나니 학습이 몇 배 빠르고, GPU 메모리도 적게 먹는다.',
+        actor: '🔒 백본 동결 + 🆕 fc 교체 — 학습 파라미터 4,098개',
+        mode: 'feature',
+        modeDetail: '특징 추출 · fc만 학습 (기본 전략)',
+        layers: [
+          { name: 'conv1', role: '엣지·색 경계', state: 'frozen' },
+          { name: 'layer1', role: '질감·코너', state: 'frozen' },
+          { name: 'layer2', role: '패턴·무늬', state: 'frozen' },
+          { name: 'layer3', role: '부품·형상', state: 'frozen' },
+          { name: 'layer4', role: '물체 수준 특징', state: 'frozen' },
+          { name: 'fc', role: '분류층 (2048 → 2)', state: 'new' },
+        ],
+        curves: ['scratchVal', 'feat'],
+        chartNote: '동결만 했는데 52% → 86%. 백본이 만든 특징 벡터가 그만큼 좋다는 뜻이다.',
+        paramBox: {
+          title: '학습할 파라미터 — 배울 양을 줄이는 것이 핵심',
+          rows: [
+            { label: '밑바닥 학습 (v0)', value: '25,557,032개', pct: 100, tone: 'bad' },
+            { label: '특징 추출 (v1)', value: '4,098개 (0.016%)', pct: 3, tone: 'good' },
+          ],
+        },
+        alert: { tone: 'good', text: '데이터가 수백 장 수준이면 여기서 멈추는 것도 정답이다. 동결 덕에 과적합할 "자유도" 자체가 없다.' },
+        code: {
+          lang: 'python',
+          filename: 'transfer_learning.py (v1 — 특징 추출)',
+          lines: [
+            '"""',
+            'transfer_learning.py — v1: 특징 추출 (feature extraction)',
+            '백본 동결 + 마지막 분류층만 교체·학습 → val 86%',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            'from torchvision import models',
+            '',
+            '# 1) ImageNet 사전학습 가중치를 이어받는다',
+            'model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)',
+            '',
+            '# 2) 백본 전체 동결 — 역전파에서 제외 (🔒)',
+            'for param in model.parameters():',
+            '    param.requires_grad = False',
+            '',
+            '# 3) 마지막 분류층만 우리 문제용으로 교체 (🆕)',
+            '#    새 nn.Linear 는 기본으로 requires_grad=True',
+            'model.fc = nn.Linear(model.fc.in_features, 2)  # 2048 → 2',
+            '',
+            'trainable = [p for p in model.parameters() if p.requires_grad]',
+            'print(sum(p.numel() for p in trainable))  # 4,098 (vs 2,500만)',
+            '',
+            '# 4) 옵티마이저에는 학습할 파라미터만 넘긴다',
+            'optimizer = torch.optim.Adam(trainable, lr=1e-3)',
+            'criterion = nn.CrossEntropyLoss()',
+            '',
+            'for epoch in range(12):',
+            '    model.train()',
+            '    for x, y in train_loader:',
+            '        optimizer.zero_grad()',
+            '        loss = criterion(model(x), y)   # 백본은 순전파만',
+            '        loss.backward()                  # 그래디언트는 fc 까지만',
+            '        optimizer.step()',
+            '',
+            '# epoch 12: train 0.91 / val 0.86  ← 과적합 틈이 좁다',
+            '# 학습 속도도 몇 배 빠르다 — 역전파가 fc 에서 끝나니까.',
+            '# 500장 규모라면 이 전략이 기본값이다.',
+          ],
+          highlight: [9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 24, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 3. 파인튜닝 — 위쪽 층부터 부분 해동, 낮은 학습률로',
+        desc: '86%에서 92%로 가려면 백본도 우리 도메인(금속 표면·스크래치)에 맞게 미세 조정해야 한다. 요령은 두 가지다. 첫째, 위쪽 층부터 부분 해동(🔥)한다 — 아래층의 엣지·질감은 어느 도메인이나 공통이라 건드릴 이유가 없고, 도메인 색이 짙은 layer4부터 녹인다. 둘째, 해동한 층에는 아주 낮은 학습률을 쓴다 — 120만 장으로 배운 지식을 lr=1e-3 같은 큰 보폭으로 갱신하면 몇 스텝 만에 파괴된다(catastrophic forgetting). 그래서 층마다 학습률을 다르게 주는 판별적 학습률(discriminative learning rate)을 쓴다: 새 fc는 1e-3, layer4는 1e-4, layer3는 1e-5처럼 아래로 갈수록 10배씩 줄인다. 언제 얼마나 녹일지는 감이 아니라 데이터 양×도메인 유사도 2×2 표로 결정한다.',
+        actor: '🔥 layer4·layer3 해동 — 층별 학습률 10배 계단',
+        mode: 'finetune',
+        modeDetail: '파인튜닝 · 판별적 학습률 (fc 1e-3 → layer3 1e-5)',
+        layers: [
+          { name: 'conv1', role: '엣지·색 경계', state: 'frozen' },
+          { name: 'layer1', role: '질감·코너', state: 'frozen' },
+          { name: 'layer2', role: '패턴·무늬', state: 'frozen' },
+          { name: 'layer3', role: '부품·형상', state: 'thaw', lr: '1e-5' },
+          { name: 'layer4', role: '물체 수준 특징', state: 'thaw', lr: '1e-4' },
+          { name: 'fc', role: '분류층 (2048 → 2)', state: 'new', lr: '1e-3' },
+        ],
+        curves: ['scratchVal', 'feat', 'fine'],
+        chartNote: '특징 추출로 수렴한 지점(에폭 8)부터 해동 — 86%의 벽을 넘어 92%로.',
+        strategyBox: {
+          title: '언제 얼마나 녹이나 — 데이터 양 × 도메인 유사도 2×2',
+          rows: [
+            { cond: '데이터 적음 × 도메인 유사', act: '동결 유지 — fc만 학습 (Step 2)', tone: 'good' },
+            { cond: '데이터 적음 × 도메인 다름', act: '위쪽 1~2블록만 조심스럽게 해동', tone: 'warn' },
+            { cond: '데이터 많음 × 도메인 유사', act: '위쪽 절반 해동 — 낮은 lr 유지', tone: 'good' },
+            { cond: '데이터 많음 × 도메인 다름', act: '전층 해동 (그래도 사전학습 초기값이 유리)', tone: 'warn' },
+          ],
+        },
+        alert: { tone: 'warn', text: '해동한 층에 큰 학습률을 쓰면 첫 몇 스텝의 난폭한 그래디언트가 백본 지식을 지운다. "녹였으면 보폭을 줄여라"가 철칙이다.' },
+        code: {
+          lang: 'python',
+          filename: 'transfer_learning.py (v2 — 파인튜닝)',
+          lines: [
+            '"""',
+            'transfer_learning.py — v2: 부분 해동 + 판별적 학습률',
+            '위층부터 녹이고, 아래로 갈수록 학습률 10배씩 축소',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            'from torchvision import models',
+            '',
+            'model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)',
+            'model.fc = nn.Linear(model.fc.in_features, 2)',
+            '',
+            '# 1) 일단 전체 동결',
+            'for param in model.parameters():',
+            '    param.requires_grad = False',
+            '',
+            '# 2) 위쪽 층부터 부분 해동 (🔥) — 아래층 엣지·질감은 보존',
+            'for module in (model.layer4, model.layer3, model.fc):',
+            '    for param in module.parameters():',
+            '        param.requires_grad = True',
+            '',
+            '# 3) 판별적 학습률 — 파라미터 그룹으로 층마다 다르게',
+            '#    새 층은 크게, 사전학습 층은 작게 (지식 파괴 방지)',
+            'optimizer = torch.optim.AdamW([',
+            '    {"params": model.fc.parameters(),     "lr": 1e-3},',
+            '    {"params": model.layer4.parameters(), "lr": 1e-4},',
+            '    {"params": model.layer3.parameters(), "lr": 1e-5},',
+            '], weight_decay=1e-4)',
+            '',
+            'criterion = nn.CrossEntropyLoss()',
+            '',
+            'for epoch in range(8):          # 특징 추출 수렴 이후 이어서',
+            '    model.train()',
+            '    for x, y in train_loader:',
+            '        optimizer.zero_grad()',
+            '        loss = criterion(model(x), y)',
+            '        loss.backward()',
+            '        optimizer.step()',
+            '',
+            '# val acc: 0.86 → 0.92  — 백본이 "금속 표면" 에 적응했다',
+            '# 만약 전층을 lr=1e-3 로 녹였다면? 초반 몇 스텝에',
+            '# ImageNet 지식이 파괴되어 오히려 70%대로 추락한다.',
+          ],
+          highlight: [12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 39, 40, 41],
+        },
+      },
+      {
+        title: 'Step 4. 실전 파이프라인 — 증강·ImageNet 정규화·2단계 레시피',
+        desc: '실무 파이프라인에서 성능을 좌우하는 디테일이 세 가지 있다. 첫째, 정규화는 반드시 ImageNet 통계(mean/std)를 그대로 쓴다 — 백본은 그 분포의 입력을 전제로 학습됐기 때문에, 다른 통계를 쓰면 이어받은 지식이 어긋난다. 둘째, 500장을 증강(뒤집기·회전·색 지터)으로 사실상 수천 장처럼 불린다 — 작은 데이터에서 증강은 선택이 아니라 필수다. 셋째, 학습은 2단계 레시피로 간다: 1단계는 백본 동결로 fc만 워밍업(새 층의 난폭한 초기 그래디언트가 백본에 닿지 않게), 2단계에서 부분 해동 후 코사인 스케줄로 학습률을 서서히 줄이며 파인튜닝하고, 검증 손실이 3에폭 개선 없으면 조기 종료한다. 이 순서를 지키는 것만으로 같은 데이터에서 몇 %p가 갈린다.',
+        actor: '📋 2단계 레시피 — 워밍업(동결) → 파인튜닝(해동)',
+        mode: 'pipeline',
+        modeDetail: '증강 + ImageNet 정규화 + 코사인 스케줄 + 조기 종료',
+        layers: [
+          { name: 'conv1', role: '엣지·색 경계', state: 'frozen' },
+          { name: 'layer1', role: '질감·코너', state: 'frozen' },
+          { name: 'layer2', role: '패턴·무늬', state: 'frozen' },
+          { name: 'layer3', role: '부품·형상', state: 'thaw', lr: '1e-5' },
+          { name: 'layer4', role: '물체 수준 특징', state: 'thaw', lr: '1e-4' },
+          { name: 'fc', role: '분류층 (2048 → 2)', state: 'new', lr: '1e-3' },
+        ],
+        curves: ['scratchVal', 'feat', 'fine'],
+        chartNote: '최종 성적표: 밑바닥 52% / 특징 추출 86% / 2단계 파인튜닝 92% — 같은 500장이다.',
+        recipeBox: {
+          title: '2단계 레시피 — 순서가 성능이다',
+          phases: [
+            { name: '0. 데이터', items: ['증강: 뒤집기·회전·색 지터', '정규화: ImageNet mean/std 고정'] },
+            { name: '1. 워밍업 (동결)', items: ['백본 🔒 + fc만 lr 1e-3', '새 층 그래디언트 안정화 (~5에폭)'] },
+            { name: '2. 파인튜닝 (해동)', items: ['layer4·3 🔥 판별적 lr + 코사인 스케줄', '조기 종료: val loss 3에폭 정체 시 중단'] },
+          ],
+        },
+        alert: { tone: 'info', text: 'fc가 무작위인 채로 바로 해동하면, fc의 큰 초기 그래디언트가 백본까지 흘러가 지식을 흔든다. 그래서 "동결 워밍업 먼저"다.' },
+        code: {
+          lang: 'python',
+          filename: 'transfer_learning.py (v3 — 실전 파이프라인)',
+          lines: [
+            '"""',
+            'transfer_learning.py — v3: 실전 2단계 레시피',
+            '증강 + ImageNet 정규화 + 워밍업 → 해동 + 조기 종료',
+            '"""',
+            'import torch',
+            'import torch.nn as nn',
+            'from torchvision import models, transforms',
+            '',
+            '# 0) 증강 + 정규화 — mean/std 는 반드시 ImageNet 통계',
+            'train_tf = transforms.Compose([',
+            '    transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),',
+            '    transforms.RandomHorizontalFlip(),',
+            '    transforms.ColorJitter(brightness=0.2, contrast=0.2),',
+            '    transforms.ToTensor(),',
+            '    transforms.Normalize(mean=[0.485, 0.456, 0.406],',
+            '                         std=[0.229, 0.224, 0.225]),',
+            '])',
+            '',
+            'model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)',
+            'model.fc = nn.Linear(model.fc.in_features, 2)',
+            'criterion = nn.CrossEntropyLoss()',
+            '',
+            '# ── 1단계: 동결 워밍업 — fc만 5에폭 ──',
+            'for p in model.parameters(): p.requires_grad = False',
+            'for p in model.fc.parameters(): p.requires_grad = True',
+            'opt1 = torch.optim.AdamW(model.fc.parameters(), lr=1e-3)',
+            'for epoch in range(5):',
+            '    train_one_epoch(model, train_loader, opt1, criterion)',
+            '',
+            '# ── 2단계: 부분 해동 + 판별적 lr + 코사인 스케줄 ──',
+            'for m in (model.layer4, model.layer3):',
+            '    for p in m.parameters(): p.requires_grad = True',
+            'opt2 = torch.optim.AdamW([',
+            '    {"params": model.fc.parameters(),     "lr": 1e-3},',
+            '    {"params": model.layer4.parameters(), "lr": 1e-4},',
+            '    {"params": model.layer3.parameters(), "lr": 1e-5},',
+            '], weight_decay=1e-4)',
+            'sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=20)',
+            '',
+            'best, patience = float("inf"), 0',
+            'for epoch in range(20):',
+            '    train_one_epoch(model, train_loader, opt2, criterion)',
+            '    sched.step()',
+            '    val_loss = evaluate(model, val_loader, criterion)',
+            '    if val_loss < best: best, patience = val_loss, 0',
+            '    else:',
+            '        patience += 1',
+            '        if patience >= 3: break   # 조기 종료 — 과적합 직전에 멈춤',
+            '',
+            '# 최종: val acc 0.92 — 같은 500장, 순서와 디테일의 차이다.',
+          ],
+          highlight: [9, 10, 11, 12, 13, 15, 16, 23, 24, 25, 26, 30, 31, 32, 33, 38, 40, 41, 44, 45, 46, 47, 48],
+        },
+      },
+      {
+        title: 'Step 5. 전이학습의 현재 — 백본 지도, HF 허브, 그리고 LoRA',
+        desc: '이 원리는 ResNet 한 모델의 기술이 아니라 딥러닝 전체의 기본 작동 방식이 됐다. 비전 백본 지도를 보면 선택지가 보인다 — 검증된 기본기 ResNet, 파라미터 효율의 EfficientNet, 데이터가 충분할 때 강한 ViT 계열(ViT·Swin·ConvNeXt). 그리고 이 백본들은 이제 torchvision보다 Hugging Face 허브·timm에서 받는 것이 표준이다 — 수십만 개의 사전학습 모델이 "남이 배운 것"의 공용 창고가 됐다. 결정적으로, LLM 파인튜닝도 정확히 같은 원리다: 거대 모델을 동결하고 작은 저랭크 어댑터만 학습하는 LoRA는 "백본 동결 + 작은 층만 학습"이라는 Step 2의 발상을 70억 파라미터 스케일로 옮긴 것뿐이다. 오늘 배운 동결/해동 감각이 llmops 챕터의 LoRA·PEFT로 그대로 이어진다.',
+        actor: '🗺 같은 원리, 다른 스케일 — 비전 백본에서 LLM까지',
+        mode: 'map',
+        modeDetail: 'timm · Hugging Face Hub · PEFT(LoRA)',
+        layers: [
+          { name: 'conv1', role: '엣지·색 경계', state: 'frozen' },
+          { name: 'layer1', role: '질감·코너', state: 'frozen' },
+          { name: 'layer2', role: '패턴·무늬', state: 'frozen' },
+          { name: 'layer3', role: '부품·형상', state: 'frozen' },
+          { name: 'layer4', role: '물체 수준 특징', state: 'frozen' },
+          { name: 'fc', role: 'LoRA 어댑터 (저랭크 A×B)', state: 'new', lr: 'r=8' },
+        ],
+        curves: ['scratchVal', 'feat', 'fine'],
+        chartNote: '전이학습의 본질 요약 — "배울 양을 줄이고, 이어받은 지식은 낮은 학습률로 지킨다".',
+        mapBox: {
+          title: '비전 백본 지도 — 무엇을 이어받을 것인가',
+          rows: [
+            { name: 'ResNet50 (2015)', trait: '검증된 기본기 · 자료 최다', pick: '첫 베이스라인은 무조건 이걸로' },
+            { name: 'EfficientNet (2019)', trait: '정확도/파라미터 효율 우수', pick: '엣지·모바일 배포 대상' },
+            { name: 'ViT · Swin (2020~)', trait: '대규모 데이터에서 CNN 추월', pick: '데이터·사전학습이 풍부할 때' },
+            { name: 'ConvNeXt (2022)', trait: 'ViT 레시피를 CNN에 역이식', pick: 'CNN 배포 편의 + 최신 성능' },
+          ],
+        },
+        loraBox: {
+          title: 'LLM 파인튜닝도 같은 원리 — LoRA 한 줄 요약',
+          text: '70억 파라미터 백본을 통째로 동결(🔒)하고, 각 가중치 옆에 저랭크 행렬 A×B(수백만 개)만 붙여 학습(🆕)한다. "백본 동결 + 작은 새 층만 학습" — Step 2에서 fc만 갈아끼운 것과 구조적으로 같은 발상이다. → llmops 챕터에서 계속.',
+        },
+        alert: { tone: 'good', text: '요즘 실무에서 "모델을 밑바닥부터 학습"하는 경우는 거의 없다. 질문은 "학습할까 말까"가 아니라 "무엇을 이어받아 얼마나 녹일까"다.' },
+        code: {
+          lang: 'python',
+          filename: 'transfer_learning.py (v4 — 허브 생태계)',
+          lines: [
+            '"""',
+            'transfer_learning.py — v4: 허브에서 백본을 이어받는 현재',
+            'timm(비전) 과 PEFT/LoRA(LLM) — 동결/해동 원리는 동일',
+            '"""',
+            '# ── 비전: timm — Hugging Face 허브의 백본 창고 ──',
+            'import timm',
+            '',
+            '# 한 줄로 사전학습 백본 + 새 분류층 (num_classes 가 fc 교체)',
+            'model = timm.create_model(',
+            '    "convnext_tiny.fb_in22k",   # ImageNet-22k 사전학습',
+            '    pretrained=True,',
+            '    num_classes=2,              # 양품/불량',
+            ')',
+            '',
+            '# 동결/해동 문법도 그대로 — 원리는 ResNet 때와 같다',
+            'for name, param in model.named_parameters():',
+            '    param.requires_grad = name.startswith("head")',
+            '',
+            '',
+            '# ── LLM: 같은 원리를 70억 파라미터로 — LoRA ──',
+            'from transformers import AutoModelForCausalLM',
+            'from peft import LoraConfig, get_peft_model',
+            '',
+            'llm = AutoModelForCausalLM.from_pretrained(',
+            '    "meta-llama/Llama-3.1-8B")',
+            '',
+            'lora = LoraConfig(',
+            '    r=8,                         # 저랭크 어댑터 차원',
+            '    lora_alpha=16,',
+            '    target_modules=["q_proj", "v_proj"],',
+            ')',
+            'llm = get_peft_model(llm, lora)  # 백본 🔒 + 어댑터 🆕',
+            'llm.print_trainable_parameters()',
+            '# trainable: 3,407,872 / 8,033,669,120 (0.042%)',
+            '',
+            '# Step 2 의 "4,098 / 25,557,032 (0.016%)" 와 같은 그림이다.',
+            '# 전이학습의 본질:',
+            '#   1) 남이 배운 것(백본)을 이어받는다',
+            '#   2) 배울 양을 줄인다 (동결, 작은 새 층)',
+            '#   3) 이어받은 지식은 낮은 학습률로 지킨다',
+          ],
+          highlight: [5, 8, 9, 10, 11, 12, 15, 16, 26, 27, 28, 29, 31, 32, 33, 35, 36, 37, 38, 39],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 층 스택 — 동결(🔒)/해동(🔥)/교체(🆕)/무작위(🎲) 시각화
+    // ─────────────────────────────────────────────────────
+    const LAYER_STYLE = {
+      random: { bg: 'bg-slate-100', border: 'border-slate-300', text: 'text-slate-600', icon: '🎲', label: '무작위 · 전부 학습' },
+      frozen: { bg: 'bg-sky-50',    border: 'border-sky-300',   text: 'text-sky-800',   icon: '🔒', label: '동결 (grad 차단)' },
+      thaw:   { bg: 'bg-amber-50',  border: 'border-amber-400', text: 'text-amber-900', icon: '🔥', label: '해동 · 학습' },
+      new:    { bg: 'bg-rose-50',   border: 'border-rose-400',  text: 'text-rose-800',  icon: '🆕', label: '교체 · 학습' },
+    };
+
+    function LayerStack({ layers }) {
+      // fc 가 맨 위에 오도록 역순으로 그린다 (입력이 아래, 출력이 위)
+      const rev = [...layers].reverse();
+      return (
+        <div className="rounded-lg border-2 border-rose-300 bg-white p-2.5">
+          <div className="flex items-center justify-between text-[11px] font-bold text-rose-900 mb-1.5">
+            <span>🧱 ResNet50 층 스택 (위 = 출력)</span>
+            <span className="font-normal text-slate-500">🔒 동결 · 🔥 해동 · 🆕 교체</span>
+          </div>
+          <div className="space-y-1">
+            {rev.map((l, i) => {
+              const s = LAYER_STYLE[l.state] || LAYER_STYLE.frozen;
+              return (
+                <React.Fragment key={l.name}>
+                  <div className={`rounded border ${s.bg} ${s.border} px-2 py-1 flex items-center gap-2 transition-all duration-500`}>
+                    <span className="text-sm">{s.icon}</span>
+                    <span className={`text-[11px] font-bold font-mono w-14 ${s.text}`}>{l.name}</span>
+                    <span className="text-[10px] text-slate-600 flex-1 truncate">{l.role}</span>
+                    {l.lr && (
+                      <span className="text-[9px] font-mono px-1 rounded bg-amber-100 text-amber-900 border border-amber-300">lr {l.lr}</span>
+                    )}
+                    <span className={`text-[9px] px-1.5 py-0.5 rounded whitespace-nowrap bg-white/80 border border-current/20 ${s.text}`}>{s.label}</span>
+                  </div>
+                  {i < rev.length - 1 && <div className="text-center text-[8px] text-rose-300 leading-none">▲</div>}
+                </React.Fragment>
+              );
+            })}
+          </div>
+          <div className="mt-1.5 text-[9px] text-slate-500 text-center">▲ 입력 사진은 아래(conv1)에서 위(fc)로 흐른다</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 성능 비교 그래프 — 밑바닥 vs 특징 추출 vs 파인튜닝 (SVG)
+    // ─────────────────────────────────────────────────────
+    const SERIES_DEF = {
+      scratchTrain: { data: CURVE_SCRATCH_TRAIN, color: '#94a3b8', dash: '3 3', label: '밑바닥 train (암기)' },
+      scratchVal:   { data: CURVE_SCRATCH_VAL,   color: '#ef4444', dash: '',    label: '밑바닥 val 52%' },
+      feat:         { data: CURVE_FEAT,          color: '#0ea5e9', dash: '',    label: '특징 추출 val 86%' },
+      fine:         { data: CURVE_FINE,          color: '#e11d48', dash: '',    label: '파인튜닝 val 92%' },
+    };
+
+    function CurveChart({ curves, note }) {
+      const W = 300, H = 120, PAD = 24;
+      const toX = (i) => PAD + (i / 12) * (W - PAD - 8);
+      const toY = (v) => H - 14 - (v / 100) * (H - 26);
+      const pts = (data) => data.map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(' ');
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-300 bg-white p-2.5">
+          <div className="text-[11px] font-bold text-rose-900 mb-1">📈 검증 정확도 비교 — 같은 500장, 다른 전략</div>
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="전략별 검증 정확도 곡선 비교">
+            {[0, 25, 50, 75, 100].map((v) => (
+              <g key={v}>
+                <line x1={PAD} y1={toY(v)} x2={W - 8} y2={toY(v)} stroke="#f1e8d8" strokeWidth="1" />
+                <text x={PAD - 3} y={toY(v) + 3} fontSize="7" fill="#8a8578" textAnchor="end">{v}%</text>
+              </g>
+            ))}
+            {curves.map((key) => {
+              const s = SERIES_DEF[key];
+              return (
+                <polyline key={key} points={pts(s.data)} fill="none" stroke={s.color}
+                  strokeWidth="2" strokeDasharray={s.dash} strokeLinecap="round" strokeLinejoin="round" />
+              );
+            })}
+            {curves.map((key) => {
+              const s = SERIES_DEF[key];
+              const last = s.data[s.data.length - 1];
+              return <circle key={key + '-dot'} cx={toX(12)} cy={toY(last)} r="2.5" fill={s.color} />;
+            })}
+            <text x={W / 2} y={H - 2} fontSize="7" fill="#8a8578" textAnchor="middle">에폭 0 → 12</text>
+          </svg>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1">
+            {curves.map((key) => {
+              const s = SERIES_DEF[key];
+              return (
+                <span key={key} className="flex items-center gap-1 text-[9px] text-slate-700">
+                  <span className="inline-block w-3 h-0.5" style={{ backgroundColor: s.color, borderTop: s.dash ? `2px dashed ${s.color}` : 'none' }}></span>
+                  {s.label}
+                </span>
+              );
+            })}
+          </div>
+          {note && <div className="mt-1 text-[10px] text-rose-900">{note}</div>}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 층별 위계 통찰 박스
+    // ─────────────────────────────────────────────────────
+    function InsightBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-sky-50 p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">💡 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-900 border-b border-sky-200">
+                <th className="text-left py-0.5">층 깊이</th>
+                <th className="text-left py-0.5 pl-2">배운 것</th>
+                <th className="text-left py-0.5 pl-2">재사용성</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.depth} className="border-t border-sky-100">
+                  <td className="py-1 font-mono font-bold text-sky-800">{r.depth}</td>
+                  <td className="py-1 pl-2 text-slate-700">{r.learned}</td>
+                  <td className={`py-1 pl-2 font-bold ${r.generic.startsWith('◎') ? 'text-emerald-700' : r.generic.startsWith('○') ? 'text-sky-700' : 'text-amber-700'}`}>{r.generic}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-1.5 text-[10px] text-sky-900">아래층일수록 범용적 — 그래서 "아래는 남기고 위만 손댄다"는 전략이 성립한다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 학습 파라미터 비교 박스
+    // ─────────────────────────────────────────────────────
+    function ParamBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-emerald-300 bg-emerald-50 p-3">
+          <div className="text-xs font-bold text-emerald-900 mb-2">⚖️ {box.title}</div>
+          {box.rows.map((r) => (
+            <div key={r.label} className="mb-1.5">
+              <div className="flex justify-between text-[10px] mb-0.5">
+                <span className="text-slate-700">{r.label}</span>
+                <span className={`font-mono font-bold ${r.tone === 'bad' ? 'text-red-700' : 'text-emerald-700'}`}>{r.value}</span>
+              </div>
+              <div className="h-2 rounded-full bg-white border border-emerald-200 overflow-hidden">
+                <div className={`h-full ${r.tone === 'bad' ? 'bg-red-400' : 'bg-emerald-500'} transition-all duration-700`} style={{ width: `${r.pct}%` }} />
+              </div>
+            </div>
+          ))}
+          <div className="text-[10px] text-emerald-900 mt-1">배울 양이 6,000분의 1 — 500장이 "충분한 데이터"가 되는 순간이다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 2×2 해동 전략표
+    // ─────────────────────────────────────────────────────
+    function StrategyBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-amber-400 bg-amber-50 p-3">
+          <div className="text-xs font-bold text-amber-900 mb-2">🧭 {box.title}</div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {box.rows.map((r) => (
+              <div key={r.cond} className={`rounded border p-1.5 ${r.tone === 'good' ? 'border-emerald-300 bg-white' : 'border-amber-300 bg-white'}`}>
+                <div className="text-[9px] font-bold text-slate-800">{r.cond}</div>
+                <div className={`text-[10px] mt-0.5 ${r.tone === 'good' ? 'text-emerald-800' : 'text-amber-900'}`}>→ {r.act}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-amber-900">감이 아니라 이 표로 결정한다. 애매하면 "덜 녹이는 쪽"이 안전하다 — 되돌리기 쉬우니까.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 2단계 레시피 박스
+    // ─────────────────────────────────────────────────────
+    function RecipeBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-white p-3">
+          <div className="text-xs font-bold text-rose-900 mb-2">📋 {box.title}</div>
+          <div className="flex gap-1.5 items-stretch">
+            {box.phases.map((p, i) => (
+              <React.Fragment key={p.name}>
+                {i > 0 && <div className="flex items-center text-rose-400 text-sm">→</div>}
+                <div className="flex-1 rounded border border-rose-200 bg-rose-50 p-1.5">
+                  <div className="text-[10px] font-bold text-rose-900 mb-1">{p.name}</div>
+                  {p.items.map((it) => (
+                    <div key={it} className="text-[9px] text-slate-700 leading-snug mb-0.5">· {it}</div>
+                  ))}
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 백본 지도 + LoRA 연결 박스
+    // ─────────────────────────────────────────────────────
+    function MapBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-rose-400 bg-gradient-to-br from-rose-50 to-sky-50 p-3">
+          <div className="text-xs font-bold text-rose-900 mb-2">🗺 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-rose-900 border-b-2 border-rose-200">
+                <th className="text-left py-0.5">백본</th>
+                <th className="text-left py-0.5 pl-2">특성</th>
+                <th className="text-left py-0.5 pl-2">고르는 기준</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.name} className="border-t border-rose-100">
+                  <td className="py-1 font-mono font-bold text-rose-800 whitespace-nowrap">{r.name}</td>
+                  <td className="py-1 pl-2 text-slate-700">{r.trait}</td>
+                  <td className="py-1 pl-2 text-slate-800">{r.pick}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LoraBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-violet-400 bg-violet-50 p-3">
+          <div className="text-xs font-bold text-violet-900 mb-1">🤖 {box.title}</div>
+          <p className="text-[10px] text-slate-800 leading-relaxed">{box.text}</p>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-rose-50',    border: 'border-rose-300',    text: 'text-rose-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 층 스택 + 성능 곡선 (rose 톤)
+    // ─────────────────────────────────────────────────────
+    const MODE_BADGE = {
+      scratch:  { icon: '🎲', label: '밑바닥 학습' },
+      feature:  { icon: '🔒', label: '특징 추출' },
+      finetune: { icon: '🔥', label: '파인튜닝' },
+      pipeline: { icon: '📋', label: '실전 파이프라인' },
+      map:      { icon: '🗺', label: '생태계 지도' },
+    };
+
+    function LiveDataPane({ state }) {
+      const mode = MODE_BADGE[state.mode] || MODE_BADGE.feature;
+      return (
+        <div className="rounded-xl border border-rose-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-rose-900 flex items-center gap-1.5">
+              <span>{mode.icon}</span>
+              <span>불량품 분류 — {mode.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-rose-700 font-mono mb-2 px-2 py-1 rounded bg-rose-50 border border-rose-200">
+            전략: {state.modeDetail}
+          </div>
+          <LayerStack layers={state.layers} />
+          <CurveChart curves={state.curves} note={state.chartNote} />
+          <InsightBox box={state.insightBox} />
+          <ParamBox box={state.paramBox} />
+          <StrategyBox box={state.strategyBox} />
+          <RecipeBox box={state.recipeBox} />
+          <MapBox box={state.mapBox} />
+          <LoraBox box={state.loraBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-rose-400/15 border-l-2 border-rose-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-rose-50 to-orange-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-rose-600 text-white font-bold">DL</span>
+              <div>
+                <h1 className="text-2xl font-bold text-rose-900">II-2-2. 전이학습·파인튜닝 실무</h1>
+                <p className="text-sm text-rose-800/80">데이터 500장으로 92% — 남이 배운 것을 이어받는 기술</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-rose-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-rose-500' : 'bg-rose-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-rose-800 text-rose-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-rose-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-rose-800 text-white' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-rose-400 bg-white text-rose-800 hover:bg-rose-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-rose-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-rose-500 bg-white px-4 py-3 text-sm text-rose-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                전이학습은 "남이 배운 것을 이어받아 배울 양을 줄이는 기술"이다.
+                데이터가 적으면 백본을 동결하고 분류층만 학습(특징 추출)하고,
+                더 짜내야 하면 위쪽 층부터 부분 해동하되 낮은 판별적 학습률로 이어받은 지식을 지킨다.
+                실전에서는 증강·ImageNet 정규화·"동결 워밍업 → 해동 파인튜닝" 2단계 레시피·조기 종료가 몇 %p를 가른다.
+                그리고 LLM의 LoRA도 정확히 같은 원리다 — 백본 동결 + 작은 어댑터만 학습.
+                이 감각은 llmops 챕터의 PEFT에서 그대로 다시 만난다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['전이학습', '파인튜닝', '특징추출', '동결', 'requires_grad', '판별적학습률', 'ImageNet정규화', '조기종료', 'timm', 'LoRA'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-900 border border-rose-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-rose-800">
+              <a href="./II-2-1.html" className="underline hover:no-underline">← 이전: II-2-1</a>
+              <a href="../index.html" className="underline hover:no-underline">챕터 목록</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
