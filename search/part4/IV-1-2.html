@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — IV-1-2. RRF — Reciprocal Rank Fusion</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔀</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search IV-1-2 — RRF (Reciprocal Rank Fusion)
+    학습 목표: BM25 점수와 벡터(코사인) 점수는 스케일이 달라 그대로 더할 수 없다는 문제(IV-1-1 회수)에서 출발해,
+              "점수는 버리고 순위만 믿는" RRF 공식 score(d)=Σ 1/(k+rank_i(d)) 를 문서 6개·검색기 2개로
+              전 과정 실계산(모든 1/(60+r) 항 표시)하여 최종 융합 순위를 손으로 도출하고,
+              k 파라미터(=60 표준)를 1/10/60/1000 으로 바꿔 순위가 어떻게 재편되는지 인터랙티브로 체험한 뒤,
+              ES/OpenSearch 내장 RRF 문법·3-way 융합·RRF의 한계(점수 소실·window)와 다음 장(리랭커)까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 스케일 불일치표 / 1-over-(k+rank) 곡선 / 융합 실계산표 / k 슬라이더 재랭킹 / 실무 박스)
+                       우(VSCode CodeViewer: problem_score_scale.py / rrf_fusion.py / rrf_k_experiment.py / es_rrf_retriever.py)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 실계산 데이터셋 — 쿼리 "파이썬 비동기 프로그래밍", 검색기 2개
+    //   각 문서 = { id, title, bm25, vec, tag }
+    //     bm25 : BM25(렉시컬) 검색 순위 (1이 최상위), null = 후보에 없음
+    //     vec  : 벡터(의미) 검색 순위,               null = 후보에 없음
+    //   RRF 점수 = Σ 1/(k + rank_i)  (rank 가 null 인 검색기는 항을 더하지 않음)
+    //   k=60 기준 최종 융합 순위: D1 > D3 > D2 > D4 > D5 > D6
+    // ─────────────────────────────────────────────────────
+    const DOCS = [
+      { id: 'D1', title: 'asyncio 로 배우는 파이썬 비동기 프로그래밍 입문', bm25: 2, vec: 1, tag: '두 검색기 모두 상위' },
+      { id: 'D2', title: 'async / await 문법 완벽 가이드',                  bm25: 3, vec: 5, tag: '키워드 강함·의미 약함' },
+      { id: 'D3', title: '코루틴과 이벤트 루프의 내부 동작 원리',           bm25: 4, vec: 2, tag: '의미 최상·키워드 중위' },
+      { id: 'D4', title: '동시성 vs 병렬성: 개념 정리',                      bm25: 5, vec: 4, tag: '양쪽 중하위' },
+      { id: 'D5', title: '파이썬 비동기 파이썬 async 파이썬 (키워드 반복)', bm25: 1, vec: null, tag: '키워드 스팸·의미 무관' },
+      { id: 'D6', title: 'Node.js 논블로킹 이벤트 루프 아키텍처',           bm25: null, vec: 3, tag: '의미만 유사·한국어 키워드 0' },
+    ];
+
+    // RRF 점수: rank 가 있는 검색기의 1/(k+rank) 만 합산
+    function rrfScore(doc, k) {
+      let s = 0;
+      if (doc.bm25 != null) s += 1 / (k + doc.bm25);
+      if (doc.vec  != null) s += 1 / (k + doc.vec);
+      return s;
+    }
+    // 주어진 k 로 전체 문서를 융합 정렬 → [{...doc, score, fused(=1부터)}]
+    function fuse(docs, k) {
+      return docs
+        .map((d) => ({ ...d, score: rrfScore(d, k) }))
+        .sort((a, b) => b.score - a.score)
+        .map((d, i) => ({ ...d, fused: i + 1 }));
+    }
+
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계 시나리오
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 재확인 — 점수는 스케일이 다르고, 순위는 스케일이 없다',
+        desc: '하이브리드 검색은 렉시컬(BM25)과 벡터(코사인) 두 검색기의 결과를 하나로 합쳐야 한다. 그런데 두 점수는 사는 세계가 다르다 — BM25 는 0부터 수십까지 열린 값이고 코사인 유사도는 -1~1(보통 0~1)에 갇혀 있다. 그래서 "0.6·BM25 + 0.4·cosine" 같은 가중 합산을 시도하면, 스케일이 큰 BM25 가 항상 결과를 삼켜 버린다. 정규화(min-max)로 스케일을 맞춰도 문제가 남는다 — 코퍼스나 질의가 바뀌면 BM25 의 최댓값이 출렁여서 가중치를 매번 다시 튜닝해야 한다. 여기서 결정적 통찰이 나온다: "순위(rank)에는 스케일이 없다." 1등은 어느 검색기에서도 그냥 1등이다. 점수를 버리고 순위만 쓰면 정규화도, 가중치 튜닝도 사라진다.',
+        actor: '⚖️ BM25 vs cosine — 스케일 불일치',
+        view: 'scaleTable',
+        alert: { tone: 'danger', text: '가중 합산은 스케일 큰 쪽(BM25)이 지배하고, 정규화는 코퍼스가 바뀔 때마다 가중치를 다시 튜닝해야 한다. 근본 원인: 두 점수는 애초에 비교 가능한 단위가 아니다.' },
+        code: {
+          lang: 'python',
+          filename: 'problem_score_scale.py (가중 합산의 실패)',
+          lines: [
+            '"""',
+            'problem_score_scale.py — 점수를 직접 더하면 왜 실패하는가',
+            'BM25 는 0~수십, cosine 은 0~1. 스케일이 달라 그대로 못 더한다.',
+            '"""',
+            '',
+            '# 같은 문서에 대한 두 검색기의 원점수 (스케일이 전혀 다르다)',
+            'bm25   = {"D1": 18.4, "D2": 15.1, "D3": 12.7, "D4": 9.2}',
+            'cosine = {"D1": 0.83, "D2": 0.71, "D3": 0.91, "D4": 0.66}',
+            '',
+            '# (시도 1) 그냥 가중 합산 → BM25 스케일이 결과를 삼킨다',
+            'def naive_sum(d, a=0.6, b=0.4):',
+            '    return a * bm25[d] + b * cosine[d]',
+            '#  naive_sum("D3") = 0.6*12.7 + 0.4*0.91 = 7.984',
+            '#  cosine 이 0.91 로 최상위여도 0.4*0.91=0.36 밖에 못 낸다',
+            '#  → 사실상 BM25 순위만 반영됨 (벡터 검색이 무의미해짐)',
+            '',
+            '# (시도 2) min-max 정규화 후 합산 → 코퍼스 의존',
+            'def normalize(scores):',
+            '    lo, hi = min(scores.values()), max(scores.values())',
+            '    return {k: (v - lo) / (hi - lo) for k, v in scores.items()}',
+            '#  문제: 새 문서가 들어와 BM25 최댓값이 18.4 -> 40 으로 바뀌면',
+            '#  정규화 분모가 통째로 흔들려 가중치를 다시 튜닝해야 한다.',
+            '',
+            '# ── 통찰: 순위(rank)에는 스케일이 없다 ──',
+            '#  BM25 1등도 1등, 벡터 1등도 1등. 단위가 같다.',
+            '#  점수를 버리고 "순위" 만 융합하면 정규화도 튜닝도 사라진다.',
+            '#  그 방법이 바로 RRF (다음 단계).',
+          ],
+          highlight: [6, 7, 10, 11, 12, 13, 14, 15, 23, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 2. RRF 공식 — score(d) = Σ 1/(k + rank_i(d))',
+        desc: 'RRF 는 놀랄 만큼 단순하다. 각 검색기에서 문서 d 가 몇 등(rank)인지만 보고, 1/(k+rank) 를 계산해 모든 검색기에 대해 더한다. 점수는 전혀 쓰지 않는다 — 순위만 쓴다. 여기서 1/(k+rank) 곡선의 모양이 핵심이다. rank 가 커질수록 값이 줄지만, 감소가 완만한 쌍곡선이다. 그래서 상위권의 순위 차이(1등 vs 2등)는 값 차이로 비교적 크게 반영되고, 하위권 차이(50등 vs 51등)는 거의 무시된다. 이것이 우리가 원하는 성질이다 — "상위에 올려 준 검색기의 의견"을 더 존중하되, 어느 한 검색기가 1등을 줬다고 독식하지는 못하게 상한(1/(k+1))을 씌운다. k 는 이 곡선의 완만함을 조절하는 손잡이다(다음 단계에서 실험).',
+        actor: '📉 1/(k+rank) 곡선 — 상위권 차이는 크게, 하위권은 평탄하게',
+        view: 'curve',
+        alert: { tone: 'info', text: 'RRF 는 점수가 아니라 순위만 쓴다. 1/(k+rank) 는 위로 볼록한 쌍곡선이라 상위 순위 차이를 더 크게, 하위 순위 차이를 작게 반영한다 — 상위권 신호를 존중하되 한 검색기의 독식은 막는다.' },
+        code: {
+          lang: 'python',
+          filename: 'rrf_fusion.py (공식)',
+          lines: [
+            '"""',
+            'rrf_fusion.py — Reciprocal Rank Fusion 순수 구현',
+            '핵심: 점수(score)가 아니라 순위(rank)만 사용한다.',
+            '"""',
+            '',
+            'def rrf_score(ranks: dict[str, int], k: int = 60) -> float:',
+            '    """한 문서의 RRF 점수.',
+            '',
+            '    Args:',
+            '        ranks: {검색기이름: 그 검색기에서의 순위(1부터)}.',
+            '               해당 검색기 후보에 없으면 키를 아예 넣지 않는다.',
+            '        k:     순위 민감도 상수 (표준값 60).',
+            '    Returns:',
+            '        Σ 1/(k + rank) — 모든 검색기에 대한 합.',
+            '    """',
+            '    return sum(1.0 / (k + rank) for rank in ranks.values())',
+            '',
+            '# 곡선의 성질 (k=60):',
+            '#   rank 1 -> 1/61 = 0.016393   (가장 큼, 상한)',
+            '#   rank 2 -> 1/62 = 0.016129   (1등과 차이 0.000264)',
+            '#   rank 3 -> 1/63 = 0.015873',
+            '#   ...',
+            '#   rank 50 -> 1/110 = 0.009091 (50 vs 51 차이는 미미)',
+            '#',
+            '# 위로 볼록 → 상위권 순위 차이를 더 크게 반영한다.',
+            '# 어떤 검색기가 1등을 줘도 최대 1/(k+1) 로 상한이 걸려',
+            '# 한 검색기가 결과를 독식하지 못한다.',
+          ],
+          highlight: [5, 6, 15, 16, 18, 19, 20, 21, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 3. 완전 실계산 — 문서 6개를 손으로 융합한다',
+        desc: '이제 실제 데이터로 전 과정을 계산한다. 쿼리 "파이썬 비동기 프로그래밍"에 대해 BM25 순위와 벡터 순위가 아래처럼 나왔다. 각 문서의 RRF 점수는 두 항 1/(60+r_bm25) + 1/(60+r_vec) 를 더한 값이다. 표의 모든 항을 그대로 펼쳐 보라 — D1 은 두 검색기 모두 상위(2등·1등)라 합이 가장 커 최종 1등이 된다. 주목할 두 가지: (1) 한쪽에만 나온 문서 처리 — D5(키워드 스팸)는 BM25 1등이지만 벡터 후보에 없어 항이 하나뿐(1/61)이라 최종 5등으로 강등된다. D6(Node.js)은 벡터에만 있어 1/63 하나로 6등. 두 검색기의 "동의"를 받지 못한 문서는 자연히 뒤로 밀린다. (2) D3 은 BM25 4등이지만 벡터 2등의 힘으로 최종 2등까지 올라온다 — 순위 융합이 단일 검색기의 편향을 교정하는 순간이다.',
+        actor: '🧮 6문서 × 2검색기 → RRF 점수 전 과정 (k=60)',
+        view: 'fusionTable',
+        alert: { tone: 'good', text: '한쪽 검색기에만 나온 문서(D5·D6)는 항이 하나뿐이라 자동으로 강등된다. 두 검색기가 함께 지지한 문서(D1·D3)가 위로 올라온다 — RRF 는 "합의"에 보상을 준다.' },
+        code: {
+          lang: 'python',
+          filename: 'rrf_fusion.py (전체 융합)',
+          lines: [
+            'from collections import defaultdict',
+            'from rrf_fusion import rrf_score   # Step 2 의 함수',
+            '',
+            '# 각 검색기의 순위 리스트 (상위 -> 하위 순서)',
+            'bm25_ranking = ["D5", "D1", "D2", "D3", "D4"]   # 렉시컬',
+            'vec_ranking  = ["D1", "D3", "D6", "D4", "D2"]   # 벡터(의미)',
+            '',
+            'def fuse(rankings: dict[str, list[str]], k: int = 60):',
+            '    """여러 검색기의 순위 리스트를 RRF 로 융합한다."""',
+            '    # 문서별로 {검색기: 순위} 를 모은다',
+            '    per_doc: dict[str, dict[str, int]] = defaultdict(dict)',
+            '    for engine, docs in rankings.items():',
+            '        for rank, doc in enumerate(docs, start=1):',
+            '            per_doc[doc][engine] = rank',
+            '    # RRF 점수로 내림차순 정렬',
+            '    scored = [(doc, rrf_score(ranks, k))',
+            '              for doc, ranks in per_doc.items()]',
+            '    return sorted(scored, key=lambda x: x[1], reverse=True)',
+            '',
+            'fused = fuse({"bm25": bm25_ranking, "vec": vec_ranking}, k=60)',
+            'for doc, score in fused:',
+            '    print(f"{doc}  {score:.5f}")',
+            '',
+            '# 출력 (좌측 표와 정확히 일치):',
+            '#   D1  0.03252   <- BM25 2등 + 벡터 1등 (합의 -> 최종 1위)',
+            '#   D3  0.03175   <- BM25 4등이지만 벡터 2등이 끌어올림',
+            '#   D2  0.03126',
+            '#   D4  0.03101',
+            '#   D5  0.01639   <- BM25 1등이나 벡터에 없어 항 하나 -> 강등',
+            '#   D6  0.01587   <- 벡터에만 존재 (한쪽 검색기)',
+          ],
+          highlight: [4, 5, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 4. k 파라미터 — 순위 민감도의 손잡이 (표준 k=60)',
+        desc: 'k 는 1/(k+rank) 곡선의 완만함을 정한다. k 가 작으면(예: k=1) 분모가 작아 상위 순위가 폭발적으로 커진다 — 1등은 1/2, 2등은 1/3 로 격차가 크다. 그래서 어느 한 검색기가 1등을 준 문서가 결과를 좌우한다. 아래 슬라이더에서 k=1 로 내려 보라: 키워드 스팸 문서 D5(BM25 1등)가 단숨에 3위까지 치고 올라온다 — 한 검색기의 1등 신호가 과대평가되는 것이다. 반대로 k 가 크면(k=1000) 모든 항이 1/1000 근처로 납작해져 순위 간 차이가 거의 사라지고, "몇 개의 검색기가 이 문서를 후보에 올렸는가"(항의 개수 = 합의)가 지배한다 — D5 는 다시 5위로 강등된다. k=60 은 이 둘 사이의 실험적 스위트 스폿이다: 상위권 신호를 존중하되 단일 검색기가 독식하지 못하게 억제한다. 원논문(Cormack 2009)이 제안한 이래 ES·OpenSearch 의 기본값으로 굳었다.',
+        actor: '🎚️ k 슬라이더 — 순위가 어떻게 재편되나',
+        view: 'kExperiment',
+        alert: { tone: 'warn', text: 'k=1: 상위 순위가 폭발 → 한 검색기의 1등이 독주(스팸 D5 급상승). k=1000: 곡선이 평탄 → "몇 개 검색기가 지지했나"만 남음. k=60 은 그 사이 균형점.' },
+        code: {
+          lang: 'python',
+          filename: 'rrf_k_experiment.py (k 민감도 실험)',
+          lines: [
+            'from rrf_fusion import fuse',
+            '',
+            'bm25_ranking = ["D5", "D1", "D2", "D3", "D4"]',
+            'vec_ranking  = ["D1", "D3", "D6", "D4", "D2"]',
+            'rankings = {"bm25": bm25_ranking, "vec": vec_ranking}',
+            '',
+            '# 같은 데이터, k 만 바꿔 융합 순위 변화를 관찰',
+            'for k in (1, 10, 60, 1000):',
+            '    order = [doc for doc, _ in fuse(rankings, k=k)]',
+            '    print(f"k={k:<4} -> {order}")',
+            '',
+            '# 출력:',
+            "#   k=1    -> ['D1', 'D3', 'D5', 'D2', 'D4', 'D6']",
+            "#   k=10   -> ['D1', 'D3', 'D2', 'D4', 'D5', 'D6']",
+            "#   k=60   -> ['D1', 'D3', 'D2', 'D4', 'D5', 'D6']",
+            "#   k=1000 -> ['D1', 'D3', 'D2', 'D4', 'D5', 'D6']",
+            '#',
+            '# k=1 에서만 D5(키워드 스팸, BM25 1등)가 3위로 튄다.',
+            '#   작은 k -> 상위 순위 폭발 -> 단일 검색기 1등이 독주.',
+            '# k 를 키우면 D5 는 5위로 내려가고 순위가 안정된다.',
+            '#   큰 k -> 곡선 평탄 -> "몇 검색기가 지지했나(합의)"가 지배.',
+            '#',
+            '# 실무 규칙: 특별한 근거가 없으면 k=60 을 그대로 쓴다.',
+            '#   튜닝하려면 검증셋(nDCG@10)으로 20~100 범위를 훑는다.',
+          ],
+          highlight: [7, 8, 9, 12, 13, 14, 15, 16, 18, 19, 20, 21, 24, 25],
+        },
+      },
+      {
+        title: 'Step 5. 실무 적용 — ES/OpenSearch 내장, 3-way 융합, 그리고 한계',
+        desc: 'RRF 는 이제 검색 엔진에 내장돼 한 줄로 쓴다 — Elasticsearch 의 retriever.rrf, OpenSearch 의 hybrid/normalization 파이프라인이 대표적이다. 검색기를 2개로 제한할 이유도 없다: BM25 + 벡터 + 인기도(popularity) 처럼 3개 이상의 순위 리스트를 그대로 합산하면 된다(항이 늘 뿐 공식은 동일). 하지만 RRF 는 공짜가 아니다. 한계가 둘이다. (1) 점수 정보를 통째로 버린다 — "0.95 로 확신한 벡터 결과"와 "0.51 로 겨우 넘긴 결과"가 같은 rank 면 동일 취급된다. (2) window(각 검색기가 넘겨주는 후보 개수, rank_window_size) 밖으로 밀린 문서는 그 검색기에서 rank 가 없어 소실된다 — window 를 너무 작게 잡으면 진짜 좋은 문서가 한쪽 항을 못 받는다. 그래서 실전 파이프라인은 2단계로 간다: RRF 로 넓게 후보를 모아(recall) → 그 위에 크로스 인코더 리랭커로 정밀 재정렬(precision). 다음 장에서 이 리랭커를 다룬다.',
+        actor: '🏭 ES/OpenSearch RRF · 3-way 융합 · 한계 → 리랭커',
+        view: 'production',
+        alert: { tone: 'good', text: 'RRF 는 강력한 1차 융합이지만 점수를 버리고 window 밖 문서를 놓친다. 실전은 "RRF 로 recall 확보 → 리랭커로 precision" 2단계. 다음 장: 크로스 인코더 리랭커.' },
+        code: {
+          lang: 'python',
+          filename: 'es_rrf_retriever.py (실무 문법)',
+          lines: [
+            '"""',
+            'es_rrf_retriever.py — 검색 엔진 내장 RRF + 3-way 융합',
+            '"""',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            '',
+            '# ── Elasticsearch 8.x: retriever.rrf 로 하이브리드 검색 ──',
+            'query = {',
+            '  "retriever": {',
+            '    "rrf": {',
+            '      "retrievers": [',
+            '        {"standard": {           # (1) BM25 렉시컬',
+            '          "query": {"match": {"content": "파이썬 비동기 프로그래밍"}}}},',
+            '        {"knn": {                # (2) 벡터(kNN)',
+            '          "field": "embedding", "query_vector": QVEC,',
+            '          "k": 50, "num_candidates": 200}},',
+            '      ],',
+            '      "rank_constant": 60,        # = RRF 의 k',
+            '      "rank_window_size": 100,    # 각 검색기 후보 개수(window)',
+            '    }',
+            '  }, "size": 10,',
+            '}',
+            'hits = es.search(index="docs", body=query)',
+            '',
+            '# ── 3-way 융합: BM25 + 벡터 + 인기도 (직접 구현도 동일) ──',
+            'from rrf_fusion import fuse',
+            'fused = fuse({',
+            '    "bm25":       bm25_ranking,',
+            '    "vector":     vec_ranking,',
+            '    "popularity": popular_ranking,   # 조회수 기준 순위',
+            '}, k=60)   # 항이 3개로 늘 뿐, 공식은 그대로',
+            '',
+            '# ── RRF 의 한계 (다음 장 리랭커로 보완) ──',
+            '#  1) 점수 소실: rank 만 봐서 0.95 확신과 0.51 을 동일 취급',
+            '#  2) window 밖 소실: rank_window_size 밖 문서는 항이 빠짐',
+            '#  → 2단계 파이프라인: RRF(recall) -> cross-encoder(precision)',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 26, 27, 28, 29, 30, 31, 32, 35, 36, 37, 38],
+        },
+      },
+    ];
+
+    // ═════════════════════════════════════════════════════
+    // 좌측 뷰 컴포넌트들 (sky/blue 톤)
+    // ═════════════════════════════════════════════════════
+
+    // Step 1 — 점수 스케일 불일치 표
+    function ScaleTable() {
+      const rows = [
+        { doc: 'D1', bm25: 18.4, cos: 0.83 },
+        { doc: 'D2', bm25: 15.1, cos: 0.71 },
+        { doc: 'D3', bm25: 12.7, cos: 0.91 },
+        { doc: 'D4', bm25: 9.2,  cos: 0.66 },
+      ];
+      const maxB = 18.4;
+      return (
+        <div className="mt-1">
+          <div className="rounded-lg border-2 border-red-300 bg-white p-3">
+            <div className="text-xs font-bold text-red-800 mb-2">⚖️ 같은 문서, 전혀 다른 점수 스케일</div>
+            <table className="w-full text-[11px]">
+              <thead>
+                <tr className="text-slate-600 border-b border-slate-200">
+                  <th className="text-left py-1">문서</th>
+                  <th className="text-left py-1">BM25 (0~수십)</th>
+                  <th className="text-left py-1">cosine (0~1)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.doc} className="border-t border-slate-100">
+                    <td className="py-1.5 font-mono font-bold text-sky-800">{r.doc}</td>
+                    <td className="py-1.5">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-24 h-2 rounded-full bg-sky-100 overflow-hidden">
+                          <div className="h-full bg-sky-500" style={{ width: `${(r.bm25 / maxB) * 100}%` }} />
+                        </div>
+                        <span className="font-mono text-slate-700">{r.bm25.toFixed(1)}</span>
+                      </div>
+                    </td>
+                    <td className="py-1.5">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-24 h-2 rounded-full bg-indigo-100 overflow-hidden">
+                          <div className="h-full bg-indigo-500" style={{ width: `${r.cos * 100}%` }} />
+                        </div>
+                        <span className="font-mono text-slate-700">{r.cos.toFixed(2)}</span>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 gap-2">
+            <div className="rounded-lg border-2 border-red-300 bg-red-50 p-2.5">
+              <div className="text-[11px] font-bold text-red-800 mb-1">❌ 가중 합산 0.6·BM25 + 0.4·cos</div>
+              <div className="text-[10px] text-red-900 font-mono leading-relaxed">
+                D3: 0.6×12.7 + 0.4×0.91 = <b>7.98</b><br/>
+                cos 최상위(0.91)여도 0.36 뿐 → BM25 가 결과를 삼킴
+              </div>
+            </div>
+            <div className="rounded-lg border-2 border-amber-300 bg-amber-50 p-2.5">
+              <div className="text-[11px] font-bold text-amber-800 mb-1">⚠️ min-max 정규화 후 합산</div>
+              <div className="text-[10px] text-amber-900 leading-relaxed">
+                새 문서로 BM25 최댓값이 18.4 → 40 으로 바뀌면 정규화 분모가 흔들려 <b>가중치를 매번 다시 튜닝</b>해야 한다.
+              </div>
+            </div>
+            <div className="rounded-lg border-2 border-emerald-400 bg-emerald-50 p-2.5">
+              <div className="text-[11px] font-bold text-emerald-800 mb-1">💡 통찰: 순위에는 스케일이 없다</div>
+              <div className="text-[10px] text-emerald-900 leading-relaxed">
+                BM25 1등도 1등, 벡터 1등도 1등. <b>점수를 버리고 순위만</b> 융합하면 정규화·가중치 튜닝이 통째로 사라진다.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2 — 1/(k+rank) 곡선 (k=1 vs k=60 비교 막대)
+    function RrfCurve() {
+      const K_LOW = 1, K_STD = 60;
+      const ranks = [1, 2, 3, 4, 5, 6, 7, 8];
+      const vLow = ranks.map((r) => 1 / (K_LOW + r));
+      const vStd = ranks.map((r) => 1 / (K_STD + r));
+      const maxLow = Math.max(...vLow);
+      const maxStd = Math.max(...vStd);
+      // 인접 순위 간 값 차이(=상위권일수록 큰지 확인)
+      const gapTop = (1 / (K_STD + 1) - 1 / (K_STD + 2));
+      const gapBot = (1 / (K_STD + 7) - 1 / (K_STD + 8));
+      return (
+        <div className="mt-1">
+          <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+            <div className="text-xs font-bold text-sky-900 mb-2">📉 1/(k+rank) — 순위가 낮아질수록 완만히 감소</div>
+            <div className="grid grid-cols-2 gap-3">
+              {/* k=1 : 가파름 */}
+              <div>
+                <div className="text-[10px] font-bold text-rose-700 mb-1">k = 1 (가파름 · 상위 독주)</div>
+                <div className="flex items-end gap-1 h-28">
+                  {vLow.map((v, i) => (
+                    <div key={i} className="flex-1 flex flex-col items-center justify-end">
+                      <span className="text-[7px] text-slate-500 font-mono">{v.toFixed(2)}</span>
+                      <div className="w-full bg-rose-400 rounded-t" style={{ height: `${(v / maxLow) * 90}%` }} />
+                      <span className="text-[8px] text-slate-500">{i + 1}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {/* k=60 : 완만 */}
+              <div>
+                <div className="text-[10px] font-bold text-sky-700 mb-1">k = 60 (완만 · 표준)</div>
+                <div className="flex items-end gap-1 h-28">
+                  {vStd.map((v, i) => (
+                    <div key={i} className="flex-1 flex flex-col items-center justify-end">
+                      <span className="text-[7px] text-slate-500 font-mono">{v.toFixed(3)}</span>
+                      <div className="w-full bg-sky-500 rounded-t" style={{ height: `${(v / maxStd) * 90}%` }} />
+                      <span className="text-[8px] text-slate-500">{i + 1}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="mt-1 text-[9px] text-slate-500 text-center">가로축 = 순위(rank), 세로축 = 1/(k+rank) 기여값</div>
+          </div>
+
+          <div className="mt-3 rounded-lg border-2 border-sky-300 bg-sky-50 p-3">
+            <div className="text-xs font-bold text-sky-900 mb-1.5">🔍 왜 이 모양이 좋은가</div>
+            <div className="space-y-1.5 text-[10px] text-sky-900">
+              <div className="flex gap-2"><span>①</span><span>위로 볼록 → <b>상위권 순위 차이</b>(1↔2등)를 하위권 차이(7↔8등)보다 크게 반영.</span></div>
+              <div className="flex gap-2"><span>②</span><span>어떤 검색기가 1등을 줘도 최대 <b>1/(k+1)</b> 로 상한 → 한 검색기의 독식을 막는다.</span></div>
+              <div className="rounded bg-white border border-sky-200 p-1.5 font-mono text-[9px] text-slate-700">
+                k=60 인접 차이 &nbsp; 상위(1↔2): {gapTop.toFixed(6)} &nbsp;&gt;&nbsp; 하위(7↔8): {gapBot.toFixed(6)}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3 — 완전 실계산 융합 표
+    function FusionTable({ k = 60 }) {
+      const fused = useMemo(() => fuse(DOCS, k), [k]);
+      const rankById = Object.fromEntries(fused.map((d) => [d.id, d.fused]));
+      const maxScore = Math.max(...fused.map((d) => d.score));
+      const term = (r) => (r == null ? null : 1 / (k + r));
+      return (
+        <div className="mt-1">
+          <div className="rounded-lg border-2 border-sky-400 bg-white p-3">
+            <div className="text-xs font-bold text-sky-900 mb-2">
+              🧮 RRF 실계산 (k={k}) — 쿼리 "파이썬 비동기 프로그래밍"
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[9.5px] whitespace-nowrap">
+                <thead>
+                  <tr className="text-slate-600 border-b-2 border-slate-200">
+                    <th className="text-left py-1 pr-1">문서</th>
+                    <th className="text-center py-1">BM25<br/>r₁</th>
+                    <th className="text-center py-1">1/(60+r₁)</th>
+                    <th className="text-center py-1">벡터<br/>r₂</th>
+                    <th className="text-center py-1">1/(60+r₂)</th>
+                    <th className="text-center py-1">RRF 합</th>
+                    <th className="text-center py-1">융합<br/>순위</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {DOCS.map((d) => {
+                    const t1 = term(d.bm25), t2 = term(d.vec);
+                    const sum = (t1 || 0) + (t2 || 0);
+                    const fr = rankById[d.id];
+                    const isTop = fr === 1;
+                    return (
+                      <tr key={d.id} className={`border-t border-slate-100 ${isTop ? 'bg-sky-50' : ''}`}>
+                        <td className="py-1.5 pr-1">
+                          <span className="font-mono font-bold text-sky-800">{d.id}</span>
+                          <div className="text-[8px] text-slate-500 whitespace-normal max-w-[92px] leading-tight">{d.tag}</div>
+                        </td>
+                        <td className="text-center font-mono">{d.bm25 ?? '—'}</td>
+                        <td className="text-center font-mono text-slate-600">{t1 ? t1.toFixed(5) : <span className="text-slate-400">0</span>}</td>
+                        <td className="text-center font-mono">{d.vec ?? '—'}</td>
+                        <td className="text-center font-mono text-slate-600">{t2 ? t2.toFixed(5) : <span className="text-slate-400">0</span>}</td>
+                        <td className="text-center font-mono font-bold text-sky-900">{sum.toFixed(5)}</td>
+                        <td className="text-center">
+                          <span className={`inline-block w-5 h-5 leading-5 rounded-full text-white font-bold ${fr === 1 ? 'bg-sky-600' : fr === 2 ? 'bg-sky-500' : fr <= 4 ? 'bg-sky-400' : 'bg-slate-400'}`}>{fr}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* 융합 결과 막대 순위 */}
+          <div className="mt-3 rounded-lg border-2 border-sky-300 bg-sky-50 p-3">
+            <div className="text-xs font-bold text-sky-900 mb-2">🏁 최종 융합 순위</div>
+            <div className="space-y-1">
+              {fused.map((d) => (
+                <div key={d.id} className="flex items-center gap-2">
+                  <span className="w-4 text-[10px] font-bold text-sky-700 text-right">{d.fused}</span>
+                  <span className="w-7 font-mono text-[10px] font-bold text-sky-800">{d.id}</span>
+                  <div className="flex-1 h-3 rounded-full bg-sky-100 overflow-hidden">
+                    <div className="h-full bg-gradient-to-r from-sky-400 to-sky-600" style={{ width: `${(d.score / maxScore) * 100}%` }} />
+                  </div>
+                  <span className="w-16 text-right font-mono text-[9px] text-slate-600">{d.score.toFixed(5)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-[10px] text-sky-900 leading-snug">
+              <b>D5</b>(BM25 1등·키워드 스팸)는 벡터 항이 없어 <b>5위로 강등</b>, <b>D3</b>(BM25 4등)은 벡터 2등의 힘으로 <b>2위</b>로 상승 — 융합이 편향을 교정한다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4 — k 슬라이더 인터랙티브 재랭킹
+    const K_CHOICES = [1, 10, 60, 1000];
+    function KExperiment() {
+      const [kIdx, setKIdx] = useState(2); // 기본 k=60
+      const k = K_CHOICES[kIdx];
+      const fused = useMemo(() => fuse(DOCS, k), [k]);
+      const maxScore = Math.max(...fused.map((d) => d.score));
+      const d5rank = fused.find((d) => d.id === 'D5').fused;
+      return (
+        <div className="mt-1">
+          <div className="rounded-lg border-2 border-sky-400 bg-white p-3">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-xs font-bold text-sky-900">🎚️ k 값을 바꿔 보라</div>
+              <div className="font-mono text-sm font-bold text-sky-700">k = {k}</div>
+            </div>
+            <input
+              type="range" min="0" max="3" step="1" value={kIdx}
+              onChange={(e) => setKIdx(Number(e.target.value))}
+              aria-label="RRF k 파라미터 선택"
+              className="w-full accent-sky-600"
+            />
+            <div className="flex justify-between text-[10px] font-mono text-slate-500 px-0.5">
+              {K_CHOICES.map((c) => (
+                <span key={c} className={c === k ? 'text-sky-700 font-bold' : ''}>{c}</span>
+              ))}
+            </div>
+            <div className="mt-1 text-[10px] text-slate-600">
+              {k === 1 && '상위 순위가 폭발 → 한 검색기의 1등이 결과를 좌우한다.'}
+              {k === 10 && '아직 상위 편중이 있으나 스팸 문서는 이미 가라앉는다.'}
+              {k === 60 && '표준값 — 상위권 존중과 합의 사이의 균형점.'}
+              {k === 1000 && '곡선이 평탄 → 순위 차이 소멸, "몇 검색기가 지지했나"만 남는다.'}
+            </div>
+          </div>
+
+          {/* 재랭킹 결과 */}
+          <div className="mt-3 rounded-lg border-2 border-sky-300 bg-sky-50 p-3">
+            <div className="text-xs font-bold text-sky-900 mb-2">📊 융합 순위 (k={k})</div>
+            <div className="space-y-1">
+              {fused.map((d) => {
+                const isSpam = d.id === 'D5';
+                return (
+                  <div key={d.id} className={`flex items-center gap-2 rounded px-1 py-0.5 ${isSpam ? 'bg-rose-100 border border-rose-300' : ''}`}>
+                    <span className="w-4 text-[10px] font-bold text-sky-700 text-right">{d.fused}</span>
+                    <span className={`w-7 font-mono text-[10px] font-bold ${isSpam ? 'text-rose-700' : 'text-sky-800'}`}>{d.id}</span>
+                    <div className="flex-1 h-3 rounded-full bg-sky-100 overflow-hidden">
+                      <div className={`h-full ${isSpam ? 'bg-rose-400' : 'bg-gradient-to-r from-sky-400 to-sky-600'} transition-all duration-500`} style={{ width: `${(d.score / maxScore) * 100}%` }} />
+                    </div>
+                    <span className="w-16 text-right font-mono text-[9px] text-slate-600">{d.score.toFixed(5)}</span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className={`mt-2 rounded p-1.5 text-[10px] leading-snug ${d5rank <= 3 ? 'bg-rose-50 border border-rose-300 text-rose-900' : 'bg-emerald-50 border border-emerald-300 text-emerald-900'}`}>
+              {d5rank <= 3
+                ? <span>🚨 키워드 스팸 <b>D5</b>가 <b>{d5rank}위</b>까지 상승! 작은 k 가 단일 검색기의 1등을 과대평가한다.</span>
+                : <span>✅ 키워드 스팸 <b>D5</b>는 <b>{d5rank}위</b>로 강등. 두 검색기의 합의를 받은 문서가 상위를 차지한다.</span>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5 — 실무 박스
+    function ProductionBox() {
+      const threeWay = useMemo(() => {
+        const docs3 = [
+          { id: 'D1', bm25: 2, vec: 1, pop: 3 },
+          { id: 'D3', bm25: 4, vec: 2, pop: 5 },
+          { id: 'D2', bm25: 3, vec: 5, pop: 1 },
+          { id: 'D4', bm25: 5, vec: 4, pop: 2 },
+        ];
+        const k = 60;
+        return docs3
+          .map((d) => ({ id: d.id, score: 1 / (k + d.bm25) + 1 / (k + d.vec) + 1 / (k + d.pop), bm25: d.bm25, vec: d.vec, pop: d.pop }))
+          .sort((a, b) => b.score - a.score);
+      }, []);
+      return (
+        <div className="mt-1 space-y-3">
+          <div className="rounded-lg border-2 border-sky-400 bg-white p-3">
+            <div className="text-xs font-bold text-sky-900 mb-2">🏭 검색 엔진 내장 RRF (한 줄로)</div>
+            <div className="space-y-1.5 text-[10px]">
+              <div className="flex items-start gap-2 rounded bg-sky-50 border border-sky-200 p-1.5">
+                <span className="font-bold text-sky-700 w-24 shrink-0">Elasticsearch</span>
+                <span className="font-mono text-slate-700">retriever.rrf {`{ rank_constant: 60, rank_window_size }`}</span>
+              </div>
+              <div className="flex items-start gap-2 rounded bg-sky-50 border border-sky-200 p-1.5">
+                <span className="font-bold text-sky-700 w-24 shrink-0">OpenSearch</span>
+                <span className="font-mono text-slate-700">hybrid query + score-ranking normalization processor</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border-2 border-indigo-300 bg-white p-3">
+            <div className="text-xs font-bold text-indigo-900 mb-2">➕ 3-way 융합: BM25 + 벡터 + 인기도 (항만 늘 뿐)</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-slate-600 border-b border-slate-200">
+                  <th className="text-left py-0.5">문서</th>
+                  <th className="text-center py-0.5">BM25</th>
+                  <th className="text-center py-0.5">벡터</th>
+                  <th className="text-center py-0.5">인기도</th>
+                  <th className="text-center py-0.5">RRF 합</th>
+                </tr>
+              </thead>
+              <tbody>
+                {threeWay.map((d, i) => (
+                  <tr key={d.id} className={`border-t border-slate-100 ${i === 0 ? 'bg-indigo-50' : ''}`}>
+                    <td className="py-1 font-mono font-bold text-indigo-800">{d.id}</td>
+                    <td className="text-center font-mono">{d.bm25}</td>
+                    <td className="text-center font-mono">{d.vec}</td>
+                    <td className="text-center font-mono">{d.pop}</td>
+                    <td className="text-center font-mono font-bold text-indigo-900">{d.score.toFixed(5)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="rounded-lg border-2 border-amber-300 bg-amber-50 p-3">
+            <div className="text-xs font-bold text-amber-800 mb-1.5">⚠️ RRF 의 한계</div>
+            <div className="space-y-1 text-[10px] text-amber-900">
+              <div className="flex gap-2"><span>①</span><span><b>점수 정보 소실</b> — 0.95 확신과 0.51 이 같은 rank 면 동일 취급.</span></div>
+              <div className="flex gap-2"><span>②</span><span><b>window 밖 소실</b> — rank_window_size 밖 문서는 그 검색기 항이 빠진다.</span></div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border-2 border-sky-500 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+            <div className="text-sm font-bold text-sky-900 mb-2">🧭 실전 2단계 파이프라인</div>
+            <div className="flex items-stretch gap-1 text-[10px] font-bold text-center">
+              <div className="flex-1 rounded-lg border-2 border-sky-300 bg-white p-2 flex flex-col items-center justify-center text-sky-900">
+                <span>1) RRF 융합</span><span className="text-[9px] font-normal text-slate-500">넓게 후보 확보 (recall)</span>
+              </div>
+              <div className="flex items-center text-sky-500 text-lg">→</div>
+              <div className="flex-1 rounded-lg border-2 border-indigo-400 bg-white p-2 flex flex-col items-center justify-center text-indigo-900">
+                <span>2) 리랭커</span><span className="text-[9px] font-normal text-slate-500">정밀 재정렬 (precision)</span>
+              </div>
+            </div>
+            <div className="mt-2 text-[10px] text-sky-900 leading-snug">
+              크로스 인코더 리랭커는 점수를 다시 계산해 RRF 가 버린 정밀도를 되찾는다 — <b>다음 장</b>에서 다룬다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 단계별 뷰 라우팅 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const VIEW_LABEL = {
+      scaleTable:  { icon: '⚖️', label: '스케일 불일치' },
+      curve:       { icon: '📉', label: '1/(k+rank) 곡선' },
+      fusionTable: { icon: '🧮', label: 'RRF 실계산' },
+      kExperiment: { icon: '🎚️', label: 'k 파라미터' },
+      production:  { icon: '🏭', label: '실무 적용' },
+    };
+
+    function LiveDataPane({ state }) {
+      const v = VIEW_LABEL[state.view] || VIEW_LABEL.fusionTable;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{v.icon}</span>
+              <span>RRF 융합 — {v.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          {state.view === 'scaleTable'  && <ScaleTable />}
+          {state.view === 'curve'       && <RrfCurve />}
+          {state.view === 'fusionTable' && <FusionTable k={60} />}
+          {state.view === 'kExperiment' && <KExperiment />}
+          {state.view === 'production'  && <ProductionBox />}
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">IV-1-2. RRF — Reciprocal Rank Fusion</h1>
+                <p className="text-sm text-sky-800/80">점수는 버리고 순위만 믿는다 — 하이브리드 검색의 사실상 표준 융합법</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계 · Step 4 는 슬라이더로 k 를 직접 조절</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                RRF 는 점수를 버리고 순위만 융합한다 — score(d) = Σ 1/(k+rank_i(d)). 순위에는 스케일이 없어 정규화도 가중치 튜닝도 필요 없다.
+                1/(k+rank) 곡선은 상위권 차이를 크게, 하위권 차이를 작게 반영하며, k(표준 60)로 그 완만함을 조절한다.
+                한쪽 검색기에만 나온 문서는 항이 하나뿐이라 자동으로 강등되고, 두 검색기의 합의를 받은 문서가 올라온다.
+                다만 RRF 는 점수 정보를 버리고 window 밖 문서를 놓치므로, 실전은 "RRF 로 recall → 리랭커로 precision" 2단계로 간다.
+                다음 장에서는 그 크로스 인코더 리랭커를 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RRF', '순위융합', '하이브리드검색', 'BM25', '벡터검색', 'k파라미터', 'rank_constant', 'rank_window_size', 'Elasticsearch', 'OpenSearch', '3-way융합', '리랭커'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./IV-1-3.html" className="underline hover:no-underline">다음: IV-1-3 (크로스 인코더 리랭커) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — V-1-1. 검색 품질 평가 — nDCG·MRR</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📏</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search V-1-1 — 검색 품질 평가 — nDCG·MRR
+    학습 목표: "요즘 검색이 이상해요" 같은 감(感)에 의존한 튜닝을 숫자로 바꾼다.
+              (1) 평가셋(골든셋)이 없으면 모든 변경이 도박임을 체험하고
+              (2) recall@k·precision@k, (3) MRR, (4) nDCG 를 각각 실제로 계산해 보며
+              (5) 어떤 상황에 어떤 지표를 쓰고, 오프라인 평가 파이프라인으로 회귀를 잡는 운영 체계를 세운다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 검색 결과에 정답 마킹 → 4지표 실계산 + 민감도 비교 + 파이프라인) / 우(VSCode CodeViewer: eval_metrics.py)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 평가 없는 튜닝의 위험 → precision/recall → MRR → nDCG → 운영 체계
+    //   results  : 검색 결과 리스트. 각 행 = { rank, title, rel }
+    //              rel : 등급 관련도 (0=무관, 1=보통, 2=좋음, 3=완벽) / 이진 지표는 rel>=1 을 정답으로 본다
+    //   metrics  : 이 단계에서 강조할 지표 계산 (중간값 포함)
+    //   code     : 우측 CodeViewer 파일 (eval_metrics.py / golden_set.py / eval_runner.py)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 평가 없는 튜닝의 위험 — 감(感)은 다른 질의를 망가뜨린다',
+        desc: '"요즘 검색이 이상해요"라는 한 마디에 개발자가 BM25 파라미터를 손대거나 동의어를 추가한다. "노트북" 질의에서는 결과가 좋아 보였다. 하지만 그 변경이 "삼성" 질의의 1등을 3등으로 밀어내고 "케이스" 질의를 무결과로 만들었는지는 아무도 모른다 — 눈으로 확인한 질의가 한두 개뿐이기 때문이다. 평가셋(질의-정답 문서 쌍의 모음, 골든셋)이 없으면 모든 변경은 "한 곳을 고치고 열 곳을 모르게 망가뜨리는" 도박이 된다. 그래서 첫 단계는 튜닝이 아니라 자(尺)를 만드는 일이다: 실제 검색 로그에서 대표 질의 100~500개를 뽑고, 각 질의에 대해 어떤 문서가 정답인지 라벨링한다. 이 골든셋 하나가 이후 모든 개선을 "개악이 아님"으로 증명하는 근거가 된다.',
+        actor: '🎲 골든셋 없이 튜닝 = 도박',
+        phase: 'risk',
+        phaseDetail: '평가셋(질의-정답 쌍)을 먼저 만든다',
+        query: '노트북 (눈으로 본 유일한 질의)',
+        results: [
+          { rank: 1, title: '삼성 노트북 갤럭시북4', rel: 3 },
+          { rank: 2, title: 'LG 그램 노트북 16인치', rel: 2 },
+          { rank: 3, title: '노트북 거치대 알루미늄', rel: 1 },
+        ],
+        riskBox: {
+          title: '눈대중 튜닝 → 다른 질의가 조용히 망가진다',
+          before: [
+            { q: '노트북', change: '1등 유지', tone: 'good' },
+            { q: '삼성', change: '1등 → 3등 하락', tone: 'bad' },
+            { q: '케이스', change: '결과 5건 → 0건', tone: 'bad' },
+          ],
+          note: '"노트북"만 눈으로 봤다. 나머지는 배포 후 CS 문의로 알게 된다.',
+        },
+        goldenBox: {
+          title: '골든셋 만들기 — 자(尺)를 먼저 세운다',
+          steps: [
+            { icon: '📜', head: '① 로그에서 질의 추출', body: '실제 검색 로그의 상위·롱테일 질의에서 대표 100~500개 샘플링' },
+            { icon: '🏷️', head: '② 정답 라벨링', body: '질의마다 정답 문서를 표시 (이진 또는 등급). 사람 판단·클릭 로그 활용' },
+            { icon: '📏', head: '③ 자로 사용', body: '변경 → 골든셋 전체 재실행 → 지표 비교. 개선/개악을 숫자로 판정' },
+          ],
+          note: '100~500질의면 충분하다. 이 자 하나가 이후 모든 튜닝의 도박성을 없앤다.',
+        },
+        alert: { tone: 'danger', text: '평가셋이 없으면 "좋아졌다"는 느낌일 뿐 증명이 아니다. 한 질의를 고치는 변경이 열 질의를 망가뜨려도 감(感)으로는 절대 보이지 않는다. 튜닝보다 자(골든셋)를 먼저 만든다.' },
+        code: {
+          lang: 'python',
+          filename: 'golden_set.py (평가셋 = 자를 만든다)',
+          lines: [
+            '"""',
+            'golden_set.py — 검색 품질의 "자(尺)": 질의-정답 문서 쌍의 모음.',
+            '이 골든셋이 없으면 모든 튜닝은 "한 곳 고치고 열 곳 망가뜨리는" 도박이다.',
+            '"""',
+            'from dataclasses import dataclass, field',
+            '',
+            '',
+            '@dataclass',
+            'class QueryCase:',
+            '    """질의 하나에 대한 평가 케이스.',
+            '    query    : 사용자가 친 검색어',
+            '    relevance: {문서id: 관련도 등급}  (0=무관,1=보통,2=좋음,3=완벽)',
+            '               이진 지표는 등급>=1 을 "정답"으로 본다.',
+            '    """',
+            '    query: str',
+            '    relevance: dict[str, int] = field(default_factory=dict)',
+            '',
+            '    def relevant_ids(self) -> set[str]:',
+            '        """이진 정답 집합 — 등급 1 이상인 문서 전체."""',
+            '        return {doc_id for doc_id, g in self.relevance.items() if g >= 1}',
+            '',
+            '',
+            '# 로그에서 뽑은 대표 질의 100~500개를 이렇게 라벨링해 둔다.',
+            'GOLDEN_SET = [',
+            '    QueryCase("노트북", {"p-01": 3, "p-02": 2, "p-09": 1}),',
+            '    QueryCase("삼성",   {"p-01": 3, "p-14": 2}),',
+            '    QueryCase("케이스", {"p-21": 2, "p-22": 2, "p-23": 1}),',
+            '    # ... 100~500 질의',
+            ']',
+            '',
+            '# 왜 100~500 인가?',
+            '#   너무 적으면 우연에 흔들리고, 너무 많으면 라벨링 비용이 폭발한다.',
+            '#   대표 질의 수백 개면 회귀(개악)를 통계적으로 잡아내기에 충분하다.',
+          ],
+          highlight: [8, 9, 15, 16, 18, 19, 20, 24, 25, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 2. recall@k 와 precision@k — 상위 k에 정답이 몇 개인가',
+        desc: '가장 기본이 되는 두 지표는 ml I-2-2의 정밀도·재현율을 "상위 k 결과"에 적용한 것이다. precision@k(정밀도)는 "상위 k개 중 정답의 비율" — 사용자가 첫 화면에서 만나는 결과가 얼마나 깨끗한가를 본다. recall@k(재현율)는 "전체 정답 중 상위 k에 걸린 비율" — 놓치지 않고 건져 올렸는가를 본다. 아래 예처럼 정답 총 4개인 질의에서 상위 5개 중 3개가 정답이면 precision@5=3/5=0.6, recall@5=3/4=0.75다. 특히 RAG에서는 recall@k가 왕이다: LLM에 넘길 컨텍스트 안에 정답 문서만 들어가 있으면, 그 정답이 3등이든 5등이든 LLM이 알아서 읽어 답을 만든다. 순위의 미세한 차이보다 "정답을 컨텍스트에 넣었는가(recall)"가 답의 성패를 가른다.',
+        actor: '🎯 정답 총 4개 · 상위 5개 평가',
+        phase: 'pr',
+        phaseDetail: 'precision@5 = 3/5,  recall@5 = 3/4',
+        query: '무선 이어폰',
+        results: [
+          { rank: 1, title: '소니 WF-1000XM5 무선 이어폰', rel: 3 },
+          { rank: 2, title: '삼성 갤럭시 버즈3 프로', rel: 2 },
+          { rank: 3, title: '무선 이어폰 실리콘 케이스', rel: 0 },
+          { rank: 4, title: '애플 에어팟 프로 2세대', rel: 2 },
+          { rank: 5, title: '유선 이어폰 3.5mm', rel: 0 },
+        ],
+        metricCalc: {
+          title: 'precision@5 · recall@5 실계산',
+          k: 5,
+          totalRelevant: 4,
+          lines: [
+            { label: '상위 5개 정답(등급≥1)', value: '1등·2등·4등 → 3개' },
+            { label: 'precision@5', value: '3 / 5 = 0.600', tone: 'sky' },
+            { label: '전체 정답 수', value: '4개 (1개는 6등 밖)' },
+            { label: 'recall@5', value: '3 / 4 = 0.750', tone: 'emerald' },
+          ],
+          note: 'precision=결과가 깨끗한가, recall=놓치지 않았는가. 둘은 트레이드오프다.',
+        },
+        ragBox: {
+          title: 'RAG 에서는 recall@k 가 왕인 이유',
+          body: 'LLM 컨텍스트에 정답 문서만 들어가면, 3등이든 5등이든 LLM 이 읽어 답을 만든다. 순위 미세 차이보다 "정답을 컨텍스트에 담았는가(recall@k)" 가 답의 성패를 가른다.',
+          contrast: '반대로 사람이 첫 화면만 보는 검색은 precision@k(첫 화면이 깨끗한가) 가 더 중요해진다.',
+        },
+        alert: { tone: 'info', text: 'precision@k 는 "상위 k 중 정답 비율", recall@k 는 "전체 정답 중 상위 k에 걸린 비율". 둘 다 순위 내 "정답 위치"는 무시하고 "정답이 k 안에 있는가"만 센다 — 순위 품질은 MRR·nDCG 가 맡는다.' },
+        code: {
+          lang: 'python',
+          filename: 'eval_metrics.py (① precision@k · recall@k)',
+          lines: [
+            '"""',
+            'eval_metrics.py — 4대 검색 품질 지표의 순수 파이썬 구현.',
+            '입력은 항상 (검색 결과 문서id 리스트, 정답 정보) 두 가지뿐이다.',
+            '"""',
+            'import math',
+            '',
+            '',
+            'def precision_at_k(ranked_ids: list[str],',
+            '                   relevant: set[str], k: int) -> float:',
+            '    """상위 k 개 중 정답의 비율 — "첫 화면이 얼마나 깨끗한가"."""',
+            '    top_k = ranked_ids[:k]',
+            '    hits = sum(1 for doc_id in top_k if doc_id in relevant)',
+            '    return hits / k',
+            '',
+            '',
+            'def recall_at_k(ranked_ids: list[str],',
+            '                relevant: set[str], k: int) -> float:',
+            '    """전체 정답 중 상위 k 에 걸린 비율 — "얼마나 안 놓쳤나"."""',
+            '    if not relevant:',
+            '        return 0.0',
+            '    top_k = ranked_ids[:k]',
+            '    hits = sum(1 for doc_id in top_k if doc_id in relevant)',
+            '    return hits / len(relevant)',
+            '',
+            '',
+            '# 예: 정답 총 4개, 상위 5개 중 1·2·4등이 정답',
+            'ranked   = ["p-01", "p-02", "p-03", "p-04", "p-05"]',
+            'relevant = {"p-01", "p-02", "p-04", "p-40"}  # p-40 은 6등 밖',
+            'print(precision_at_k(ranked, relevant, 5))  # 3/5 = 0.6',
+            'print(recall_at_k(ranked, relevant, 5))     # 3/4 = 0.75',
+            '',
+            '# RAG 는 recall@k 가 왕: 컨텍스트에 정답만 들어가면',
+            '#   순위가 3등이든 5등이든 LLM 이 읽어 답을 만든다.',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 16, 17, 18, 21, 22, 23, 27, 28, 29, 30, 31],
+        },
+      },
+      {
+        title: 'Step 3. MRR — 첫 정답의 순위, 그 역수',
+        desc: 'precision·recall은 "정답이 k 안에 있는가"만 세고 순위 안에서의 위치는 무시했다. MRR(Mean Reciprocal Rank)은 반대로 "첫 정답이 몇 등에 나왔는가"에 집중한다. 한 질의의 RR(Reciprocal Rank)은 첫 정답 순위의 역수다: 1등이면 1/1=1.0, 2등이면 1/2=0.5, 3등이면 1/3≈0.33. 정답이 아래로 내려갈수록 점수가 급격히 떨어져 "맨 위에 정답을 놓아라"라는 압력을 준다. MRR은 여러 질의의 RR을 평균한 값이다. 이 지표가 특히 잘 맞는 곳은 정답이 사실상 하나인 검색 — 내비게이션 질의("네이버", "구글 로그인")나 "이 오류의 정답 문서 하나"를 찾는 상황이다. 정답이 여럿이고 그 전부의 순서가 중요한 랭킹에는 부적합하고(첫 정답만 보므로), 그 경우는 다음 단계의 nDCG를 쓴다.',
+        actor: '🥇 첫 정답 순위의 역수 · 3질의 평균',
+        phase: 'mrr',
+        phaseDetail: 'RR = 1/(첫 정답 순위),  MRR = 평균',
+        query: '3개 질의의 첫 정답 위치',
+        results: [
+          { rank: 1, title: 'q1 "네이버" → 1등이 정답', rel: 3, rr: '1/1 = 1.00' },
+          { rank: 2, title: 'q2 "구글 로그인" → 첫 정답 3등', rel: 0, rr: '1/3 = 0.33', firstAt: 3 },
+          { rank: 3, title: 'q3 "다음 메일" → 첫 정답 2등', rel: 0, rr: '1/2 = 0.50', firstAt: 2 },
+        ],
+        mrrTable: {
+          title: 'MRR 실계산 — 첫 정답 순위만 본다',
+          rows: [
+            { q: 'q1 네이버', first: '1등', rr: 1.0 },
+            { q: 'q2 구글 로그인', first: '3등', rr: 1 / 3 },
+            { q: 'q3 다음 메일', first: '2등', rr: 0.5 },
+          ],
+          sum: '1.00 + 0.33 + 0.50 = 1.833',
+          mrr: '1.833 / 3 = 0.611',
+        },
+        fitBox: {
+          title: 'MRR 이 맞는 곳 / 안 맞는 곳',
+          good: '정답이 사실상 하나 — 내비게이션 질의("네이버"), 정답 문서 1건 찾기(FAQ·에러코드). 첫 정답을 맨 위로 올리는 데 집중.',
+          bad: '정답이 여럿이고 그 전부의 순서가 중요한 랭킹(쇼핑·뉴스). MRR 은 첫 정답 이후를 아예 안 보므로 nDCG 가 필요.',
+        },
+        alert: { tone: 'info', text: 'RR 은 첫 정답 순위의 역수라 위에서 아래로 급격히 떨어진다(1.0→0.5→0.33→0.25). "정답을 맨 위에 놓아라"는 압력. 단, 첫 정답만 보므로 나머지 정답의 순서는 완전히 무시한다.' },
+        code: {
+          lang: 'python',
+          filename: 'eval_metrics.py (② MRR)',
+          lines: [
+            'def reciprocal_rank(ranked_ids: list[str],',
+            '                    relevant: set[str]) -> float:',
+            '    """첫 정답 순위의 역수 — 1등=1.0, 3등=0.33, 없으면 0."""',
+            '    for i, doc_id in enumerate(ranked_ids, start=1):',
+            '        if doc_id in relevant:',
+            '            return 1.0 / i          # 첫 정답을 만나는 순간 끝',
+            '    return 0.0                      # 정답이 하나도 없으면 0',
+            '',
+            '',
+            'def mean_reciprocal_rank(cases: list[tuple]) -> float:',
+            '    """여러 질의의 RR 평균.',
+            '    cases: [(ranked_ids, relevant), ...] 형태의 질의 목록.',
+            '    """',
+            '    if not cases:',
+            '        return 0.0',
+            '    total = sum(reciprocal_rank(r, rel) for r, rel in cases)',
+            '    return total / len(cases)',
+            '',
+            '',
+            '# 예: 3개 내비게이션 질의',
+            'cases = [',
+            '    (["p-01"],               {"p-01"}),   # 1등  → 1.00',
+            '    (["p-08", "p-02", "p-05"], {"p-05"}), # 3등  → 0.33',
+            '    (["p-03", "p-07"],       {"p-07"}),   # 2등  → 0.50',
+            ']',
+            'print(mean_reciprocal_rank(cases))  # 1.833/3 = 0.611',
+            '',
+            '# MRR 은 "첫 정답" 만 본다 → 정답이 하나인 검색에 최적.',
+            '#   정답이 여럿·순서가 중요하면 nDCG(다음 단계) 를 쓴다.',
+          ],
+          highlight: [1, 2, 3, 4, 5, 6, 7, 10, 15, 16, 17, 21, 22, 23, 24, 26],
+        },
+      },
+      {
+        title: 'Step 4. nDCG — 등급 관련도 + 상위 가중, 그리고 정규화',
+        desc: '지금까지의 지표는 정답을 예/아니오로만 봤다. 하지만 현실의 관련도는 등급이 있다 — 완벽(3)·좋음(2)·보통(1)·무관(0). nDCG는 이 등급을 쓰면서 "위에 있을수록 더 값지다"는 원리를 log 할인으로 담는다. DCG는 각 결과의 관련도를 그 순위의 log에 나눠 더한다: gain_i / log2(i+1). 아래 예 [3,2,0,1,2]의 DCG는 3/1 + 2/1.585 + 0 + 1/2.322 + 2/2.585 = 5.467이다. 그런데 DCG의 절대값은 질의마다 정답 개수·등급이 달라 서로 비교할 수 없다. 그래서 이상적으로 정렬한 순서(등급 내림차순 [3,2,2,1,0])의 DCG인 IDCG=5.693으로 나눈다. nDCG = 5.467/5.693 = 0.960 — 0~1로 정규화돼 질의 간·시스템 간 비교가 가능해진다. 등급·순위·정규화를 모두 담기에 nDCG는 순위 품질의 사실상 표준 지표다.',
+        actor: '📐 등급 [3,2,0,1,2] → nDCG 0.960',
+        phase: 'ndcg',
+        phaseDetail: 'nDCG = DCG / IDCG = 5.467 / 5.693',
+        query: '기계식 키보드',
+        results: [
+          { rank: 1, title: '레오폴드 FC660M 기계식', rel: 3 },
+          { rank: 2, title: '한성 GK888B 기계식 청축', rel: 2 },
+          { rank: 3, title: '키보드 손목 받침대', rel: 0 },
+          { rank: 4, title: '멤브레인 사무용 키보드', rel: 1 },
+          { rank: 5, title: '바밀로 VA87M 기계식 갈축', rel: 2 },
+        ],
+        dcgTable: {
+          title: 'DCG 실계산 — gain / log2(순위+1)',
+          rows: [
+            { rank: 1, gain: 3, disc: 'log2(2)=1.000', contrib: 3.000 },
+            { rank: 2, gain: 2, disc: 'log2(3)=1.585', contrib: 1.262 },
+            { rank: 3, gain: 0, disc: 'log2(4)=2.000', contrib: 0.000 },
+            { rank: 4, gain: 1, disc: 'log2(5)=2.322', contrib: 0.431 },
+            { rank: 5, gain: 2, disc: 'log2(6)=2.585', contrib: 0.774 },
+          ],
+          dcg: 5.467,
+        },
+        idcgTable: {
+          title: '이상적 순서(IDCG) — 등급 내림차순 [3,2,2,1,0]',
+          rows: [
+            { rank: 1, gain: 3, disc: '1.000', contrib: 3.000 },
+            { rank: 2, gain: 2, disc: '1.585', contrib: 1.262 },
+            { rank: 3, gain: 2, disc: '2.000', contrib: 1.000 },
+            { rank: 4, gain: 1, disc: '2.322', contrib: 0.431 },
+            { rank: 5, gain: 0, disc: '2.585', contrib: 0.000 },
+          ],
+          idcg: 5.693,
+          ndcg: '5.467 / 5.693 = 0.960',
+        },
+        alert: { tone: 'good', text: 'nDCG 는 등급(완벽/좋음/보통/무관) + 상위 가중(log 할인) + 정규화(IDCG로 나눔) 를 모두 담는다. 0~1 값이라 질의·시스템 간 비교가 되고, 정답이 여럿·순서가 중요한 일반 랭킹의 표준 지표다.' },
+        code: {
+          lang: 'python',
+          filename: 'eval_metrics.py (③ nDCG)',
+          lines: [
+            'def dcg(gains: list[int]) -> float:',
+            '    """DCG = Σ gain_i / log2(i+1).  순위 i 는 1 부터.',
+            '    log 할인으로 "위에 있을수록 값지다" 를 표현한다.',
+            '    """',
+            '    return sum(g / math.log2(i + 1)',
+            '               for i, g in enumerate(gains, start=1))',
+            '',
+            '',
+            'def ndcg_at_k(ranked_ids: list[str],',
+            '              grades: dict[str, int], k: int) -> float:',
+            '    """등급 관련도 기반 정규화 DCG (0~1).',
+            '    grades: {문서id: 등급}  (0=무관,1=보통,2=좋음,3=완벽)',
+            '    """',
+            '    gains = [grades.get(doc_id, 0) for doc_id in ranked_ids[:k]]',
+            '    actual = dcg(gains)',
+            '    # 이상적 순서 = 등급 내림차순으로 정렬한 DCG (IDCG)',
+            '    ideal = dcg(sorted(grades.values(), reverse=True)[:k])',
+            '    return actual / ideal if ideal > 0 else 0.0',
+            '',
+            '',
+            '# 예: 실제 순서 등급 [3,2,0,1,2]',
+            'ranked = ["a", "b", "c", "d", "e"]',
+            'grades = {"a": 3, "b": 2, "c": 0, "d": 1, "e": 2}',
+            'print(round(dcg([3, 2, 0, 1, 2]), 3))   # 5.467  (DCG)',
+            'print(round(dcg([3, 2, 2, 1, 0]), 3))   # 5.693  (IDCG)',
+            'print(round(ndcg_at_k(ranked, grades, 5), 3))  # 0.960',
+            '',
+            '# 왜 정규화? DCG 절대값은 질의마다 스케일이 달라 비교 불가.',
+            '#   IDCG(그 질의의 최대 가능치)로 나눠 0~1 로 맞춘다.',
+          ],
+          highlight: [1, 5, 6, 9, 10, 14, 15, 17, 18, 24, 25, 26, 28, 29],
+        },
+      },
+      {
+        title: 'Step 5. 평가 운영 체계 — 지표 선택과 오프라인 파이프라인',
+        desc: '지표를 알았으니 이제 "어떤 상황에 무엇을 쓰고, 어떻게 굴리는가"다. 지표 선택은 목적이 정한다: RAG는 정답을 컨텍스트에 담는 게 전부라 recall@k, 내비게이션처럼 정답이 하나면 MRR, 정답이 여럿이고 순서가 중요한 일반 랭킹은 nDCG다. 이것을 굴리는 골격이 오프라인 평가 파이프라인이다 — 변경(파라미터·동의어·모델)을 넣으면 골든셋 전체를 자동 실행하고, 지표를 이전 버전과 비교해, 임계치 이상 떨어진 질의를 회귀(regression)로 잡아 배포를 막는다. 이 오프라인 지표는 사람 라벨 기준이라 빠르고 재현 가능하지만 실제 사용자 반응은 아니다. 그래서 배포 후에는 온라인 지표 — 클릭률(CTR), 무결과율(zero-result rate), 재검색률 — 로 실사용을 확인하고, 그 신호를 다시 골든셋 라벨로 되먹인다(V-2-1 A/B 테스트로 직결). 오프라인은 "개악 방지 게이트", 온라인은 "진짜 성패 판정"이다.',
+        actor: '🔁 지표 선택 + 오프라인/온라인 루프',
+        phase: 'ops',
+        phaseDetail: 'RAG=recall@k · 내비=MRR · 랭킹=nDCG',
+        query: '',
+        results: [],
+        guideTable: {
+          title: '지표 선택표 — 목적이 지표를 정한다',
+          rows: [
+            { use: 'RAG (검색증강생성)', metric: 'recall@k', why: '컨텍스트에 정답만 담으면 됨. 순위 미세차 무관' },
+            { use: '내비게이션 (정답 1개)', metric: 'MRR', why: '첫 정답을 맨 위로. "네이버"→네이버' },
+            { use: '일반 랭킹 (쇼핑·뉴스)', metric: 'nDCG', why: '등급·순위·정규화 종합. 정답 여럿·순서 중요' },
+            { use: '첫 화면 청결도', metric: 'precision@k', why: '사람이 상위 몇 개만 볼 때' },
+          ],
+        },
+        pipelineBox: {
+          title: '오프라인 평가 파이프라인 — 개악 방지 게이트',
+          steps: ['변경\n(파라미터·동의어)', '골든셋\n전체 실행', '지표 비교\n(이전 vs 신규)', '회귀 감지\n→ 배포 차단'],
+          note: '사람 라벨 기준 → 빠르고 재현 가능. CI 에 걸어 매 변경마다 자동 실행.',
+        },
+        onlineBox: {
+          title: '온라인 지표 — 진짜 사용자 반응 (V-2-1 직결)',
+          rows: [
+            { icon: '👆', name: 'CTR (클릭률)', desc: '상위 결과를 실제로 클릭하는가' },
+            { icon: '🕳️', name: '무결과율', desc: '결과 0건으로 끝난 질의 비율 — 낮출수록 좋음' },
+            { icon: '🔁', name: '재검색률', desc: '같은 세션서 다시 검색 = 첫 결과 실패 신호' },
+          ],
+          note: '오프라인=개악 방지, 온라인=진짜 성패. 온라인 신호를 골든셋 라벨로 되먹인다.',
+        },
+        alert: { tone: 'good', text: '오프라인 파이프라인이 회귀를 막는 게이트라면, 온라인 지표(CTR·무결과율)는 실사용 판정이다. 이 둘의 루프 — 오프라인으로 거르고, 온라인으로 확인하고, 결과를 라벨에 되먹임 — 이 검색 품질 운영의 심장이다(다음: V-2-1 A/B 테스트).' },
+        code: {
+          lang: 'python',
+          filename: 'eval_runner.py (④ 평가 러너 + 회귀 감지)',
+          lines: [
+            '"""',
+            'eval_runner.py — 골든셋 전체를 돌려 지표를 내고, 이전 버전과',
+            '비교해 회귀(개악)를 잡는 오프라인 평가 파이프라인.',
+            '"""',
+            'from eval_metrics import recall_at_k, ndcg_at_k',
+            'from golden_set import GOLDEN_SET',
+            '',
+            '',
+            'def evaluate(search_fn, k: int = 5) -> dict:',
+            '    """골든셋 전체를 search_fn 으로 실행 → 평균 지표.',
+            '    search_fn: query -> 문서id 순위 리스트 (평가 대상 검색기)',
+            '    """',
+            '    recalls, ndcgs = [], []',
+            '    for case in GOLDEN_SET:',
+            '        ranked = search_fn(case.query)',
+            '        recalls.append(recall_at_k(ranked, case.relevant_ids(), k))',
+            '        ndcgs.append(ndcg_at_k(ranked, case.relevance, k))',
+            '    n = len(GOLDEN_SET)',
+            '    return {"recall@k": sum(recalls) / n,',
+            '            "ndcg@k":  sum(ndcgs) / n}',
+            '',
+            '',
+            'def detect_regression(old: dict, new: dict,',
+            '                      tol: float = 0.01) -> list[str]:',
+            '    """지표가 tol 이상 떨어지면 회귀로 보고 → 배포 차단 근거."""',
+            '    regressed = []',
+            '    for name, old_v in old.items():',
+            '        if new[name] < old_v - tol:',
+            '            regressed.append(',
+            '                f"{name}: {old_v:.3f} -> {new[name]:.3f} 하락")',
+            '    return regressed',
+            '',
+            '',
+            '# CI 파이프라인에서:',
+            'base = evaluate(current_search)   # 배포 중인 버전',
+            'cand = evaluate(tuned_search)     # 튜닝한 후보',
+            'if detect_regression(base, cand):',
+            '    raise SystemExit("회귀 감지 — 배포 차단")  # 개악 방지 게이트',
+            '',
+            '# 오프라인 통과 후 → 온라인 CTR·무결과율로 실사용 확인 (V-2-1)',
+          ],
+          highlight: [9, 14, 15, 16, 17, 19, 20, 24, 25, 28, 29, 30, 31, 32, 37, 38, 39, 40],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 등급 관련도 → 배지 스타일 (sky/blue 톤)
+    //   3=완벽, 2=좋음, 1=보통, 0=무관
+    // ─────────────────────────────────────────────────────
+    const REL_STYLE = {
+      3: { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800', label: '완벽 (3)' },
+      2: { bg: 'bg-sky-50',     border: 'border-sky-400',     text: 'text-sky-800',     label: '좋음 (2)' },
+      1: { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-800',   label: '보통 (1)' },
+      0: { bg: 'bg-slate-50',   border: 'border-slate-200',   text: 'text-slate-500',   label: '무관 (0)' },
+    };
+
+    function ResultRow({ row }) {
+      const v = REL_STYLE[row.rel] || REL_STYLE[0];
+      return (
+        <div className={`rounded border ${v.bg} ${v.border} px-2 py-1 flex items-center gap-2`}>
+          <span className="text-[10px] font-mono font-bold text-sky-700 w-8 text-center shrink-0">#{row.rank}</span>
+          <div className="min-w-0 flex-1">
+            <div className="text-[11px] font-bold text-slate-800 truncate">{row.title}</div>
+            {row.rr && <div className="text-[9px] text-sky-600 font-mono">RR = {row.rr}</div>}
+          </div>
+          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap ${v.text} bg-white/70 border border-current/20`}>
+            {row.rel >= 1 ? '✓' : '·'} {v.label}
+          </span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 눈대중 튜닝 위험 표 + 골든셋 만들기
+    // ─────────────────────────────────────────────────────
+    function RiskBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">🎲 {box.title}</div>
+          <div className="space-y-1">
+            {box.before.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 text-[10px]">
+                <span className="w-16 shrink-0 font-mono font-bold text-slate-700">"{r.q}"</span>
+                <span className="text-slate-400">→</span>
+                <span className={`flex-1 font-bold ${r.tone === 'good' ? 'text-emerald-700' : 'text-red-700'}`}>
+                  {r.tone === 'good' ? '✓ ' : '✗ '}{r.change}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-red-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    function GoldenBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">📏 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.steps.map((s, i) => (
+              <div key={i} className="flex gap-2 rounded border border-sky-200 bg-sky-50 p-1.5">
+                <span className="text-base">{s.icon}</span>
+                <div className="min-w-0">
+                  <div className="text-[11px] font-bold text-sky-900">{s.head}</div>
+                  <div className="text-[10px] text-slate-600 leading-snug">{s.body}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-sky-900 font-bold">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — precision/recall 실계산 + RAG 박스
+    // ─────────────────────────────────────────────────────
+    const CALC_TONE = { sky: 'text-sky-700', emerald: 'text-emerald-700' };
+    function MetricCalc({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🧮 {box.title}</div>
+          <div className="space-y-1">
+            {box.lines.map((l, i) => (
+              <div key={i} className="flex items-center justify-between text-[11px] border-b border-slate-100 py-0.5">
+                <span className="text-slate-600">{l.label}</span>
+                <span className={`font-mono font-bold ${CALC_TONE[l.tone] || 'text-slate-800'}`}>{l.value}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-sky-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    function RagBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-emerald-400 bg-emerald-50 p-3">
+          <div className="text-xs font-bold text-emerald-900 mb-1">👑 {box.title}</div>
+          <div className="text-[10px] text-emerald-900 leading-snug">{box.body}</div>
+          <div className="mt-1.5 text-[10px] text-slate-600 leading-snug border-t border-emerald-200 pt-1.5">{box.contrast}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — MRR 계산 표 + 적합/부적합
+    // ─────────────────────────────────────────────────────
+    function MrrTable({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🥇 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-900 border-b border-sky-200">
+                <th className="text-left py-0.5">질의</th>
+                <th className="text-center py-0.5">첫 정답</th>
+                <th className="text-right py-0.5">RR = 1/순위</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r, i) => (
+                <tr key={i} className="border-t border-sky-100">
+                  <td className="py-1 font-bold text-slate-700">{r.q}</td>
+                  <td className="py-1 text-center font-mono">{r.first}</td>
+                  <td className="py-1 text-right font-mono text-sky-700 font-bold">{r.rr.toFixed(3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-1.5 text-[10px] text-slate-600 font-mono">합: {box.sum}</div>
+          <div className="text-[11px] text-sky-900 font-mono font-bold">MRR = {box.mrr}</div>
+        </div>
+      );
+    }
+
+    function FitBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 grid grid-cols-1 gap-2">
+          <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 p-2">
+            <div className="text-[11px] font-bold text-emerald-900 mb-0.5">✅ 잘 맞는 곳</div>
+            <div className="text-[10px] text-emerald-900 leading-snug">{box.good}</div>
+          </div>
+          <div className="rounded-lg border-2 border-amber-300 bg-amber-50 p-2">
+            <div className="text-[11px] font-bold text-amber-900 mb-0.5">⚠️ 안 맞는 곳</div>
+            <div className="text-[10px] text-amber-900 leading-snug">{box.bad}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — DCG / IDCG 계산 표
+    // ─────────────────────────────────────────────────────
+    function DcgTable({ box, isIdeal }) {
+      if (!box) return null;
+      const accent = isIdeal ? 'emerald' : 'sky';
+      return (
+        <div className={`mt-3 rounded-lg border-2 border-${accent}-300 bg-white p-3`}>
+          <div className={`text-xs font-bold text-${accent}-900 mb-2`}>{isIdeal ? '🌟' : '📐'} {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className={`text-${accent}-900 border-b border-${accent}-200`}>
+                <th className="text-left py-0.5">순위</th>
+                <th className="text-center py-0.5">등급(gain)</th>
+                <th className="text-center py-0.5">할인 log2(i+1)</th>
+                <th className="text-right py-0.5">기여분</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r, i) => (
+                <tr key={i} className={`border-t border-${accent}-100`}>
+                  <td className="py-1 font-mono">#{r.rank}</td>
+                  <td className="py-1 text-center font-mono font-bold">{r.gain}</td>
+                  <td className="py-1 text-center font-mono text-slate-500">{r.disc}</td>
+                  <td className={`py-1 text-right font-mono font-bold text-${accent}-700`}>{r.contrib.toFixed(3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className={`mt-1.5 text-[11px] text-${accent}-900 font-mono font-bold text-right`}>
+            {isIdeal ? `IDCG = ${box.idcg}` : `DCG = ${box.dcg}`}
+          </div>
+          {isIdeal && box.ndcg && (
+            <div className="mt-1 rounded bg-emerald-50 border border-emerald-300 px-2 py-1 text-[11px] text-emerald-900 font-mono font-bold text-center">
+              nDCG = {box.ndcg}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 지표 선택표 / 파이프라인 / 온라인 지표
+    // ─────────────────────────────────────────────────────
+    function GuideTable({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🧭 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-900 border-b border-sky-200">
+                <th className="text-left py-0.5">상황</th>
+                <th className="text-left py-0.5 pl-2">지표</th>
+                <th className="text-left py-0.5 pl-2">이유</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r, i) => (
+                <tr key={i} className="border-t border-sky-100 align-top">
+                  <td className="py-1 font-bold text-slate-700">{r.use}</td>
+                  <td className="py-1 pl-2 font-mono font-bold text-sky-700 whitespace-nowrap">{r.metric}</td>
+                  <td className="py-1 pl-2 text-slate-600 leading-snug">{r.why}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function PipelineBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-sky-500 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+          <div className="text-sm font-bold text-sky-900 mb-2">🔁 {box.title}</div>
+          <div className="flex items-stretch gap-1">
+            {box.steps.map((s, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <div className="flex items-center text-sky-500 text-lg">→</div>}
+                <div className="flex-1 rounded-lg border-2 border-sky-300 bg-white p-2 text-[10px] font-bold text-sky-900 text-center whitespace-pre-line flex items-center justify-center">
+                  {s}
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-sky-900 leading-snug">{box.note}</div>
+        </div>
+      );
+    }
+
+    function OnlineBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-indigo-300 bg-indigo-50 p-3">
+          <div className="text-xs font-bold text-indigo-900 mb-2">📡 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 text-[10px]">
+                <span className="text-base">{r.icon}</span>
+                <span className="w-24 shrink-0 font-bold text-indigo-900">{r.name}</span>
+                <span className="flex-1 text-slate-600 leading-snug">{r.desc}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[10px] text-indigo-900 font-bold border-t border-indigo-200 pt-1.5">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 검색 결과 + 지표 실계산 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const PHASE_BADGE = {
+      risk:  { icon: '🎲', label: '평가셋 부재' },
+      pr:    { icon: '🎯', label: 'precision·recall' },
+      mrr:   { icon: '🥇', label: 'MRR' },
+      ndcg:  { icon: '📐', label: 'nDCG' },
+      ops:   { icon: '🔁', label: '평가 운영' },
+    };
+
+    function LiveDataPane({ state }) {
+      const ph = PHASE_BADGE[state.phase] || PHASE_BADGE.pr;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{ph.icon}</span>
+              <span>검색 품질 평가 — {ph.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          {state.query && (
+            <div className="mb-2 flex items-center gap-2 px-2 py-1 rounded border border-sky-200 bg-sky-50">
+              <span className="text-xs">🔎</span>
+              <span className="text-[11px] font-mono text-sky-800">질의: "{state.query}"</span>
+            </div>
+          )}
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            지표: {state.phaseDetail}
+          </div>
+          {state.results && state.results.length > 0 && (
+            <div className="space-y-1.5">
+              {state.results.map((r) => <ResultRow key={r.rank} row={r} />)}
+            </div>
+          )}
+          <RiskBox box={state.riskBox} />
+          <GoldenBox box={state.goldenBox} />
+          <MetricCalc box={state.metricCalc} />
+          <RagBox box={state.ragBox} />
+          <MrrTable box={state.mrrTable} />
+          <FitBox box={state.fitBox} />
+          <DcgTable box={state.dcgTable} />
+          <DcgTable box={state.idcgTable} isIdeal />
+          <GuideTable box={state.guideTable} />
+          <PipelineBox box={state.pipelineBox} />
+          <OnlineBox box={state.onlineBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">V-1-1. 검색 품질 평가 — nDCG·MRR</h1>
+                <p className="text-sm text-sky-800/80">"요즘 검색이 이상해요"를 숫자로 — 개선인지 개악인지 판정하는 자(尺)</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                평가셋(골든셋)이 없으면 모든 튜닝은 도박이다 — 한 질의를 고치고 열 질의를 조용히 망가뜨린다.
+                precision@k(첫 화면 청결도)·recall@k(놓치지 않음)는 정답이 k 안에 있는지를, MRR(첫 정답 순위 역수)은 정답이 하나인 검색을,
+                nDCG(등급·상위 가중·정규화)는 정답 여럿·순서 중요한 랭킹을 잰다.
+                지표는 목적이 정한다: RAG=recall@k, 내비=MRR, 일반 랭킹=nDCG.
+                오프라인 파이프라인(변경→골든셋 실행→지표 비교→회귀 감지)이 개악을 막는 게이트라면,
+                온라인 지표(CTR·무결과율)는 실사용 판정이다 — 이 루프가 검색 품질 운영의 심장이다(다음: V-2-1 A/B 테스트).
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['골든셋', '평가셋', 'precision@k', 'recall@k', 'MRR', 'nDCG', 'DCG', 'IDCG', '등급관련도', '회귀감지', '오프라인평가', 'CTR', '무결과율'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../part5/V-2-1.html" className="underline hover:no-underline">다음: V-2-1 (A/B 테스트) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

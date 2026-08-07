@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — I-1-2. 역색인(inverted index) 원리</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔎</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search I-1-2 — 역색인(inverted index) 원리
+    학습 목표: "문서→단어" 순방향 색인을 "단어→문서" 역방향으로 뒤집는 발상을 체험하고,
+              색인 구축(토큰화→소문자화→posting) → 검색(AND 교집합·OR 합집합 병합) →
+              posting 확장(df·position·field) → 실무 세그먼트·불변 색인까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 문서·역색인 사전·병합 시각화) / 우(VSCode CodeViewer: inverted_index.py 진화)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 예제 코퍼스 — 문서 3개 (검색 엔진 색인의 최소 재현)
+    //   D1 "노트북 가방 추천"   → [노트북, 가방, 추천]
+    //   D2 "가방 세일 정보"     → [가방, 세일, 정보]
+    //   D3 "게이밍 노트북 후기" → [노트북, 게이밍, 후기]
+    // 이 코퍼스에서 역색인은 아래처럼 뒤집힌다:
+    //   노트북 → [1,3] · 가방 → [1,2] · 추천 → [1]
+    //   세일 → [2] · 정보 → [2] · 게이밍 → [3] · 후기 → [3]
+    // ─────────────────────────────────────────────────────
+    const DOCS = [
+      { id: 1, text: '노트북 가방 추천', tokens: ['노트북', '가방', '추천'] },
+      { id: 2, text: '가방 세일 정보',   tokens: ['가방', '세일', '정보'] },
+      { id: 3, text: '게이밍 노트북 후기', tokens: ['노트북', '게이밍', '후기'] },
+    ];
+
+    // 완성된 역색인 (단계별로 부분 공개하며 자라는 모습을 보여줌)
+    const FULL_DICT = [
+      { term: '노트북',   postings: [1, 3] },
+      { term: '가방',     postings: [1, 2] },
+      { term: '추천',     postings: [1] },
+      { term: '세일',     postings: [2] },
+      { term: '정보',     postings: [2] },
+      { term: '게이밍',   postings: [3] },
+      { term: '후기',     postings: [3] },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 발상의 전환 — 문서→단어를 단어→문서로 뒤집기',
+        desc: '순방향으로 저장하면(문서 → 그 안의 단어들) "노트북"이 든 문서를 찾으려고 매번 전 문서를 처음부터 훑어야 한다 — 문서가 백만 개면 백만 번 읽는 것이다. 발상을 뒤집는다: 저장을 단어 기준으로 바꿔 "노트북 → [1, 3]"처럼 단어가 어느 문서에 있는지를 미리 적어 둔다. 책 맨 뒤의 찾아보기(index)가 바로 이 구조다 — 본문을 다 읽지 않고 "역색인" 항목만 펼쳐 페이지 번호로 점프한다. 검색은 사전에서 단어 하나를 찾는 O(1)에 가까운 조회로 바뀐다. 이 뒤집힌 표가 검색 엔진의 심장, 역색인(inverted index)이다.',
+        actor: '🔄 순방향(문서→단어) ↔ 역방향(단어→문서)',
+        phase: 'flip',
+        phaseDetail: '구조를 뒤집는다 — forward → inverted',
+        docs: DOCS,
+        dict: [],
+        flipBox: {
+          forward: DOCS.map((d) => ({ from: 'D' + d.id, to: d.tokens.join(', ') })),
+          inverted: FULL_DICT.map((e) => ({ from: e.term, to: e.postings.map((p) => 'D' + p).join(', ') })),
+        },
+        alert: { tone: 'info', text: '순방향은 "이 문서에 뭐가 있나?"에 강하고, 역방향은 "이 단어가 어디에 있나?"에 강하다. 검색은 후자의 질문이므로 색인을 미리 뒤집어 둔다.' },
+        code: {
+          lang: 'python',
+          filename: 'inverted_index.py (개념)',
+          lines: [
+            '"""',
+            'inverted_index.py — Step 1: 순방향 vs 역방향',
+            '',
+            '순방향(forward):  문서 → 그 안의 단어들',
+            '역방향(inverted): 단어 → 그 단어가 든 문서들',
+            '',
+            '검색은 "이 단어가 어디 있나?" 질문이므로 역방향이 유리하다.',
+            '"""',
+            '',
+            '# 문서 3개 (제목만 사용)',
+            'docs = {',
+            '    1: "노트북 가방 추천",',
+            '    2: "가방 세일 정보",',
+            '    3: "게이밍 노트북 후기",',
+            '}',
+            '',
+            '# 순방향 색인: 문서 → 단어들 (그냥 원문 그대로)',
+            'forward = {doc_id: text.split() for doc_id, text in docs.items()}',
+            '# forward[1] = ["노트북", "가방", "추천"]',
+            '',
+            '# "노트북"이 든 문서를 순방향으로 찾으면 → 전 문서를 훑어야 한다',
+            'def search_forward(term):',
+            '    """느림: 문서 수 N 에 비례해 매번 전체 스캔."""',
+            '    return [d for d, words in forward.items() if term in words]',
+            '',
+            '# 역방향 색인: 단어 → 문서들 (미리 뒤집어 둔다)',
+            'inverted = {',
+            '    "노트북": [1, 3],',
+            '    "가방":   [1, 2],',
+            '    "추천":   [1],',
+            '    # ...',
+            '}',
+            '',
+            '# 역방향은 사전 한 번 조회로 끝난다 (책 뒤 찾아보기와 같다)',
+            'def search_inverted(term):',
+            '    """빠름: 해시 조회 O(1) 로 문서 목록을 바로 얻는다."""',
+            '    return inverted.get(term, [])',
+          ],
+          highlight: [3, 4, 6, 18, 22, 23, 24, 26, 27, 28, 29, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 2. 색인 구축 — 토큰화 → 소문자화 → posting 추가',
+        desc: '색인은 공짜로 뒤집히지 않는다. 문서를 하나씩 읽어 (1) 토큰화로 단어를 쪼개고, (2) 대소문자·표기를 정규화(소문자화 등)해 "Laptop"과 "laptop"을 같은 열쇠로 묶고, (3) 각 단어의 posting list(그 단어가 등장한 문서 ID 목록)에 현재 문서 번호를 덧붙인다. 아래에서 D1→D2→D3을 차례로 흘려보면 사전이 자라는 게 보인다 — "노트북"은 D1에서 생겨 D3에서 [1, 3]으로 늘고, "가방"은 D1·D2를 만나 [1, 2]가 된다. posting list를 문서 ID 오름차순으로 유지하는 게 핵심인데, 정렬돼 있어야 다음 단계의 교집합을 빠르게 병합할 수 있다.',
+        actor: '🏗 문서 3개를 흘려보내 posting list 채우기',
+        phase: 'build',
+        phaseDetail: 'tokenize → normalize → append posting',
+        docs: DOCS,
+        dict: FULL_DICT.map((e) => ({ ...e, isNew: true })),
+        buildBox: {
+          pipeline: ['원문: "게이밍 노트북 후기"', '① 토큰화 → [게이밍, 노트북, 후기]', '② 정규화(소문자화·표기 통일)', '③ 각 단어의 posting에 문서ID 3 추가'],
+          note: '"노트북"은 D1에서 [1] → D3에서 [1,3]. posting은 항상 문서ID 오름차순 유지.',
+        },
+        alert: { tone: 'good', text: '색인 구축은 문서를 한 번만 순회(O(전체 토큰 수))하면 끝난다. 한 번 뒤집어 두면 이후 모든 검색이 이 사전을 재사용한다 — 색인은 "미리 낸 세금"이다.' },
+        code: {
+          lang: 'python',
+          filename: 'inverted_index.py (build)',
+          lines: [
+            '"""',
+            'inverted_index.py — Step 2: 색인 구축',
+            '문서를 한 번 순회하며 단어별 posting list 를 채운다.',
+            '"""',
+            'from collections import defaultdict',
+            '',
+            '',
+            'def tokenize(text: str) -> list[str]:',
+            '    """공백 기준 토큰화 + 소문자화(정규화).',
+            '',
+            '    실무에선 형태소 분석기(nori 등)가 이 자리에 온다.',
+            '    "Laptop" 과 "laptop" 을 같은 열쇠로 묶으려면 정규화가 필수.',
+            '    """',
+            '    return [t.lower() for t in text.split()]',
+            '',
+            '',
+            'def build_index(docs: dict[int, str]) -> dict[str, list[int]]:',
+            '    """문서 사전 → 역색인 { term: [문서ID, ...] }.',
+            '',
+            '    Args:',
+            '        docs: {문서ID: 원문}',
+            '    Returns:',
+            '        term 별 posting list (문서ID 오름차순)',
+            '    """',
+            '    index: dict[str, list[int]] = defaultdict(list)',
+            '    for doc_id in sorted(docs):          # 문서를 순서대로',
+            '        for term in tokenize(docs[doc_id]):',
+            '            posting = index[term]',
+            '            # 중복 방지 + 오름차순 유지 (문서를 순서대로 보므로 append 로 충분)',
+            '            if not posting or posting[-1] != doc_id:',
+            '                posting.append(doc_id)',
+            '    return dict(index)',
+            '',
+            '',
+            'docs = {1: "노트북 가방 추천", 2: "가방 세일 정보", 3: "게이밍 노트북 후기"}',
+            'index = build_index(docs)',
+            '# index["노트북"] == [1, 3]',
+            '# index["가방"]   == [1, 2]',
+          ],
+          highlight: [8, 14, 17, 25, 26, 27, 28, 30, 31, 32, 37, 38, 39, 40],
+        },
+      },
+      {
+        title: 'Step 3. 검색 실행 — AND는 교집합, OR는 합집합 (병합)',
+        desc: '질의 "노트북 가방"이 들어오면 각 단어의 posting list를 조회한다 — 노트북 → [1, 3], 가방 → [1, 2]. AND 검색(두 단어 모두 포함)은 두 리스트의 교집합 [1]이고, OR 검색(하나라도 포함)은 합집합 [1, 2, 3]이다. 핵심은 posting이 정렬돼 있다는 점이다: 두 리스트에 포인터를 하나씩 두고, 작은 쪽을 전진시키며 같은 값일 때만 결과에 담는 병합(merge) 방식이면 각 리스트를 딱 한 번씩만 훑는 O(n+m)에 끝난다. 정렬이 없었다면 한쪽 원소마다 반대쪽 전체를 뒤지는 O(n×m)이 됐을 것이다 — 이것이 색인을 정렬 상태로 유지하는 이유다.',
+        actor: '🔎 질의 "노트북 가방" → 두 posting 병합',
+        phase: 'search',
+        phaseDetail: 'AND=교집합 · OR=합집합 · merge O(n+m)',
+        docs: DOCS,
+        dict: [
+          { term: '노트북', postings: [1, 3], hit: true },
+          { term: '가방',   postings: [1, 2], hit: true },
+        ],
+        searchBox: {
+          query: '노트북 가방',
+          listA: { term: '노트북', postings: [1, 3] },
+          listB: { term: '가방', postings: [1, 2] },
+          andResult: [1],
+          orResult: [1, 2, 3],
+          merge: [
+            { a: 1, b: 1, act: 'match → 결과에 1', hit: true },
+            { a: 3, b: 2, act: '2 < 3 → B 포인터 전진', hit: false },
+            { a: 3, b: '·', act: 'B 소진 → 종료', hit: false },
+          ],
+        },
+        alert: { tone: 'info', text: '정렬된 두 리스트의 교집합은 "두 포인터 병합"으로 각 리스트를 한 번씩만 지나간다. 검색 속도가 문서 총량이 아니라 "매칭 후보 수"에 비례하게 되는 비결이다.' },
+        code: {
+          lang: 'python',
+          filename: 'inverted_index.py (search)',
+          lines: [
+            '"""',
+            'inverted_index.py — Step 3: AND / OR 검색',
+            '정렬된 posting list 두 개를 병합(merge)해 교집합·합집합을 구한다.',
+            '"""',
+            '',
+            '',
+            'def intersect(a: list[int], b: list[int]) -> list[int]:',
+            '    """정렬된 두 posting 의 교집합 (AND). O(n+m).',
+            '',
+            '    포인터 i, j 를 나란히 전진시키며 같은 값만 담는다.',
+            '    정렬돼 있으므로 각 리스트를 한 번씩만 훑는다.',
+            '    """',
+            '    i, j, out = 0, 0, []',
+            '    while i < len(a) and j < len(b):',
+            '        if a[i] == b[j]:',
+            '            out.append(a[i]); i += 1; j += 1',
+            '        elif a[i] < b[j]:',
+            '            i += 1            # 작은 쪽만 전진',
+            '        else:',
+            '            j += 1',
+            '    return out',
+            '',
+            '',
+            'def union(a: list[int], b: list[int]) -> list[int]:',
+            '    """정렬된 두 posting 의 합집합 (OR)."""',
+            '    return sorted(set(a) | set(b))',
+            '',
+            '',
+            'def search(index: dict[str, list[int]], query: str, mode="AND"):',
+            '    """질의의 각 단어 posting 을 병합해 문서 목록 반환."""',
+            '    terms = tokenize(query)',
+            '    postings = [index.get(t, []) for t in terms]',
+            '    result = postings[0]',
+            '    for p in postings[1:]:',
+            '        result = intersect(result, p) if mode == "AND" else union(result, p)',
+            '    return result',
+            '',
+            '',
+            '# search(index, "노트북 가방", "AND") == [1]',
+            '# search(index, "노트북 가방", "OR")  == [1, 2, 3]',
+          ],
+          highlight: [7, 13, 14, 15, 16, 17, 18, 19, 20, 21, 29, 32, 33, 34, 35, 36, 40, 41],
+        },
+      },
+      {
+        title: 'Step 4. posting에 더 담기 — df · position · field',
+        desc: 'posting을 "문서 ID"만 담는 데서 멈추면 아깝다. 여기에 셋을 더 얹는다. (1) 문서 빈도 df(document frequency): 그 단어를 가진 문서 수 — "가방"은 흔하고(df=2) "게이밍"은 희귀하다(df=1). 희귀한 단어일수록 변별력이 커서 다음 Part의 TF-IDF 랭킹 원료가 된다. (2) 위치 position: 문서 안 몇 번째 토큰인지 — D1에서 노트북@0, 가방@1이므로 "노트북 가방"이 붙어 있는지(연속 위치) 판정하는 구문(phrase) 검색이 가능해진다. (3) 필드 field: 제목/본문 구분 — 제목 매칭에 가중치를 더 준다. 즉 posting list는 단순 목록이 아니라 "랭킹의 원료 창고"다.',
+        actor: '📦 posting = 문서ID + df + position + field',
+        phase: 'posting',
+        phaseDetail: 'df(변별력) · position(구문검색) · field(가중치)',
+        docs: DOCS,
+        dict: [
+          { term: '노트북', postings: [1, 3], df: 2 },
+          { term: '가방',   postings: [1, 2], df: 2 },
+          { term: '게이밍', postings: [3], df: 1, rare: true },
+        ],
+        postingBox: {
+          term: '노트북',
+          df: 2,
+          entries: [
+            { doc: 1, positions: [0], field: 'title' },
+            { doc: 3, positions: [1], field: 'title' },
+          ],
+          phrase: { query: '"노트북 가방"', check: 'D1: 노트북@0, 가방@1 → 0+1==1 연속 ✓ 구문 일치' },
+          note: 'df 낮을수록 희귀 → 변별력 ↑ (TF-IDF 복선). position 있으면 구문검색, field 있으면 제목 가중치.',
+        },
+        alert: { tone: 'good', text: 'posting에 df·position·field를 실으면 "포함 여부"를 넘어 "얼마나 관련 있나"를 계산할 수 있다. 다음 Part의 TF-IDF·BM25 랭킹은 전부 이 posting 메타데이터를 먹고 돈다.' },
+        code: {
+          lang: 'python',
+          filename: 'inverted_index.py (rich posting)',
+          lines: [
+            '"""',
+            'inverted_index.py — Step 4: posting 에 메타데이터 싣기',
+            'posting = 문서ID 뿐 아니라 위치·필드까지 담아 랭킹의 원료로 쓴다.',
+            '"""',
+            'from collections import defaultdict',
+            '',
+            '',
+            'def build_rich_index(docs: dict[int, str]):',
+            '    """term -> {doc_id: [위치들]} + df 를 함께 구축.',
+            '',
+            '    Returns:',
+            '        index: {term: {doc_id: [positions]}}',
+            '        df:    {term: 문서 빈도}',
+            '    """',
+            '    index = defaultdict(lambda: defaultdict(list))',
+            '    for doc_id in sorted(docs):',
+            '        for pos, term in enumerate(tokenize(docs[doc_id])):',
+            '            index[term][doc_id].append(pos)   # 위치 기록',
+            '    df = {term: len(postings) for term, postings in index.items()}',
+            '    return index, df',
+            '',
+            '',
+            'def phrase_search(index, phrase: str) -> list[int]:',
+            '    """구문 검색: 단어들이 연속 위치로 등장하는 문서만."""',
+            '    terms = tokenize(phrase)',
+            '    candidates = None',
+            '    for term in terms:',
+            '        docs_of_term = set(index.get(term, {}))',
+            '        candidates = docs_of_term if candidates is None else candidates & docs_of_term',
+            '    hits = []',
+            '    for doc_id in sorted(candidates or []):',
+            '        first = index[terms[0]][doc_id]',
+            '        # 뒤 단어가 앞 단어 +1, +2 ... 위치에 있으면 연속 = 구문 일치',
+            '        if any(all((p + k) in index[terms[k]][doc_id]',
+            '                   for k in range(1, len(terms))) for p in first):',
+            '            hits.append(doc_id)',
+            '    return hits',
+            '',
+            '',
+            'index, df = build_rich_index({1: "노트북 가방 추천", 3: "게이밍 노트북 후기"})',
+            '# df["게이밍"] == 1 (희귀 → 변별력 ↑)  ·  df["노트북"] == 2',
+            '# phrase_search(index, "노트북 가방") == [1]',
+          ],
+          highlight: [8, 15, 16, 17, 18, 19, 23, 27, 28, 29, 32, 33, 34, 35, 40, 41, 42],
+        },
+      },
+      {
+        title: 'Step 5. 실무 구조 — 세그먼트 · 불변 색인 · 병합',
+        desc: '실무 검색 엔진(Lucene/Elasticsearch)의 색인은 하나의 큰 파일이 아니라 여러 개의 작은 불변(immutable) 세그먼트로 쌓인다. 왜 불변인가 — 색인은 append-only여야 동시 검색과 색인이 락 없이 안전하고, 이미 만든 세그먼트는 절대 수정하지 않으니 캐시·메모리 매핑이 깨지지 않기 때문이다. 새 문서는 새 세그먼트로 추가되고, 삭제는 "삭제 표시"만 남긴다(tombstone). 세그먼트가 늘면 검색이 조각마다 조회를 반복해 느려지므로, 백그라운드에서 여러 세그먼트를 하나로 병합(merge)하며 삭제분을 실제로 청소한다. 여기엔 트레이드오프가 있다: 색인·병합에 CPU/디스크를 쓰는 대신 검색을 빠르게 산다. 자주 쓰는 term 사전은 메모리에 상주시켜 조회를 더 당긴다. 다음 장에서는 이 파이프라인의 입구, 토크나이저(한국어 형태소 분석)를 연다.',
+        actor: '🗂 세그먼트 3개 → 병합 → 불변 색인 1개',
+        phase: 'segment',
+        phaseDetail: 'append-only · immutable segment · background merge',
+        docs: DOCS,
+        dict: FULL_DICT,
+        segmentBox: {
+          segments: [
+            { name: 'seg_0', docs: [1, 2], state: 'sealed' },
+            { name: 'seg_1', docs: [3], state: 'sealed' },
+            { name: 'seg_2 (new)', docs: ['4?'], state: 'live' },
+          ],
+          merged: { name: 'seg_merged', docs: [1, 2, 3] },
+          tradeoff: [
+            { k: '불변(append-only)', v: '락 없는 동시 검색·색인, 캐시 안전' },
+            { k: '세그먼트 多', v: '검색 시 조각마다 조회 → 느려짐' },
+            { k: '병합(merge)', v: 'CPU·디스크 써서 삭제분 청소 + 검색 가속' },
+            { k: '메모리 상주 사전', v: 'term 조회를 디스크 없이 즉시' },
+          ],
+        },
+        alert: { tone: 'info', text: '"색인은 왜 append-only인가?"의 답 = 불변 세그먼트라야 동시성·캐시가 공짜로 안전해지기 때문. 비용(색인·병합)을 미리 치르고 검색 속도를 산다 — 검색 엔진의 근본 거래.' },
+        code: {
+          lang: 'python',
+          filename: 'inverted_index.py (segments)',
+          lines: [
+            '"""',
+            'inverted_index.py — Step 5: 세그먼트 · 불변 색인 · 병합',
+            '',
+            '실무(Lucene/Elasticsearch)는 작은 불변 세그먼트를 쌓고,',
+            '백그라운드에서 병합한다. append-only 라서 동시성이 공짜로 안전하다.',
+            '"""',
+            '',
+            '',
+            'class Segment:',
+            '    """한 번 만들면 수정하지 않는 불변 색인 조각."""',
+            '    def __init__(self, docs: dict[int, str]):',
+            '        self.index = build_index(docs)   # Step 2 재사용',
+            '        self.deleted: set[int] = set()   # 삭제는 표시만(tombstone)',
+            '',
+            '    def search(self, term: str) -> list[int]:',
+            '        return [d for d in self.index.get(term, [])',
+            '                if d not in self.deleted]',
+            '',
+            '',
+            'def search_all(segments: list[Segment], term: str) -> list[int]:',
+            '    """세그먼트가 여러 개면 조각마다 조회 후 합친다 (많을수록 느림)."""',
+            '    out: list[int] = []',
+            '    for seg in segments:',
+            '        out.extend(seg.search(term))',
+            '    return sorted(out)',
+            '',
+            '',
+            'def merge(segments: list[Segment]) -> Segment:',
+            '    """여러 세그먼트를 하나로 병합 — 삭제분을 실제로 청소한다.',
+            '',
+            '    비용(CPU·디스크)을 미리 치르고 이후 검색 속도를 산다.',
+            '    """',
+            '    live = {}',
+            '    for seg in segments:',
+            '        for term, postings in seg.index.items():',
+            '            for d in postings:',
+            '                if d not in seg.deleted:',
+            '                    live.setdefault(d, []).append(term)',
+            '    text = {d: " ".join(terms) for d, terms in live.items()}',
+            '    return Segment(text)   # 새 불변 세그먼트',
+            '',
+            '',
+            '# 새 문서 = 새 세그먼트 append → 세그먼트 늘면 merge 로 정리',
+            '# 자주 쓰는 term 사전은 메모리 상주 → 조회를 디스크 없이 즉시',
+          ],
+          highlight: [9, 10, 11, 12, 13, 20, 21, 23, 24, 28, 33, 34, 35, 36, 37, 39, 40, 44, 45],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 문서(코퍼스) 카드 — 좌측 상단 공통
+    // ─────────────────────────────────────────────────────
+    function DocCard({ doc }) {
+      return (
+        <div className="rounded border border-sky-300 bg-sky-50 px-2 py-1 flex items-center gap-2">
+          <span className="text-[10px] font-bold text-sky-700 font-mono">D{doc.id}</span>
+          <span className="text-[11px] font-bold text-slate-800 truncate">{doc.text}</span>
+          <span className="ml-auto text-[9px] text-slate-500 font-mono truncate">[{doc.tokens.join(', ')}]</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 역색인 사전 한 줄 — term → posting list
+    // ─────────────────────────────────────────────────────
+    function DictRow({ entry }) {
+      return (
+        <div className={`rounded border px-2 py-1 flex items-center gap-2 ${entry.hit ? 'bg-amber-50 border-amber-400' : entry.rare ? 'bg-blue-50 border-blue-400' : 'bg-white border-sky-200'}`}>
+          <span className="text-[11px] font-bold text-sky-900 font-mono w-14 truncate">{entry.term}</span>
+          <span className="text-sky-400">→</span>
+          <span className="flex gap-1">
+            {entry.postings.map((p) => (
+              <span key={p} className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-sky-100 text-sky-800 border border-sky-300">D{p}</span>
+            ))}
+          </span>
+          {entry.df !== undefined && (
+            <span className={`ml-auto text-[9px] font-mono px-1 rounded ${entry.rare ? 'bg-blue-100 text-blue-800 font-bold' : 'bg-slate-100 text-slate-600'}`}>df={entry.df}</span>
+          )}
+          {entry.isNew && entry.df === undefined && (
+            <span className="ml-auto text-[9px] text-emerald-600 font-bold">+추가</span>
+          )}
+        </div>
+      );
+    }
+
+    function DictPanel({ dict }) {
+      if (!dict || dict.length === 0) return null;
+      return (
+        <div className="mt-2 rounded-lg border-2 border-sky-300 bg-white p-2">
+          <div className="text-[11px] font-bold text-sky-900 mb-1.5 flex items-center gap-1">
+            <span>📖</span><span>역색인 사전 (term → posting list)</span>
+          </div>
+          <div className="space-y-1">
+            {dict.map((e) => <DictRow key={e.term} entry={e} />)}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 순방향 vs 역방향 뒤집기
+    // ─────────────────────────────────────────────────────
+    function FlipBox({ box }) {
+      if (!box) return null;
+      const Col = ({ title, rows, tone }) => (
+        <div className={`flex-1 rounded-lg border-2 p-2 ${tone === 'fwd' ? 'border-slate-300 bg-slate-50' : 'border-sky-400 bg-sky-50'}`}>
+          <div className={`text-[11px] font-bold mb-1.5 ${tone === 'fwd' ? 'text-slate-700' : 'text-sky-900'}`}>{title}</div>
+          <div className="space-y-1">
+            {rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-1 text-[10px]">
+                <span className={`font-mono font-bold px-1 rounded ${tone === 'fwd' ? 'bg-white text-slate-700 border border-slate-300' : 'bg-white text-sky-800 border border-sky-300'}`}>{r.from}</span>
+                <span className={tone === 'fwd' ? 'text-slate-400' : 'text-sky-500'}>→</span>
+                <span className="font-mono text-slate-700 truncate">{r.to}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+      return (
+        <div className="mt-2 rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🔄 같은 데이터, 뒤집힌 두 표</div>
+          <div className="flex gap-2 items-stretch">
+            <Col title="순방향: 문서 → 단어들" rows={box.forward} tone="fwd" />
+            <div className="flex items-center text-sky-500 text-lg font-bold">⇄</div>
+            <Col title="역방향: 단어 → 문서들" rows={box.inverted} tone="inv" />
+          </div>
+          <div className="mt-2 text-[10px] text-sky-900">왼쪽을 세로로 읽으면 오른쪽이 된다 — "노트북"이 D1·D3에 있으니 노트북 → [D1, D3].</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 색인 구축 파이프라인
+    // ─────────────────────────────────────────────────────
+    function BuildBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-2 rounded-lg border-2 border-emerald-300 bg-emerald-50 p-3">
+          <div className="text-xs font-bold text-emerald-800 mb-2">🏗 색인 구축 파이프라인 (문서 1건 기준)</div>
+          <div className="space-y-1">
+            {box.pipeline.map((p, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <div className="text-center text-[10px] text-emerald-500">▼</div>}
+                <div className="rounded border border-emerald-300 bg-white px-2 py-1 text-[10px] text-slate-800 font-mono">{p}</div>
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-emerald-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 검색 병합 (AND 교집합 / OR 합집합)
+    // ─────────────────────────────────────────────────────
+    function SearchBox({ box }) {
+      if (!box) return null;
+      const Chip = ({ children, tone }) => (
+        <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border ${tone === 'hit' ? 'bg-amber-100 text-amber-800 border-amber-400' : 'bg-sky-100 text-sky-800 border-sky-300'}`}>{children}</span>
+      );
+      return (
+        <div className="mt-2 rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🔎 질의 "{box.query}" 처리</div>
+          <div className="space-y-1 mb-2">
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="font-mono font-bold text-sky-900 w-14">{box.listA.term}</span><span className="text-sky-400">→</span>
+              {box.listA.postings.map((p) => <Chip key={p}>D{p}</Chip>)}
+            </div>
+            <div className="flex items-center gap-1 text-[11px]">
+              <span className="font-mono font-bold text-sky-900 w-14">{box.listB.term}</span><span className="text-sky-400">→</span>
+              {box.listB.postings.map((p) => <Chip key={p}>D{p}</Chip>)}
+            </div>
+          </div>
+          {/* 병합 진행 */}
+          <div className="rounded border border-slate-300 bg-slate-50 p-2 mb-2">
+            <div className="text-[10px] font-bold text-slate-700 mb-1">두 포인터 병합 (merge)</div>
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-slate-600 border-b border-slate-200">
+                  <th className="text-left py-0.5">노트북 i</th>
+                  <th className="text-left py-0.5">가방 j</th>
+                  <th className="text-left py-0.5 pl-2">동작</th>
+                </tr>
+              </thead>
+              <tbody>
+                {box.merge.map((m, i) => (
+                  <tr key={i} className={`border-t border-slate-100 ${m.hit ? 'bg-amber-50' : ''}`}>
+                    <td className="py-1 font-mono">{m.a}</td>
+                    <td className="py-1 font-mono">{m.b}</td>
+                    <td className="py-1 pl-2 text-slate-800">{m.hit ? '✓ ' : ''}{m.act}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex gap-2">
+            <div className="flex-1 rounded border-2 border-amber-400 bg-amber-50 p-2">
+              <div className="text-[10px] font-bold text-amber-800">AND (교집합)</div>
+              <div className="mt-1 flex gap-1">{box.andResult.map((p) => <Chip key={p} tone="hit">D{p}</Chip>)}</div>
+            </div>
+            <div className="flex-1 rounded border-2 border-sky-400 bg-sky-50 p-2">
+              <div className="text-[10px] font-bold text-sky-800">OR (합집합)</div>
+              <div className="mt-1 flex gap-1">{box.orResult.map((p) => <Chip key={p}>D{p}</Chip>)}</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — posting 메타데이터 (df · position · field)
+    // ─────────────────────────────────────────────────────
+    function PostingBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-2 rounded-lg border-2 border-blue-400 bg-white p-3">
+          <div className="text-xs font-bold text-blue-900 mb-2">📦 posting 상세 — term "{box.term}" (df={box.df})</div>
+          <table className="w-full text-[10px] mb-2">
+            <thead>
+              <tr className="text-blue-900 border-b-2 border-blue-200">
+                <th className="text-left py-0.5">문서</th>
+                <th className="text-left py-0.5 pl-2">position</th>
+                <th className="text-left py-0.5 pl-2">field</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.entries.map((e) => (
+                <tr key={e.doc} className="border-t border-blue-100">
+                  <td className="py-1 font-mono font-bold">D{e.doc}</td>
+                  <td className="py-1 pl-2 font-mono">@{e.positions.join(', @')}</td>
+                  <td className="py-1 pl-2"><span className="px-1 rounded bg-blue-100 text-blue-800">{e.field}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="rounded border border-amber-400 bg-amber-50 px-2 py-1 text-[10px] text-amber-900">
+            <span className="font-bold">구문검색 {box.phrase.query}:</span> {box.phrase.check}
+          </div>
+          <div className="mt-1.5 text-[10px] text-blue-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 세그먼트 · 병합
+    // ─────────────────────────────────────────────────────
+    function SegmentBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-2 rounded-lg border-2 border-sky-500 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🗂 세그먼트 → 병합 (append-only, immutable)</div>
+          <div className="flex items-center gap-2 mb-2">
+            <div className="flex flex-col gap-1 flex-1">
+              {box.segments.map((s) => (
+                <div key={s.name} className={`rounded border px-2 py-1 text-[10px] ${s.state === 'live' ? 'border-emerald-400 bg-emerald-50' : 'border-slate-300 bg-slate-50'}`}>
+                  <span className="font-mono font-bold text-slate-800">{s.name}</span>
+                  <span className="ml-1 text-slate-600">docs [{s.docs.join(', ')}]</span>
+                  <span className={`ml-1 text-[9px] px-1 rounded ${s.state === 'live' ? 'bg-emerald-200 text-emerald-800' : 'bg-slate-200 text-slate-600'}`}>{s.state === 'live' ? '쓰기중' : '🔒 불변'}</span>
+                </div>
+              ))}
+            </div>
+            <div className="text-sky-500 text-lg font-bold">⇒</div>
+            <div className="flex-1">
+              <div className="rounded border-2 border-sky-400 bg-sky-50 px-2 py-2 text-[10px]">
+                <span className="font-mono font-bold text-sky-900">{box.merged.name}</span>
+                <div className="text-slate-700 mt-0.5">docs [{box.merged.docs.join(', ')}]</div>
+                <div className="text-[9px] text-sky-700 mt-0.5">병합 = 삭제분 청소 + 조회 조각 감소</div>
+              </div>
+            </div>
+          </div>
+          <table className="w-full text-[10px]">
+            <tbody>
+              {box.tradeoff.map((t) => (
+                <tr key={t.k} className="border-t border-sky-100">
+                  <td className="py-1 font-bold text-sky-900 w-32">{t.k}</td>
+                  <td className="py-1 text-slate-700">{t.v}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-2 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 문서 · 역색인 · 단계별 시각화 (sky 톤)
+    // ─────────────────────────────────────────────────────
+    const PHASE_BADGE = {
+      flip:    { icon: '🔄', label: '뒤집기' },
+      build:   { icon: '🏗', label: '색인 구축' },
+      search:  { icon: '🔎', label: '검색 실행' },
+      posting: { icon: '📦', label: 'posting 확장' },
+      segment: { icon: '🗂', label: '세그먼트' },
+    };
+
+    function LiveDataPane({ state }) {
+      const ph = PHASE_BADGE[state.phase] || PHASE_BADGE.flip;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{ph.icon}</span>
+              <span>역색인 — {ph.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            단계: {state.phaseDetail}
+          </div>
+          {/* 코퍼스 */}
+          <div className="space-y-1">
+            {state.docs.map((d) => <DocCard key={d.id} doc={d} />)}
+          </div>
+          <FlipBox box={state.flipBox} />
+          <DictPanel dict={state.dict} />
+          <BuildBox box={state.buildBox} />
+          <SearchBox box={state.searchBox} />
+          <PostingBox box={state.postingBox} />
+          <SegmentBox box={state.segmentBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-16 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">I-1-2. 역색인(inverted index) 원리</h1>
+                <p className="text-sm text-sky-800/80">책 뒤의 찾아보기가 검색 엔진의 심장이 되기까지 — 문서→단어를 단어→문서로 뒤집기</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                역색인은 "문서 → 단어"를 "단어 → 문서"로 뒤집어, 검색을 전 문서 스캔에서 사전 조회로 바꾼다.
+                색인 구축은 토큰화·정규화 후 posting list에 문서 ID를 오름차순으로 쌓는 것이고, 검색은 정렬된 posting들을
+                병합(AND=교집합·OR=합집합)해 O(n+m)에 끝낸다. posting에 df·position·field를 실으면 랭킹(TF-IDF·BM25)의 원료가 되고,
+                실무 색인은 불변 세그먼트를 append-only로 쌓고 백그라운드 병합으로 정리한다 — 색인 비용을 미리 치르고 검색 속도를 산다.
+                다음 장에서는 이 파이프라인의 입구, 토크나이저(한국어 형태소 분석 nori)를 연다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['역색인', 'inverted-index', 'posting-list', '토큰화', '교집합', '합집합', 'merge', 'df', 'position', '세그먼트', 'append-only'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-2-1.html" className="underline hover:no-underline">다음: I-2-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — III-1-2. ANN 알고리즘 — HNSW 그래프</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🕸️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search III-1-2 — ANN 알고리즘 — HNSW 그래프
+    학습 목표: 100만 벡터 전수 비교(브루트포스)의 비용을 실제로 계산해 그 벽을 체감한 뒤,
+              "정확한 최근접(kNN)"을 포기하고 "거의 최근접(ANN)"으로 넘어가는 거래(recall↔속도)를 이해하고,
+              그래프 greedy 탐색 → HNSW 계층(고속도로→골목) → 파라미터(M·ef) 감각 → ANN 지형도(HNSW/IVF/PQ)
+              까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 브루트포스 비용계산기 + 2D greedy 그래프 탐색 애니메이션 + HNSW 3계층 하강 + recall-속도 게이지 + ANN 비교표) / 우(VSCode CodeViewer: hnsw_demo.py)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 결정론적 2D 점 구름 — greedy 그래프 탐색을 "실제로" 계산하기 위한 데이터
+    //   seededPoints : LCG 로 60개 점을 재현 가능하게 생성 (0~100 좌표)
+    //   query        : 질의 벡터(점). 목표는 이 점에 가장 가까운 데이터 점을 찾는 것.
+    // ─────────────────────────────────────────────────────
+    function makePoints(n, seed) {
+      let s = seed >>> 0;
+      const rnd = () => {
+        // 간단한 LCG (numerical recipes 계수)
+        s = (1664525 * s + 1013904223) >>> 0;
+        return s / 4294967296;
+      };
+      const pts = [];
+      for (let i = 0; i < n; i++) {
+        pts.push({ id: i, x: 6 + rnd() * 88, y: 6 + rnd() * 88 });
+      }
+      return pts;
+    }
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    const POINTS = makePoints(60, 12345);
+    const QUERY = { x: 74, y: 30 };            // 질의점
+    const START_ID = 3;                        // greedy 탐색 진입점(임의의 점)
+
+    // kNN 그래프: 각 점을 가장 가까운 K개 점과 연결 (무방향)
+    function buildKnnGraph(points, K) {
+      const adj = points.map(() => new Set());
+      points.forEach((p, i) => {
+        const near = points
+          .map((q, j) => ({ j, d: dist(p, q) }))
+          .filter((o) => o.j !== i)
+          .sort((a, b) => a.d - b.d)
+          .slice(0, K);
+        near.forEach((o) => { adj[i].add(o.j); adj[o.j].add(i); });
+      });
+      return adj.map((s) => [...s]);
+    }
+    const GRAPH = buildKnnGraph(POINTS, 3);
+
+    // greedy 탐색: 현재 점에서 이웃 중 질의에 "더 가까운" 이웃으로 이동, 없으면 종료
+    function greedySearch(points, graph, startId, query) {
+      let cur = startId;
+      let curD = dist(points[cur], query);
+      const path = [cur];
+      const guard = new Set([cur]);
+      while (true) {
+        let best = cur, bestD = curD;
+        for (const nb of graph[cur]) {
+          const d = dist(points[nb], query);
+          if (d < bestD) { bestD = d; best = nb; }
+        }
+        if (best === cur || guard.has(best)) break;   // 더 가까운 이웃 없음 → 지역 최적
+        guard.add(best);
+        path.push(best);
+        cur = best; curD = bestD;
+      }
+      return path;
+    }
+    const GREEDY_PATH = greedySearch(POINTS, GRAPH, START_ID, QUERY);
+    // 진짜 최근접(전수 비교) — greedy 결과와 비교해 recall 을 보여주기 위함
+    const TRUE_NN = POINTS.reduce((best, p) => (dist(p, QUERY) < dist(POINTS[best], QUERY) ? p.id : best), 0);
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 브루트포스의 벽 — 100만 벡터를 한 줄씩 비교하면',
+        desc: '임베딩 검색의 가장 정직한 방법은 질의 벡터와 모든 문서 벡터의 거리를 하나씩 재는 것이다(정확한 최근접, kNN). 문제는 비용이다. 100만 개 × 768차원이면 한 번 검색에 곱셈·덧셈이 약 7.7억 번, 여기에 정렬까지 붙는다. 단일 코어로는 수백 ms~초 단위라 실시간 검색창엔 못 쓰고, 초당 수천 질의(QPS)를 받으면 CPU가 그대로 녹는다. 그래서 우리는 타협한다 — "무조건 1등"을 포기하고 "거의 1등(예: 상위 10개 중 9~10개가 진짜 이웃)"을 아주 빠르게 받는다. 이 recall과 속도의 거래가 ANN(Approximate Nearest Neighbor)의 출발점이다.',
+        actor: '💥 100만 × 768차원 — 전수 비교의 비용',
+        phase: 'bruteforce',
+        phaseDetail: 'kNN(정확) → O(N·d) 전수 비교',
+        costBox: {
+          title: '브루트포스 1회 검색 비용 (실계산)',
+          N: 1000000, d: 768,
+          // 곱+덧 ≈ 2·N·d, 대략 5 GFLOP/s 단일코어 가정
+          rows: [
+            { label: '거리 계산 곱·덧셈', value: '≈ 1.5 GFLOP', sub: '2 × 100만 × 768' },
+            { label: '단일 코어 추정', value: '≈ 300 ms', sub: '~5 GFLOP/s 가정 + 정렬' },
+            { label: '1,000 QPS 라면', value: '≈ 300 코어', sub: '실시간엔 비현실적' },
+          ],
+        },
+        tradeBox: {
+          title: 'kNN(정확) vs ANN(근사) — 무엇을 주고 무엇을 얻나',
+          give: 'recall 약간 (100% → 95~99%)',
+          get: '속도 100~1000배 (300ms → 0.3~3ms)',
+        },
+        alert: { tone: 'warn', text: '정확도 100%(진짜 최근접)를 고집하면 규모가 커질수록 비용이 선형으로 폭발한다. "거의 최근접"을 허용하는 순간 로그 규모 탐색이 열린다 — 이 한 걸음이 ANN의 전부다.' },
+        code: {
+          lang: 'python',
+          filename: 'hnsw_demo.py — 1) 브루트포스 비용',
+          lines: [
+            '"""',
+            'hnsw_demo.py — 브루트포스 kNN vs HNSW ANN 벤치마크',
+            '  pip install numpy hnswlib   (faiss 는 마지막 단계에서만)',
+            '"""',
+            'import time',
+            'import numpy as np',
+            '',
+            'N, D = 1_000_000, 768        # 100만 벡터, 768차원',
+            'rng = np.random.default_rng(42)',
+            'data = rng.standard_normal((N, D)).astype(np.float32)',
+            'query = rng.standard_normal((1, D)).astype(np.float32)',
+            '',
+            'def brute_force_knn(data, query, k=10):',
+            '    """전수 비교: 모든 벡터와의 거리를 재고 상위 k개."""',
+            '    # (N, D) - (1, D) → (N, D), 제곱합 → (N,)',
+            '    dists = ((data - query) ** 2).sum(axis=1)',
+            '    return np.argpartition(dists, k)[:k]',
+            '',
+            't0 = time.perf_counter()',
+            'true_ids = brute_force_knn(data, query, k=10)',
+            'dt = (time.perf_counter() - t0) * 1000',
+            'print(f"brute-force: {dt:.0f} ms")   # 수백 ms — 실시간 불가',
+            '',
+            '# 연산량: 2·N·D ≈ 1.5 GFLOP / 검색 1회',
+            '# 1,000 QPS 면 초당 1.5 TFLOP → 수백 코어가 필요하다.',
+            '# 정확도 100%를 고집한 대가다. 여기서 타협이 시작된다.',
+          ],
+          highlight: [7, 12, 13, 14, 15, 16, 17, 22, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 2. 그래프 탐색 직관 — 이웃을 따라 질의 쪽으로 굴러간다',
+        desc: '벡터들을 "가까운 것끼리" 미리 연결해 그래프를 만들어 두면, 검색은 이 그래프 위를 걷는 문제가 된다. 아무 점에서 출발해 현재 점의 이웃들 중 질의에 더 가까운 쪽으로 한 칸씩 이동하고, 더 가까워지는 이웃이 없으면 멈춘다(greedy 탐색). 아래는 60개 점과 3-최근접 그래프에서 실제로 계산한 경로다 — 진입점에서 질의(★)를 향해 몇 번의 홉만에 굴러간다. 전수 비교가 아니라 "방문한 점의 이웃만" 보므로 훨씬 적게 계산한다. 다만 함정이 있다 — 이웃 중엔 더 가까운 점이 없지만 그래프 전체엔 있는 "지역 최적"에 갇힐 수 있다. 단일 그래프·단일 진입점의 이 약점을 다음 단계의 계층 구조가 푼다.',
+        actor: '🕸️ 60점 · 3-NN 그래프 · greedy 실계산',
+        phase: 'greedy',
+        phaseDetail: 'greedy walk — 이웃 중 더 가까운 쪽으로',
+        graph: { animate: true },
+        alert: { tone: 'info', text: 'greedy 탐색은 방문한 점의 이웃만 계산한다 — 100만 점이라도 실제로 만지는 건 수십~수백 개뿐. 대신 진입점 하나·평평한 그래프면 "지역 최적"에 빠질 위험이 있다.' },
+        code: {
+          lang: 'python',
+          filename: 'hnsw_demo.py — 2) greedy 그래프 탐색',
+          lines: [
+            'def greedy_search(graph, coords, start, query):',
+            '    """이웃 중 질의에 더 가까운 점으로 이동, 없으면 종료."""',
+            '    cur = start',
+            '    cur_d = np.linalg.norm(coords[cur] - query)',
+            '    path = [cur]',
+            '    while True:',
+            '        best, best_d = cur, cur_d',
+            '        for nb in graph[cur]:          # 이웃만 확인',
+            '            d = np.linalg.norm(coords[nb] - query)',
+            '            if d < best_d:',
+            '                best, best_d = nb, d',
+            '        if best == cur:                # 더 가까운 이웃 없음',
+            '            break                      #   → 지역 최적에서 종료',
+            '        cur, cur_d = best, best_d',
+            '        path.append(cur)',
+            '    return path',
+            '',
+            '# 핵심: 전수 비교(N개) 대신 "방문 점의 이웃"만 계산한다.',
+            '#   방문 수는 보통 O(log N) 규모 → 100만 점도 수십 홉.',
+            '#',
+            '# 약점: 진입점 하나 + 평평한 그래프면 지역 최적에 갇힌다.',
+            '#   전역엔 더 가까운 점이 있어도 이웃엔 없어서 멈춰버린다.',
+            '#   → 해결책이 다음 단계의 "계층(HNSW)" 이다.',
+          ],
+          highlight: [0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 18, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 3. HNSW 계층 — 고속도로에서 내려와 골목으로',
+        desc: 'HNSW(Hierarchical Navigable Small World)는 그래프를 여러 층으로 쌓는다. 맨 위 층은 점이 적고 링크가 성긴 "고속도로" — 한 홉에 멀리 점프해 질의의 대략적 위치로 순식간에 이동한다. 아래로 내려갈수록 점이 많아지고 링크가 촘촘해져 "국도 → 골목"이 되고, 맨 아래 0층은 모든 점을 담아 정밀하게 마무리한다. 각 층에서 greedy로 지역 최적에 닿으면 그 점을 진입점 삼아 한 층 내려간다. 스킵 리스트가 정렬 리스트를 층으로 건너뛰어 O(log N) 탐색을 얻는 것과 똑같은 아이디어를, 1차원 순서가 아니라 고차원 이웃 그래프에 적용한 것이다. 위에서 크게 좁히고 아래서 정밀화하니, 단일 그래프의 지역 최적 함정도 크게 완화된다.',
+        actor: '🛣️ 3계층 하강 — 고속도로→국도→골목',
+        phase: 'hnsw',
+        phaseDetail: 'Layer 2 → 1 → 0 하강 탐색',
+        layers: {
+          animate: true,
+          rows: [
+            { name: 'Layer 2 · 고속도로', count: 5,  desc: '성긴 장거리 링크 — 대략적 위치로 점프' },
+            { name: 'Layer 1 · 국도',     count: 16, desc: '중간 밀도 — 지역으로 좁히기' },
+            { name: 'Layer 0 · 골목',     count: 60, desc: '전체 점 · 촘촘한 링크 — 정밀 마무리' },
+          ],
+        },
+        alert: { tone: 'good', text: '스킵 리스트를 고차원 그래프로 일반화한 것이 HNSW다. 상위 층에서 대략 위치를 잡고 하위 층에서 정밀화 → 탐색 복잡도가 O(N)에서 O(log N) 수준으로 내려간다.' },
+        code: {
+          lang: 'python',
+          filename: 'hnsw_demo.py — 3) hnswlib 색인·검색',
+          lines: [
+            'import hnswlib',
+            '',
+            '# HNSW 색인 만들기 (계층 그래프는 라이브러리가 구성)',
+            'index = hnswlib.Index(space="l2", dim=D)',
+            'index.init_index(',
+            '    max_elements=N,',
+            '    M=16,                  # 층당 이웃 수(연결 정도)',
+            '    ef_construction=200,   # 색인 품질(클수록 정확·느림)',
+            ')',
+            'index.add_items(data, np.arange(N))',
+            '',
+            'index.set_ef(50)           # 검색 시 후보 폭(ef_search)',
+            't0 = time.perf_counter()',
+            'labels, distances = index.knn_query(query, k=10)',
+            'dt = (time.perf_counter() - t0) * 1000',
+            'print(f"hnsw: {dt:.2f} ms")   # 수 ms — 100배+ 빠름',
+            '',
+            '# 내부 동작(개념):',
+            '#   상위 층(성긴 고속도로)에서 greedy 로 대략 위치 점프',
+            '#   → 한 층 내려가 그 점을 진입점으로 다시 greedy',
+            '#   → 0층(전체 점·촘촘)에서 정밀 마무리',
+            '# 스킵 리스트가 O(log N) 을 얻는 원리를 그래프에 적용한 것.',
+          ],
+          highlight: [0, 3, 4, 5, 6, 7, 8, 9, 11, 13, 15, 17, 18, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 4. 파라미터 감각 — M · ef_construction · ef_search',
+        desc: 'HNSW의 성능은 세 다이얼로 조율한다. M은 층당 이웃 수 — 크면 그래프가 촘촘해져 정확도가 오르지만 메모리(벡터당 링크)와 색인 시간이 늘고, 보통 8~64를 쓴다. ef_construction은 색인을 지을 때 후보를 얼마나 넓게 탐색하는지 — 크면 그래프 품질이 좋아지지만 색인이 느려진다(한 번만 치르는 비용). ef_search는 검색 순간의 후보 리스트 폭으로, 이게 바로 실시간에 돌리는 recall↔속도 다이얼이다 — 키우면 더 많은 후보를 훑어 recall이 오르지만 QPS(초당 처리량)가 떨어진다. 아래 게이지에서 ef_search를 올리며 recall은 포화 곡선으로 오르고 속도는 반대로 내려가는 트레이드오프를 확인하라. 실무 기본값은 M=16, ef_construction=200에서 시작해 목표 recall에 맞춰 ef_search만 튜닝하는 것이다.',
+        actor: '🎛️ ef_search 다이얼 — recall ↔ QPS',
+        phase: 'params',
+        phaseDetail: 'ef_search 를 올리면 recall↑ · QPS↓',
+        efDial: {
+          title: 'ef_search 스윕 — recall 과 속도의 거래',
+          // 실측 감각을 옮긴 곡선: ef 가 커질수록 recall 포화, QPS 하락
+          rows: [
+            { ef: 10,  recall: 0.82, qps: 12000 },
+            { ef: 20,  recall: 0.91, qps: 8000 },
+            { ef: 50,  recall: 0.97, qps: 4200 },
+            { ef: 100, recall: 0.99, qps: 2300 },
+            { ef: 200, recall: 0.995, qps: 1200 },
+          ],
+        },
+        paramCards: [
+          { name: 'M', role: '층당 이웃 수', up: '정확도↑ · 메모리↑ · 색인↑', typ: '8 ~ 64 (기본 16)', color: 'sky' },
+          { name: 'ef_construction', role: '색인 품질', up: '그래프 품질↑ · 색인시간↑', typ: '100 ~ 500 (기본 200)', color: 'indigo' },
+          { name: 'ef_search', role: '검색 후보 폭', up: 'recall↑ · QPS↓ (실시간 다이얼)', typ: '10 ~ 300 (목표 recall로)', color: 'emerald' },
+        ],
+        alert: { tone: 'info', text: 'M·ef_construction 은 색인 시 한 번 정하는 비용, ef_search 는 매 검색마다 조절하는 실시간 다이얼이다. 실무는 M=16·ef_construction=200 로 시작해 목표 recall이 나올 때까지 ef_search 만 올린다.' },
+        code: {
+          lang: 'python',
+          filename: 'hnsw_demo.py — 4) recall 측정 · ef 스윕',
+          lines: [
+            'def recall_at_k(approx_ids, true_ids):',
+            '    """근사 결과가 진짜 최근접 k개 중 몇 개를 맞췄나 (0~1)."""',
+            '    hit = len(set(approx_ids) & set(true_ids))',
+            '    return hit / len(true_ids)',
+            '',
+            '# ground truth 는 브루트포스로 한 번만 구해 둔다',
+            'true_ids = brute_force_knn(data, query, k=10)',
+            '',
+            'print("ef  recall   QPS")',
+            'for ef in [10, 20, 50, 100, 200]:',
+            '    index.set_ef(ef)               # 실시간 다이얼',
+            '    t0 = time.perf_counter()',
+            '    ids, _ = index.knn_query(query, k=10)',
+            '    sec = time.perf_counter() - t0',
+            '    r = recall_at_k(ids[0], true_ids)',
+            '    print(f"{ef:<3} {r:.3f}  {1/sec:,.0f}")',
+            '',
+            '# ef↑ → 더 많은 후보를 훑음 → recall↑ 이지만 QPS↓.',
+            '# recall 은 포화(0.99 부근에서 완만)하고 비용은 계속 는다.',
+            '# → "충분히 좋은 recall"에서 멈추는 게 튜닝의 핵심.',
+          ],
+          highlight: [0, 1, 2, 3, 6, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20],
+        },
+      },
+      {
+        title: 'Step 5. ANN 지형도 — HNSW vs IVF vs PQ, 그리고 조합',
+        desc: 'HNSW만이 답은 아니다. ANN 인덱스는 크게 세 갈래다. HNSW는 그래프 기반으로 recall·지연이 최상급이지만 벡터당 링크를 메모리에 들고 있어야 해 RAM을 많이 먹는다. IVF(Inverted File)는 벡터를 미리 군집(centroid)으로 나눠, 검색 시 질의와 가까운 몇 개 군집(nprobe)만 뒤진다 — 메모리 효율이 좋고 대용량에 유리하나 recall은 nprobe로 조절해야 한다. PQ(Product Quantization)는 벡터를 짧은 코드로 압축해 메모리를 8~32배 줄이는 대신 거리 계산이 근사가 된다. 실무에선 이들을 조합한다 — IVF로 후보 군집을 좁히고 PQ로 압축해 수십억 벡터를 RAM에 얹는 IVF-PQ가 대표적이다. 규모가 크지 않고 recall·지연이 최우선이면 HNSW, 메모리가 빠듯하고 수억~수십억이면 IVF-PQ가 출발점이다. 이 선택은 vector-db 주제로 이어지고, 다음 장에서는 이 모든 것을 감싸는 kNN 실전 도구(FAISS·hnswlib·벡터 DB)를 직접 다룬다.',
+        actor: '🗺️ HNSW · IVF · PQ · IVF-PQ 한눈 비교',
+        phase: 'landscape',
+        phaseDetail: '규모·메모리·recall 제약별 선택',
+        annTable: {
+          title: 'ANN 방식 비교 — 무엇을 언제',
+          rows: [
+            { name: 'HNSW', idea: '이웃 그래프 계층 탐색', mem: '높음(링크 저장)', recall: '최상', when: '~수천만 · recall/지연 최우선' },
+            { name: 'IVF', idea: '군집 분할 후 nprobe개만', mem: '중간', recall: '중~상(nprobe)', when: '대용량 · 메모리 절약' },
+            { name: 'PQ', idea: '벡터를 짧은 코드로 압축', mem: '매우 낮음', recall: '중(근사거리)', when: 'RAM 빠듯 · 압축 필수' },
+            { name: 'IVF-PQ', idea: 'IVF로 좁히고 PQ로 압축', mem: '낮음', recall: '중~상', when: '수억~수십억 벡터' },
+          ],
+        },
+        pickBox: {
+          title: '규모·제약별 첫 선택',
+          rows: [
+            { cond: '~수천만 · recall/지연 최우선', pick: 'HNSW', icon: '🕸️' },
+            { cond: '메모리 빠듯 · 수억+', pick: 'IVF-PQ', icon: '📦' },
+            { cond: '균형 · 운영 단순', pick: '벡터 DB(HNSW 내장)', icon: '🗄️' },
+          ],
+        },
+        alert: { tone: 'good', text: '다음 장: kNN 실전 도구 — FAISS·hnswlib·벡터 DB로 위 인덱스들을 실제로 만들고, 필터링·업데이트·영속화까지 다룬다. HNSW는 그중 "그래프 계열"의 대표일 뿐이다.' },
+        code: {
+          lang: 'python',
+          filename: 'hnsw_demo.py — 5) faiss IVF 한 줄 비교',
+          lines: [
+            '# ── ANN 지형도: HNSW 외의 선택지 (faiss) ──',
+            'import faiss   # pip install faiss-cpu',
+            '',
+            '# IVF: 벡터를 nlist 개 군집으로 나누고, 검색 시 nprobe개만',
+            'quantizer = faiss.IndexFlatL2(D)',
+            'ivf = faiss.IndexIVFFlat(quantizer, D, 4096)  # nlist=4096',
+            'ivf.train(data)          # 군집 centroid 학습',
+            'ivf.add(data)',
+            'ivf.nprobe = 16          # 가까운 16개 군집만 탐색 → recall 다이얼',
+            'D_, I_ = ivf.search(query, 10)',
+            '',
+            '# IVF-PQ: 여기에 PQ 압축을 더해 메모리를 8~32배 절약',
+            '#   faiss.IndexIVFPQ(quantizer, D, 4096, m=64, nbits=8)',
+            '#   → 수억~수십억 벡터를 RAM 에 얹는 표준 조합.',
+            '',
+            '# 선택 요약:',
+            '#   HNSW   : 그래프 · recall/지연 최상 · 메모리 큼',
+            '#   IVF    : 군집 분할 · 메모리 효율 · nprobe 로 recall',
+            '#   PQ     : 압축 · 메모리 최소 · 근사 거리',
+            '#   IVF-PQ : 대용량 표준 조합',
+            '# → 다음 장: 이 도구들을 감싸는 kNN 실전(FAISS·벡터 DB).',
+          ],
+          highlight: [0, 1, 4, 5, 6, 7, 8, 9, 11, 12, 13, 16, 17, 18, 19, 20, 21],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 브루트포스 비용 계산기
+    // ─────────────────────────────────────────────────────
+    function CostBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">💥 {box.title}</div>
+          <div className="text-[10px] text-red-900 font-mono mb-2">
+            N = {box.N.toLocaleString()} 벡터 · d = {box.d} 차원
+          </div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className="flex items-center justify-between rounded border border-red-200 bg-white px-2 py-1">
+                <div>
+                  <div className="text-[11px] font-bold text-red-900">{r.label}</div>
+                  <div className="text-[9px] text-slate-500 font-mono">{r.sub}</div>
+                </div>
+                <span className="text-sm font-mono font-bold text-red-700">{r.value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function TradeBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">⚖️ {box.title}</div>
+          <div className="flex items-center gap-2 text-[11px]">
+            <div className="flex-1 rounded border-2 border-red-300 bg-red-50 p-2 text-center">
+              <div className="text-[9px] text-red-700 font-bold">내주는 것</div>
+              <div className="text-red-900 font-bold">{box.give}</div>
+            </div>
+            <span className="text-lg text-sky-500">→</span>
+            <div className="flex-1 rounded border-2 border-emerald-300 bg-emerald-50 p-2 text-center">
+              <div className="text-[9px] text-emerald-700 font-bold">얻는 것</div>
+              <div className="text-emerald-900 font-bold">{box.get}</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 2D greedy 그래프 탐색 애니메이션 (SVG, 실계산 경로)
+    // ─────────────────────────────────────────────────────
+    function GraphSearchViz({ active }) {
+      const [hop, setHop] = useState(0);   // 현재까지 밝혀진 경로 홉 수
+      useEffect(() => {
+        if (!active) return;
+        setHop(0);
+        const t = setInterval(() => {
+          setHop((h) => (h >= GREEDY_PATH.length ? 0 : h + 1));
+        }, 750);
+        return () => clearInterval(t);
+      }, [active]);
+
+      const shown = GREEDY_PATH.slice(0, Math.max(1, hop));
+      const shownSet = new Set(shown);
+      const curId = shown[shown.length - 1];
+      const found = hop >= GREEDY_PATH.length;
+
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-2.5">
+          <div className="flex items-center justify-between text-[11px] font-bold text-sky-900 mb-1">
+            <span>🕸️ greedy 탐색 경로 (실계산)</span>
+            <span className="font-mono">홉 {Math.min(shown.length, GREEDY_PATH.length)} / {GREEDY_PATH.length}</span>
+          </div>
+          <svg viewBox="0 0 100 100" className="w-full rounded bg-sky-50 border border-sky-200" style={{ aspectRatio: '1 / 1' }}>
+            {/* 그래프 엣지 */}
+            {POINTS.map((p) => GRAPH[p.id].filter((j) => j > p.id).map((j) => (
+              <line key={p.id + '-' + j} x1={p.x} y1={p.y} x2={POINTS[j].x} y2={POINTS[j].y}
+                    stroke="#bae6fd" strokeWidth="0.3" />
+            )))}
+            {/* 탐색 경로 엣지 */}
+            {shown.slice(1).map((id, i) => (
+              <line key={'path-' + i} x1={POINTS[shown[i]].x} y1={POINTS[shown[i]].y}
+                    x2={POINTS[id].x} y2={POINTS[id].y} stroke="#0284c7" strokeWidth="0.9" />
+            ))}
+            {/* 점 */}
+            {POINTS.map((p) => {
+              const isPath = shownSet.has(p.id);
+              const isCur = p.id === curId;
+              const isTrue = p.id === TRUE_NN;
+              return (
+                <circle key={p.id} cx={p.x} cy={p.y}
+                        r={isCur ? 2.2 : isPath ? 1.6 : 1}
+                        fill={isCur ? '#0369a1' : isPath ? '#38bdf8' : isTrue ? '#10b981' : '#cbd5e1'}
+                        stroke={isTrue ? '#059669' : 'none'} strokeWidth={isTrue ? 0.6 : 0} />
+              );
+            })}
+            {/* 진입점 표시 */}
+            <circle cx={POINTS[START_ID].x} cy={POINTS[START_ID].y} r="2.6" fill="none" stroke="#0369a1" strokeWidth="0.5" strokeDasharray="1 1" />
+            {/* 질의점 ★ */}
+            <text x={QUERY.x} y={QUERY.y + 2} fontSize="6" textAnchor="middle" fill="#f59e0b">★</text>
+          </svg>
+          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[9px] text-slate-600">
+            <span>★ 질의</span>
+            <span className="text-emerald-700">● 진짜 최근접</span>
+            <span className="text-sky-700">● 탐색 경로</span>
+            <span>◌ 진입점(#{START_ID})</span>
+            <span className="text-slate-400">● 미방문</span>
+          </div>
+          <div className="mt-1 text-[10px] text-sky-900">
+            {found
+              ? `종료: #${curId} 도착 (진짜 최근접 #${TRUE_NN}${curId === TRUE_NN ? ' = 정답 적중' : ' — 지역 최적일 수 있음'})`
+              : `이동 중: #${curId} 의 이웃 중 질의에 더 가까운 점으로…`}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — HNSW 3계층 하강 (SVG)
+    // ─────────────────────────────────────────────────────
+    function HnswLayers({ box, active }) {
+      const [lv, setLv] = useState(0);   // 현재 밝혀진 층 (0=top 부터 아래로)
+      useEffect(() => {
+        if (!box || !active) return;
+        setLv(0);
+        const t = setInterval(() => {
+          setLv((v) => (v >= box.rows.length ? 0 : v + 1));
+        }, 850);
+        return () => clearInterval(t);
+      }, [box, active]);
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🛣️ HNSW 계층 하강 탐색</div>
+          <div className="space-y-2">
+            {box.rows.map((r, i) => {
+              const reached = i < lv;
+              const isCur = i === lv - 1;
+              // 층별 점 위치 (성긴→촘촘) 결정론적 배치
+              const pts = Array.from({ length: r.count }, (_, k) => ({
+                x: ((k * 61 + i * 13) % 90) + 5,
+                y: 50,
+              }));
+              return (
+                <div key={i} className={`rounded-lg border-2 p-2 transition ${reached ? 'border-sky-400 bg-sky-50' : 'border-slate-200 bg-white'}`}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className={`text-[11px] font-bold ${reached ? 'text-sky-900' : 'text-slate-400'}`}>
+                      {isCur ? '📍 ' : reached ? '✓ ' : ''}{r.name}
+                    </span>
+                    <span className="text-[9px] text-slate-500 font-mono">{r.count}점</span>
+                  </div>
+                  <svg viewBox="0 0 100 12" className="w-full" style={{ height: '18px' }}>
+                    {pts.map((p, k) => k < pts.length - 1 && (
+                      <line key={'l' + k} x1={p.x} y1="6" x2={pts[k + 1].x} y2="6"
+                            stroke={reached ? '#7dd3fc' : '#e2e8f0'} strokeWidth="0.4" />
+                    ))}
+                    {pts.map((p, k) => (
+                      <circle key={k} cx={p.x} cy="6" r={reached ? 1.6 : 1.1}
+                              fill={reached ? '#0ea5e9' : '#cbd5e1'} />
+                    ))}
+                  </svg>
+                  <div className={`text-[9px] mt-0.5 ${reached ? 'text-sky-800' : 'text-slate-400'}`}>{r.desc}</div>
+                  {i < box.rows.length - 1 && (
+                    <div className="text-center text-sky-400 text-[10px] leading-none mt-1">↓ 지역 최적점을 진입점 삼아 하강</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-2 text-[10px] text-sky-900">
+            {lv >= box.rows.length
+              ? '0층 도착 — 촘촘한 골목에서 최근접을 정밀 확정.'
+              : '상위 층에서 대략 위치를 잡고 아래로 내려가며 정밀화…'}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — ef_search 다이얼 (recall↑ · QPS↓ 곡선)
+    // ─────────────────────────────────────────────────────
+    function EfDial({ box }) {
+      const [idx, setIdx] = useState(2);
+      if (!box) return null;
+      const rows = box.rows;
+      const r = rows[idx];
+      const maxQps = Math.max(...rows.map((x) => x.qps));
+      return (
+        <div className="mt-3 rounded-lg border-2 border-emerald-300 bg-white p-3">
+          <div className="text-xs font-bold text-emerald-900 mb-2">🎛️ {box.title}</div>
+          {/* 슬라이더 */}
+          <input type="range" min="0" max={rows.length - 1} value={idx}
+                 onChange={(e) => setIdx(+e.target.value)}
+                 aria-label="ef_search 값 조절"
+                 className="w-full accent-emerald-600" />
+          <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 mb-2">
+            {rows.map((x, i) => <span key={i} className={i === idx ? 'text-emerald-700 font-bold' : ''}>{x.ef}</span>)}
+          </div>
+          {/* 현재값 게이지 */}
+          <div className="space-y-2">
+            <div>
+              <div className="flex justify-between text-[10px] font-bold text-emerald-800">
+                <span>recall@10</span><span className="font-mono">{(r.recall * 100).toFixed(1)}%</span>
+              </div>
+              <div className="h-2.5 rounded-full bg-emerald-100 overflow-hidden">
+                <div className="h-full bg-emerald-500 transition-all duration-500" style={{ width: `${r.recall * 100}%` }} />
+              </div>
+            </div>
+            <div>
+              <div className="flex justify-between text-[10px] font-bold text-sky-800">
+                <span>QPS(처리량)</span><span className="font-mono">{r.qps.toLocaleString()}/s</span>
+              </div>
+              <div className="h-2.5 rounded-full bg-sky-100 overflow-hidden">
+                <div className="h-full bg-sky-500 transition-all duration-500" style={{ width: `${(r.qps / maxQps) * 100}%` }} />
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-slate-700">
+            ef_search = <b className="font-mono text-emerald-700">{r.ef}</b> — recall 은 포화 곡선으로 오르고 QPS 는 반대로 내려간다.
+            {r.recall >= 0.99 ? ' 이 지점 이후는 비용만 늘고 recall 이득은 미미하다.' : ' 목표 recall 까지 더 올릴 여지가 있다.'}
+          </div>
+        </div>
+      );
+    }
+
+    function ParamCards({ cards }) {
+      if (!cards) return null;
+      const tone = {
+        sky: 'border-sky-300 bg-sky-50 text-sky-900',
+        indigo: 'border-indigo-300 bg-indigo-50 text-indigo-900',
+        emerald: 'border-emerald-300 bg-emerald-50 text-emerald-900',
+      };
+      return (
+        <div className="mt-3 grid grid-cols-1 gap-2">
+          {cards.map((c, i) => (
+            <div key={i} className={`rounded border-2 p-2 ${tone[c.color]}`}>
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold font-mono">{c.name}</span>
+                <span className="text-[9px] font-mono opacity-80">{c.typ}</span>
+              </div>
+              <div className="text-[10px] mt-0.5"><b>{c.role}</b> — {c.up}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — ANN 비교표 + 선택 가이드
+    // ─────────────────────────────────────────────────────
+    function AnnTable({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🗺️ {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-900 border-b border-sky-200">
+                <th className="text-left py-0.5">방식</th>
+                <th className="text-left py-0.5 pl-1">아이디어</th>
+                <th className="text-left py-0.5 pl-1">메모리</th>
+                <th className="text-left py-0.5 pl-1">recall</th>
+                <th className="text-left py-0.5 pl-1">언제</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.name} className="border-t border-sky-100 align-top">
+                  <td className="py-1 font-bold text-sky-900 font-mono">{r.name}</td>
+                  <td className="py-1 pl-1 text-slate-700">{r.idea}</td>
+                  <td className="py-1 pl-1 text-slate-700">{r.mem}</td>
+                  <td className="py-1 pl-1 text-emerald-700 font-bold">{r.recall}</td>
+                  <td className="py-1 pl-1 text-slate-700">{r.when}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function PickBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-sky-500 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+          <div className="text-sm font-bold text-sky-900 mb-2">🎯 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 text-[10px]">
+                <span className="text-base">{r.icon}</span>
+                <span className="flex-1 text-slate-700">{r.cond}</span>
+                <span className="text-sky-500">→</span>
+                <span className="w-40 shrink-0 text-emerald-800 font-bold text-right">{r.pick}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — HNSW/ANN 시뮬레이션 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const PHASE_BADGE = {
+      bruteforce: { icon: '💥', label: '브루트포스' },
+      greedy:     { icon: '🕸️', label: '그래프 탐색' },
+      hnsw:       { icon: '🛣️', label: 'HNSW 계층' },
+      params:     { icon: '🎛️', label: '파라미터' },
+      landscape:  { icon: '🗺️', label: 'ANN 지형도' },
+    };
+
+    function LiveDataPane({ state, active }) {
+      const ph = PHASE_BADGE[state.phase] || PHASE_BADGE.bruteforce;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{ph.icon}</span>
+              <span>벡터 검색 — {ph.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            방식: {state.phaseDetail}
+          </div>
+          <CostBox box={state.costBox} />
+          <TradeBox box={state.tradeBox} />
+          {state.graph && <GraphSearchViz active={active} />}
+          {state.layers && <HnswLayers box={state.layers} active={active} />}
+          <EfDial box={state.efDial} />
+          <ParamCards cards={state.paramCards} />
+          <AnnTable box={state.annTable} />
+          <PickBox box={state.pickBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">III-1-2. ANN 알고리즘 — HNSW 그래프</h1>
+                <p className="text-sm text-sky-800/80">100만 벡터에서 10ms — 정확도를 조금 내주고 속도를 천 배 얻는 거래</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} active={true} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                브루트포스 kNN은 정확하지만 100만×768차원에서 검색 1회에 ~1.5 GFLOP를 써 실시간엔 못 쓴다.
+                ANN은 recall을 조금(예: 100%→97%) 내주고 속도를 100~1000배 얻는 거래다.
+                그래프 greedy 탐색은 이웃만 보며 질의로 굴러가고(지역 최적 위험), HNSW는 이를 고속도로→골목의 계층으로 쌓아 O(log N)으로 만든다(스킵 리스트의 그래프판).
+                튜닝은 M·ef_construction(색인 시 1회)과 ef_search(실시간 recall↔QPS 다이얼)로 하고, M=16·ef_construction=200에서 시작해 ef_search만 올린다.
+                지형도로는 HNSW(그래프·메모리 큼)·IVF(군집 분할)·PQ(압축)와 조합 IVF-PQ가 있으며, 규모·메모리 제약이 선택을 가른다. 다음 장에서는 이 도구들(FAISS·벡터 DB)을 실전으로 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['ANN', 'HNSW', 'kNN', 'recall', 'QPS', 'greedy탐색', '스킵리스트', 'M파라미터', 'ef_search', 'IVF', 'PQ', 'IVF-PQ', 'faiss', 'hnswlib'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-1-3.html" className="underline hover:no-underline">다음: III-1-3 (kNN 실전 도구) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

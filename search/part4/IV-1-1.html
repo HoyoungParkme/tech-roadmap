@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — IV-1-1. 렉시컬 vs 벡터 — 언제 뭐가 이기나</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🥊</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search IV-1-1 — 렉시컬 vs 벡터 — 언제 뭐가 이기나
+    학습 목표: 같은 코퍼스·같은 질의 5종으로 BM25(렉시컬, Part Ⅱ)와 임베딩(벡터, Part Ⅲ)을 나란히 돌려
+              (1) "어느 쪽이 낫냐"가 아니라 "어떤 질의에서 갈리냐"를 본다
+              (2) 렉시컬이 반드시 이기는 질의(정확 매칭·OOV)와 벡터가 반드시 이기는 질의(의미 변형)를 각각 재현
+              (3) 실패 매트릭스로 "둘 다 써야 한다"를 논리적으로 도출
+              (4) 점수 스케일이 달라 단순 합산이 안 되는 문제 → "점수가 아니라 순위로 합치자"(RRF) 예고
+    패턴: fastapi v1 — 좌(LiveDataPane: 대결 스코어보드 + 실패 사례 카드 + 승패 매트릭스 + 스케일 불일치) / 우(VSCode CodeViewer: lexical_vs_vector.py 계열)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 공통 코퍼스 — 신발/전자제품이 섞인 작은 쇼핑몰 상품 6종.
+    //   대결 질의 5종이 모두 이 코퍼스 위에서 돈다(변인 통제).
+    //   d1~d6 을 각 스텝의 랭킹이 참조한다.
+    // ─────────────────────────────────────────────────────
+    // d1: RTX4090 그래픽카드   d2: 겨울용 방한 부츠   d3: 방수 레인코트
+    // d4: 라이트한 러닝화       d5: 알엑스 조명 스탠드  d6: DB 에러 해설 문서
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 대결 구도 → 렉시컬 승 → 벡터 승 → 실패 매트릭스 → 합치기의 함정
+    //   match      : 한 질의의 BM25 랭킹 vs 벡터 랭킹 (좌 스코어보드)
+    //   caseCards  : "왜 졌나" 해설 카드
+    //   matrix     : 질의유형 × 방식 승패표
+    //   dist       : 실서비스 질의 분포
+    //   scaleViz   : 점수 스케일 불일치 시각화
+    //   rrfBox     : 순위 기반 결합(RRF) 예고
+    //   code       : 우측 CodeViewer 파일
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 대결 구도 — 같은 코퍼스, 같은 질의 5종',
+        desc: '"BM25가 낫냐, 벡터가 낫냐"는 잘못 세운 질문이다. 옳은 질문은 "어떤 질의에서 승패가 갈리냐"다. 그래서 신발과 전자제품이 섞인 같은 상품 코퍼스 위에 질의 5종을 던져 렉시컬(BM25)과 벡터(임베딩)의 순위를 나란히 세운다. 미리 결과를 훑으면 정확 매칭류(모델명·에러코드)는 렉시컬이, 의미 변형류(자연어 문장·동의어)는 벡터가 이긴다 — 승자가 질의 성격에 따라 규칙적으로 뒤바뀐다. 이 규칙성이 바로 "하나만 쓰면 반드시 지는 질의가 있다"는 이 장의 출발점이다.',
+        actor: '🥊 질의 5종 · 코퍼스 공통',
+        engine: 'preview',
+        engineDetail: 'BM25(렉시컬) vs Embedding(벡터) — 승패 미리보기',
+        query: '',
+        preview: {
+          title: '질의 5종 대결 미리보기 — 승자가 질의 성격 따라 뒤집힌다',
+          rows: [
+            { q: 'RTX4090', type: '모델명(정확)', winner: 'lexical', reason: '희귀 토큰 정확 일치' },
+            { q: 'ORA-00942', type: '에러코드(정확)', winner: 'lexical', reason: 'OOV — 임베딩 학습 밖' },
+            { q: '겨울에 신을 따뜻한 신발', type: '자연어 문장', winner: 'vector', reason: '토큰 안 겹쳐도 의미 일치' },
+            { q: '레인코트', type: '동의어', winner: 'vector', reason: '방수자켓과 의미 근접' },
+            { q: '라이트한 러닝화', type: '혼합', winner: 'tie', reason: '둘 다 부분적으로 맞음' },
+          ],
+        },
+        alert: { tone: 'info', text: '핵심 프레임: "누가 이기나"가 아니라 "어떤 질의에서 갈리나". 승자가 질의 유형에 따라 규칙적으로 바뀐다면, 한 방식만으로는 그 규칙의 반대편 질의를 반드시 놓친다.' },
+        code: {
+          lang: 'python',
+          filename: 'lexical_vs_vector.py (실험 셋업)',
+          lines: [
+            '"""',
+            'lexical_vs_vector.py — 같은 코퍼스·같은 질의로 BM25 vs 벡터 비교.',
+            '  - BM25   : rank_bm25 (렉시컬, 단어 일치)',
+            '  - Vector : sentence-transformers (임베딩, 의미 유사)',
+            '핵심 질문: "누가 이기나"가 아니라 "어떤 질의에서 갈리나".',
+            '"""',
+            'from rank_bm25 import BM25Okapi',
+            'from sentence_transformers import SentenceTransformer, util',
+            '',
+            '# 신발 + 전자제품이 섞인 공통 코퍼스(변인 통제)',
+            'CORPUS = [',
+            '    "RTX4090 그래픽카드 24GB 게이밍 GPU",   # d1',
+            '    "겨울용 방한 부츠 기모 방수 발열",        # d2',
+            '    "방수 레인코트 경량 우비 자켓",           # d3',
+            '    "가벼운 러닝화 마라톤 경량 운동화",       # d4',
+            '    "알엑스 LED 조명 스탠드 книга 독서등",    # d5',
+            '    "ORA-00942 테이블 없음 오류 해결 가이드", # d6',
+            ']',
+            '',
+            'QUERIES = [',
+            '    "RTX4090",              # 모델명(정확 매칭)',
+            '    "ORA-00942",            # 에러코드(정확 매칭·OOV)',
+            '    "겨울에 신을 따뜻한 신발",  # 자연어 문장(의미)',
+            '    "레인코트",              # 동의어',
+            '    "라이트한 러닝화",        # 혼합',
+            ']',
+            '',
+            '# 두 방식을 한 번에 준비 — 이후 스텝에서 질의별로 돌린다',
+            'bm25 = BM25Okapi([doc.split() for doc in CORPUS])',
+            'model = SentenceTransformer("jhgan/ko-sroberta-multitask")',
+            'doc_emb = model.encode(CORPUS, convert_to_tensor=True)',
+            '',
+            '# 다음 스텝: 질의를 하나씩 던져 두 랭킹을 나란히 비교한다.',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 2. 렉시컬이 이기는 질의 — 정확 매칭·희귀 토큰·OOV',
+        desc: '"RTX4090"을 검색하면 사용자는 정확히 그 제품 하나를 원한다. BM25는 이 희귀 토큰을 문서에서 그대로 찾아 d1을 1위로 올린다 — IDF가 높은(=희귀한) 단어의 정확 일치는 렉시컬의 홈그라운드다. 반면 벡터는 진다. "RTX4090"은 임베딩 모델의 학습 어휘 밖(OOV)이거나 하위 토큰으로 쪼개져 의미 벡터가 부실하고, "GPU·그래픽·조명 스탠드"처럼 주변 의미가 비슷한 것들에 유사도가 뭉개져 엉뚱한 d5(조명)를 위로 올린다. 에러코드("ORA-00942")·인명·신조어도 같은 이유로 벡터가 약하다 — 의미로 뭉개면 안 되고 글자 그대로 맞아야 하는 질의이기 때문이다.',
+        actor: '🎯 "RTX4090" — 정확 매칭류',
+        engine: 'lexical',
+        engineDetail: 'BM25 승 — 희귀 토큰 정확 일치',
+        query: 'RTX4090',
+        match: {
+          winner: 'lexical',
+          queryType: '모델명 · 희귀 토큰 · 정확 매칭',
+          bm25: [
+            { rank: 1, doc: 'd1 · RTX4090 그래픽카드 24GB GPU', rel: true, score: '18.4' },
+            { rank: 2, doc: 'd5 · 알엑스 LED 조명 스탠드', rel: false, score: '0.0' },
+            { rank: 3, doc: 'd6 · ORA-00942 오류 해결 가이드', rel: false, score: '0.0' },
+          ],
+          vector: [
+            { rank: 1, doc: 'd5 · 알엑스 LED 조명 스탠드', rel: false, score: '0.61' },
+            { rank: 2, doc: 'd1 · RTX4090 그래픽카드 24GB GPU', rel: true, score: '0.58' },
+            { rank: 3, doc: 'd4 · 가벼운 러닝화', rel: false, score: '0.44' },
+          ],
+          why: 'BM25는 희귀 토큰 "RTX4090"을 d1에서 정확히 찾아 1위. 벡터는 이 토큰이 OOV라 의미가 부실 → 주변 의미(조명·GPU)에 뭉개져 엉뚱한 d5를 1위로.',
+        },
+        caseCards: {
+          title: '벡터가 지는 정확 매칭 질의 4종',
+          items: [
+            { kind: 'lex', icon: '🔢', head: '모델명 — "RTX4090"', body: '희귀 토큰은 IDF가 높아 BM25의 강점. 임베딩엔 OOV·서브워드 분해로 의미가 부실.' },
+            { kind: 'lex', icon: '🧩', head: '에러코드 — "ORA-00942"', body: '학습 코퍼스 밖 문자열. 벡터엔 의미가 없어 아무 데나 붙는다. 글자 일치가 정답.' },
+            { kind: 'lex', icon: '🧑', head: '인명 — "김철수 저자"', body: '고유명사는 유사어가 없어야 정상. 벡터는 비슷한 이름·맥락에 뭉갠다.' },
+            { kind: 'lex', icon: '🆕', head: '신조어 — 최신 제품/밈', body: '학습 시점 이후 등장어는 OOV. 임베딩이 못 배운 단어는 렉시컬만 잡는다.' },
+          ],
+        },
+        alert: { tone: 'danger', text: '벡터의 약점은 "희귀·미학습 토큰"이다. 의미로 뭉개면 안 되고 글자 그대로 맞아야 하는 질의(모델명·코드·고유명사·신조어)에서 임베딩은 구조적으로 진다.' },
+        code: {
+          lang: 'python',
+          filename: 'lexical_wins.py (렉시컬 승 재현)',
+          lines: [
+            '"""',
+            'lexical_wins.py — 정확 매칭 질의에서 BM25가 이기는 이유 재현.',
+            '"""',
+            'import numpy as np',
+            'from rank_bm25 import BM25Okapi',
+            'from sentence_transformers import SentenceTransformer, util',
+            '',
+            'def top3(scores, corpus):',
+            '    """점수 배열 → 상위 3개 (문서, 점수)."""',
+            '    order = np.argsort(scores)[::-1][:3]',
+            '    return [(corpus[i], float(scores[i])) for i in order]',
+            '',
+            'query = "RTX4090"   # 희귀 토큰 · 정확 매칭',
+            '',
+            '# (1) BM25 — 토큰 그대로 일치 → d1 이 압도적 1위',
+            'bm25_scores = bm25.get_scores(query.split())',
+            'print(top3(bm25_scores, CORPUS))',
+            '#  → [("RTX4090 그래픽카드 ...", 18.4), ("...", 0.0), ...]',
+            '',
+            '# (2) Vector — "RTX4090" 은 OOV → 서브워드로 쪼개져 의미 부실',
+            'q_emb = model.encode(query, convert_to_tensor=True)',
+            'cos = util.cos_sim(q_emb, doc_emb)[0].cpu().numpy()',
+            'print(top3(cos, CORPUS))',
+            '#  → [("알엑스 LED 조명 ...", 0.61), ("RTX4090 ...", 0.58)]',
+            '#     주변 의미에 뭉개져 엉뚱한 조명(d5)을 1위로 올린다.',
+            '',
+            '# 결론: 희귀 토큰의 정확 일치는 IDF 높은 BM25의 홈그라운드.',
+            '#   에러코드·인명·신조어도 같은 이유로 벡터가 약하다.',
+          ],
+          highlight: [12, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 26, 27],
+        },
+      },
+      {
+        title: 'Step 3. 벡터가 이기는 질의 — 자연어 문장·동의어·오타·다국어',
+        desc: '"겨울에 신을 따뜻한 신발"이라고 검색하면, 정답 문서 d2("겨울용 방한 부츠 기모 발열")에는 "따뜻한"도 "신발"도 글자로는 한 번도 안 나온다. BM25는 겹치는 토큰이 "겨울" 하나뿐이라 관련도를 제대로 못 매긴다 — 토큰 불일치 앞에서 렉시컬은 눈이 먼다. 벡터는 이긴다. "방한·기모·발열"이 "따뜻한"과, "부츠"가 "신발"과 임베딩 공간에서 가까워 의미로 d2를 1위로 끌어올린다. 동의어("레인코트"↔"방수 자켓"), 오타 일부, 다국어도 마찬가지다 — 표면 글자가 달라도 의미가 같으면 벡터가 잡고, 바로 그 지점에서 BM25는 토큰이 안 겹쳐 진다.',
+        actor: '🧠 "겨울에 신을 따뜻한 신발" — 의미 변형류',
+        engine: 'vector',
+        engineDetail: 'Vector 승 — 토큰 안 겹쳐도 의미 일치',
+        query: '겨울에 신을 따뜻한 신발',
+        match: {
+          winner: 'vector',
+          queryType: '자연어 문장 · 동의어 · 의미 변형',
+          bm25: [
+            { rank: 1, doc: 'd3 · 방수 레인코트 경량 우비', rel: false, score: '2.1' },
+            { rank: 2, doc: 'd2 · 겨울용 방한 부츠 기모 발열', rel: true, score: '1.9' },
+            { rank: 3, doc: 'd4 · 가벼운 러닝화 경량', rel: false, score: '0.7' },
+          ],
+          vector: [
+            { rank: 1, doc: 'd2 · 겨울용 방한 부츠 기모 발열', rel: true, score: '0.79' },
+            { rank: 2, doc: 'd4 · 가벼운 러닝화 경량', rel: false, score: '0.52' },
+            { rank: 3, doc: 'd3 · 방수 레인코트 경량 우비', rel: false, score: '0.41' },
+          ],
+          why: 'BM25는 겹치는 토큰이 "겨울"뿐 → 정답 d2를 2위로 밀고 엉뚱한 d3를 위로. 벡터는 "방한·기모·발열≈따뜻한", "부츠≈신발" 의미 근접으로 d2를 1위로.',
+        },
+        caseCards: {
+          title: 'BM25가 지는 의미 변형 질의 4종',
+          items: [
+            { kind: 'vec', icon: '💬', head: '자연어 문장', body: '"겨울에 신을 따뜻한 신발" — 정답에 그 단어가 없다. 토큰이 안 겹치면 BM25는 실명.' },
+            { kind: 'vec', icon: '🔁', head: '동의어 — "레인코트"↔"방수 자켓"', body: '표면 글자가 달라 BM25 미탐. 벡터는 의미 근접으로 잡는다.' },
+            { kind: 'vec', icon: '✏️', head: '오타 일부 — "따듯한"', body: '한 글자 변형도 BM25엔 다른 토큰. 임베딩은 문맥으로 흡수.' },
+            { kind: 'vec', icon: '🌐', head: '다국어 — "sneakers"', body: '한국어 코퍼스에 영어 질의. BM25는 토큰 불일치, 다국어 임베딩은 연결.' },
+          ],
+        },
+        alert: { tone: 'good', text: 'BM25의 약점은 "토큰 불일치"다. 자연어 문장·동의어·오타·다국어처럼 표면 글자가 달라도 의미가 같은 질의에서 렉시컬은 겹치는 단어가 없어 구조적으로 진다.' },
+        code: {
+          lang: 'python',
+          filename: 'vector_wins.py (벡터 승 재현)',
+          lines: [
+            '"""',
+            'vector_wins.py — 의미 변형 질의에서 벡터가 이기는 이유 재현.',
+            '"""',
+            'import numpy as np',
+            'from sentence_transformers import util',
+            '',
+            'query = "겨울에 신을 따뜻한 신발"   # 자연어 문장',
+            'TARGET = "겨울용 방한 부츠 기모 방수 발열"   # 정답 d2',
+            '',
+            '# (1) BM25 — 겹치는 토큰이 "겨울" 하나뿐',
+            'overlap = set(query.split()) & set(TARGET.split())',
+            'print("겹치는 토큰:", overlap)   # → {"겨울"}  (나머지 0)',
+            'bm25_scores = bm25.get_scores(query.split())',
+            'print(top3(bm25_scores, CORPUS))',
+            '#  → 정답 d2 가 2위로 밀리고 엉뚱한 d3(레인코트)가 위로',
+            '',
+            '# (2) Vector — "방한/기모/발열≈따뜻한", "부츠≈신발"',
+            'q_emb = model.encode(query, convert_to_tensor=True)',
+            'cos = util.cos_sim(q_emb, doc_emb)[0].cpu().numpy()',
+            'print(top3(cos, CORPUS))',
+            '#  → [("겨울용 방한 부츠 ...", 0.79), ...]  정답 d2 가 1위',
+            '',
+            '# 왜? 임베딩 공간에서 "따뜻한" 근처에 방한·기모·발열이 모인다.',
+            '#   토큰이 안 겹쳐도 의미가 겹치면 벡터가 잡는다.',
+            '#   동의어·오타·다국어도 같은 원리로 BM25가 진다.',
+          ],
+          highlight: [7, 8, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 4. 실패 매트릭스 — "둘 다 써야 한다"의 논리적 도출',
+        desc: '두 스텝의 결과를 한 표로 모으면 패턴이 선명해진다 — 정확 매칭류는 렉시컬 승, 의미 변형류는 벡터 승. 승자가 질의 유형에 따라 갈리므로, 한 방식만 쓰면 그 방식이 지는 유형의 질의를 통째로 놓친다. 여기서 흔한 오해 하나 — "요즘은 벡터가 대세니 벡터만 쓰면 되지 않나?" 실서비스 질의 로그를 까 보면 모델명·품번·에러코드 같은 정확 매칭류가 의외로 큰 비중을 차지한다(그래서 로그 분석이 중요하다 — V-2-1에서 다룬다). 벡터만 깔면 이 질의들에서 조용히 품질이 무너진다. 결론은 취향이 아니라 논리다 — 승패가 유형별로 갈리고 두 유형이 모두 실제로 들어온다면, 둘 다 써서 각자의 홈그라운드를 살려야 한다.',
+        actor: '🧮 승패 매트릭스 + 실서비스 질의 분포',
+        engine: 'matrix',
+        engineDetail: '질의 유형 × 방식 — 승자가 갈린다',
+        query: '',
+        matrix: {
+          title: '질의 유형 × 방식 — 승패표',
+          headers: ['질의 유형', 'BM25(렉시컬)', 'Vector(벡터)'],
+          rows: [
+            { type: '모델명 "RTX4090"', bm25: 'win', vector: 'lose' },
+            { type: '에러코드 "ORA-00942"', bm25: 'win', vector: 'lose' },
+            { type: '인명·신조어(OOV)', bm25: 'win', vector: 'lose' },
+            { type: '자연어 문장', bm25: 'lose', vector: 'win' },
+            { type: '동의어', bm25: 'lose', vector: 'win' },
+            { type: '오타·다국어', bm25: 'lose', vector: 'win' },
+          ],
+        },
+        dist: {
+          title: '실서비스 질의 분포 — 정확 매칭류가 의외로 많다',
+          rows: [
+            { label: '정확 매칭류(모델명·품번·코드)', pct: 42, tone: 'lex' },
+            { label: '의미/자연어류', pct: 33, tone: 'vec' },
+            { label: '동의어·오타·혼합', pct: 25, tone: 'mix' },
+          ],
+          note: '"벡터만 깔면 된다"는 착각 — 정확 매칭류 42%가 조용히 무너진다. 로그 분석의 중요성(V-2-1 복선).',
+        },
+        alert: { tone: 'warn', text: '결론은 취향이 아니라 논리다. 승패가 유형별로 갈리고(매트릭스) 두 유형이 모두 실제로 들어온다면(분포), 하나만으로는 반드시 한쪽을 놓친다 → 둘 다 써야 한다.' },
+        code: {
+          lang: 'python',
+          filename: 'failure_matrix.py (승패 집계)',
+          lines: [
+            '"""',
+            'failure_matrix.py — 5질의 결과를 유형별 승패로 집계.',
+            '  relevant(정답 문서 id)를 알 때, 각 방식이 정답을 1위로 올렸는지 본다.',
+            '"""',
+            '',
+            'GOLD = {                       # 질의 → 정답 문서 id',
+            '    "RTX4090": "d1", "ORA-00942": "d6",',
+            '    "겨울에 신을 따뜻한 신발": "d2", "레인코트": "d3",',
+            '}',
+            '',
+            'def top1_id(scores, ids):',
+            '    """점수 최댓값의 문서 id."""',
+            '    return ids[int(np.argmax(scores))]',
+            '',
+            'DOC_IDS = ["d1", "d2", "d3", "d4", "d5", "d6"]',
+            '',
+            'for q, gold in GOLD.items():',
+            '    bm = top1_id(bm25.get_scores(q.split()), DOC_IDS)',
+            '    qe = model.encode(q, convert_to_tensor=True)',
+            '    ve = top1_id(util.cos_sim(qe, doc_emb)[0].cpu().numpy(), DOC_IDS)',
+            '    print(q, "| BM25:", bm == gold, "| Vec:", ve == gold)',
+            '',
+            '# 출력 패턴:',
+            '#   RTX4090            | BM25: True  | Vec: False   ← 렉시컬 승',
+            '#   ORA-00942          | BM25: True  | Vec: False   ← 렉시컬 승',
+            '#   겨울에 신을 ...신발 | BM25: False | Vec: True    ← 벡터 승',
+            '#   레인코트            | BM25: False | Vec: True    ← 벡터 승',
+            '#',
+            '# 승패가 유형별로 갈린다 → 하나만 쓰면 반대편 유형을 통째로 놓친다.',
+            '# 실서비스 로그엔 두 유형이 모두 들어온다(V-2-1) → 둘 다 써야 한다.',
+          ],
+          highlight: [5, 6, 7, 8, 16, 17, 18, 19, 20, 23, 24, 25, 26, 29, 30],
+        },
+      },
+      {
+        title: 'Step 5. 합치는 방법의 문제 — 점수 단위가 다르다',
+        desc: '"둘 다 쓰자"까지는 왔는데, 막상 합치려니 벽에 부딪힌다. BM25 점수는 0에서 수십까지 제멋대로 커지고(코퍼스·질의 길이에 따라 상한이 없다), 코사인 유사도는 0~1에 갇혀 있다. 두 점수를 그냥 더하면 스케일이 큰 BM25가 합계를 지배해 벡터가 무의미해진다. "그럼 정규화하자"도 함정이다 — min-max 정규화는 질의마다 최솟값·최댓값이 바뀌어(특히 이상치 하나에) 결과가 요동치고, 질의 간 비교도 불안정하다. 근본 통찰은 이렇다 — 두 점수의 "크기"는 애초에 같은 자로 잴 수 없다. 그러나 각 방식이 매긴 "순위(1등, 2등...)"는 방식이 달라도 동일한 의미를 갖는다. 그래서 점수가 아니라 순위로 합친다 — 이것이 다음 장 RRF(Reciprocal Rank Fusion)의 출발점이다.',
+        actor: '⚖️ 점수 스케일 불일치 → 순위로 합치기',
+        engine: 'merge',
+        engineDetail: 'BM25(0~수십) + Cosine(0~1) — 단위 불일치',
+        query: '',
+        scaleViz: {
+          title: '점수 스케일 불일치 — 그냥 더하면 BM25가 지배한다',
+          bm25: { label: 'BM25 점수', value: 18.4, max: 20, tone: 'lex', range: '0 ~ 수십 (상한 없음)' },
+          vector: { label: 'Cosine 유사도', value: 0.79, max: 1, tone: 'vec', range: '0 ~ 1 (상한 고정)' },
+          sumNote: '단순 합: 18.4 + 0.79 = 19.19 → 사실상 BM25 점수. 벡터의 0.79는 반올림 오차 수준으로 묻힌다.',
+        },
+        rrfBox: {
+          title: '"점수"가 아니라 "순위"로 합치자 → RRF',
+          trap: 'min-max 정규화의 함정: 질의마다 min·max가 바뀜(이상치 하나에 요동) → 불안정·질의 간 비교 불가',
+          insight: '두 점수의 크기는 같은 자로 못 잰다. 하지만 "1등·2등·3등"이라는 순위는 방식이 달라도 뜻이 같다.',
+          formula: 'RRF(d) = Σ 1 / (k + rank_방식(d))     # k=60 관례',
+          next: '다음 장 IV-1-2: RRF로 두 랭킹을 순위 기반으로 합쳐 스케일 문제 없이 하이브리드를 만든다.',
+        },
+        alert: { tone: 'info', text: '점수의 "크기"는 방식마다 단위가 달라 못 더한다. 그러나 "순위"는 방식이 달라도 같은 의미다 → 점수가 아니라 순위로 합치는 RRF가 다음 장의 답.' },
+        code: {
+          lang: 'python',
+          filename: 'score_merge_problem.py (스케일 함정 재현)',
+          lines: [
+            '"""',
+            'score_merge_problem.py — 점수 단순 합산이 왜 안 되는지 재현.',
+            '"""',
+            'import numpy as np',
+            '',
+            'query = "RTX4090"',
+            'bm25_scores = bm25.get_scores(query.split())      # 0 ~ 수십',
+            'qe = model.encode(query, convert_to_tensor=True)',
+            'cos = util.cos_sim(qe, doc_emb)[0].cpu().numpy()  # 0 ~ 1',
+            '',
+            'print(bm25_scores.max(), cos.max())   # 예: 18.4  0.61',
+            '',
+            '# (1) 단순 합산 — 스케일 큰 BM25 가 지배 → 벡터 무의미',
+            'naive = bm25_scores + cos',
+            'print("합산 1위:", CORPUS[int(np.argmax(naive))])',
+            '#  → BM25 순위와 사실상 동일. cos 의 0~1 은 묻힌다.',
+            '',
+            '# (2) min-max 정규화 — 질의마다 min·max 가 바뀌어 불안정',
+            'def minmax(x):',
+            '    lo, hi = x.min(), x.max()',
+            '    return (x - lo) / (hi - lo + 1e-9)   # 이상치 하나에 요동',
+            'mixed = minmax(bm25_scores) + minmax(cos)',
+            '#  질의가 바뀌면 스케일 기준이 또 바뀐다 → 재현성 없음',
+            '',
+            '# (3) 근본 해법: 점수가 아니라 "순위"로 합친다 (RRF)',
+            'def rrf(rank, k=60):',
+            '    return 1.0 / (k + rank)',
+            '# rank 는 방식이 달라도 의미가 같다 → 스케일 문제 소멸.',
+            '# 다음 장 IV-1-2 에서 두 랭킹을 RRF 로 융합한다.',
+          ],
+          highlight: [6, 7, 8, 9, 11, 13, 14, 15, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 승자 배지
+    // ─────────────────────────────────────────────────────
+    const WINNER_STYLE = {
+      lexical: { bg: 'bg-sky-600',     text: 'text-white', label: '🏆 렉시컬(BM25) 승' },
+      vector:  { bg: 'bg-indigo-600',  text: 'text-white', label: '🏆 벡터(임베딩) 승' },
+      tie:     { bg: 'bg-slate-500',   text: 'text-white', label: '🤝 무승부' },
+    };
+
+    // ─────────────────────────────────────────────────────
+    // 랭킹 한 열(방식 하나의 상위 3개)
+    // ─────────────────────────────────────────────────────
+    function RankColumn({ title, accent, rows, isWinner }) {
+      return (
+        <div className={`flex-1 rounded-lg border-2 p-2 ${accent.border} ${accent.bg}`}>
+          <div className={`text-[11px] font-bold mb-1.5 flex items-center justify-between ${accent.text}`}>
+            <span>{title}</span>
+            {isWinner && <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/80 text-emerald-700 border border-emerald-300">WIN</span>}
+          </div>
+          <div className="space-y-1">
+            {rows.map((r) => (
+              <div
+                key={r.rank}
+                className={`flex items-center gap-1.5 rounded px-1.5 py-1 border ${r.rel ? 'bg-emerald-50 border-emerald-400' : 'bg-white border-slate-200'}`}
+              >
+                <span className={`text-[10px] font-bold w-4 text-center ${r.rank === 1 ? 'text-amber-500' : 'text-slate-400'}`}>{r.rank}</span>
+                <span className="text-[10px] flex-1 min-w-0 truncate text-slate-800">{r.doc}</span>
+                <span className={`text-[9px] font-mono ${r.rel ? 'text-emerald-700' : 'text-slate-400'}`}>{r.score}</span>
+                <span className="text-[10px]">{r.rel ? '✓' : '·'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 대결 스코어보드 (Step 2~3) — 두 방식 랭킹 나란히
+    // ─────────────────────────────────────────────────────
+    function Scoreboard({ box }) {
+      if (!box) return null;
+      const win = WINNER_STYLE[box.winner] || WINNER_STYLE.tie;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-xs font-bold text-sky-900">🥊 방식별 상위 3 랭킹 (✓=정답 문서)</div>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${win.bg} ${win.text}`}>{win.label}</span>
+          </div>
+          <div className="text-[10px] text-slate-500 mb-2">질의 유형: {box.queryType}</div>
+          <div className="flex gap-2">
+            <RankColumn
+              title="BM25 · 렉시컬"
+              accent={{ border: 'border-sky-300', bg: 'bg-sky-50', text: 'text-sky-900' }}
+              rows={box.bm25}
+              isWinner={box.winner === 'lexical'}
+            />
+            <RankColumn
+              title="Embedding · 벡터"
+              accent={{ border: 'border-indigo-300', bg: 'bg-indigo-50', text: 'text-indigo-900' }}
+              rows={box.vector}
+              isWinner={box.winner === 'vector'}
+            />
+          </div>
+          <div className="mt-2 text-[10px] leading-snug text-slate-700 bg-amber-50 border border-amber-200 rounded p-1.5">
+            <span className="font-bold text-amber-900">왜 갈렸나: </span>{box.why}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 대결 미리보기 표 (Step 1)
+    // ─────────────────────────────────────────────────────
+    function PreviewTable({ box }) {
+      if (!box) return null;
+      const badge = {
+        lexical: { c: 'text-sky-700 bg-sky-100 border-sky-300', t: '렉시컬' },
+        vector:  { c: 'text-indigo-700 bg-indigo-100 border-indigo-300', t: '벡터' },
+        tie:     { c: 'text-slate-600 bg-slate-100 border-slate-300', t: '무승부' },
+      };
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🔭 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-900 border-b border-sky-200">
+                <th className="text-left py-0.5">질의</th>
+                <th className="text-left py-0.5 pl-2">유형</th>
+                <th className="text-left py-0.5 pl-2">승자</th>
+                <th className="text-left py-0.5 pl-2">이유</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => {
+                const b = badge[r.winner];
+                return (
+                  <tr key={r.q} className="border-t border-sky-100 align-top">
+                    <td className="py-1 font-mono font-bold text-slate-800">{r.q}</td>
+                    <td className="py-1 pl-2 text-slate-600">{r.type}</td>
+                    <td className="py-1 pl-2"><span className={`px-1.5 py-0.5 rounded-full border font-bold ${b.c}`}>{b.t}</span></td>
+                    <td className="py-1 pl-2 text-slate-600">{r.reason}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 실패 사례 카드 (Step 2~3)
+    // ─────────────────────────────────────────────────────
+    const CASE_TONE = {
+      lex: 'border-sky-400 bg-sky-50 text-sky-900',
+      vec: 'border-indigo-400 bg-indigo-50 text-indigo-900',
+    };
+    function CaseCards({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-slate-300 bg-white p-3">
+          <div className="text-xs font-bold text-slate-800 mb-2">🔎 {box.title}</div>
+          <div className="grid grid-cols-2 gap-2">
+            {box.items.map((it, i) => (
+              <div key={i} className={`rounded border-2 p-2 ${CASE_TONE[it.kind]}`}>
+                <div className="text-[11px] font-bold mb-0.5">{it.icon} {it.head}</div>
+                <div className="text-[10px] leading-snug">{it.body}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 승패 매트릭스 (Step 4)
+    // ─────────────────────────────────────────────────────
+    function WinCell({ v }) {
+      const win = v === 'win';
+      return (
+        <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${win ? 'text-emerald-700 bg-emerald-100 border border-emerald-300' : 'text-red-700 bg-red-100 border border-red-300'}`}>
+          {win ? '◎ WIN' : '✗ LOSE'}
+        </span>
+      );
+    }
+    function Matrix({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🧮 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-900 border-b border-sky-200">
+                {box.headers.map((h, i) => (
+                  <th key={i} className={`py-1 ${i === 0 ? 'text-left' : 'text-center'}`}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.type} className="border-t border-sky-100">
+                  <td className="py-1.5 font-bold text-slate-800">{r.type}</td>
+                  <td className="py-1.5 text-center"><WinCell v={r.bm25} /></td>
+                  <td className="py-1.5 text-center"><WinCell v={r.vector} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-1.5 text-[10px] text-slate-700">대각선이 갈린다 — 승자가 유형에 따라 뒤집힌다. 하나만 쓰면 반대편 유형을 통째로 놓친다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 실서비스 질의 분포 (Step 4)
+    // ─────────────────────────────────────────────────────
+    const DIST_TONE = { lex: 'bg-sky-500', vec: 'bg-indigo-500', mix: 'bg-amber-500' };
+    function DistBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-amber-300 bg-amber-50 p-3">
+          <div className="text-xs font-bold text-amber-900 mb-2">📊 {box.title}</div>
+          <div className="space-y-2">
+            {box.rows.map((r, i) => (
+              <div key={i}>
+                <div className="flex items-center justify-between text-[10px] mb-0.5">
+                  <span className="text-slate-800 font-bold">{r.label}</span>
+                  <span className="font-mono text-slate-600">{r.pct}%</span>
+                </div>
+                <div className="h-2.5 rounded-full bg-white border border-amber-200 overflow-hidden">
+                  <div className={`h-full ${DIST_TONE[r.tone]}`} style={{ width: `${r.pct}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-amber-900 leading-snug">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 점수 스케일 불일치 시각화 (Step 5)
+    // ─────────────────────────────────────────────────────
+    const SCALE_TONE = { lex: 'bg-sky-500', vec: 'bg-indigo-500' };
+    function ScaleBar({ item }) {
+      const pct = Math.min(100, (item.value / item.max) * 100);
+      return (
+        <div>
+          <div className="flex items-center justify-between text-[10px] mb-0.5">
+            <span className="font-bold text-slate-800">{item.label}</span>
+            <span className="font-mono text-slate-600">{item.value} · 범위 {item.range}</span>
+          </div>
+          <div className="h-3 rounded-full bg-white border border-slate-300 overflow-hidden">
+            <div className={`h-full ${SCALE_TONE[item.tone]}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+    function ScaleViz({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">⚖️ {box.title}</div>
+          <div className="space-y-2.5 bg-white rounded p-2 border border-red-200">
+            <ScaleBar item={box.bm25} />
+            <ScaleBar item={box.vector} />
+          </div>
+          <div className="mt-2 text-[10px] text-red-900 leading-snug bg-white border border-red-200 rounded p-1.5">
+            <span className="font-bold">문제: </span>{box.sumNote}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 순위 기반 결합(RRF) 예고 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function RrfBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-sky-500 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+          <div className="text-sm font-bold text-sky-900 mb-2">🧭 {box.title}</div>
+          <div className="text-[10px] text-red-800 bg-white border border-red-200 rounded p-1.5 mb-1.5">
+            <span className="font-bold">함정: </span>{box.trap}
+          </div>
+          <div className="text-[10px] text-sky-900 bg-white border border-sky-200 rounded p-1.5 mb-1.5">
+            <span className="font-bold">통찰: </span>{box.insight}
+          </div>
+          <div className="text-[11px] font-mono text-indigo-900 bg-indigo-100 border border-indigo-300 rounded p-1.5 mb-1.5">{box.formula}</div>
+          <div className="text-[10px] text-sky-900 leading-snug font-bold">➡ {box.next}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 렉시컬 vs 벡터 대결 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      preview: { icon: '🥊', label: '대결 구도' },
+      lexical: { icon: '🎯', label: '렉시컬 승' },
+      vector:  { icon: '🧠', label: '벡터 승' },
+      matrix:  { icon: '🧮', label: '실패 매트릭스' },
+      merge:   { icon: '⚖️', label: '합치기 함정' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.preview;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>렉시컬 vs 벡터 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          {state.query && (
+            <div className="mb-2 flex items-center gap-2 px-2 py-1 rounded border border-sky-200 bg-sky-50">
+              <span className="text-xs">🔎</span>
+              <span className="text-[11px] font-mono text-sky-800">검색어: "{state.query}"</span>
+            </div>
+          )}
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            방식: {state.engineDetail}
+          </div>
+          <PreviewTable box={state.preview} />
+          <Scoreboard box={state.match} />
+          <CaseCards box={state.caseCards} />
+          <Matrix box={state.matrix} />
+          <DistBox box={state.dist} />
+          <ScaleViz box={state.scaleViz} />
+          <RrfBox box={state.rrfBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">IV-1-1. 렉시컬 vs 벡터 — 언제 뭐가 이기나</h1>
+                <p className="text-sm text-sky-800/80">BM25와 임베딩의 실패 사례 교환전 — 하나만 쓰면 반드시 지는 질의가 있다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                렉시컬(BM25)과 벡터(임베딩)의 우열은 "누가 낫냐"가 아니라 "어떤 질의냐"에 달렸다.
+                모델명·에러코드·인명·신조어 같은 정확 매칭류·OOV는 렉시컬이, 자연어 문장·동의어·오타·다국어 같은 의미 변형류는 벡터가 이긴다.
+                실서비스 로그엔 두 유형이 모두 들어오므로(정확 매칭류가 의외로 큰 비중), 하나만 쓰면 반대편을 반드시 놓친다 — 둘 다 써야 한다.
+                그런데 BM25(0~수십)와 코사인(0~1)은 스케일이 달라 단순 합산도 min-max 정규화도 불안정하다.
+                해법은 "점수가 아니라 순위로 합치는 것" — 다음 장 IV-1-2의 RRF로 직결된다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['렉시컬검색', 'BM25', '벡터검색', '임베딩', 'OOV', '정확매칭', '의미유사', '동의어', '실패매트릭스', '질의로그분석', '스케일불일치', 'RRF', '하이브리드'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./IV-1-2.html" className="underline hover:no-underline">다음: IV-1-2 (RRF 하이브리드) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

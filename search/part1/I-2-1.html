@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — I-2-1. 토크나이저·형태소 분석 — 한국어 nori</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔍</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search I-2-1 — 토크나이저·형태소 분석 — 한국어 nori
+    학습 목표: "삼성전자 노트북을 샀다" 라는 한 문장을 검색 가능한 조각(토큰)으로 쪼개는 과정을 따라가며
+              (1) 분석기의 3단 구조(char filter → tokenizer → token filter)를 영어 예제로 이해하고
+              (2) 공백 기준 자르기가 교착어인 한국어에서 왜 검색 실패를 만드는지 재현하고
+              (3) nori 형태소 분석기의 복합명사 분해·조사 제거·분해 모드 3종을 비교하고
+              (4) 사용자 사전과 동의어 필터(색인 시 vs 검색 시)로 실무 문제를 잡고
+              (5) 색인/검색 분석기 일치 원칙과 필드별 분석기 설계까지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 3단 파이프 토큰 변형 애니메이션 / nori 분해 모드 비교표 / 사용자 사전·동의어)
+                     / 우(VSCode CodeViewer: analyzer_demo.py / analyzer_settings.json)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 분석기 3단 → 한국어 실패 → nori → 사전·동의어 → 실무 설계
+    //   pipe   : 분석기 파이프라인 시뮬레이션 { input, stages:[{ name, sub, tokens:[{t, tag?}] }] }
+    //            토큰이 단계를 지날 때마다 어떻게 변형/제거되는지 chip 으로 표현
+    //   query  : 좌측 상단 검색어 배지
+    //   code   : 우측 CodeViewer 파일 (analyzer_demo.py / analyzer_settings.json)
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 분석기의 3단 구조 — 문자를 다듬고, 자르고, 가공한다',
+        desc: '검색 엔진은 문장을 통째로 저장하지 않는다. "검색 가능한 조각(토큰)"으로 쪼개 역색인에 넣는데, 이 쪼개는 부품이 분석기(analyzer)다. 분석기는 항상 세 칸을 순서대로 지난다 — ① char filter 는 자르기 전에 원문을 다듬고(HTML 태그 제거, 문자 치환), ② tokenizer 는 다듬은 문자열을 실제로 자르며(공백·규칙 기준), ③ token filter 는 잘린 토큰을 가공한다(소문자화, 불용어 제거, 어간 추출). 영어 "The &lt;b&gt;Running&lt;/b&gt; Shoes" 가 이 파이프를 지나면 html_strip 이 태그를 걷어내고, standard tokenizer 가 단어로 자르고, lowercase→stop→stemmer 가 running 을 run 으로 바꾼다. 순서가 곧 결과다 — tokenizer 는 하나뿐이지만 char/token filter 는 여러 개를 체인으로 걸 수 있고, 거는 순서가 최종 토큰을 바꾼다.',
+        actor: '🔤 영어 "The <b>Running</b> Shoes"',
+        engine: 'pipe',
+        engineDetail: 'char filter → tokenizer → token filter',
+        query: 'running shoes',
+        pipe: {
+          input: 'The <b>Running</b> Shoes',
+          stages: [
+            { name: '① char filter', sub: 'html_strip — 태그 제거', tokens: [{ t: 'The Running Shoes' }], raw: true },
+            { name: '② tokenizer', sub: 'standard — 단어로 자름', tokens: [{ t: 'The' }, { t: 'Running' }, { t: 'Shoes' }] },
+            { name: '③ lowercase', sub: 'token filter — 소문자화', tokens: [{ t: 'the' }, { t: 'running' }, { t: 'shoes' }] },
+            { name: '③ stop', sub: 'token filter — 불용어 제거', tokens: [{ t: 'the', drop: true }, { t: 'running' }, { t: 'shoes' }] },
+            { name: '③ stemmer', sub: 'token filter — 어간 추출', tokens: [{ t: 'run', changed: true }, { t: 'shoe', changed: true }] },
+          ],
+        },
+        alert: { tone: 'info', text: 'tokenizer 는 정확히 1개, char/token filter 는 0개 이상을 체인으로 건다. running→run 처럼 색인 시점에 어간까지 정규화해 두면, 사용자가 "run" 을 쳐도 "running" 문서가 걸린다.' },
+        code: {
+          lang: 'python',
+          filename: 'analyzer_demo.py — 3단 파이프 확인',
+          lines: [
+            '"""',
+            'analyzer_demo.py — 분석기 3단 구조를 _analyze 로 눈으로 확인',
+            'char filter → tokenizer → token filter 순서로 토큰이 변형된다.',
+            '실행: docker 로 띄운 Elasticsearch(9200)에 붙는다.',
+            '"""',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            '',
+            '# _analyze: 색인하지 않고 "이 분석기로 자르면 뭐가 나오나" 만 확인',
+            'body = {',
+            '    "char_filter": ["html_strip"],        # ① 원문 다듬기',
+            '    "tokenizer": "standard",              # ② 단어로 자르기',
+            '    "filter": ["lowercase", "stop", "porter_stem"],  # ③ 가공(순서 중요)',
+            '    "text": "The <b>Running</b> Shoes",',
+            '}',
+            'res = es.indices.analyze(body=body)',
+            '',
+            'tokens = [t["token"] for t in res["tokens"]]',
+            'print(tokens)   # -> [\'run\', \'shoe\']',
+            '#  html_strip:  "The Running Shoes"',
+            '#  standard:    [The, Running, Shoes]',
+            '#  lowercase:   [the, running, shoes]',
+            '#  stop:        [running, shoes]        (the 제거)',
+            '#  porter_stem: [run, shoe]             (어간 추출)',
+            '#',
+            '# 핵심: filter 순서를 바꾸면 결과가 달라진다.',
+            '#   stop 을 lowercase 앞에 두면 "The"(대문자)가 안 걸러진다.',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 16, 18, 19],
+        },
+      },
+      {
+        title: 'Step 2. 영어식으로 한국어를 자르면 — "노트북을" ≠ "노트북"',
+        desc: '영어는 공백이 곧 단어 경계라 whitespace/standard tokenizer 로 충분하다. 하지만 한국어는 교착어 — 명사 뒤에 조사(을/를/이/가)와 어미가 달라붙는다. "삼성전자 노트북을 샀다" 를 공백으로 자르면 [삼성전자, 노트북을, 샀다] 가 나오는데, 사용자는 검색창에 조사를 떼고 "노트북" 이라고 친다. 색인에는 "노트북을" 이 들어가 있고 질의는 "노트북" 이니 문자열이 달라 매칭 실패 — 검색 결과 0건이다. 복합명사도 문제다. "삼성전자" 는 통짜 한 토큰이라 "삼성" 으로는 안 걸린다. 즉 공백 토크나이저는 한국어에서 조사·어미·복합명사라는 세 벽에 동시에 부딪힌다. 이건 튜닝으로 못 넘고, 단어의 "형태"를 이해하는 형태소 분석기가 있어야 한다.',
+        actor: '🇰🇷 공백 tokenizer → 검색 실패 재현',
+        engine: 'fail',
+        engineDetail: 'whitespace tokenizer — 조사가 붙은 채 색인됨',
+        query: '노트북',
+        pipe: {
+          input: '삼성전자 노트북을 샀다',
+          stages: [
+            { name: '① char filter', sub: '없음 — 원문 그대로', tokens: [{ t: '삼성전자 노트북을 샀다' }], raw: true },
+            { name: '② whitespace', sub: '공백으로만 자름', tokens: [{ t: '삼성전자' }, { t: '노트북을', bad: true }, { t: '샀다', bad: true }] },
+            { name: '③ (필터 없음)', sub: '가공 없이 그대로 색인', tokens: [{ t: '삼성전자' }, { t: '노트북을', bad: true }, { t: '샀다', bad: true }] },
+          ],
+        },
+        matchFail: {
+          title: '색인 토큰 vs 검색어 — 문자열이 달라 미스매치',
+          indexed: ['삼성전자', '노트북을', '샀다'],
+          queries: [
+            { q: '노트북', hit: false, why: '색인엔 "노트북을"(조사 붙음) → 불일치' },
+            { q: '삼성', hit: false, why: '"삼성전자" 통짜 토큰 → 복합명사 분해 안 됨' },
+            { q: '노트북을', hit: true, why: '토큰과 글자까지 완전 일치해야만 걸림' },
+          ],
+        },
+        alert: { tone: 'danger', text: '교착어인 한국어는 조사·어미가 명사에 달라붙는다. 공백 tokenizer 는 "노트북을"을 통째로 색인하므로, 조사를 뗀 "노트북" 질의와 문자열이 어긋나 0건이 된다. 복합명사 "삼성전자"도 "삼성"으로 못 찾는다.' },
+        code: {
+          lang: 'python',
+          filename: 'analyzer_demo.py — 공백 자르기의 실패',
+          lines: [
+            '"""',
+            'analyzer_demo.py — 한국어를 공백으로 자르면 왜 실패하나',
+            '"""',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            '',
+            'text = "삼성전자 노트북을 샀다"',
+            '',
+            '# whitespace tokenizer: 공백 기준으로만 자른다',
+            'res = es.indices.analyze(body={',
+            '    "tokenizer": "whitespace",',
+            '    "text": text,',
+            '})',
+            'print([t["token"] for t in res["tokens"]])',
+            '#  -> [\'삼성전자\', \'노트북을\', \'샀다\']',
+            '',
+            '# 색인엔 "노트북을"(조사 "을" 포함) 이 들어간다.',
+            '# 사용자는 검색창에 "노트북" 이라고 친다 → 문자열 불일치 → 0건',
+            '',
+            'def match(indexed_tokens, query):',
+            '    """전문검색 매칭 흉내: 질의어가 색인 토큰과 정확히 같아야 걸림."""',
+            '    return query in indexed_tokens',
+            '',
+            'indexed = ["삼성전자", "노트북을", "샀다"]',
+            'print(match(indexed, "노트북"))    # -> False  (조사 때문에 미스)',
+            'print(match(indexed, "삼성"))      # -> False  (복합명사 미분해)',
+            'print(match(indexed, "노트북을"))  # -> True   (완전 일치만 성공)',
+            '#',
+            '# 결론: 공백 자르기로는 교착어를 감당할 수 없다.',
+            '#   → 단어의 "형태" 를 아는 형태소 분석기(nori) 가 필요하다.',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 16, 21, 22, 23, 25, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 3. 형태소 분석 — nori 가 하는 일',
+        desc: 'nori 는 Elasticsearch 공식 한국어 형태소 분석기다. 사전 기반으로 문장을 형태소(의미의 최소 단위)로 쪼개고, 각 조각에 품사 태그를 붙인다. "삼성전자 노트북을 샀다" 를 nori 로 돌리면 복합명사 "삼성전자" 를 [삼성, 전자] 로 분해하고(원본도 함께 남길 수 있다), 조사 "을"(품사 J)을 떼며, "샀다" 를 어간 "사"(동사)로 되돌린다. 핵심은 복합명사 분해 모드(decompound_mode) 3종이다 — none 은 분해 없이 "삼성전자" 통짜, discard 는 분해 조각 [삼성, 전자] 만 남기고 원본을 버림, mixed 는 원본과 조각을 모두 색인([삼성전자, 삼성, 전자]). 실무 기본값은 mixed 다 — "삼성전자" 로도 "삼성" 으로도 걸려야 하니까. 여기에 품사 태그 필터(nori_part_of_speech)로 조사·어미·기호를 색인에서 빼면, 검색에 의미 있는 어근만 깔끔히 남는다.',
+        actor: '🧬 nori — 복합명사 분해 + 조사 제거',
+        engine: 'nori',
+        engineDetail: 'nori_tokenizer + nori_part_of_speech',
+        query: '삼성 / 노트북',
+        pipe: {
+          input: '삼성전자 노트북을 샀다',
+          stages: [
+            { name: '① nori tokenizer', sub: '형태소로 분해 + 품사 태그', tokens: [{ t: '삼성전자', tag: 'NNP' }, { t: '삼성', tag: 'NNG' }, { t: '전자', tag: 'NNG' }, { t: '노트북', tag: 'NNG' }, { t: '을', tag: 'J', drop: true }, { t: '사', tag: 'VV', changed: true }, { t: '았', tag: 'E', drop: true }, { t: '다', tag: 'E', drop: true }] },
+            { name: '② nori_part_of_speech', sub: '조사(J)·어미(E) 제거', tokens: [{ t: '삼성전자', tag: 'NNP' }, { t: '삼성', tag: 'NNG' }, { t: '전자', tag: 'NNG' }, { t: '노트북', tag: 'NNG' }, { t: '사', tag: 'VV' }] },
+          ],
+        },
+        decompound: {
+          title: 'decompound_mode 3종 — "삼성전자" 를 어떻게 색인하나',
+          rows: [
+            { mode: 'none', out: ['삼성전자'], note: '분해 안 함. "삼성"으로 못 찾음', tone: 'bad' },
+            { mode: 'discard', out: ['삼성', '전자'], note: '조각만. "삼성전자" 원본이 사라짐', tone: 'warn' },
+            { mode: 'mixed', out: ['삼성전자', '삼성', '전자'], note: '원본+조각 모두. 실무 기본값 ◎', tone: 'good' },
+          ],
+        },
+        alert: { tone: 'good', text: 'mixed 모드는 "삼성전자" 원본과 분해 조각 [삼성, 전자] 를 모두 색인해 두 검색어 모두 잡는다. 대신 색인 크기가 커진다 — 정확도(recall)와 저장 비용의 트레이드오프다.' },
+        code: {
+          lang: 'python',
+          filename: 'analyzer_demo.py — nori 분해 모드 비교',
+          lines: [
+            '"""',
+            'analyzer_demo.py — nori 로 형태소 분석 + decompound 3모드 비교',
+            '전제: elasticsearch-plugin install analysis-nori (플러그인 설치)',
+            '"""',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            'TEXT = "삼성전자 노트북을 샀다"',
+            '',
+            '# explain=True 로 각 토큰의 품사(leftPOS)까지 확인할 수 있다',
+            'res = es.indices.analyze(body={',
+            '    "tokenizer": "nori_tokenizer",',
+            '    "filter": ["nori_part_of_speech"],  # 조사/어미 품사 제거',
+            '    "explain": True,',
+            '    "text": TEXT,',
+            '})',
+            '',
+            '# decompound_mode 를 바꿔 가며 "삼성전자" 결과를 비교',
+            'for mode in ["none", "discard", "mixed"]:',
+            '    r = es.indices.analyze(body={',
+            '        "tokenizer": {',
+            '            "type": "nori_tokenizer",',
+            '            "decompound_mode": mode,',
+            '        },',
+            '        "text": "삼성전자",',
+            '    })',
+            '    print(mode, [t["token"] for t in r["tokens"]])',
+            '#  none     [\'삼성전자\']',
+            '#  discard  [\'삼성\', \'전자\']',
+            '#  mixed    [\'삼성전자\', \'삼성\', \'전자\']   <- 실무 기본',
+          ],
+          highlight: [11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 4. 사용자 사전과 동의어 — 사전이 모르는 말, 같은 뜻의 말',
+        desc: 'nori 도 만능은 아니다. 신조어·브랜드명은 내장 사전에 없어 이상하게 잘린다 — "아이폰15프로" 가 [아이폰, 15, 프로] 로 흩어지면 "아이폰15프로" 정확검색이 어긋난다. 사용자 사전(user_dictionary)에 "아이폰15프로" 를 한 줄 등록하면 nori 가 그걸 한 토큰으로 고정한다(원한다면 분해 규칙까지 지정). 다른 축은 동의어(synonym) — "노트북" 과 "랩탑" 은 다른 글자지만 같은 뜻이라 서로 검색되게 묶어야 한다. 중요한 건 적용 시점이다. 색인 시 동의어(synonym at index)는 색인에 두 단어를 모두 저장해 저장·재색인 비용이 크지만 검색이 빠르다. 검색 시 동의어(synonym_graph at search)는 색인은 가볍게 두고 질의를 확장하는데, 사전을 바꿔도 재색인 없이 즉시 반영돼 실무에서 선호된다 — 특히 multi-word 동의어는 synonym_graph 를 검색 시 쓰는 게 정석이다.',
+        actor: '📖 user_dictionary + synonym filter',
+        engine: 'dict',
+        engineDetail: 'user_dictionary · synonym_graph',
+        query: '아이폰15프로 / 랩탑',
+        pipe: {
+          input: '아이폰15프로 케이스',
+          stages: [
+            { name: '사전 등록 전', sub: 'nori 기본 — 신조어를 흩뜨림', tokens: [{ t: '아이폰', tag: 'NNG', bad: true }, { t: '15', tag: 'SN', bad: true }, { t: '프로', tag: 'NNG', bad: true }, { t: '케이스', tag: 'NNG' }] },
+            { name: '사전 등록 후', sub: 'user_dictionary 에 "아이폰15프로"', tokens: [{ t: '아이폰15프로', tag: 'NNP', changed: true }, { t: '케이스', tag: 'NNG' }] },
+          ],
+        },
+        synonym: {
+          title: '동의어 적용 시점 — 색인 시 vs 검색 시',
+          rows: [
+            { when: '색인 시 (index)', how: '색인에 [노트북, 랩탑] 둘 다 저장', pro: '검색 빠름', con: '사전 바꾸면 전체 재색인 필요', tone: 'warn' },
+            { when: '검색 시 (search)', how: '질의 "랩탑" → (랩탑 OR 노트북) 확장', pro: '재색인 없이 즉시 반영 ◎', con: '질의마다 확장 비용(작음)', tone: 'good' },
+          ],
+          note: 'multi-word 동의어("삼성 노트북" ↔ "삼성노트북")는 synonym_graph 를 검색 시 적용하는 것이 정석. 색인 시 적용은 그래프 토큰을 평탄화해 위치 정보가 깨질 수 있다.',
+        },
+        alert: { tone: 'warn', text: '사용자 사전과 동의어는 "재색인 비용" 관점으로 갈린다. 자주 바뀌는 동의어는 검색 시(synonym_graph) 적용해 사전 파일만 갱신하면 즉시 반영되게 하는 편이 운영이 편하다.' },
+        code: {
+          lang: 'json',
+          filename: 'analyzer_settings.json — 사전·동의어',
+          lines: [
+            '{',
+            '  "settings": {',
+            '    "analysis": {',
+            '      "tokenizer": {',
+            '        "my_nori_tok": {',
+            '          "type": "nori_tokenizer",',
+            '          "decompound_mode": "mixed",',
+            '          "user_dictionary": "userdict_ko.txt"',
+            '        }',
+            '      },',
+            '      "filter": {',
+            '        "my_synonym": {',
+            '          "type": "synonym_graph",',
+            '          "synonyms": ["노트북, 랩탑, 랩톱", "핸드폰, 휴대폰, 스마트폰"]',
+            '        },',
+            '        "my_pos": {',
+            '          "type": "nori_part_of_speech",',
+            '          "stoptags": ["J", "E", "SP", "SF"]',
+            '        }',
+            '      }',
+            '    }',
+            '  }',
+            '}',
+            '',
+            '// userdict_ko.txt (한 줄에 하나, 공백으로 분해 규칙 지정 가능)',
+            '//   아이폰15프로',
+            '//   삼성전자 삼성 전자',
+          ],
+          highlight: [4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 5. 실무 설계 — 색인/검색 분석기의 일치, 그리고 필드별 분석기',
+        desc: '실무에서 가장 흔한 버그는 색인 분석기와 검색 분석기의 불일치다. 색인은 nori(mixed)로 "삼성전자→[삼성전자,삼성,전자]" 하고, 검색은 whitespace 로 "삼성" 을 통짜로 보내면 규칙이 어긋나 결과가 샌다. 원칙은 하나 — 같은 필드는 색인·검색에서 같은(또는 호환되는) 분석기를 쓴다. 예외는 동의어처럼 "검색 시에만" 확장을 얹는 경우인데, 이때도 토크나이즈 규칙 자체는 맞춰야 한다. 두 번째 축은 필드별 분석기다. 하나의 상품에도 제목(정확·간결하게 nori), 본문(재현율 높게 mixed+동의어), 자동완성(앞글자부터 매칭되는 edge n-gram)은 요구가 다르므로 multi-field 로 필드마다 다른 분석기를 건다. 마지막 습관 하나 — 색인 전에 반드시 _analyze API 로 "이 문장이 어떤 토큰이 되는지" 눈으로 확인하라. 대부분의 검색 미스는 여기서 5분이면 잡힌다. 다음 장에서는 이렇게 만든 토큰들이 실제로 어떤 파이프라인을 타고 역색인에 꽂히는지 "파이프라인 지도" 를 그린다.',
+        actor: '🏗️ 분석기 일치 원칙 + 필드별 설계',
+        engine: 'design',
+        engineDetail: 'search_analyzer 일치 · multi-field · _analyze 습관',
+        query: '삼성전자',
+        matchDesign: {
+          title: '색인 분석기 vs 검색 분석기 — 반드시 맞춘다',
+          rows: [
+            { field: '❌ 불일치', idx: 'nori mixed → [삼성전자,삼성,전자]', srch: 'whitespace → [삼성전자]', ok: false, why: '규칙이 달라 미스매치 버그' },
+            { field: '✅ 일치', idx: 'nori mixed', srch: 'nori mixed (+검색 시 동의어)', ok: true, why: '같은 규칙 → 색인/질의 토큰이 맞물림' },
+          ],
+        },
+        fields: {
+          title: '한 상품, 세 필드 — 요구가 다르면 분석기도 다르다',
+          rows: [
+            { name: 'title (제목)', an: 'nori (mixed)', use: '정확·간결한 명사 매칭', icon: '🏷️' },
+            { name: 'body (본문)', an: 'nori + synonym', use: '재현율↑, 동의어까지', icon: '📄' },
+            { name: 'suggest (자동완성)', an: 'edge n-gram', use: '"노"→"노트북" 앞글자 매칭', icon: '⌨️' },
+          ],
+        },
+        alert: { tone: 'info', text: '_analyze API 는 색인 전 디버깅의 핵심 도구다. "왜 이 검색이 0건이지?" 의 90%는 색인 토큰과 질의 토큰을 _analyze 로 나란히 찍어 보면 원인이 드러난다.' },
+        code: {
+          lang: 'json',
+          filename: 'analyzer_settings.json — 필드별 분석기',
+          lines: [
+            '{',
+            '  "mappings": {',
+            '    "properties": {',
+            '      "title": {',
+            '        "type": "text",',
+            '        "analyzer": "nori_index",       // 색인 분석기',
+            '        "search_analyzer": "nori_search" // 검색 분석기(일치!)',
+            '      },',
+            '      "body": {',
+            '        "type": "text",',
+            '        "analyzer": "nori_index",',
+            '        "search_analyzer": "nori_syn_search"  // 검색 시 동의어',
+            '      },',
+            '      "suggest": {',
+            '        "type": "text",',
+            '        "analyzer": "edge_ngram_index",  // 자동완성용',
+            '        "search_analyzer": "standard"',
+            '      }',
+            '    }',
+            '  }',
+            '}',
+            '',
+            '// 색인 전 반드시 확인하는 습관:',
+            '//   GET /products/_analyze',
+            '//   { "field": "title", "text": "삼성전자 노트북" }',
+            '//   -> 색인 토큰을 눈으로 보고 질의와 맞는지 대조',
+            '//',
+            '// 다음 장: 이 토큰들이 타는 "분석 파이프라인 지도".',
+          ],
+          highlight: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 23, 24, 25, 26],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 토큰 chip — 분석기 단계별 토큰 표현 (sky/blue 톤)
+    //   drop    : 이 단계에서 제거될 토큰 (취소선·회색)
+    //   changed : 이 단계에서 변형된 토큰 (형광펜 강조)
+    //   bad     : 문제 있는 토큰 (조사 붙음 등, amber)
+    //   tag     : 품사 태그 (NNG/J/VV ...)
+    // ─────────────────────────────────────────────────────
+    function TokenChip({ tok, raw }) {
+      if (raw) {
+        return (
+          <span className="inline-flex items-center px-2 py-1 rounded border-2 border-sky-200 bg-sky-50 text-[11px] font-mono text-sky-900">
+            {tok.t}
+          </span>
+        );
+      }
+      let cls = 'border-sky-300 bg-white text-sky-900';
+      if (tok.drop) cls = 'border-slate-300 bg-slate-100 text-slate-400 line-through';
+      else if (tok.changed) cls = 'border-amber-400 bg-amber-100 text-amber-900 font-bold';
+      else if (tok.bad) cls = 'border-amber-400 bg-amber-50 text-amber-800';
+      return (
+        <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border-2 ${cls} text-[11px] font-mono`}>
+          {tok.t}
+          {tok.tag && <span className="text-[8px] px-1 rounded-full bg-sky-600 text-white not-italic">{tok.tag}</span>}
+        </span>
+      );
+    }
+
+    // 분석기 파이프라인 — 단계가 위→아래로 흐르며 토큰이 변형
+    function PipelinePane({ pipe }) {
+      if (!pipe) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-[11px] font-bold text-sky-900 mb-2">
+            🧪 입력: <span className="font-mono px-1.5 py-0.5 rounded bg-sky-100">{pipe.input}</span>
+          </div>
+          <div className="space-y-1.5">
+            {pipe.stages.map((st, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && (
+                  <div className="flex justify-center text-sky-400 text-xs leading-none">↓</div>
+                )}
+                <div className="rounded border border-sky-200 bg-sky-50/60 px-2 py-1.5">
+                  <div className="flex items-baseline justify-between mb-1">
+                    <span className="text-[10px] font-bold text-sky-800">{st.name}</span>
+                    <span className="text-[9px] text-slate-500">{st.sub}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {st.tokens.map((tok, j) => (
+                      <TokenChip key={j} tok={tok} raw={st.raw} />
+                    ))}
+                  </div>
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 색인 토큰 vs 검색어 매칭 실패표
+    // ─────────────────────────────────────────────────────
+    function MatchFailBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">🚧 {box.title}</div>
+          <div className="mb-2 text-[10px]">
+            <span className="text-slate-600">색인된 토큰: </span>
+            {box.indexed.map((t) => (
+              <span key={t} className="inline-block mx-0.5 px-1.5 py-0.5 rounded bg-white border border-red-200 font-mono text-red-900">{t}</span>
+            ))}
+          </div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-red-800 border-b border-red-200">
+                <th className="text-left py-0.5">검색어</th>
+                <th className="text-center py-0.5">결과</th>
+                <th className="text-left py-0.5 pl-2">이유</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.queries.map((q) => (
+                <tr key={q.q} className="border-t border-red-100">
+                  <td className="py-1 font-mono font-bold">"{q.q}"</td>
+                  <td className={`py-1 text-center font-bold ${q.hit ? 'text-emerald-700' : 'text-red-600'}`}>
+                    {q.hit ? '✓ 1건' : '✗ 0건'}
+                  </td>
+                  <td className="py-1 pl-2 text-slate-700">{q.why}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — decompound_mode 3종 비교
+    // ─────────────────────────────────────────────────────
+    const DEC_TONE = {
+      bad:  'border-red-300 bg-red-50',
+      warn: 'border-amber-300 bg-amber-50',
+      good: 'border-emerald-400 bg-emerald-50',
+    };
+    function DecompoundBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🔬 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r) => (
+              <div key={r.mode} className={`rounded border-2 p-2 ${DEC_TONE[r.tone]}`}>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-sky-700 text-white">{r.mode}</span>
+                  <div className="flex flex-wrap gap-1">
+                    {r.out.map((t) => (
+                      <span key={t} className="px-1.5 py-0.5 rounded bg-white border border-sky-300 text-[10px] font-mono text-sky-900">{t}</span>
+                    ))}
+                  </div>
+                </div>
+                <div className="text-[10px] text-slate-600 mt-1">{r.note}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 동의어 적용 시점 비교
+    // ─────────────────────────────────────────────────────
+    function SynonymBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-indigo-300 bg-indigo-50 p-3">
+          <div className="text-xs font-bold text-indigo-900 mb-2">🔁 {box.title}</div>
+          <div className="grid grid-cols-2 gap-2">
+            {box.rows.map((r) => (
+              <div key={r.when} className={`rounded border-2 p-2 ${r.tone === 'good' ? 'border-emerald-400 bg-white' : 'border-amber-300 bg-white'}`}>
+                <div className="text-[11px] font-bold text-indigo-900 mb-1">{r.when}</div>
+                <div className="text-[10px] text-slate-700 mb-1 font-mono">{r.how}</div>
+                <div className="text-[10px] text-emerald-700">👍 {r.pro}</div>
+                <div className="text-[10px] text-red-600">👎 {r.con}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-indigo-900 leading-snug">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 색인/검색 분석기 일치표 + 필드별 분석기
+    // ─────────────────────────────────────────────────────
+    function MatchDesignBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">⚖️ {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className={`rounded border-2 p-2 ${r.ok ? 'border-emerald-400 bg-emerald-50' : 'border-red-300 bg-red-50'}`}>
+                <div className="text-[11px] font-bold mb-1 text-slate-800">{r.field}</div>
+                <div className="text-[10px] text-slate-700 font-mono">색인: {r.idx}</div>
+                <div className="text-[10px] text-slate-700 font-mono">검색: {r.srch}</div>
+                <div className={`text-[10px] mt-0.5 font-bold ${r.ok ? 'text-emerald-700' : 'text-red-600'}`}>→ {r.why}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function FieldsBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-400 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+          <div className="text-sm font-bold text-sky-900 mb-2">🗂️ {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r) => (
+              <div key={r.name} className="flex items-center gap-2 rounded border border-sky-300 bg-white px-2 py-1.5">
+                <span className="text-base">{r.icon}</span>
+                <span className="w-40 shrink-0 text-[11px] font-bold text-sky-900">{r.name}</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-100 text-sky-800 shrink-0">{r.an}</span>
+                <span className="text-[10px] text-slate-600 flex-1">{r.use}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 분석기 파이프라인 시뮬레이션 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      pipe:   { icon: '🔤', label: '분석기 3단' },
+      fail:   { icon: '🇰🇷', label: '공백 자르기' },
+      nori:   { icon: '🧬', label: 'nori 형태소' },
+      dict:   { icon: '📖', label: '사전·동의어' },
+      design: { icon: '🏗️', label: '실무 설계' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.pipe;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>텍스트 분석 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          {state.query && (
+            <div className="mb-2 flex items-center gap-2 px-2 py-1 rounded border border-sky-200 bg-sky-50">
+              <span className="text-xs">🔎</span>
+              <span className="text-[11px] font-mono text-sky-800">검색어: "{state.query}"</span>
+            </div>
+          )}
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            분석기: {state.engineDetail}
+          </div>
+          <PipelinePane pipe={state.pipe} />
+          <MatchFailBox box={state.matchFail} />
+          <DecompoundBox box={state.decompound} />
+          <SynonymBox box={state.synonym} />
+          <MatchDesignBox box={state.matchDesign} />
+          <FieldsBox box={state.fields} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">I-2-1. 토크나이저·형태소 분석 — 한국어 nori</h1>
+                <p className="text-sm text-sky-800/80">"삼성전자 노트북을 샀다"를 검색 가능한 조각으로 — 색인 품질은 여기서 결정된다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                분석기는 char filter(다듬기) → tokenizer(자르기) → token filter(가공)의 3단 파이프다.
+                공백 tokenizer 는 교착어인 한국어의 조사·복합명사 앞에서 검색 실패를 낳고,
+                nori 형태소 분석기가 복합명사 분해(decompound mixed)·조사 제거·어간 추출로 이를 해결한다.
+                신조어는 user_dictionary 로 고정하고, 동의어는 재색인 부담이 적은 검색 시(synonym_graph) 적용이 실무에서 편하다.
+                가장 중요한 원칙은 색인/검색 분석기의 일치 — 어긋나면 미스매치 버그다. 필드마다(제목·본문·자동완성) 다른 분석기를 걸고,
+                색인 전엔 반드시 _analyze 로 토큰을 눈으로 확인한다. 다음 장에서는 이 토큰들이 타는 분석 파이프라인 지도를 그린다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['analyzer', 'char_filter', 'tokenizer', 'token_filter', 'nori', '복합명사분해', 'decompound_mode', '품사태그', 'user_dictionary', 'synonym_graph', '색인검색일치', 'edge_ngram', '_analyze'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-2-2.html" className="underline hover:no-underline">다음: I-2-2 (분석 파이프라인 지도) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

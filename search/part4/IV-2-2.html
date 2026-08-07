@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — IV-2-2. 하이브리드 아키텍처 설계</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔍</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search IV-2-2 — 하이브리드 아키텍처 설계
+    학습 목표: 이 과정에서 만든 모든 부품(분석기·역색인·BM25·임베딩·HNSW·RRF·리랭커)을
+              하나의 검색 시스템으로 조립한다. (1) 부품 복습 → (2) 표준 하이브리드 조립(병렬+RRF+리랭커, 지연 예산)
+              → (3) 규모별 변형(소/중/대) + 조건부 라우팅 → (4) 그대로 RAG retriever 가 됨
+              → (5) 설계 체크리스트·안티패턴. 이 장은 Part IV 의 종합 완결판이다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 부품 선반 → 아키텍처 흐름도 → 변형 비교 → RAG 파이프라인 → 체크리스트)
+                       우(VSCode CodeViewer: hybrid_system.py 종합 완결판)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 부품 총집합 → 표준 조립 → 변형 → RAG → 체크리스트
+    //   parts    : 지금까지 만든 부품 카드 { icon, name, role, chapter }
+    //   flow     : 표준 하이브리드 데이터 흐름 (병렬 경로 → RRF → 리랭커)
+    //   variants : 규모별 변형 3안
+    //   rag      : RAG 파이프라인 접속도
+    //   checklist: 설계 결정 순서 + 안티패턴
+    //   code     : 우측 CodeViewer (hybrid_system.py) — 단계별 하이라이트 이동
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 부품 총집합 — 지금까지 만든 모든 것을 한 상 위에',
+        desc: 'Part IV 를 지나며 우리는 검색 부품을 하나씩 만들었다. 분석기는 텍스트를 토큰으로 쪼개고, 역색인은 단어→문서를 즉시 조회하며, BM25 는 단어 일치의 관련도를 점수화한다. 다른 축에서는 임베딩이 문장을 의미 벡터로 바꾸고, HNSW 가 그 벡터들을 근사 최근접(ANN)으로 빠르게 찾으며, RRF 가 서로 점수 체계가 다른 두 랭킹을 순위만으로 공정하게 융합하고, 리랭커(cross-encoder)가 상위 후보만 정밀 재정렬한다. 왜 이걸 다시 늘어놓는가? 각 부품은 혼자서는 반쪽짜리이기 때문이다 — 렉시컬은 정확 매칭에 강하지만 의미를 모르고, 벡터는 의미를 알지만 고유명사·코드·숫자에 약하다. 다음 단계부터 이 부품들을 한 시스템으로 조립한다.',
+        actor: '🧰 부품 7종 · 렉시컬 축 + 벡터 축 + 융합/재정렬',
+        stage: 'parts',
+        stageDetail: '분석기 · 역색인 · BM25 · 임베딩 · HNSW · RRF · 리랭커',
+        parts: {
+          title: '조립 전 부품 점검 — 각자 무엇을 잘하고 무엇에 약한가',
+          lexical: [
+            { icon: '✂️', name: '분석기(Analyzer)', role: '텍스트→토큰. 형태소·소문자·불용어', chapter: 'IV-1' },
+            { icon: '📖', name: '역색인', role: '단어→문서 즉시 조회 (풀스캔 제거)', chapter: 'IV-1' },
+            { icon: '📊', name: 'BM25', role: '단어 일치 관련도 점수 (TF·IDF·길이보정)', chapter: 'IV-1' },
+          ],
+          vector: [
+            { icon: '🧭', name: '임베딩', role: '문장→의미 벡터. 동의어·문맥 포착', chapter: 'IV-2' },
+            { icon: '🕸️', name: 'HNSW', role: '벡터 근사 최근접(ANN) 고속 탐색', chapter: 'IV-2' },
+          ],
+          fusion: [
+            { icon: '🔗', name: 'RRF', role: '이질적 두 랭킹을 순위로 융합', chapter: 'IV-2' },
+            { icon: '🎯', name: '리랭커', role: '상위 후보만 cross-encoder 정밀 재정렬', chapter: 'IV-2' },
+          ],
+          note: '렉시컬은 "글자 일치"에 강하고 의미를 모른다. 벡터는 "의미"에 강하고 고유명사·숫자·코드에 약하다. 서로의 사각지대를 메우는 게 하이브리드의 존재 이유.',
+        },
+        alert: { tone: 'info', text: '부품은 이미 다 있다. 이 장의 과제는 "새 알고리즘"이 아니라 "조립 설계" — 어떤 순서로, 어떤 지연 예산으로, 어떤 규모에서 무엇을 붙일지 결정하는 일이다.' },
+        code: {
+          lang: 'python',
+          filename: 'hybrid_system.py — ① 부품 임포트',
+          lines: [
+            '"""',
+            'hybrid_system.py — Part IV 부품 총집합 → 하이브리드 검색 시스템',
+            '이 파일 하나가 렉시컬·벡터·융합·리랭커·RAG 를 조립하는 완결판이다.',
+            '"""',
+            'from dataclasses import dataclass, field',
+            '',
+            '# ── 렉시컬 축 (IV-1) ──',
+            'from search.analyzer import analyze          # 텍스트 → 토큰',
+            'from search.inverted_index import InvertedIndex  # 단어 → 문서',
+            'from search.bm25 import BM25Ranker           # 단어 일치 점수',
+            '',
+            '# ── 벡터 축 (IV-2) ──',
+            'from search.embedding import embed           # 문장 → 벡터',
+            'from search.hnsw import HNSWIndex            # 벡터 ANN 탐색',
+            '',
+            '# ── 융합 / 재정렬 ──',
+            'from search.fusion import reciprocal_rank_fusion  # RRF',
+            'from search.rerank import CrossEncoderReranker    # 리랭커',
+            '',
+            '',
+            '@dataclass',
+            'class Doc:',
+            '    """색인 대상 문서. text 는 렉시컬·벡터 양쪽에 쓰인다."""',
+            '    id: str',
+            '    text: str',
+            '    meta: dict = field(default_factory=dict)',
+            '',
+            '# 핵심: 부품은 이미 완성돼 있다. 남은 일은 "조립 설계".',
+            '#   렉시컬=정확 매칭·숫자, 벡터=의미·동의어 → 사각지대 상호 보완',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 2. 표준 하이브리드 조립 — 병렬 경로 → RRF 융합 → (선택)리랭커',
+        desc: '표준 조립은 이렇게 흐른다. 질의가 들어오면 BM25 경로와 벡터 경로를 병렬로 실행한다(순차로 하면 지연이 두 배가 되므로 반드시 동시에). 각 경로는 상위 K개(예: 50개)의 후보 랭킹을 내놓고, RRF 가 두 랭킹을 순위 기반으로 융합해 하나의 후보 목록을 만든다. 여기까지가 1차 검색(recall 확보)이고, 필요하면 융합 상위 20~50개에만 리랭커를 태워 정밀도를 끌어올린다. 지연 예산이 중요하다 — 사용자 체감 한계인 300ms 안에서 BM25·벡터 병렬이 약 40ms, RRF 가 5ms 미만, 리랭커가 후보 20개에 약 120ms를 쓴다. 리랭커는 정확도를 크게 올리지만 가장 비싼 구간이라 "상위 후보에만" 거는 게 철칙이다. 색인 쪽도 대칭이다 — 문서 하나가 들어오면 분석기→역색인과 임베딩→HNSW 로 동시에 이중 색인된다.',
+        actor: '🏗️ 질의 → [BM25 ‖ 벡터] → RRF → 리랭커 → 결과',
+        stage: 'assemble',
+        stageDetail: '검색 지연 예산 = 병렬 40ms + RRF 5ms + 리랭커 120ms',
+        flow: {
+          title: '검색 경로 — 병렬 실행이 핵심 (순차면 지연 2배)',
+          stages: [
+            { key: 'q', icon: '🔎', label: '질의', sub: '"방수 등산화 추천"', ms: null, tone: 'sky' },
+            { key: 'parallel', icon: '⇉', label: '병렬 1차 검색', sub: 'BM25 경로 ‖ 벡터 경로 (각 top-50)', ms: 40, tone: 'indigo' },
+            { key: 'rrf', icon: '🔗', label: 'RRF 융합', sub: '두 랭킹 → 순위 기반 단일 목록', ms: 5, tone: 'violet' },
+            { key: 'rerank', icon: '🎯', label: '리랭커(선택)', sub: '상위 20개만 cross-encoder', ms: 120, tone: 'emerald' },
+            { key: 'result', icon: '📋', label: '결과 top-10', sub: '최종 정렬', ms: null, tone: 'sky' },
+          ],
+          budget: { total: 300, used: 165, note: '체감 한계 300ms 안. 리랭커가 가장 비싸므로 후보 20개에만 건다.' },
+        },
+        indexFlow: {
+          title: '색인 경로 — 문서 1개가 양쪽으로 동시에',
+          rows: [
+            { icon: '✂️', path: '분석기 → 역색인', out: 'BM25 검색용' },
+            { icon: '🧭', path: '임베딩 → HNSW', out: '벡터 검색용' },
+          ],
+          note: '한 문서를 두 색인에 함께 넣는다. 둘 중 하나만 갱신되면 검색 결과가 어긋난다 → 색인은 트랜잭션처럼 함께.',
+        },
+        alert: { tone: 'good', text: '설계 철칙 3가지 — (1) 두 경로는 반드시 병렬, (2) RRF 는 점수 정규화 없이 순위만 쓰므로 이질적 엔진 융합에 안전, (3) 리랭커는 비싸니 상위 후보에만.' },
+        code: {
+          lang: 'python',
+          filename: 'hybrid_system.py — ② 병렬 검색 + RRF + 리랭커',
+          lines: [
+            'import asyncio',
+            '',
+            'class HybridSearcher:',
+            '    """표준 하이브리드: 병렬 1차 검색 → RRF → 선택적 리랭킹."""',
+            '',
+            '    def __init__(self, bm25: BM25Ranker, hnsw: HNSWIndex,',
+            '                 reranker: CrossEncoderReranker | None = None):',
+            '        self.bm25 = bm25',
+            '        self.hnsw = hnsw',
+            '        self.reranker = reranker   # None 이면 리랭킹 생략',
+            '',
+            '    async def search(self, query: str, k: int = 10,',
+            '                     candidates: int = 50) -> list[Doc]:',
+            '        # (1) 두 경로를 반드시 "병렬" 로 — 순차면 지연이 2배',
+            '        lexical, vector = await asyncio.gather(',
+            '            self._lexical(query, candidates),',
+            '            self._vector(query, candidates),',
+            '        )',
+            '        # (2) RRF: 점수 정규화 없이 "순위" 로만 융합 → 이질 엔진 안전',
+            '        fused = reciprocal_rank_fusion([lexical, vector], k=60)',
+            '        # (3) 리랭커: 비싸므로 융합 상위 후보에만 (전체 X)',
+            '        if self.reranker:',
+            '            top = fused[: min(20, len(fused))]',
+            '            return self.reranker.rerank(query, top)[:k]',
+            '        return fused[:k]',
+            '',
+            '    async def _lexical(self, q, n):',
+            '        return self.bm25.search(analyze(q), top_n=n)',
+            '',
+            '    async def _vector(self, q, n):',
+            '        return self.hnsw.query(embed(q), top_n=n)',
+            '',
+            '    # 지연 예산: 병렬 40ms + RRF 5ms + 리랭커 120ms ≈ 165ms < 300ms',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 3. 변형 패턴 — 규모와 요구가 아키텍처를 결정한다',
+        desc: '"표준"은 하나지만 현실의 조립은 규모에 따라 달라진다. 소규모(수만~수십만 문서)라면 Postgres + pgvector 하나로 렉시컬(tsvector)과 벡터를 같은 DB에 두고, RRF 는 애플리케이션 레벨에서 몇 줄로 구현하는 게 가장 단순하고 운영 부담이 적다. 중규모(수백만)라면 Elasticsearch/OpenSearch 한 대가 BM25와 kNN, 그리고 하이브리드 융합까지 내장 기능으로 제공하니 엔진 하나로 끝난다. 대규모(수천만~억)라면 렉시컬 클러스터와 벡터 검색기(예: 전용 ANN 서비스)를 분리해 각각 독립적으로 스케일하고, 그 앞에 융합 서비스를 두어 랭킹을 합친다. 여기에 직교하는 최적화가 조건부 라우팅이다 — IV-1-1의 질의 유형 매트릭스를 활용해, SKU·전화번호·코드처럼 정확 매칭이 감지되면 벡터 경로를 건너뛰고 렉시컬만 태운다(불필요한 벡터 지연·비용 절약). 규모를 넘겨짚어 처음부터 대규모 아키텍처를 짜는 것이야말로 대표적 과설계다.',
+        actor: '🧩 소규모 · 중규모 · 대규모 + 조건부 라우팅',
+        stage: 'variants',
+        stageDetail: '규모가 커질수록 "합쳐진 엔진" → "분리된 검색기 + 융합 서비스"',
+        variants: {
+          title: '규모별 변형 — 넘겨짚은 대규모 설계는 과설계다',
+          items: [
+            { scale: '소규모', size: '~수십만', stack: 'Postgres + pgvector', fusion: '앱 레벨 RRF', pros: '단일 DB·운영 최소·트랜잭션 일관', tone: 'emerald' },
+            { scale: '중규모', size: '~수백만', stack: 'Elasticsearch / OpenSearch', fusion: '엔진 내장 하이브리드', pros: 'BM25+kNN+융합 한 엔진', tone: 'sky' },
+            { scale: '대규모', size: '수천만~', stack: '렉시컬 클러스터 + 벡터 검색기 분리', fusion: '별도 융합 서비스', pros: '축별 독립 스케일·장애 격리', tone: 'indigo' },
+          ],
+          note: '규모는 처음부터 큰 걸 고르는 게 아니라, 현재 규모의 한 단계 위까지만 대비한다.',
+        },
+        routing: {
+          title: '조건부 라우팅 — 정확 매칭이면 벡터를 건너뛴다 (IV-1-1 매트릭스)',
+          rows: [
+            { q: 'SKU-8842-BLK', type: '정확 매칭(코드)', route: '렉시컬만', skip: '벡터 skip' },
+            { q: '010-1234-5678', type: '정확 매칭(번호)', route: '렉시컬만', skip: '벡터 skip' },
+            { q: '가벼운 방수 등산화', type: '의미 질의', route: '하이브리드', skip: '둘 다' },
+          ],
+          note: '정확 매칭에 벡터를 태우면 지연·비용만 늘고 정확도는 안 오른다.',
+        },
+        alert: { tone: 'warn', text: '아키텍처는 규모의 함수다. 문서 10만 개에 대규모 분리 아키텍처를 얹으면 운영 복잡도만 폭증한다. "지금 규모 + 한 단계"가 정답 — 나머지는 나중의 나에게 맡긴다.' },
+        code: {
+          lang: 'python',
+          filename: 'hybrid_system.py — ③ 조건부 라우팅',
+          lines: [
+            'import re',
+            '',
+            '# IV-1-1 질의 유형 매트릭스: 정확 매칭 신호를 감지',
+            'EXACT_PATTERNS = [',
+            '    r"^[A-Z]{2,}-\\d{3,}",     # SKU-8842',
+            '    r"^\\d{2,4}-\\d{3,4}-\\d{4}$",  # 전화번호',
+            '    r"^\\w+@\\w+\\.\\w+$",         # 이메일',
+            ']',
+            '',
+            'def looks_exact(query: str) -> bool:',
+            '    """정확 매칭 질의로 보이면 True → 벡터 경로를 건너뛴다."""',
+            '    return any(re.match(p, query.strip()) for p in EXACT_PATTERNS)',
+            '',
+            '',
+            'class RoutedHybrid(HybridSearcher):',
+            '    async def search(self, query, k=10, candidates=50):',
+            '        # 조건부 라우팅: 정확 매칭이면 렉시컬만 (벡터 지연·비용 절약)',
+            '        if looks_exact(query):',
+            '            return (await self._lexical(query, candidates))[:k]',
+            '        # 그 외 의미 질의는 표준 하이브리드 경로',
+            '        return await super().search(query, k, candidates)',
+            '',
+            '# 규모별 조립(변형):',
+            '#   소규모 → Postgres+pgvector, RRF 는 이 클래스처럼 앱 레벨',
+            '#   중규모 → ES/OpenSearch 한 엔진이 BM25+kNN+융합 내장',
+            '#   대규모 → 렉시컬/벡터 검색기 분리 + 별도 융합 서비스',
+            '# 과설계 경고: 문서 10만 개에 대규모 분리 구조는 운영만 무겁다.',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20],
+        },
+      },
+      {
+        title: 'Step 4. RAG의 검색기로 — 이 하이브리드가 그대로 retriever가 된다',
+        desc: '여기서 관점이 하나 열린다. 지금 만든 하이브리드 검색기는 아무 수정 없이 RAG(검색 증강 생성)의 retriever 가 된다. RAG 파이프라인은 이렇다 — 문서를 청킹(적당한 크기로 분할)해 색인하고, 사용자 질문이 오면 하이브리드 검색으로 관련 청크 상위 N개를 뽑아, 그것을 LLM 프롬프트의 컨텍스트로 넣어 답을 생성한다. 핵심 통찰은 이것이다 — RAG 품질 문제의 다수는 사실 "검색 품질 문제"다. LLM 이 엉뚱한 답(환각)을 하는 원인은 대개 모델이 아니라, retriever 가 관련 없는 청크를 넣었거나 정작 필요한 청크를 놓쳤기 때문이다. 그래서 Part IV 에서 다진 렉시컬+벡터+RRF+리랭커가 RAG 에서 그대로 값을 한다. 특히 리랭커는 LLM 에 넣을 상위 청크의 정밀도를 올려 환각을 크게 줄인다. "검색을 잘하면 RAG 가 잘된다" — 이 장의 부품들이 곧 RAG 의 토대다.',
+        actor: '🤖 청킹 → 하이브리드 검색 → 상위 청크 → LLM 컨텍스트',
+        stage: 'rag',
+        stageDetail: 'RAG 품질 문제의 다수 = 검색 품질 문제 (retriever 가 좌우)',
+        rag: {
+          title: 'RAG 파이프라인 — 하이브리드 검색기가 심장',
+          index: [
+            { icon: '📄', label: '원문 문서', sub: '매뉴얼·위키·PDF' },
+            { icon: '✂️', label: '청킹', sub: '의미 단위 분할(+오버랩)' },
+            { icon: '🗂️', label: '이중 색인', sub: '역색인 + HNSW' },
+          ],
+          query: [
+            { icon: '❓', label: '사용자 질문', sub: '"환불 규정 알려줘"' },
+            { icon: '🔎', label: '하이브리드 검색', sub: 'BM25‖벡터→RRF→리랭커' },
+            { icon: '📎', label: '상위 청크 N개', sub: '관련 근거 컨텍스트' },
+            { icon: '💬', label: 'LLM 생성', sub: '청크 근거로 답변' },
+          ],
+          note: 'retriever 는 이 장의 HybridSearcher 그대로. 검색기를 바꾸지 않고 RAG 로 승격된다.',
+        },
+        insight: {
+          title: '왜 "RAG 품질 = 검색 품질"인가',
+          rows: [
+            { bad: 'retriever 가 관련 없는 청크를 넣음', effect: 'LLM 이 엉뚱한 근거로 환각' },
+            { bad: '필요한 청크를 아예 놓침(recall↓)', effect: '"모른다" 또는 지어냄' },
+            { bad: '순서가 뒤죽박죽(정밀도↓)', effect: '핵심이 뒤로 밀려 무시됨' },
+          ],
+          fix: '해결은 대개 모델 교체가 아니라 검색 개선 — 하이브리드 recall + 리랭커 정밀도.',
+        },
+        alert: { tone: 'info', text: 'RAG 주제와 상호 링크. RAG 를 디버깅할 때 첫 질문은 "LLM 이 이상한가?"가 아니라 "retriever 가 올바른 청크를 줬는가?"여야 한다 — 원인의 다수가 검색에 있다.' },
+        code: {
+          lang: 'python',
+          filename: 'hybrid_system.py — ④ RAG retriever 로 승격',
+          lines: [
+            'class RagRetriever:',
+            '    """하이브리드 검색기를 그대로 RAG 의 retriever 로 사용."""',
+            '',
+            '    def __init__(self, searcher: HybridSearcher):',
+            '        self.searcher = searcher   # 수정 없이 재사용',
+            '',
+            '    def index_document(self, doc: Doc, chunk_size: int = 500):',
+            '        """원문 → 청킹 → 이중 색인. RAG 색인 진입점."""',
+            '        for i, chunk in enumerate(_chunk(doc.text, chunk_size)):',
+            '            c = Doc(id=f"{doc.id}#{i}", text=chunk, meta=doc.meta)',
+            '            self.searcher.bm25.add(c)      # 역색인',
+            '            self.searcher.hnsw.add(embed(c.text), c)  # 벡터',
+            '',
+            '    async def retrieve(self, question: str, n: int = 5) -> list[Doc]:',
+            '        """질문 → 하이브리드 검색 → LLM 에 넣을 상위 청크."""',
+            '        return await self.searcher.search(question, k=n)',
+            '',
+            '',
+            'async def rag_answer(retriever: RagRetriever, llm, question: str):',
+            '    chunks = await retriever.retrieve(question, n=5)',
+            '    context = "\\n\\n".join(c.text for c in chunks)',
+            '    prompt = f"다음 근거로만 답하라.\\n[근거]\\n{context}\\n\\n[질문] {question}"',
+            '    return llm.generate(prompt)',
+            '',
+            '# 통찰: RAG 환각의 다수는 LLM 이 아니라 retriever 문제.',
+            '#   → 하이브리드 recall + 리랭커 정밀도가 RAG 품질을 좌우.',
+          ],
+          highlight: [6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 19, 20, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 5. 설계 체크리스트 — 새 검색 시스템을 처음부터 세우는 순서',
+        desc: '마지막은 실무 투입용 결정 순서다. 새 검색 시스템을 설계할 때는 반드시 이 순서를 따른다. (1) 질의 유형 분석 — 사용자가 무엇을 어떻게 검색하는가(정확 매칭 비중·자연어 비중·언어). (2) 색인 설계 — 무엇을 토큰화하고 무엇을 임베딩할지, 청크 크기. (3) 1단계 검색 방식 — 렉시컬만? 벡터만? 하이브리드? (질의 유형이 결정한다). (4) 융합 — 하이브리드면 RRF. (5) 리랭커 유무 — 정밀도가 중요하고 지연 예산이 허락하면 장착. (6) 평가 계획 — 이게 마지막이 아니라 처음부터 세워야 한다. 안티패턴 둘을 특히 경계한다. 첫째, "무조건 벡터만" — 벡터는 만능이 아니라 고유명사·숫자·코드에 약하고, 렉시컬을 버리면 recall 이 새는 지점이 생긴다. 둘째, "평가 없는 튜닝" — 측정 지표(nDCG·MRR·recall@k) 없이 파라미터를 만지면 좋아졌는지조차 알 수 없다. 이 평가·운영이 바로 다음 Part Ⅴ의 주제다.',
+        actor: '✅ 결정 6단계 + 안티패턴 2종 → Part Ⅴ 예고',
+        stage: 'checklist',
+        stageDetail: '질의 분석 → 색인 → 1단계 방식 → 융합 → 리랭커 → 평가',
+        checklist: {
+          title: '설계 결정 순서 — 위에서 아래로',
+          steps: [
+            { n: 1, head: '질의 유형 분석', body: '정확 매칭 vs 자연어 비중, 언어, 도메인 어휘' },
+            { n: 2, head: '색인 설계', body: '토큰화 대상·임베딩 대상·청크 크기·메타필드' },
+            { n: 3, head: '1단계 검색 방식', body: '렉시컬 / 벡터 / 하이브리드 — 질의 유형이 결정' },
+            { n: 4, head: '융합(하이브리드면)', body: 'RRF — 순위 기반, 점수 정규화 불필요' },
+            { n: 5, head: '리랭커 유무', body: '정밀도 필요 + 지연 예산 허락 → 상위 후보에만' },
+            { n: 6, head: '평가 계획', body: 'nDCG·MRR·recall@k — 처음부터 세운다' },
+          ],
+        },
+        antipatterns: {
+          title: '안티패턴 — 이 둘을 특히 경계',
+          items: [
+            { icon: '🚫', head: '무조건 벡터만', body: '벡터는 고유명사·숫자·코드에 약하다. 렉시컬을 버리면 recall 이 샌다. 벡터는 만능이 아니다.' },
+            { icon: '🚫', head: '평가 없는 튜닝', body: '지표 없이 파라미터를 만지면 개선 여부를 알 수 없다. 측정이 먼저, 튜닝은 그 다음.' },
+          ],
+        },
+        nextPart: {
+          title: 'Part Ⅴ 예고 — 평가와 운영',
+          body: '검색은 "만들면 끝"이 아니다. nDCG·MRR 로 품질을 측정하고, A/B 테스트로 변화를 검증하며, 로그로 실패 질의를 찾아 계속 고친다. 다음 Part 는 이 "검색을 운영하는 법"을 다룬다.',
+        },
+        alert: { tone: 'good', text: 'Part IV 완결. 부품(분석기·역색인·BM25·임베딩·HNSW·RRF·리랭커)을 하나의 하이브리드 시스템으로 조립했고, 그것이 그대로 RAG retriever 가 됨을 봤다. 다음은 이 시스템을 "평가·운영"하는 Part Ⅴ.' },
+        code: {
+          lang: 'python',
+          filename: 'hybrid_system.py — ⑤ 설계 체크리스트(요약)',
+          lines: [
+            'def design_checklist():',
+            '    """새 검색 시스템 설계 결정 순서 — 위에서 아래로."""',
+            '    return [',
+            '        "1. 질의 유형 분석 (정확매칭 vs 자연어, 언어, 도메인)",',
+            '        "2. 색인 설계   (토큰화·임베딩 대상, 청크 크기)",',
+            '        "3. 1단계 방식  (렉시컬 / 벡터 / 하이브리드)",',
+            '        "4. 융합        (하이브리드면 RRF)",',
+            '        "5. 리랭커 유무 (정밀도 필요 + 지연 허락 시)",',
+            '        "6. 평가 계획   (nDCG·MRR·recall@k) — 처음부터",',
+            '    ]',
+            '',
+            '# ── 안티패턴 (하지 말 것) ──',
+            'ANTIPATTERNS = {',
+            '    "무조건 벡터만": "고유명사·숫자·코드에 약함 → recall 샌다",',
+            '    "평가 없는 튜닝": "지표 없이는 개선 여부조차 모른다",',
+            '}',
+            '',
+            '# ── 종합 조립 예시 ──',
+            'def build_system(reranker=None) -> HybridSearcher:',
+            '    bm25 = BM25Ranker()',
+            '    hnsw = HNSWIndex(dim=768)',
+            '    return RoutedHybrid(bm25, hnsw, reranker)   # 조건부 라우팅 포함',
+            '',
+            '# 다음 Part Ⅴ: 평가·운영 — nDCG·MRR·A/B·실패질의 로그.',
+          ],
+          highlight: [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 18, 19, 20, 21],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 색상 토큰 (sky/blue 기조 + 축별 의미색)
+    // ─────────────────────────────────────────────────────
+    const TONE = {
+      sky:     { border: 'border-sky-400',     bg: 'bg-sky-50',     text: 'text-sky-900' },
+      indigo:  { border: 'border-indigo-400',  bg: 'bg-indigo-50',  text: 'text-indigo-900' },
+      violet:  { border: 'border-violet-400',  bg: 'bg-violet-50',  text: 'text-violet-900' },
+      emerald: { border: 'border-emerald-400', bg: 'bg-emerald-50', text: 'text-emerald-900' },
+    };
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 부품 선반 (렉시컬 / 벡터 / 융합)
+    // ─────────────────────────────────────────────────────
+    function PartCard({ p, tone }) {
+      const t = TONE[tone] || TONE.sky;
+      return (
+        <div className={`rounded border-2 ${t.border} ${t.bg} px-2 py-1.5`}>
+          <div className={`text-[11px] font-bold ${t.text} flex items-center gap-1`}>
+            <span>{p.icon}</span><span>{p.name}</span>
+            <span className="ml-auto text-[8px] text-slate-500 font-mono">{p.chapter}</span>
+          </div>
+          <div className="text-[10px] text-slate-600 leading-snug mt-0.5">{p.role}</div>
+        </div>
+      );
+    }
+    function PartsShelf({ box }) {
+      if (!box) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🧰 {box.title}</div>
+          <div className="grid grid-cols-1 gap-2">
+            <div>
+              <div className="text-[10px] font-bold text-sky-700 mb-1">렉시컬 축 (단어 일치)</div>
+              <div className="space-y-1.5">{box.lexical.map((p, i) => <PartCard key={i} p={p} tone="sky" />)}</div>
+            </div>
+            <div>
+              <div className="text-[10px] font-bold text-indigo-700 mb-1">벡터 축 (의미)</div>
+              <div className="space-y-1.5">{box.vector.map((p, i) => <PartCard key={i} p={p} tone="indigo" />)}</div>
+            </div>
+            <div>
+              <div className="text-[10px] font-bold text-violet-700 mb-1">융합 · 재정렬</div>
+              <div className="space-y-1.5">{box.fusion.map((p, i) => <PartCard key={i} p={p} tone="violet" />)}</div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-slate-700 leading-snug bg-sky-50 border border-sky-200 rounded p-1.5">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 표준 아키텍처 흐름 + 지연 예산 + 색인 이중 경로
+    // ─────────────────────────────────────────────────────
+    function ArchFlow({ box }) {
+      if (!box) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🏗️ {box.title}</div>
+          <div className="space-y-1.5">
+            {box.stages.map((s, i) => {
+              const t = TONE[s.tone] || TONE.sky;
+              return (
+                <React.Fragment key={s.key}>
+                  <div className={`rounded border-2 ${t.border} ${t.bg} px-2 py-1.5 flex items-center gap-2`}>
+                    <span className="text-base">{s.icon}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className={`text-[11px] font-bold ${t.text}`}>{s.label}</div>
+                      <div className="text-[10px] text-slate-600 truncate">{s.sub}</div>
+                    </div>
+                    {s.ms != null && (
+                      <span className="text-[10px] font-mono font-bold text-slate-700 bg-white/70 border border-current/20 rounded px-1.5 py-0.5">{s.ms}ms</span>
+                    )}
+                  </div>
+                  {i < box.stages.length - 1 && <div className="text-center text-sky-400 text-sm leading-none">↓</div>}
+                </React.Fragment>
+              );
+            })}
+          </div>
+          <div className="mt-2 rounded border border-sky-300 bg-sky-50 p-2">
+            <div className="flex items-center justify-between text-[10px] font-bold text-sky-900 mb-1">
+              <span>⏱ 지연 예산</span>
+              <span className="font-mono">{box.budget.used}ms / {box.budget.total}ms</span>
+            </div>
+            <div className="h-2 rounded-full bg-sky-100 overflow-hidden">
+              <div className="h-full bg-emerald-500" style={{ width: `${(box.budget.used / box.budget.total) * 100}%` }} />
+            </div>
+            <div className="mt-1 text-[10px] text-slate-600">{box.budget.note}</div>
+          </div>
+        </div>
+      );
+    }
+    function IndexFlow({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-indigo-300 bg-indigo-50 p-3">
+          <div className="text-xs font-bold text-indigo-900 mb-2">🗂️ {box.title}</div>
+          <div className="flex items-center gap-2">
+            <div className="rounded border-2 border-slate-300 bg-white px-2 py-1.5 text-[11px] font-bold text-slate-700 text-center">📄<br/>문서 1개</div>
+            <div className="text-indigo-500 text-lg">⇉</div>
+            <div className="flex-1 space-y-1.5">
+              {box.rows.map((r, i) => (
+                <div key={i} className="rounded border border-indigo-300 bg-white px-2 py-1 flex items-center gap-2 text-[10px]">
+                  <span>{r.icon}</span>
+                  <span className="font-mono text-indigo-900 flex-1">{r.path}</span>
+                  <span className="text-slate-500">{r.out}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="mt-1.5 text-[10px] text-indigo-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 규모별 변형 비교 + 조건부 라우팅
+    // ─────────────────────────────────────────────────────
+    function VariantCompare({ box }) {
+      if (!box) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🧩 {box.title}</div>
+          <div className="space-y-2">
+            {box.items.map((v, i) => {
+              const t = TONE[v.tone] || TONE.sky;
+              return (
+                <div key={i} className={`rounded border-2 ${t.border} ${t.bg} p-2`}>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className={`text-[11px] font-bold ${t.text}`}>{v.scale}</span>
+                    <span className="text-[9px] font-mono text-slate-500">{v.size} 문서</span>
+                  </div>
+                  <div className="text-[10px] text-slate-700"><span className="font-bold">스택:</span> {v.stack}</div>
+                  <div className="text-[10px] text-slate-700"><span className="font-bold">융합:</span> {v.fusion}</div>
+                  <div className="text-[10px] text-emerald-800 mt-0.5">◎ {v.pros}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-2 text-[10px] text-slate-700 bg-amber-50 border border-amber-200 rounded p-1.5">{box.note}</div>
+        </div>
+      );
+    }
+    function RoutingTable({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-violet-300 bg-violet-50 p-3">
+          <div className="text-xs font-bold text-violet-900 mb-2">🔀 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-violet-900 border-b border-violet-200">
+                <th className="text-left py-0.5">질의</th>
+                <th className="text-left py-0.5 pl-2">유형</th>
+                <th className="text-left py-0.5 pl-2">경로</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r, i) => (
+                <tr key={i} className="border-t border-violet-100">
+                  <td className="py-1 font-mono text-slate-700">{r.q}</td>
+                  <td className="py-1 pl-2 text-slate-600">{r.type}</td>
+                  <td className="py-1 pl-2">
+                    <span className={`font-bold ${r.route === '하이브리드' ? 'text-sky-700' : 'text-emerald-700'}`}>{r.route}</span>
+                    <span className="text-[8px] text-slate-400 ml-1">({r.skip})</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-1.5 text-[10px] text-violet-900">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — RAG 파이프라인 + 통찰
+    // ─────────────────────────────────────────────────────
+    function RagPipeline({ box }) {
+      if (!box) return null;
+      const Chip = ({ s, tone }) => {
+        const t = TONE[tone] || TONE.sky;
+        return (
+          <div className={`rounded border-2 ${t.border} ${t.bg} px-1.5 py-1 text-center flex-1 min-w-0`}>
+            <div className="text-base leading-none">{s.icon}</div>
+            <div className={`text-[10px] font-bold ${t.text} mt-0.5`}>{s.label}</div>
+            <div className="text-[8px] text-slate-500 leading-tight truncate">{s.sub}</div>
+          </div>
+        );
+      };
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🤖 {box.title}</div>
+          <div className="text-[10px] font-bold text-slate-600 mb-1">색인 단계 (오프라인)</div>
+          <div className="flex items-center gap-1">
+            {box.index.map((s, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <span className="text-sky-400 text-xs">→</span>}
+                <Chip s={s} tone="indigo" />
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="text-[10px] font-bold text-slate-600 mt-2 mb-1">질의 단계 (온라인) — retriever = 이 장의 HybridSearcher</div>
+          <div className="flex items-center gap-1">
+            {box.query.map((s, i) => (
+              <React.Fragment key={i}>
+                {i > 0 && <span className="text-sky-400 text-xs">→</span>}
+                <Chip s={s} tone={i === 1 ? 'sky' : i === 3 ? 'emerald' : 'sky'} />
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-slate-700 bg-sky-50 border border-sky-200 rounded p-1.5">{box.note}</div>
+        </div>
+      );
+    }
+    function RagInsight({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">💡 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 text-[10px]">
+                <span className="flex-1 text-red-700 font-bold">{r.bad}</span>
+                <span className="text-red-400">→</span>
+                <span className="flex-1 text-slate-700">{r.effect}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-emerald-800 font-bold bg-emerald-50 border border-emerald-200 rounded p-1.5">◎ {box.fix}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 설계 체크리스트 + 안티패턴 + Part Ⅴ 예고
+    // ─────────────────────────────────────────────────────
+    function ChecklistBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">✅ {box.title}</div>
+          <div className="space-y-1.5">
+            {box.steps.map((s) => (
+              <div key={s.n} className="flex items-start gap-2">
+                <span className="w-5 h-5 shrink-0 rounded-full bg-sky-600 text-white text-[11px] font-bold flex items-center justify-center">{s.n}</span>
+                <div className="min-w-0">
+                  <div className="text-[11px] font-bold text-sky-900">{s.head}</div>
+                  <div className="text-[10px] text-slate-600 leading-snug">{s.body}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+    function AntiPatterns({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">🚫 {box.title}</div>
+          <div className="grid grid-cols-1 gap-2">
+            {box.items.map((it, i) => (
+              <div key={i} className="rounded border-2 border-red-400 bg-white p-2">
+                <div className="text-[11px] font-bold text-red-800">{it.icon} {it.head}</div>
+                <div className="text-[10px] text-slate-700 leading-snug mt-0.5">{it.body}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+    function NextPart({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-sky-500 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+          <div className="text-sm font-bold text-sky-900 mb-1">🗺️ {box.title}</div>
+          <div className="text-[10px] text-sky-900 leading-snug">{box.body}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 단계별 시각화 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const STAGE_BADGE = {
+      parts:     { icon: '🧰', label: '부품 점검' },
+      assemble:  { icon: '🏗️', label: '표준 조립' },
+      variants:  { icon: '🧩', label: '규모별 변형' },
+      rag:       { icon: '🤖', label: 'RAG 검색기' },
+      checklist: { icon: '✅', label: '설계 체크리스트' },
+    };
+
+    function LiveDataPane({ state }) {
+      const st = STAGE_BADGE[state.stage] || STAGE_BADGE.parts;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{st.icon}</span>
+              <span>하이브리드 설계 — {st.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            {state.stageDetail}
+          </div>
+          <PartsShelf box={state.parts} />
+          <ArchFlow box={state.flow} />
+          <IndexFlow box={state.indexFlow} />
+          <VariantCompare box={state.variants} />
+          <RoutingTable box={state.routing} />
+          <RagPipeline box={state.rag} />
+          <RagInsight box={state.insight} />
+          <ChecklistBox box={state.checklist} />
+          <AntiPatterns box={state.antipatterns} />
+          <NextPart box={state.nextPart} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">IV-2-2. 하이브리드 아키텍처 설계</h1>
+                <p className="text-sm text-sky-800/80">렉시컬+벡터+RRF+리랭커를 하나의 시스템으로 — 그리고 이것이 RAG의 검색기가 된다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Part IV 의 모든 부품(분석기·역색인·BM25·임베딩·HNSW·RRF·리랭커)을 하나의 하이브리드 시스템으로 조립했다.
+                표준 조립은 질의→[BM25 ‖ 벡터 병렬]→RRF 융합→(선택)리랭커이며, 지연 예산 안에서 리랭커는 상위 후보에만 건다.
+                규모에 따라 소규모(pgvector+앱 RRF)·중규모(ES 내장)·대규모(검색기 분리+융합 서비스)로 변형하고,
+                정확 매칭은 조건부 라우팅으로 벡터를 건너뛴다. 이 하이브리드 검색기는 수정 없이 RAG 의 retriever 가 되며,
+                RAG 품질 문제의 다수가 곧 검색 품질 문제다. 설계는 질의분석→색인→1단계 방식→융합→리랭커→평가 순으로 결정하고,
+                "무조건 벡터만"·"평가 없는 튜닝"을 피한다. 다음 Part Ⅴ 는 이 시스템의 평가·운영을 다룬다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['하이브리드', '병렬검색', 'RRF', '리랭커', '지연예산', '이중색인', '조건부라우팅', 'pgvector', 'Elasticsearch', 'RAG', 'retriever', '청킹', '설계체크리스트', '안티패턴'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../index.html" className="underline hover:no-underline">다음: Part Ⅴ (평가·운영) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

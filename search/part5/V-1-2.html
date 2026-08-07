@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — V-1-2. 색인 설계·분석기 튜닝</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔍</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search V-1-2 — 색인 설계·분석기 튜닝
+    학습 목표: 검색 품질의 8할이 결정되는 색인 단계를 실무 수준으로 설계한다.
+              (1) 하나의 원문을 목적별 멀티필드로 갈라 색인하는 원칙,
+              (2) nori 사용자/불용어/동의어 사전을 운영하고 _analyze로 회귀 테스트,
+              (3) 분석기 변경 = 재색인. alias 무중단 전환과 reindex, 재색인 중 쓰기 처리,
+              (4) 샤드·refresh·매핑 폭발·벡터 메모리까지 성능 튜닝,
+              (5) 설계 리뷰 체크리스트와 안티패턴으로 마무리 — 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 멀티필드 분기도 / alias 무중단 전환 / 트레이드오프 게이지 / 설계 템플릿 카드) / 우(VSCode CodeViewer: index_design.json / reindex_ops.py)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5단계 시나리오 — 멀티필드 설계 → 분석기 튜닝 → 재색인 전략 → 성능 튜닝 → 설계 리뷰
+    //   fields   : 원문 하나가 목적별 다중 필드로 갈라지는 구조 (Step 1)
+    //   dict     : nori 사전 운영/회귀 테스트 카드 (Step 2)
+    //   alias    : alias 무중단 전환 단계 애니메이션 (Step 3)
+    //   gauges   : 샤드/refresh/매핑/벡터 트레이드오프 게이지 (Step 4)
+    //   template : 설계 문서 템플릿 카드 + 안티패턴 (Step 5)
+    //   code     : 우측 CodeViewer (index_design.json / reindex_ops.py)
+    const STEPS = [
+      {
+        title: 'Step 1. 필드 설계의 원칙 — 원문 하나를 목적별 다중 필드로',
+        desc: '색인 설계의 첫 질문은 "어떻게 검색할 것인가"다 — 검색할 방식이 색인 방식을 결정하기 때문이다. "삼성 갤럭시북4"라는 상품명 하나도 쓰임이 셋으로 갈린다: 형태소로 쪼개 "갤럭시북"으로도 찾게 할 title(text·nori), 정렬·집계·정확 일치용 title.keyword(분석 안 함), 타이핑 중간에 자동완성을 띄울 title.ngram이다. 이것이 멀티필드(fields) 패턴 — 원문은 한 번 저장하되 분석기만 여러 벌 걸어 목적별 역색인을 각각 만든다(I-2-1·II-2-1의 역색인·랭킹 회수). 흔한 실패는 이 구분 없이 전부 text 하나로 색인해 정렬이 깨지거나, 전부 keyword로 넣어 부분 검색이 0건이 되는 것이다. "이 필드로 무엇을 할지"를 먼저 적고 그에 맞는 타입·분석기를 붙이는 습관이 품질의 8할을 좌우한다.',
+        actor: '🧬 "삼성 갤럭시북4" → 3개 목적 필드',
+        engine: 'fields',
+        engineDetail: '멀티필드: 원문 1개 → 목적별 색인 N개',
+        query: '삼성 갤럭시북4',
+        fieldTree: {
+          source: 'title = "삼성 갤럭시북4"',
+          branches: [
+            { name: 'title', type: 'text · nori', use: '본문 검색 (형태소)', tokens: ['삼성', '갤럭시북', '4'], color: 'sky' },
+            { name: 'title.keyword', type: 'keyword', use: '정렬·집계·정확 일치', tokens: ['삼성 갤럭시북4'], color: 'indigo' },
+            { name: 'title.ngram', type: 'text · edge_ngram', use: '자동완성 (접두어)', tokens: ['삼', '삼성', '삼성 ', '삼성 갤'], color: 'emerald' },
+          ],
+        },
+        alert: { tone: 'info', text: '"검색할 방식이 색인을 결정한다." 정렬·집계는 keyword, 부분 검색은 text·nori, 자동완성은 ngram. 한 원문을 fields 로 갈라 목적마다 다른 역색인을 만든다.' },
+        code: {
+          lang: 'json',
+          filename: 'index_design.json (멀티필드 매핑)',
+          lines: [
+            '// index_design.json — products 색인 매핑 (v1)',
+            '// 원칙: 원문 1개를 "검색 목적"별로 멀티필드로 분기한다.',
+            '{',
+            '  "settings": {',
+            '    "analysis": {',
+            '      "analyzer": {',
+            '        "nori_search": {          // 형태소 본문 검색용',
+            '          "type": "custom",',
+            '          "tokenizer": "nori_tokenizer",',
+            '          "filter": ["nori_readingform", "lowercase"]',
+            '        },',
+            '        "edge_ngram_index": {     // 자동완성 색인용',
+            '          "type": "custom",',
+            '          "tokenizer": "edge_ngram_tk"',
+            '        }',
+            '      },',
+            '      "tokenizer": {',
+            '        "edge_ngram_tk": {',
+            '          "type": "edge_ngram",',
+            '          "min_gram": 1, "max_gram": 20,',
+            '          "token_chars": ["letter", "digit"]',
+            '        }',
+            '      }',
+            '    }',
+            '  },',
+            '  "mappings": {',
+            '    "properties": {',
+            '      "title": {',
+            '        "type": "text",',
+            '        "analyzer": "nori_search",  // 본문: 형태소',
+            '        "fields": {',
+            '          "keyword": { "type": "keyword" },        // 정확 일치·정렬',
+            '          "ngram":   { "type": "text",',
+            '                       "analyzer": "edge_ngram_index",',
+            '                       "search_analyzer": "nori_search" }  // 자동완성',
+            '        }',
+            '      }',
+            '    }',
+            '  }',
+            '}',
+          ],
+          highlight: [26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 2. 분석기 튜닝 실전 — 사전 운영과 _analyze 회귀 테스트',
+        desc: '분석기는 한 번 만들고 끝이 아니라 "운영"하는 것이다. nori 사용자 사전(user_dictionary)에는 형태소 분석기가 모르는 신조어·브랜드·상품명을 등록한다 — "갤럭시북"을 한 단어로 잡아 주지 않으면 "갤럭시"+"북"으로 쪼개져 엉뚱하게 매칭된다. 여기에 세 종류의 사전이 붙는다: 검색에서 뺄 불용어(stopwords), 같은 뜻을 묶는 동의어(synonyms: "노트북,랩탑,laptop"), 그리고 사용자 사전이다. 운영의 핵심 질문은 "누가 언제 갱신하나"다 — 상품 MD가 주간으로 신상품명을 올리고, 검색 담당이 리뷰 후 반영하는 식의 책임과 주기를 정해 둬야 사전이 방치되지 않는다. 사전을 고칠 때마다 두려운 것은 "다른 검색이 깨지지 않았나"인데, 이때 _analyze API로 대표 쿼리 묶음을 돌려 토큰 결과를 스냅샷과 비교하는 회귀 테스트를 CI에 걸면, 사전 변경의 부작용을 배포 전에 잡을 수 있다.',
+        actor: '📖 nori 사전 운영 + _analyze 회귀',
+        engine: 'dict',
+        engineDetail: '사용자·불용어·동의어 사전 + 토큰 회귀 테스트',
+        query: '갤럭시북 / 랩탑',
+        dictCards: {
+          title: '세 종류의 사전 — 누가 언제 갱신하나',
+          items: [
+            { kind: 'user', icon: '🆕', head: '사용자 사전 (user_dictionary)', body: '신조어·브랜드·상품명. "갤럭시북" 미등록 시 "갤럭시"+"북"으로 분해. 상품 MD가 주간 갱신 → 검색팀 리뷰.' },
+            { kind: 'stop', icon: '🚫', head: '불용어 (stopwords)', body: '검색 가치 없는 조사·기능어 제거. 과하게 빼면 "그 외 1건" 같은 정보 손실 — 도메인별로 신중히.' },
+            { kind: 'syn', icon: '🔗', head: '동의어 (synonyms)', body: '"노트북,랩탑,laptop" 를 한 개념으로. 검색 시점(search_analyzer) 적용이 재색인 부담이 적어 실무 선호.' },
+            { kind: 'test', icon: '🧪', head: '_analyze 회귀 테스트', body: '대표 쿼리 토큰 결과를 스냅샷과 비교. 사전 변경이 다른 검색을 깨뜨렸는지 CI 에서 배포 전 감지.' },
+          ],
+        },
+        analyzeRows: {
+          title: '_analyze — 사전 적용 전/후 토큰 비교',
+          rows: [
+            { input: '갤럭시북4', before: ['갤럭시', '북', '4'], after: ['갤럭시북', '4'], ok: true },
+            { input: '랩탑 추천', before: ['랩탑', '추천'], after: ['노트북', '추천'], ok: true },
+            { input: '노트북을', before: ['노트북을'], after: ['노트북'], ok: true },
+          ],
+        },
+        alert: { tone: 'warn', text: '사전은 "만들고 끝"이 아니라 "운영"한다. 갱신 책임·주기를 정하고, _analyze 회귀 테스트를 CI 에 걸어야 사전 한 줄 수정이 다른 검색을 조용히 깨뜨리는 사고를 막는다.' },
+        code: {
+          lang: 'python',
+          filename: 'reindex_ops.py (사전 갱신·_analyze 회귀)',
+          lines: [
+            '"""',
+            'reindex_ops.py — 분석기 운영: 사전 갱신 후 _analyze 회귀 테스트',
+            '사전을 고칠 때마다 "다른 검색이 깨졌나"를 배포 전에 검증한다.',
+            '"""',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            '',
+            '# 회귀 스냅샷: 대표 쿼리 → 기대 토큰. 사전 변경 후에도 유지돼야 한다.',
+            'ANALYZE_SNAPSHOTS = {',
+            '    "갤럭시북4": ["갤럭시북", "4"],       # 사용자 사전 등록 확인',
+            '    "랩탑 추천": ["노트북", "추천"],       # 동의어 확장 확인',
+            '    "노트북을":  ["노트북"],              # 조사 제거 확인',
+            '}',
+            '',
+            '',
+            'def analyze(index: str, text: str) -> list[str]:',
+            '    """_analyze 로 실제 색인될 토큰을 뽑는다."""',
+            '    res = es.indices.analyze(',
+            '        index=index, body={"field": "title", "text": text}',
+            '    )',
+            '    return [t["token"] for t in res["tokens"]]',
+            '',
+            '',
+            'def run_regression(index: str) -> list[str]:',
+            '    """스냅샷과 다르면 실패 목록을 반환 — CI 게이트로 사용."""',
+            '    failures = []',
+            '    for text, expected in ANALYZE_SNAPSHOTS.items():',
+            '        got = analyze(index, text)',
+            '        if got != expected:',
+            '            failures.append(f"{text!r}: {got} != {expected}")',
+            '    return failures',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    fails = run_regression("products_v2")',
+            '    if fails:',
+            '        raise SystemExit("사전 회귀 실패:\\n" + "\\n".join(fails))',
+            '    print("OK — 모든 대표 쿼리 토큰 일치")',
+          ],
+          highlight: [9, 10, 11, 12, 13, 14, 26, 27, 28, 29, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 3. 재색인 전략 — 분석기 변경은 무중단 전환으로',
+        desc: '분석기·매핑을 바꾸면 이미 색인된 문서에는 소급 적용되지 않는다 — 새 규칙으로 다시 색인(reindex)해야 한다. 문제는 재색인 중에도 검색은 계속돼야 한다는 것. 정답은 alias 패턴이다: 애플리케이션은 항상 별칭(products)만 바라보게 하고, 실제 색인은 products_v1 → products_v2로 뒤에서 교체한다. v2를 새 매핑으로 만들고 _reindex API로 v1 데이터를 복사한 뒤, alias를 원자적으로 v1에서 v2로 옮기면(atomic swap) 사용자는 전환을 느끼지 못한다. 남은 관문은 "재색인 도중 들어온 쓰기"다 — 두 가지 방법이 있다: 애플리케이션이 v1·v2에 동시에 쓰는 이중 쓰기(dual write), 또는 변경분을 큐(Kafka 등)에 쌓아 두고 재색인 완료 후 재생(replay)하는 방법. 큐 방식이 애플리케이션을 단순하게 유지해 대규모에서 선호된다. 색인에는 반드시 버전(v1·v2)을 붙여 롤백 여지를 남긴다.',
+        actor: '🔄 products_v1 → v2 무중단 전환',
+        engine: 'alias',
+        engineDetail: 'alias atomic swap + reindex + 쓰기 처리',
+        query: '',
+        aliasFlow: {
+          title: 'alias 무중단 전환 — 앱은 별칭만 본다',
+          alias: 'products (alias)',
+          stages: [
+            { label: '① v2 생성', v1: 'live', v2: 'new', point: 'v1', desc: '새 매핑으로 products_v2 생성' },
+            { label: '② reindex', v1: 'live', v2: 'copy', point: 'v1', desc: '_reindex 로 v1 → v2 데이터 복사' },
+            { label: '③ 쓰기 반영', v1: 'live', v2: 'sync', point: 'v1', desc: '재색인 중 변경분: 큐 replay / 이중 쓰기' },
+            { label: '④ swap', v1: 'old', v2: 'live', point: 'v2', desc: 'alias 를 v1→v2 원자적 이동' },
+          ],
+        },
+        writeCards: {
+          title: '재색인 중 쓰기 — 이중 쓰기 vs 큐',
+          items: [
+            { kind: 'dual', icon: '✍️', head: '이중 쓰기 (dual write)', body: '앱이 v1·v2에 동시 쓰기. 구현 단순하나 앱에 전환 로직이 새고, 실패 시 정합성 깨질 위험.' },
+            { kind: 'queue', icon: '📮', head: '큐 replay (선호)', body: '변경분을 Kafka 등에 쌓고 재색인 후 재생. 앱은 무관심 — 대규모·다중 색인에서 안전.' },
+          ],
+        },
+        alert: { tone: 'danger', text: '"분석기 변경 = 재색인 필수." 소급 적용은 없다. alias 로 앱을 별칭에 묶고 v1→v2 를 뒤에서 교체하면 무중단 전환이 된다. 색인 버전을 붙여 롤백 여지를 남겨라.' },
+        code: {
+          lang: 'python',
+          filename: 'reindex_ops.py (alias 무중단 재색인)',
+          lines: [
+            '"""',
+            'reindex_ops.py — alias 패턴으로 무중단 재색인.',
+            '앱은 항상 별칭 "products" 만 본다. 실제 색인은 뒤에서 v1→v2 교체.',
+            '"""',
+            'from elasticsearch import Elasticsearch',
+            '',
+            'es = Elasticsearch("http://localhost:9200")',
+            'ALIAS, OLD, NEW = "products", "products_v1", "products_v2"',
+            '',
+            '',
+            'def create_v2(mapping: dict) -> None:',
+            '    """새 분석기·매핑으로 v2 색인 생성."""',
+            '    es.indices.create(index=NEW, body=mapping)',
+            '',
+            '',
+            'def reindex_v1_to_v2() -> None:',
+            '    """_reindex 로 v1 → v2 전량 복사 (대량은 wait_for_completion=False)."""',
+            '    es.reindex(',
+            '        body={"source": {"index": OLD}, "dest": {"index": NEW}},',
+            '        wait_for_completion=True, request_timeout=3600,',
+            '    )',
+            '',
+            '',
+            'def swap_alias() -> None:',
+            '    """alias 를 v1→v2 로 원자적 이동 — 사용자는 전환을 못 느낀다."""',
+            '    es.indices.update_aliases(body={"actions": [',
+            '        {"remove": {"index": OLD, "alias": ALIAS}},',
+            '        {"add":    {"index": NEW, "alias": ALIAS}},',
+            '    ]})',
+            '',
+            '',
+            'def replay_queue(changes: list[dict]) -> None:',
+            '    """재색인 중 쌓인 변경분을 v2 에 재생 (큐 방식)."""',
+            '    for c in changes:',
+            '        es.index(index=NEW, id=c["id"], document=c["doc"])',
+            '',
+            '',
+            '# 실행 순서: create_v2 → reindex → replay_queue → swap_alias',
+            '# 문제 시 alias 를 다시 v1 로 되돌리면 즉시 롤백된다.',
+          ],
+          highlight: [24, 25, 26, 27, 28, 29, 39, 40],
+        },
+      },
+      {
+        title: 'Step 4. 성능 튜닝 — 샤드·refresh·매핑 폭발·벡터 메모리',
+        desc: '색인 성능은 네 손잡이의 균형이다. 첫째, 샤드 수 — 많을수록 병렬성이 늘지만 샤드마다 고정 오버헤드(파일·메모리·스레드)가 붙어 과샤딩은 순수 낭비다. 흔한 지침은 샤드당 10~50GB, 데이터가 적으면 1개로 충분하다. 둘째, refresh_interval — 색인된 문서가 검색에 보이려면 refresh가 일어나야 하는데, 기본 1초는 대량 색인 시 부담이라 벌크 적재 중에는 -1(끄기)이나 30s로 늘려 색인 처리량을 크게 올린다(검색 가시성과의 트레이드오프). 셋째, 매핑 폭발(mapping explosion) — dynamic 매핑을 켜 두고 키가 매번 다른 JSON을 넣으면 필드가 무한히 늘어 클러스터가 죽는다. dynamic: strict로 스키마를 고정하고 필드 수 상한을 둔다. 넷째, 벡터 필드 메모리 — HNSW 그래프는 검색을 위해 메모리에 상주해야 빠르다(III-1-2 회수). 차원×문서수×4바이트로 대략 계산해 미리 용량을 잡지 않으면, 색인은 되는데 검색이 디스크로 새어 느려진다.',
+        actor: '⚙️ 4개 손잡이의 트레이드오프',
+        engine: 'perf',
+        engineDetail: '샤드 · refresh · 매핑 상한 · 벡터 메모리',
+        query: '',
+        gauges: {
+          title: '성능 손잡이 — 어느 쪽으로 돌릴 것인가',
+          items: [
+            { name: '샤드 수', left: '적음(1)', right: '많음(과샤딩)', pos: 30, good: 'left', note: '샤드당 10~50GB. 적은 데이터는 1개로 충분 — 과샤딩은 낭비.' },
+            { name: 'refresh_interval', left: '길게(30s/-1)', right: '기본(1s)', pos: 25, good: 'left', note: '대량 색인 중엔 길게 → 처리량↑. 검색 가시성과 맞바꾼다.' },
+            { name: '필드 수', left: '스키마 고정', right: 'dynamic 폭발', pos: 20, good: 'left', note: 'dynamic:strict + 필드 상한. 키가 매번 다른 JSON 금지.' },
+            { name: '벡터 메모리', left: '용량 계획', right: '무계획', pos: 22, good: 'left', note: 'HNSW 상주. dims×docs×4B 로 미리 계산 (III-1-2 회수).' },
+          ],
+        },
+        vectorCalc: {
+          title: '벡터 메모리 어림 — dims × docs × 4B',
+          rows: [
+            { dims: 768, docs: '100만', mem: '≈ 3.1 GB' },
+            { dims: 768, docs: '1000만', mem: '≈ 31 GB' },
+            { dims: 1536, docs: '1000만', mem: '≈ 61 GB' },
+          ],
+        },
+        alert: { tone: 'warn', text: '색인 성능은 켜고 끄는 스위치가 아니라 "돌리는 손잡이"다. 샤드·refresh·필드 수·벡터 메모리를 데이터 규모에 맞춰 잡아야 색인 처리량과 검색 지연을 동시에 지킨다.' },
+        code: {
+          lang: 'json',
+          filename: 'index_design.json (성능 설정)',
+          lines: [
+            '// index_design.json — 성능 튜닝 설정 블록',
+            '{',
+            '  "settings": {',
+            '    "number_of_shards": 1,        // 데이터 적으면 1. 과샤딩 금지',
+            '    "number_of_replicas": 1,',
+            '    "refresh_interval": "30s",    // 대량 색인 중엔 길게(-1 도 가능)',
+            '    "mapping": {',
+            '      "total_fields": { "limit": 1000 },  // 매핑 폭발 방어',
+            '      "nested_fields": { "limit": 50 }',
+            '    }',
+            '  },',
+            '  "mappings": {',
+            '    "dynamic": "strict",          // 스키마 고정 — 임의 필드 거부',
+            '    "properties": {',
+            '      "title":     { "type": "text", "analyzer": "nori_search" },',
+            '      "price":     { "type": "integer" },',
+            '      "embedding": {',
+            '        "type": "dense_vector",',
+            '        "dims": 768,              // 메모리 ≈ dims×docs×4B',
+            '        "index": true,',
+            '        "similarity": "cosine",',
+            '        "index_options": {',
+            '          "type": "hnsw",         // HNSW 그래프는 메모리 상주',
+            '          "m": 16, "ef_construction": 100',
+            '        }',
+            '      }',
+            '    }',
+            '  }',
+            '}',
+            '',
+            '// 벌크 적재 완료 후 검색용으로 되돌린다:',
+            '// PUT products_v2/_settings { "refresh_interval": "1s" }',
+          ],
+          highlight: [4, 6, 8, 13, 17, 18, 19, 23],
+        },
+      },
+      {
+        title: 'Step 5. 설계 리뷰 체크리스트 — 템플릿과 안티패턴',
+        desc: '새 색인을 만들기 전에 설계 문서 한 장을 먼저 쓰는 습관이 사고를 막는다. 템플릿은 네 칸이면 충분하다: (1) 필드 목록 — 각 필드의 타입·분석기·멀티필드, (2) 질의 패턴 — 이 색인에 들어올 대표 검색(정확 일치? 부분? 자동완성? 벡터?), (3) 분석기 — 사용자·불용어·동의어 사전과 갱신 주체, (4) 용량 추정 — 문서 수·평균 크기·벡터 메모리·예상 샤드. 이 네 칸을 채우다 보면 "이 필드는 정렬만 하는데 왜 text지?" 같은 모순이 스스로 드러난다. 리뷰에서 걸러야 할 안티패턴 셋: 전 필드 dynamic(매핑 폭발), 색인·검색 분석기 불일치(색인은 nori인데 검색은 standard면 토큰이 안 맞아 0건), 무계획 재색인(alias 없이 운영 색인을 직접 갈아엎기). 이 셋만 피해도 대형 사고의 대부분을 예방한다. 다음 장에서는 이렇게 잘 설계한 색인 위에서 실제 검색 로그를 모아 무엇이 안 나오는지 측정하고 개선하는 "검색 품질 개선 루프"로 넘어간다.',
+        actor: '✅ 설계 템플릿 + 안티패턴 3종',
+        engine: 'review',
+        engineDetail: '설계 문서 4칸 + 리뷰 체크리스트',
+        query: '',
+        templateCard: {
+          title: '새 색인 설계 문서 — 4칸 템플릿',
+          rows: [
+            { k: '① 필드 목록', v: 'title(text·nori) +.keyword +.ngram / price(integer) / embedding(dense_vector 768)' },
+            { k: '② 질의 패턴', v: '본문 검색 · 정확 일치 정렬 · 접두어 자동완성 · 벡터 유사도' },
+            { k: '③ 분석기', v: '사용자/불용어/동의어 사전 — MD 주간 갱신, 검색팀 리뷰, _analyze 회귀' },
+            { k: '④ 용량 추정', v: '문서 1000만 · 평균 2KB · 벡터 ≈31GB · 샤드 3개' },
+          ],
+        },
+        antiCards: {
+          title: '리뷰에서 반드시 거르는 안티패턴 3',
+          items: [
+            { icon: '💥', head: '전 필드 dynamic', body: '스키마 없이 아무 JSON → 매핑 폭발. dynamic:strict + 필드 상한으로 차단.' },
+            { icon: '🔀', head: '분석기 불일치', body: '색인 nori · 검색 standard → 토큰 안 맞아 0건. search_analyzer 명시로 정합.' },
+            { icon: '🧨', head: '무계획 재색인', body: 'alias 없이 운영 색인 직접 갈아엎기 → 다운타임·롤백 불가. alias 필수.' },
+          ],
+        },
+        alert: { tone: 'good', text: '다음 장: 검색 품질 개선 루프. 잘 설계한 색인 위에서 실제 검색 로그를 모아 "무엇이 안 나오는지" 측정하고, 사전·필드를 데이터로 고쳐 나간다.' },
+        code: {
+          lang: 'python',
+          filename: 'reindex_ops.py (설계 리뷰 체크리스트)',
+          lines: [
+            '"""',
+            'reindex_ops.py — 새 색인 배포 전 자동 설계 리뷰 체크리스트.',
+            '안티패턴 3종을 매핑에서 정적으로 검사해 배포를 막는다.',
+            '"""',
+            '',
+            '',
+            'def review_mapping(mapping: dict) -> list[str]:',
+            '    """설계 안티패턴을 잡아 경고 목록을 반환. 비어 있어야 통과."""',
+            '    warnings = []',
+            '    mp = mapping.get("mappings", {})',
+            '    st = mapping.get("settings", {})',
+            '',
+            '    # (1) 전 필드 dynamic — 매핑 폭발 위험',
+            '    if mp.get("dynamic") != "strict":',
+            '        warnings.append("dynamic 이 strict 아님 → 매핑 폭발 위험")',
+            '    if "total_fields" not in st.get("mapping", {}):',
+            '        warnings.append("total_fields 상한 미설정")',
+            '',
+            '    # (2) 색인/검색 분석기 불일치',
+            '    for name, f in mp.get("properties", {}).items():',
+            '        if f.get("type") == "text":',
+            '            if "analyzer" in f and "search_analyzer" not in f:',
+            '                warnings.append(f"{name}: search_analyzer 미지정 → 불일치 위험")',
+            '',
+            '    # (3) 벡터 필드 용량 계획 흔적(dims) 확인',
+            '    for name, f in mp.get("properties", {}).items():',
+            '        if f.get("type") == "dense_vector" and "dims" not in f:',
+            '            warnings.append(f"{name}: dims 미지정 → 메모리 계획 불가")',
+            '',
+            '    return warnings',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    import json',
+            '    with open("index_design.json", encoding="utf-8") as fp:',
+            '        mapping = json.load(fp)',
+            '    for w in review_mapping(mapping):',
+            '        print("⚠️", w)',
+            '    # 다음 장: 검색 로그로 품질을 측정하고 개선하는 루프로.',
+          ],
+          highlight: [13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25, 26, 27, 28],
+        },
+      },
+    ];
+
+    // 필드 분기도 색상 (sky/blue 톤)
+    const BRANCH_COLOR = {
+      sky:     { border: 'border-sky-400',     bg: 'bg-sky-50',     text: 'text-sky-900' },
+      indigo:  { border: 'border-indigo-400',  bg: 'bg-indigo-50',  text: 'text-indigo-900' },
+      emerald: { border: 'border-emerald-400', bg: 'bg-emerald-50', text: 'text-emerald-900' },
+    };
+
+    // 원문 → 멀티필드 분기 구조도 (Step 1)
+    function FieldTree({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-center mb-2">
+            <span className="inline-block px-3 py-1.5 rounded-lg bg-sky-800 text-white text-xs font-mono font-bold">
+              📄 {box.source}
+            </span>
+            <div className="text-sky-500 text-lg leading-none mt-1">↓ fields</div>
+          </div>
+          <div className="grid grid-cols-1 gap-2">
+            {box.branches.map((b, i) => {
+              const c = BRANCH_COLOR[b.color] || BRANCH_COLOR.sky;
+              return (
+                <div key={i} className={`rounded-lg border-2 ${c.border} ${c.bg} p-2`}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className={`text-[11px] font-bold font-mono ${c.text}`}>{b.name}</span>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/70 border border-current/20 font-mono text-slate-700">{b.type}</span>
+                  </div>
+                  <div className="text-[10px] text-slate-600 mb-1">🎯 {b.use}</div>
+                  <div className="flex flex-wrap gap-1">
+                    {b.tokens.map((t, j) => (
+                      <span key={j} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white border border-slate-300 text-slate-700">{t}</span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // 사전 운영 카드 (Step 2)
+    const DICT_TONE = {
+      user: 'border-sky-400 bg-sky-50 text-sky-900',
+      stop: 'border-red-400 bg-red-50 text-red-900',
+      syn:  'border-emerald-400 bg-emerald-50 text-emerald-900',
+      test: 'border-indigo-400 bg-indigo-50 text-indigo-900',
+    };
+    function DictCards({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">📖 {box.title}</div>
+          <div className="grid grid-cols-2 gap-2">
+            {box.items.map((it, i) => (
+              <div key={i} className={`rounded border-2 p-2 ${DICT_TONE[it.kind]}`}>
+                <div className="text-[11px] font-bold mb-0.5">{it.icon} {it.head}</div>
+                <div className="text-[10px] leading-snug">{it.body}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // _analyze 토큰 비교 표 (Step 2)
+    function AnalyzeRows({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-indigo-300 bg-indigo-50 p-3">
+          <div className="text-xs font-bold text-indigo-900 mb-2">🧪 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-indigo-900 border-b border-indigo-200">
+                <th className="text-left py-0.5">입력</th>
+                <th className="text-left py-0.5 pl-2">사전 전</th>
+                <th className="text-left py-0.5 pl-2">사전 후</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r) => (
+                <tr key={r.input} className="border-t border-indigo-100 align-top">
+                  <td className="py-1 font-mono font-bold text-indigo-900">{r.input}</td>
+                  <td className="py-1 pl-2 font-mono text-slate-500">{r.before.join(' · ')}</td>
+                  <td className="py-1 pl-2 font-mono text-emerald-700">✓ {r.after.join(' · ')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // alias 무중단 전환 애니메이션 (Step 3)
+    const IDX_STATE = {
+      live: { bg: 'bg-emerald-500', text: 'text-white', label: 'LIVE' },
+      new:  { bg: 'bg-sky-400',     text: 'text-white', label: '생성' },
+      copy: { bg: 'bg-amber-400',   text: 'text-amber-900', label: '복사중' },
+      sync: { bg: 'bg-amber-400',   text: 'text-amber-900', label: '동기화' },
+      old:  { bg: 'bg-slate-300',   text: 'text-slate-600', label: '구버전' },
+    };
+    function IndexBox({ name, st }) {
+      const s = IDX_STATE[st] || IDX_STATE.old;
+      return (
+        <div className={`rounded-lg ${s.bg} ${s.text} px-2 py-1.5 text-center`}>
+          <div className="text-[10px] font-mono font-bold">{name}</div>
+          <div className="text-[8px] opacity-90">{s.label}</div>
+        </div>
+      );
+    }
+    function AliasFlow({ box, stepPhase }) {
+      if (!box) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🔄 {box.title}</div>
+          <div className="space-y-2.5">
+            {box.stages.map((stg, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <div className="w-16 shrink-0 text-[10px] font-bold text-sky-800">{stg.label}</div>
+                {/* alias 포인터 */}
+                <div className="w-28 shrink-0 text-center">
+                  <div className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-800 text-white font-mono inline-block">{box.alias}</div>
+                  <div className={`text-sky-500 text-xs leading-none mt-0.5 ${stg.point === 'v2' ? 'text-right pr-3' : 'text-left pl-3'}`}>
+                    {stg.point === 'v2' ? '↘' : '↙'}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 w-32 shrink-0">
+                  <IndexBox name="v1" st={stg.v1} />
+                  <IndexBox name="v2" st={stg.v2} />
+                </div>
+                <div className="text-[9px] text-slate-600 flex-1 leading-tight">{stg.desc}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // 재색인 중 쓰기 카드 (Step 3)
+    const WRITE_TONE = {
+      dual:  'border-amber-400 bg-amber-50 text-amber-900',
+      queue: 'border-emerald-400 bg-emerald-50 text-emerald-900',
+    };
+    function WriteCards({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">✍️ {box.title}</div>
+          <div className="grid grid-cols-2 gap-2">
+            {box.items.map((it, i) => (
+              <div key={i} className={`rounded border-2 p-2 ${WRITE_TONE[it.kind]}`}>
+                <div className="text-[11px] font-bold mb-0.5">{it.icon} {it.head}</div>
+                <div className="text-[10px] leading-snug">{it.body}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // 성능 트레이드오프 게이지 (Step 4)
+    function Gauges({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-3">⚙️ {box.title}</div>
+          <div className="space-y-3">
+            {box.items.map((g, i) => (
+              <div key={i}>
+                <div className="flex items-center justify-between text-[10px] font-bold text-sky-900 mb-0.5">
+                  <span className="text-emerald-700">◀ {g.left}</span>
+                  <span className="font-mono">{g.name}</span>
+                  <span className="text-red-600">{g.right} ▶</span>
+                </div>
+                <div className="relative h-2.5 rounded-full bg-gradient-to-r from-emerald-200 via-amber-200 to-red-200 overflow-visible">
+                  <div
+                    className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full bg-sky-700 border-2 border-white shadow transition-all duration-700"
+                    style={{ left: `calc(${g.pos}% - 7px)` }}
+                  />
+                </div>
+                <div className="text-[9px] text-slate-600 mt-1 leading-tight">{g.note}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // 벡터 메모리 어림 표 (Step 4)
+    function VectorCalc({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-indigo-300 bg-indigo-50 p-3">
+          <div className="text-xs font-bold text-indigo-900 mb-2">🧮 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-indigo-900 border-b border-indigo-200">
+                <th className="text-left py-0.5">차원(dims)</th>
+                <th className="text-left py-0.5 pl-2">문서 수</th>
+                <th className="text-right py-0.5">HNSW 메모리</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.rows.map((r, i) => (
+                <tr key={i} className="border-t border-indigo-100">
+                  <td className="py-1 font-mono">{r.dims}</td>
+                  <td className="py-1 pl-2 font-mono">{r.docs}</td>
+                  <td className="py-1 text-right font-mono font-bold text-indigo-900">{r.mem}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-1.5 text-[10px] text-indigo-900">HNSW 그래프는 검색 속도를 위해 메모리에 상주 — 미리 잡지 않으면 검색이 디스크로 샌다.</div>
+        </div>
+      );
+    }
+
+    // 설계 문서 템플릿 카드 (Step 5)
+    function TemplateCard({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-1 rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">📋 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className="flex gap-2 text-[10px]">
+                <span className="w-20 shrink-0 font-bold text-sky-800">{r.k}</span>
+                <span className="flex-1 text-slate-700 font-mono leading-tight">{r.v}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // 안티패턴 카드 (Step 5)
+    function AntiCards({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">🚫 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.items.map((it, i) => (
+              <div key={i} className="rounded border-2 border-red-300 bg-white p-2">
+                <div className="text-[11px] font-bold text-red-800 mb-0.5">{it.icon} {it.head}</div>
+                <div className="text-[10px] leading-snug text-slate-700">{it.body}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // 경고/알림 박스
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // 좌측 LiveDataPane — 색인 설계 시뮬레이션 (sky/blue 톤)
+    const ENGINE_BADGE = {
+      fields: { icon: '🧬', label: '멀티필드 설계' },
+      dict:   { icon: '📖', label: '분석기 튜닝' },
+      alias:  { icon: '🔄', label: '무중단 재색인' },
+      perf:   { icon: '⚙️', label: '성능 튜닝' },
+      review: { icon: '✅', label: '설계 리뷰' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.fields;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>색인 설계 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          {state.query && (
+            <div className="mb-2 flex items-center gap-2 px-2 py-1 rounded border border-sky-200 bg-sky-50">
+              <span className="text-xs">🔎</span>
+              <span className="text-[11px] font-mono text-sky-800">대상: "{state.query}"</span>
+            </div>
+          )}
+          <div className="text-[10px] text-sky-700 font-mono mb-2 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            방식: {state.engineDetail}
+          </div>
+          <FieldTree box={state.fieldTree} />
+          <DictCards box={state.dictCards} />
+          <AnalyzeRows box={state.analyzeRows} />
+          <AliasFlow box={state.aliasFlow} />
+          <WriteCards box={state.writeCards} />
+          <Gauges box={state.gauges} />
+          <VectorCalc box={state.vectorCalc} />
+          <TemplateCard box={state.templateCard} />
+          <AntiCards box={state.antiCards} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // App
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">V-1-2. 색인 설계·분석기 튜닝</h1>
+                <p className="text-sm text-sky-800/80">검색 품질의 8할은 색인에서 — 필드 설계와 분석기를 실무 수준으로</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                색인 설계가 검색 품질의 8할을 결정한다. 원문 하나를 목적별 멀티필드(text·keyword·ngram)로 갈라 색인하고,
+                nori 사용자·불용어·동의어 사전을 "누가 언제" 갱신할지 정한 뒤 _analyze 회귀 테스트로 지킨다.
+                분석기 변경은 재색인 필수 — alias 로 v1→v2 를 무중단 전환하고, 재색인 중 쓰기는 큐 replay 로 처리한다.
+                성능은 샤드·refresh·매핑 상한·벡터 메모리 네 손잡이의 균형이며, 설계 문서 4칸 템플릿과 안티패턴 3종(전 필드 dynamic·분석기 불일치·무계획 재색인) 점검으로 사고를 예방한다.
+                다음 장에서는 이 색인 위에서 검색 로그로 품질을 측정·개선하는 루프로 넘어간다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['멀티필드', 'keyword', 'edge_ngram', 'nori사전', '동의어', '불용어', '_analyze', 'alias', 'reindex', '이중쓰기', '큐replay', '샤드', 'refresh_interval', '매핑폭발', 'HNSW메모리', '설계리뷰'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-1-3.html" className="underline hover:no-underline">다음: V-1-3 (검색 품질 개선 루프) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

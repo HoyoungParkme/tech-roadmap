@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search 학습 — V-2-1. 검색 로그 기반 개선 루프</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔁</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Search V-2-1 — 검색 로그 기반 개선 루프
+    학습 목표: 검색 로그를 "사용자가 매일 무료로 남기는 관련도 정답지"로 읽고,
+              (1) 각 로그 필드가 말해주는 신호를 해석하고
+              (2) 무결과·저품질 질의를 발굴해 유형별 처방(II-2-2 장치들)으로 매핑하고
+              (3) 클릭 데이터의 위치 편향을 보정해 골든셋·동의어 후보(V-1-1 연결)를 자동 발굴하고
+              (4) 오프라인 지표와 실사용이 다를 수 있어 A/B 테스트로 검증하고
+              (5) 이 모든 것을 주간 운영 리듬(사이클)으로 완성하는 과정을 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 로그 테이블 신호 하이라이트 / 처방 매핑 보드 / 위치편향 곡선 / A/B 카드 / 개선 루프 사이클) / 우(VSCode CodeViewer: log_analysis.py)
+    색상: sky/blue (search 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 로그 신호 → 무결과 발굴 → 클릭 편향 → A/B → 개선 루프
+    //   logRows  : 검색 로그 테이블. 각 행 = 한 번의 검색 세션
+    //              signal : 이 단계에서 강조할 필드 키 (하이라이트 대상)
+    //   code     : 우측 CodeViewer 파일 (log_analysis.py) — 단계별 하이라이트 라인 변경
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 로그에 담긴 신호 — 사용자가 무료로 남기는 정답지',
+        desc: '검색 로그의 한 줄 한 줄은 단순한 접속 기록이 아니라 "사용자가 우리 검색을 어떻게 느꼈는지"를 담은 신호다. 질의(query)는 사용자가 실제로 쓴 말이고, 결과 수(result_count)가 0이면 그 순간 사용자는 빈 화면을 봤다는 뜻이다. 클릭한 순위(clicked_rank)는 우리가 매긴 순위가 맞았는지를 사용자가 채점해 준 것이고, 재검색(reformulated) 여부는 "첫 결과가 만족스럽지 않아 말을 바꿔 다시 찾았다"는 불만의 신호다. 이탈(no_click)은 결과를 봤지만 아무것도 누르지 않은 것 — 관련도 실패다. 핵심은 이것이다: 관련도 판단이라는 가장 비싼 작업을, 사용자가 매일 수천 번 무료로 해주고 있다. 우리는 그걸 읽기만 하면 된다.',
+        actor: '📜 하루치 검색 로그 · 신호 해독',
+        phase: 'schema',
+        phaseDetail: 'query · result_count · clicked_rank · reformulated · no_click',
+        logRows: [
+          { q: '노트북', cnt: 128, rank: 1, reform: false, click: true },
+          { q: '무선 이어폰', cnt: 342, rank: 7, reform: true, click: true },
+          { q: '갤럭시 북', cnt: 0, rank: null, reform: true, click: false },
+          { q: '캠핑 의자', cnt: 56, rank: null, reform: false, click: false },
+        ],
+        signalCards: {
+          title: '각 필드가 말해주는 것',
+          items: [
+            { field: 'query', icon: '💬', body: '사용자가 실제 쓴 말. 우리 카테고리 용어와 다를 수 있다("랩탑" vs "노트북").' },
+            { field: 'result_count', icon: '0️⃣', body: '0이면 빈 화면. 오타·동의어 부재·재고 없음 중 하나다.' },
+            { field: 'clicked_rank', icon: '🎯', body: '사용자가 채점한 우리 순위. 7위를 눌렀다면 1~6위는 틀렸다.' },
+            { field: 'reformulated', icon: '🔁', body: '말을 바꿔 다시 검색 = 첫 결과 불만족의 증거.' },
+            { field: 'no_click', icon: '🚪', body: '결과를 봤지만 이탈. 관련도 실패(결과는 있는데 안 누름).' },
+          ],
+        },
+        alert: { tone: 'good', text: '관련도 판단은 원래 사람이 일일이 해야 하는 가장 비싼 라벨링 작업이다. 그걸 사용자가 매일 무료로 남긴다 — 로그를 읽는 순간 우리는 정답지를 손에 쥔다.' },
+        code: {
+          lang: 'python',
+          filename: 'log_analysis.py — 로그 스키마',
+          lines: [
+            '"""',
+            'log_analysis.py — 검색 로그 기반 개선 루프',
+            '로그 한 줄 = 사용자가 남긴 "관련도 정답지" 한 장.',
+            '수집 → 무결과/저품질 추출 → 동의어 마이닝 → A/B → 주간 리포트.',
+            '"""',
+            'from __future__ import annotations',
+            'from dataclasses import dataclass',
+            'from collections import Counter, defaultdict',
+            '',
+            '',
+            '@dataclass',
+            'class SearchLog:',
+            '    """검색 한 번(세션)에 대한 로그 한 줄."""',
+            '    ts: str            # 발생 시각 (ISO8601)',
+            '    query: str         # 사용자가 실제 입력한 질의',
+            '    result_count: int  # 노출된 결과 수 (0 = 무결과)',
+            '    clicked_rank: int | None  # 클릭한 결과의 순위 (없으면 None)',
+            '    reformulated: bool # 직후 질의를 바꿔 재검색했는가',
+            '    session_id: str    # 재검색 쌍을 잇기 위한 세션 키',
+            '',
+            '    @property',
+            '    def no_click(self) -> bool:',
+            '        """결과는 있는데 아무것도 안 눌렀다 = 관련도 실패 신호."""',
+            '        return self.result_count > 0 and self.clicked_rank is None',
+            '',
+            '',
+            '# 로그는 이렇게 쌓인다 (프런트 검색 이벤트 → 수집 파이프라인)',
+            'RAW = [',
+            '    SearchLog("T09:01", "노트북", 128, 1, False, "s1"),',
+            '    SearchLog("T09:02", "무선 이어폰", 342, 7, True, "s2"),',
+            '    SearchLog("T09:03", "갤럭시 북", 0, None, True, "s3"),',
+            '    SearchLog("T09:04", "캠핑 의자", 56, None, False, "s4"),',
+            ']',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 2. 무결과·저품질 질의 발굴 — 유형 분류에서 처방까지',
+        desc: '개선의 출발점은 "가장 아픈 질의"를 순위로 세우는 것이다. 무결과(0건) 질의를 빈도순으로 뽑으면, 왜 0건인지가 유형으로 갈린다 — 오타("갤력시"), 동의어 부재("랩탑"은 있는데 색인은 "노트북"), 진짜 재고 없음. 유형마다 처방이 다르다: 오타는 오타 교정(II-2-2의 편집거리)으로, 동의어 부재는 동의어 사전 등록으로, 재고 없음은 검색이 아니라 MD/소싱의 몫이다. 저품질 질의는 더 교묘하다 — 결과는 나왔는데 아무도 안 누른(no_click) 질의다. 결과가 있다는 건 색인은 됐다는 뜻이니, 문제는 "관련도"다. 순위가 틀렸거나, 상위 결과가 엉뚱한 것이다. 무결과가 "검색이 안 됨"이라면 저품질은 "검색은 됐는데 틀림"이다. 발굴한 질의를 유형→담당 처방으로 매핑하면, 로그가 그대로 백로그가 된다.',
+        actor: '🔎 아픈 질의 랭킹 → 처방 매핑',
+        phase: 'zero',
+        phaseDetail: 'zero_result 랭킹 · no_click 랭킹 → 유형 분류',
+        prescriptionBoard: {
+          title: '아픈 질의 → 유형 → 처방 (II-2-2 장치 회수)',
+          rows: [
+            { q: '갤력시북', cnt: 210, kind: '오타', tone: 'amber', fix: '오타 교정(편집거리) — "갤럭시북"' },
+            { q: '랩탑', cnt: 180, kind: '동의어 부재', tone: 'indigo', fix: '동의어 사전에 "랩탑=노트북" 등록' },
+            { q: '아이폰17', cnt: 95, kind: '재고 없음', tone: 'slate', fix: '검색 밖 — MD/소싱 이슈로 이관' },
+            { q: '무선 이어폰', cnt: 342, kind: '저품질(안 누름)', tone: 'red', fix: '관련도/랭킹 조정 — 상위 결과 점검' },
+          ],
+        },
+        alert: { tone: 'warn', text: '무결과 = "검색이 안 됨"(색인/사전 문제), 저품질 = "검색은 됐는데 틀림"(관련도/랭킹 문제). 처방하는 팀과 방법이 다르므로 반드시 나눠서 발굴한다.' },
+        code: {
+          lang: 'python',
+          filename: 'log_analysis.py — 무결과/저품질 추출',
+          lines: [
+            '# ── 무결과 질의 랭킹: 왜 0건인지 유형까지 붙인다 ──',
+            'def zero_result_ranking(logs: list[SearchLog]) -> list[tuple[str, int]]:',
+            '    """result_count == 0 인 질의를 빈도순으로."""',
+            '    c = Counter(l.query for l in logs if l.result_count == 0)',
+            '    return c.most_common()',
+            '',
+            '',
+            'def classify_zero(query: str, known_terms: set[str]) -> str:',
+            '    """0건 질의의 원인 유형을 추정 → 처방 팀이 달라진다."""',
+            '    if edit_distance_hit(query, known_terms):',
+            '        return "오타"          # → 오타 교정(편집거리)',
+            '    if is_synonym_candidate(query, known_terms):',
+            '        return "동의어 부재"    # → 동의어 사전 등록',
+            '    return "재고 없음"          # → 검색 밖(MD/소싱)',
+            '',
+            '',
+            '# ── 저품질 질의: 결과는 있는데 아무도 안 누른다 ──',
+            'def low_quality_ranking(logs: list[SearchLog]) -> list[tuple[str, int]]:',
+            '    """no_click 세션이 많은 질의 = 관련도 실패 후보."""',
+            '    c = Counter(l.query for l in logs if l.no_click)',
+            '    return c.most_common()',
+            '',
+            '#  무결과 → 색인/사전 문제 (검색이 안 됨)',
+            '#  저품질 → 관련도/랭킹 문제 (검색은 됐는데 틀림)',
+            '#  둘은 담당 팀도, 처방도 다르므로 반드시 분리한다.',
+          ],
+          highlight: [1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 3. 클릭 데이터의 함정과 활용 — 위치 편향을 걷어내면 정답이 보인다',
+        desc: '클릭 로그는 금광이지만, 그대로 믿으면 함정에 빠진다. 가장 큰 함정이 위치 편향(position bias)이다 — 1등은 관련도가 높아서가 아니라 "그냥 맨 위에 있어서" 많이 클릭된다. 실제로 클릭률은 순위가 내려갈수록 급격히 떨어지는데, 이건 관련도 곡선이 아니라 "사람 눈이 위에서 아래로 훑는" 습관의 곡선이다. 그래서 클릭 수를 그대로 관련도로 쓰면, 이미 위에 있는 결과만 계속 위에 있게 되는 악순환(rich-get-richer)이 생긴다. 보정의 핵심 아이디어는 "그 위치였다면 원래 받았을 클릭"으로 나눠서, 위치빨을 걷어낸 순수 관련도를 남기는 것이다. 이렇게 정제한 클릭은 두 곳에 쓴다. 첫째, 많이·꾸준히 클릭되는 (질의,문서) 쌍은 골든셋 후보다(V-1-1의 평가셋으로 연결). 둘째, 한 세션에서 "노트북→랩탑"처럼 연이어 검색한 재검색 쌍은 동의어 후보다 — 사용자가 스스로 같은 뜻임을 알려준 셈이다.',
+        actor: '🖱️ 위치 편향 보정 → 골든셋·동의어 후보',
+        phase: 'click',
+        phaseDetail: 'position bias 보정 → golden set(V-1-1) · 동의어 마이닝',
+        biasCurve: {
+          title: '위치 편향 곡선 — 1등이 원래 많이 눌린다',
+          points: [
+            { rank: 1, ctr: 45 },
+            { rank: 2, ctr: 26 },
+            { rank: 3, ctr: 16 },
+            { rank: 4, ctr: 10 },
+            { rank: 5, ctr: 7 },
+            { rank: 6, ctr: 5 },
+            { rank: 7, ctr: 4 },
+          ],
+          note: '이 곡선은 관련도가 아니라 "눈이 위→아래로 훑는 습관". 클릭을 이 값으로 나눠 위치빨을 걷어낸다.',
+        },
+        miningCards: {
+          title: '정제한 클릭을 어디에 쓰나',
+          items: [
+            { icon: '🏅', head: '골든셋 후보 (→ V-1-1)', body: '많이·꾸준히 클릭되는 (질의, 문서) 쌍 = 사실상의 정답. 평가셋 씨앗으로 회수.' },
+            { icon: '🔗', head: '동의어 후보 (재검색 쌍)', body: '한 세션에서 "노트북 → 랩탑" 연쇄 검색 = 사용자가 같은 뜻이라고 알려준 것.' },
+          ],
+        },
+        alert: { tone: 'danger', text: '클릭 수를 그대로 관련도로 쓰면 "위에 있어서 눌린" 결과가 계속 위에 남는 rich-get-richer 악순환에 빠진다. 반드시 위치 편향으로 나눠 보정한 뒤 신호로 쓴다.' },
+        code: {
+          lang: 'python',
+          filename: 'log_analysis.py — 클릭 보정·마이닝',
+          lines: [
+            '# ── 위치 편향: 순위별 "기본 클릭 확률"을 먼저 추정 ──',
+            'POSITION_BIAS = {1: 0.45, 2: 0.26, 3: 0.16, 4: 0.10,',
+            '                 5: 0.07, 6: 0.05, 7: 0.04}  # 로그로 측정',
+            '',
+            'def debiased_click(clicked_rank: int) -> float:',
+            '    """클릭 1건을 "그 위치의 기본 확률"로 나눠 위치빨 제거.',
+            '    아래 순위인데도 눌렸다면 관련도 가중치가 더 커진다.',
+            '    """',
+            '    base = POSITION_BIAS.get(clicked_rank, 0.03)',
+            '    return 1.0 / base',
+            '',
+            '',
+            '# ── 골든셋 후보: 보정 클릭이 꾸준히 높은 (질의,문서) 쌍 ──',
+            'def golden_set_candidates(logs, docs_by_session):',
+            '    score = defaultdict(float)',
+            '    for l in logs:',
+            '        if l.clicked_rank is not None:',
+            '            doc = docs_by_session[l.session_id][l.clicked_rank - 1]',
+            '            score[(l.query, doc)] += debiased_click(l.clicked_rank)',
+            '    # 상위 쌍 → V-1-1 평가셋(golden set)의 씨앗',
+            '    return sorted(score.items(), key=lambda x: -x[1])[:100]',
+            '',
+            '',
+            '# ── 동의어 후보: 같은 세션의 재검색 쌍 ("노트북"→"랩탑") ──',
+            'def synonym_candidates(logs) -> Counter:',
+            '    by_sess = defaultdict(list)',
+            '    for l in logs:',
+            '        by_sess[l.session_id].append(l.query)',
+            '    pairs = Counter()',
+            '    for queries in by_sess.values():',
+            '        for a, b in zip(queries, queries[1:]):  # 연쇄 검색 쌍',
+            '            if a != b:',
+            '                pairs[(a, b)] += 1',
+            '    return pairs  # 자주 이어지는 쌍 = 동의어 후보',
+          ],
+          highlight: [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 14, 19, 20, 24, 25, 29, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 4. A/B 테스트 — 오프라인 지표가 좋아도 실사용은 다르다',
+        desc: '동의어를 넣고 랭킹을 손봐서 오프라인 평가(V-1-1의 nDCG 등)가 올랐다고 끝이 아니다. 오프라인 지표는 "우리가 고른 정답셋" 기준이라, 실제 사용자가 정말 더 잘 찾는지는 다를 수 있다. 그래서 진짜 판정은 A/B 테스트로 한다. 트래픽을 사용자 단위로 A(기존)·B(변경)로 나누고, 핵심 지표(CTR·재검색률·구매전환)를 비교한다. 이때 반드시 가드레일 지표를 함께 본다 — 클릭은 늘었는데 p95 지연이 나빠졌거나 무결과율이 올랐다면, 좋아 보여도 배포하면 안 된다. 기간도 충분히(보통 1~2주, 요일·주말 패턴을 덮게) 잡아 통계적으로 유의한지 확인한다. 한 줄 덧붙이면, interleaving은 A와 B의 결과를 한 페이지에 섞어 보여주고 어느 쪽이 더 눌리는지 보는 더 민감한 비교법으로, 같은 트래픽으로 더 빨리 승부를 가른다.',
+        actor: '🧪 트래픽 분할 A/B + 가드레일',
+        phase: 'ab',
+        phaseDetail: '트래픽 분할 · 주지표 vs 가드레일 · 기간',
+        abTest: {
+          title: 'A(기존) vs B(동의어+랭킹 개선)',
+          metrics: [
+            { name: 'CTR (주지표)', a: '18.2%', b: '21.6%', good: true, kind: 'primary' },
+            { name: '재검색률 (주지표)', a: '31%', b: '24%', good: true, kind: 'primary' },
+            { name: 'p95 지연 (가드레일)', a: '120ms', b: '128ms', good: true, kind: 'guard' },
+            { name: '무결과율 (가드레일)', a: '6.1%', b: '4.3%', good: true, kind: 'guard' },
+          ],
+          verdict: 'B 승 — 주지표 개선 + 가드레일 안전. 통계 유의(2주, p<0.05) 확인 후 100% 반영.',
+          note: 'interleaving: A·B 결과를 한 페이지에 섞어 노출 → 어느 쪽이 더 눌리나. 같은 트래픽으로 더 빨리 판정하는 민감한 비교법.',
+        },
+        alert: { tone: 'warn', text: '가드레일을 안 보면 "클릭은 늘었는데 지연/무결과율이 나빠진" 개악을 좋은 것으로 착각한다. 주지표가 올라도 가드레일이 무너지면 배포 금지가 원칙이다.' },
+        code: {
+          lang: 'python',
+          filename: 'log_analysis.py — A/B 배정·집계',
+          lines: [
+            '# ── A/B 배정: 사용자 단위 해시로 안정적으로 나눈다 ──',
+            'import hashlib',
+            '',
+            'def assign_bucket(user_id: str, exp: str, ratio: float = 0.5) -> str:',
+            '    """user_id 를 해시 → 같은 사용자는 늘 같은 그룹(깜빡임 방지)."""',
+            '    h = hashlib.md5(f"{exp}:{user_id}".encode()).hexdigest()',
+            '    frac = int(h[:8], 16) / 0xFFFFFFFF',
+            '    return "B" if frac < ratio else "A"',
+            '',
+            '',
+            'def ab_metrics(logs: list[SearchLog], bucket_of) -> dict:',
+            '    """그룹별 주지표(CTR·재검색률)와 가드레일(무결과율)을 집계."""',
+            '    agg = {"A": Counter(), "B": Counter()}',
+            '    for l in logs:',
+            '        g = agg[bucket_of(l.session_id)]',
+            '        g["n"] += 1',
+            '        g["click"] += 1 if l.clicked_rank else 0',
+            '        g["reform"] += 1 if l.reformulated else 0',
+            '        g["zero"] += 1 if l.result_count == 0 else 0',
+            '    out = {}',
+            '    for name, g in agg.items():',
+            '        n = max(g["n"], 1)',
+            '        out[name] = {',
+            '            "ctr": g["click"] / n,          # 주지표',
+            '            "reform_rate": g["reform"] / n,  # 주지표',
+            '            "zero_rate": g["zero"] / n,      # 가드레일',
+            '        }',
+            '    return out',
+            '',
+            '# 주지표가 좋아도 가드레일(p95 지연·무결과율)이 나빠지면 배포 금지.',
+            '# interleaving: A·B 결과를 섞어 노출 → 더 민감·더 빠른 비교.',
+          ],
+          highlight: [1, 4, 5, 6, 7, 8, 11, 12, 17, 18, 19, 24, 25, 26, 30, 31],
+        },
+      },
+      {
+        title: 'Step 5. 개선 루프 완성 — 매주 도는 사이클과 대시보드',
+        desc: '지금까지의 조각들(로그 읽기→발굴→마이닝→A/B)은 한 번 하고 끝나는 프로젝트가 아니라, 매주 도는 톱니바퀴다. 주간 리듬은 이렇게 돈다: ①로그 리뷰(무결과·저품질·클릭 신호 확인) → ②백로그(발굴한 아픈 질의를 처방 티켓으로) → ③변경(동의어·오타·랭킹 반영) → ④오프라인 평가(V-1-1 정답셋으로 nDCG 확인) → ⑤A/B(실사용 검증) → ⑥반영, 그리고 다시 ①로. 이 루프가 멈추지 않게 하려면 매일 볼 대시보드가 필요하다 — 필수 위젯은 무결과율(검색이 안 되는 비율), CTR(관련도 대리 지표), p95 지연(속도 가드레일)이다. 이 지표들을 시계열로 띄우고 임계선 알림을 걸면, 개악이 배포된 날 곡선이 튀어 바로 잡힌다. 지연·에러·트래픽을 함께 보는 관측성(observability)과 자연스럽게 이어지는 지점이다. 다음 장에서는 이 모든 조각을 하나로 묶는 종합 설계 — 색인·랭킹·평가·운영을 관통하는 검색 시스템 아키텍처를 다룬다.',
+        actor: '🔁 주간 운영 사이클 + 대시보드',
+        phase: 'loop',
+        phaseDetail: '로그 리뷰→백로그→변경→평가→A/B→반영 (순환)',
+        loopCycle: {
+          title: '개선 루프 — 매주 도는 톱니바퀴',
+          stages: ['로그 리뷰', '백로그', '변경', '오프라인 평가', 'A/B', '반영'],
+        },
+        dashboard: {
+          title: '대시보드 필수 위젯 (매일 본다)',
+          widgets: [
+            { icon: '0️⃣', name: '무결과율', desc: '검색이 아예 안 되는 비율 — 오르면 색인/사전 사고' },
+            { icon: '🖱️', name: 'CTR', desc: '관련도의 대리 지표 — 떨어지면 랭킹 회귀 의심' },
+            { icon: '⏱️', name: 'p95 지연', desc: '속도 가드레일 — observability 주제와 직결' },
+          ],
+        },
+        alert: { tone: 'good', text: '다음 장: 종합 설계. 색인·랭킹·오타·형태소·평가·운영 루프를 하나의 검색 시스템 아키텍처로 묶는다. 로그 루프는 그 시스템을 "살아 있게" 유지하는 심장이다.' },
+        code: {
+          lang: 'python',
+          filename: 'log_analysis.py — 주간 리포트',
+          lines: [
+            '# ── 주간 리포트: 루프 한 바퀴를 한 장으로 요약 ──',
+            'def weekly_report(logs: list[SearchLog], known_terms: set[str]) -> dict:',
+            '    """로그 리뷰 → 백로그 후보 → 대시보드 지표를 한 번에 뽑는다."""',
+            '    n = max(len(logs), 1)',
+            '    zero = sum(1 for l in logs if l.result_count == 0)',
+            '    click = sum(1 for l in logs if l.clicked_rank)',
+            '',
+            '    report = {',
+            '        # 대시보드 필수 위젯 3종',
+            '        "zero_rate": zero / n,            # 무결과율',
+            '        "ctr": click / n,                 # CTR',
+            '        "p95_latency_ms": p95([l for l in logs]),  # 속도 가드레일',
+            '        # 백로그 후보 (처방 티켓으로 전환)',
+            '        "top_zero": zero_result_ranking(logs)[:10],',
+            '        "top_low_quality": low_quality_ranking(logs)[:10],',
+            '        "synonym_candidates": synonym_candidates(logs).most_common(10),',
+            '    }',
+            '    return report',
+            '',
+            '',
+            '# ── 매주 도는 루프 (스케줄러가 이 순서로 실행) ──',
+            'def run_weekly_loop(logs, known_terms):',
+            '    rpt = weekly_report(logs, known_terms)   # 1) 로그 리뷰',
+            '    backlog = to_tickets(rpt=rpt)            # 2) 백로그',
+            '    apply_changes(backlog)                  # 3) 변경(동의어·랭킹)',
+            '    offline = eval_offline(golden_set())     # 4) 오프라인 평가(V-1-1)',
+            '    if offline.improved:',
+            '        ab = run_ab_test(ratio=0.5, days=14)  # 5) A/B',
+            '        if ab.winner == "B" and ab.guardrails_ok:',
+            '            rollout(100)                     # 6) 반영 → 다시 1)',
+            '',
+            '# 대시보드 시계열 + 임계선 알림 → observability 로 연결.',
+            '# 다음 장: 색인·랭킹·평가·운영을 묶는 검색 시스템 종합 설계.',
+          ],
+          highlight: [1, 2, 3, 9, 10, 11, 12, 13, 14, 15, 21, 22, 23, 24, 25, 26, 27, 28],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 로그 테이블 — 필드별 신호 하이라이트 (Step 1)
+    // ─────────────────────────────────────────────────────
+    function LogTable({ rows }) {
+      if (!rows) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-2.5 overflow-x-auto">
+          <div className="text-xs font-bold text-sky-900 mb-2">📜 검색 로그 (하루치 발췌)</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-800 border-b border-sky-200">
+                <th className="text-left py-0.5">query</th>
+                <th className="text-right py-0.5">result_count</th>
+                <th className="text-right py-0.5">clicked_rank</th>
+                <th className="text-center py-0.5">reformulated</th>
+                <th className="text-center py-0.5">신호</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => {
+                const zero = r.cnt === 0;
+                const noClick = r.cnt > 0 && r.rank === null;
+                return (
+                  <tr key={i} className="border-t border-sky-100">
+                    <td className="py-1 font-mono font-bold text-slate-800">"{r.q}"</td>
+                    <td className={`py-1 text-right font-mono ${zero ? 'text-red-700 font-bold bg-red-50' : 'text-slate-700'}`}>{r.cnt}</td>
+                    <td className={`py-1 text-right font-mono ${r.rank && r.rank > 3 ? 'text-amber-700 font-bold bg-amber-50' : 'text-slate-700'}`}>{r.rank === null ? '—' : r.rank}</td>
+                    <td className="py-1 text-center">{r.reform ? <span className="text-indigo-700 font-bold">🔁 yes</span> : <span className="text-slate-400">no</span>}</td>
+                    <td className="py-1 text-center text-[9px] whitespace-nowrap">
+                      {zero ? <span className="text-red-700 font-bold">0건</span>
+                        : noClick ? <span className="text-red-700 font-bold">이탈</span>
+                        : r.rank > 3 ? <span className="text-amber-700 font-bold">낮은순위</span>
+                        : <span className="text-emerald-700 font-bold">✓ 만족</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function SignalCards({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">💡 {box.title}</div>
+          <div className="grid grid-cols-1 gap-1.5">
+            {box.items.map((it, i) => (
+              <div key={i} className="flex items-start gap-2 rounded border border-sky-200 bg-sky-50 px-2 py-1">
+                <span className="text-base">{it.icon}</span>
+                <div className="min-w-0">
+                  <span className="text-[11px] font-bold text-sky-900 font-mono">{it.field}</span>
+                  <div className="text-[10px] text-slate-700 leading-snug">{it.body}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 처방 매핑 보드 — 아픈 질의 → 유형 → 처방 (Step 2)
+    // ─────────────────────────────────────────────────────
+    const KIND_TONE = {
+      amber:  'border-amber-400 bg-amber-50 text-amber-900',
+      indigo: 'border-indigo-400 bg-indigo-50 text-indigo-900',
+      slate:  'border-slate-300 bg-slate-50 text-slate-700',
+      red:    'border-red-400 bg-red-50 text-red-900',
+    };
+    function PrescriptionBoard({ box }) {
+      if (!box) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🔎 {box.title}</div>
+          <div className="space-y-1.5">
+            {box.rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <div className="w-28 shrink-0">
+                  <div className="font-mono text-[11px] font-bold text-slate-800 truncate">"{r.q}"</div>
+                  <div className="text-[9px] text-slate-500">{r.cnt}건</div>
+                </div>
+                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${KIND_TONE[r.tone]} whitespace-nowrap`}>{r.kind}</span>
+                <span className="text-sky-500">→</span>
+                <span className="flex-1 text-[10px] text-emerald-800 font-bold leading-snug">{r.fix}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 위치 편향 곡선 (Step 3)
+    // ─────────────────────────────────────────────────────
+    function BiasCurve({ box }) {
+      if (!box) return null;
+      const max = Math.max(...box.points.map((p) => p.ctr));
+      return (
+        <div className="rounded-lg border-2 border-red-300 bg-white p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">📉 {box.title}</div>
+          <div className="flex items-end gap-2 h-32 px-1">
+            {box.points.map((p) => (
+              <div key={p.rank} className="flex-1 flex flex-col items-center justify-end gap-1">
+                <span className="text-[9px] font-mono font-bold text-red-700">{p.ctr}%</span>
+                <div className="w-full rounded-t bg-gradient-to-t from-red-500 to-amber-400 transition-all duration-700" style={{ height: `${(p.ctr / max) * 100}%` }} />
+                <span className="text-[9px] text-slate-500">{p.rank}위</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-red-900 leading-snug">{box.note}</div>
+        </div>
+      );
+    }
+
+    function MiningCards({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">⛏️ {box.title}</div>
+          <div className="grid grid-cols-1 gap-2">
+            {box.items.map((it, i) => (
+              <div key={i} className="rounded border-2 border-emerald-300 bg-emerald-50 p-2">
+                <div className="text-[11px] font-bold text-emerald-900 mb-0.5">{it.icon} {it.head}</div>
+                <div className="text-[10px] text-emerald-900/90 leading-snug">{it.body}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // A/B 테스트 카드 (Step 4)
+    // ─────────────────────────────────────────────────────
+    function ABTest({ box }) {
+      if (!box) return null;
+      return (
+        <div className="rounded-lg border-2 border-sky-400 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">🧪 {box.title}</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-sky-800 border-b border-sky-200">
+                <th className="text-left py-0.5">지표</th>
+                <th className="text-right py-0.5">A(기존)</th>
+                <th className="text-right py-0.5">B(변경)</th>
+                <th className="text-center py-0.5">판정</th>
+              </tr>
+            </thead>
+            <tbody>
+              {box.metrics.map((m, i) => (
+                <tr key={i} className="border-t border-sky-100">
+                  <td className={`py-1 font-bold ${m.kind === 'guard' ? 'text-amber-800' : 'text-slate-800'}`}>
+                    {m.name}
+                  </td>
+                  <td className="py-1 text-right font-mono text-slate-600">{m.a}</td>
+                  <td className="py-1 text-right font-mono font-bold text-sky-800">{m.b}</td>
+                  <td className="py-1 text-center">{m.good ? '✅' : '⚠️'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-2 rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-[10px] font-bold text-emerald-900">🏆 {box.verdict}</div>
+          <div className="mt-1.5 text-[10px] text-slate-600 leading-snug">{box.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 개선 루프 사이클 다이어그램 — 단계 순환 애니메이션 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function LoopCycle({ box }) {
+      const [active, setActive] = useState(0);
+      useEffect(() => {
+        if (!box) return;
+        const t = setInterval(() => setActive((a) => (a + 1) % box.stages.length), 900);
+        return () => clearInterval(t);
+      }, [box]);
+      if (!box) return null;
+      const n = box.stages.length;
+      const R = 78, cx = 100, cy = 100;
+      return (
+        <div className="rounded-lg border-2 border-sky-400 bg-gradient-to-br from-sky-50 to-indigo-50 p-3">
+          <div className="text-sm font-bold text-sky-900 mb-1">🔁 {box.title}</div>
+          <div className="flex justify-center">
+            <svg viewBox="0 0 200 200" className="w-56 h-56">
+              <circle cx={cx} cy={cy} r={R} fill="none" stroke="#bae6fd" strokeWidth="2" strokeDasharray="4 4" />
+              {box.stages.map((s, i) => {
+                const ang = (i / n) * 2 * Math.PI - Math.PI / 2;
+                const x = cx + R * Math.cos(ang);
+                const y = cy + R * Math.sin(ang);
+                const on = i === active;
+                return (
+                  <g key={i}>
+                    <circle cx={x} cy={y} r={on ? 17 : 13} fill={on ? '#0284c7' : '#fff'} stroke={on ? '#0369a1' : '#7dd3fc'} strokeWidth="2" className="transition-all duration-300" />
+                    <text x={x} y={y - 20} textAnchor="middle" fontSize="8" fontWeight="bold" fill={on ? '#0369a1' : '#64748b'}>{i + 1}</text>
+                    <text x={x} y={y + 3} textAnchor="middle" fontSize="7.5" fontWeight="bold" fill={on ? '#fff' : '#0369a1'}>
+                      {s.length > 5 ? s.slice(0, 4) : s}
+                    </text>
+                  </g>
+                );
+              })}
+              <text x={cx} y={cy - 4} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#0369a1">매주</text>
+              <text x={cx} y={cy + 8} textAnchor="middle" fontSize="9" fontWeight="bold" fill="#0369a1">순환</text>
+            </svg>
+          </div>
+          <div className="text-center text-[11px] font-bold text-sky-900">
+            지금: <span className="text-sky-700">{active + 1}. {box.stages[active]}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function Dashboard({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-sky-300 bg-white p-3">
+          <div className="text-xs font-bold text-sky-900 mb-2">📊 {box.title}</div>
+          <div className="grid grid-cols-1 gap-1.5">
+            {box.widgets.map((w, i) => (
+              <div key={i} className="flex items-start gap-2 rounded border border-sky-200 bg-sky-50 px-2 py-1.5">
+                <span className="text-base">{w.icon}</span>
+                <div className="min-w-0">
+                  <span className="text-[11px] font-bold text-sky-900">{w.name}</span>
+                  <div className="text-[10px] text-slate-700 leading-snug">{w.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-sky-50',     border: 'border-sky-300',     text: 'text-sky-900',     icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 로그 개선 루프 시뮬레이션 (sky/blue 톤)
+    // ─────────────────────────────────────────────────────
+    const PHASE_BADGE = {
+      schema: { icon: '📜', label: '로그 신호 해독' },
+      zero:   { icon: '🔎', label: '아픈 질의 발굴' },
+      click:  { icon: '🖱️', label: '클릭 보정·마이닝' },
+      ab:     { icon: '🧪', label: 'A/B 검증' },
+      loop:   { icon: '🔁', label: '개선 루프' },
+    };
+
+    function LiveDataPane({ state }) {
+      const ph = PHASE_BADGE[state.phase] || PHASE_BADGE.schema;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-sky-900 flex items-center gap-1.5">
+              <span>{ph.icon}</span>
+              <span>검색 로그 — {ph.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-sky-700 font-mono mb-3 px-2 py-1 rounded bg-sky-50 border border-sky-200">
+            대상: {state.phaseDetail}
+          </div>
+          <LogTable rows={state.logRows} />
+          <SignalCards box={state.signalCards} />
+          {state.prescriptionBoard && <PrescriptionBoard box={state.prescriptionBoard} />}
+          {state.biasCurve && <BiasCurve box={state.biasCurve} />}
+          <MiningCards box={state.miningCards} />
+          {state.abTest && <ABTest box={state.abTest} />}
+          {state.loopCycle && <LoopCycle box={state.loopCycle} />}
+          <Dashboard box={state.dashboard} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-400/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-14 h-10 rounded-lg bg-sky-600 text-white font-bold text-sm">Search</span>
+              <div>
+                <h1 className="text-2xl font-bold text-sky-900">V-2-1. 검색 로그 기반 개선 루프</h1>
+                <p className="text-sm text-sky-800/80">사용자가 매일 알려주는 개선 지도 — 로그를 읽으면 다음 할 일이 보인다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-sky-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-sky-500' : 'bg-sky-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-sky-800 text-sky-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-sky-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-sky-800 text-white' : 'bg-sky-600 text-white hover:bg-sky-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-sky-400 bg-white text-sky-800 hover:bg-sky-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-sky-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-sky-500 bg-white px-4 py-3 text-sm text-sky-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                검색 로그는 사용자가 매일 무료로 남기는 관련도 정답지다. 무결과(검색 안 됨)와 저품질(안 누름)을 나눠 발굴해
+                유형별 처방(오타 교정·동의어·랭킹)으로 매핑하고, 클릭은 위치 편향을 보정해 골든셋·동의어 후보로 회수한다.
+                오프라인 지표가 좋아도 실사용은 다를 수 있어 A/B(주지표+가드레일)로 검증하고,
+                이 전 과정을 로그 리뷰→백로그→변경→평가→A/B→반영의 주간 사이클로 돌린다.
+                무결과율·CTR·p95 지연을 대시보드로 매일 지켜보며 관측성과 잇고, 다음 장에서 검색 시스템 종합 설계로 묶는다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['검색로그', '무결과질의', '저품질질의', '클릭데이터', '위치편향', '골든셋', '동의어마이닝', 'AB테스트', '가드레일지표', 'interleaving', '개선루프', '대시보드', 'observability'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-900 border border-sky-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-sky-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-2-2.html" className="underline hover:no-underline">다음: V-2-2 (종합 설계) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
