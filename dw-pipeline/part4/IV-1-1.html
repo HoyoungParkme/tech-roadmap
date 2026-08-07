@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DW Pipeline 학습 — IV-1-1. Airflow DAG 해부</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌬️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DW Pipeline IV-1-1 — Airflow DAG 해부
+    학습 목표: 크론으로는 왜 의존성 있는 배치를 지휘할 수 없는지 체험하고,
+              DAG(방향 비순환 그래프)로 태스크·의존성을 선언하면 Airflow가
+              순서·병렬·재시도·모니터링을 어떻게 자동으로 관리하는지 5단계로 추적한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 크론 vs DAG 비교 + 태스크 상태 전이 애니메이션 + 오퍼레이터 카드 + 실행 아키텍처)
+                       우(VSCode CodeViewer: etl_dag.py 진화)
+    색상: teal (data 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // ETL DAG 태스크 정의 — 원천→스테이징→변환→적재
+    //   key   : 태스크 식별자
+    //   deps  : 선행 태스크 key 배열 (엣지)
+    //   op    : 오퍼레이터 종류
+    // ─────────────────────────────────────────────────────
+    const TASKS = [
+      { key: 'extract',   icon: '📤', name: 'extract_orders',  op: 'Python',  deps: [],           desc: '원천 DB에서 주문 추출' },
+      { key: 'wait_file', icon: '⏳', name: 'wait_for_csv',    op: 'Sensor',  deps: [],           desc: '외부 CSV 도착 대기' },
+      { key: 'stage',     icon: '📥', name: 'load_staging',    op: 'Python',  deps: ['extract', 'wait_file'], desc: '스테이징 원본 적재' },
+      { key: 'transform', icon: '⚙️', name: 'transform_dw',    op: 'SQL',     deps: ['stage'],    desc: '변환·정제 (SQL)' },
+      { key: 'load',      icon: '🏛️', name: 'load_warehouse',  op: 'Python',  deps: ['transform'], desc: 'DW 적재 (멱등)' },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계 시나리오
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 크론의 한계 — 시간은 알지만 의존성은 모른다',
+        desc: '"추출 끝나면 변환, 변환 끝나면 적재"를 크론으로 짜면 흔히 이렇게 한다 — 02:00 추출, 02:30 변환, 03:00 적재. 겉보기엔 순서가 맞지만 크론이 아는 건 오직 "시각"뿐이다. 앞 작업이 아직 안 끝났거나 아예 실패했어도, 02:30이 되면 크론은 아랑곳없이 변환을 실행한다. 그 결과 반쪽짜리 데이터로 변환이 돌고 오염이 하류로 번진다. 게다가 실패해도 자동 재시도가 없고, 무엇이 언제 왜 실패했는지 한눈에 보는 모니터링도 없다. 그래서 "작업 사이의 의존성과 성공 여부"를 이해하는 오케스트레이터가 필요하다 — 그게 Airflow다.',
+        panel: 'cronVsDag',
+        engine: 'cron', engineDetail: '크론: 시각만으로 개별 실행',
+        actor: '⚠️ 의존성 무시 · 실패 전파',
+        highlightTasks: [],
+        alert: { tone: 'danger', text: '크론의 3대 맹점: ① 의존성 모름(앞 작업 실패해도 뒷 작업 강행) ② 재시도 없음(실패하면 그냥 끝) ③ 모니터링 없음(어디서 멈췄는지 로그를 뒤져야). 시간 기반 스케줄로는 그래프를 지휘할 수 없다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'etl_dag.py — ① 크론의 함정',
+          lines: [
+            '# ① crontab — 시간만 알 뿐, 의존성도 성공 여부도 모른다',
+            '#',
+            '# 02:00  추출  →  02:30  변환  →  03:00  적재',
+            '#   0 2 * * *  python extract.py',
+            '#  30 2 * * *  python transform.py   # ⚠️ 추출 성공 여부 확인 안 함',
+            '#   0 3 * * *  python load.py         # ⚠️ 변환 성공 여부 확인 안 함',
+            '',
+            '# 🔥 무엇이 잘못되나:',
+            '#   · 02:00 추출이 03분 걸려 실패 → 02:30 변환은 그래도 실행된다',
+            '#   · 변환은 "어제 데이터"로 돌아버리고, 오염이 하류로 번진다',
+            '#   · 실패해도 재시도 없음 → 다음 날 아침에야 발견',
+            '#   · "지금 어느 단계?"를 알려면 서버에 SSH 로그인해 로그 grep',
+            '',
+            '# 근본 원인: 크론은 "작업들의 관계"를 모른다.',
+            '#   추출·변환·적재는 사실 하나의 그래프(의존성)인데',
+            '#   크론에겐 그냥 3개의 독립된 시각일 뿐이다.',
+            '#',
+            '# 필요한 것: 태스크 사이의 의존성을 이해하고,',
+            '#   앞이 성공해야 뒤를 실행하고, 실패하면 재시도하고,',
+            '#   전체 상태를 한 화면에 보여주는 "오케스트레이터".',
+            '#   → 그것이 Apache Airflow 이고, 단위가 DAG 이다.',
+          ],
+          highlight: [3, 4, 5, 8, 9, 10, 11, 12, 18, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 2. DAG 구조 — 태스크(노드) + 의존성(엣지)를 선언한다',
+        desc: 'DAG는 방향 비순환 그래프(Directed Acyclic Graph)다 — 태스크가 노드, 의존성이 화살표(엣지)이고, 사이클이 없어 실행이 반드시 끝난다. 핵심은 우리가 "실행 순서를 명령"하지 않고 "관계를 선언"한다는 점이다. extract >> stage >> transform >> load 한 줄이면, extract가 성공한 뒤에야 stage가 돌고, 서로 의존이 없는 태스크는 Airflow가 알아서 병렬로 돌린다. 개발자는 어떤 순서로 실행할지 스케줄러에게 맡기고, 무엇이 무엇에 의존하는지만 그리면 된다. schedule로 주기를, catchup으로 과거 미실행분을 채울지 말지를 정한다 — catchup=True면 start_date부터 밀린 날짜를 전부 백필한다.',
+        panel: 'dagGraph',
+        engine: 'dag', engineDetail: 'task >> task 로 의존성 선언',
+        actor: '🔗 그래프로 순서·병렬 자동 관리',
+        highlightTasks: ['extract', 'stage', 'transform', 'load'],
+        alert: { tone: 'info', text: '"명령"이 아니라 "선언"이다: extract >> stage 는 "extract 다음 stage 실행하라"가 아니라 "stage는 extract에 의존한다"는 관계 선언. 순서·병렬·대기 판단은 스케줄러가 그래프를 보고 스스로 한다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'etl_dag.py — ② 기본 DAG 정의',
+          lines: [
+            '# ② DAG: 태스크(노드) + 의존성(엣지)를 선언한다',
+            'from datetime import datetime',
+            'from airflow import DAG',
+            'from airflow.operators.empty import EmptyOperator',
+            '',
+            'with DAG(',
+            '    dag_id="etl_orders",',
+            '    start_date=datetime(2024, 1, 1),',
+            '    schedule="0 2 * * *",       # 매일 02:00 (스케줄)',
+            '    catchup=False,              # 밀린 과거분 백필 안 함',
+            '    tags=["dw", "etl"],',
+            ') as dag:',
+            '    extract   = EmptyOperator(task_id="extract")',
+            '    stage     = EmptyOperator(task_id="stage")',
+            '    transform = EmptyOperator(task_id="transform")',
+            '    load      = EmptyOperator(task_id="load")',
+            '',
+            '    # 의존성 선언: >> 는 "왼쪽이 성공해야 오른쪽 실행"',
+            '    extract >> stage >> transform >> load',
+            '',
+            '# Airflow 가 이 그래프를 읽고 스스로 판단한다:',
+            '#   · extract 가 성공(state=success)해야 stage 를 큐에 넣는다',
+            '#   · 의존이 없는 태스크끼리는 병렬로 실행',
+            '#   · 사이클이 없으니(비순환) 실행은 반드시 종료된다',
+            '#',
+            '# catchup=True 였다면? start_date(1/1)부터 오늘까지',
+            '#   밀린 날짜만큼 DAG 실행을 자동 생성해 "백필"한다.',
+          ],
+          highlight: [6, 7, 8, 9, 10, 13, 14, 15, 16, 18, 19, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 3. 오퍼레이터와 태스크 — 각 노드가 실제로 하는 일',
+        desc: '태스크는 그래프의 노드지만, 그 안에서 "무엇을 하는가"는 오퍼레이터가 정한다. PythonOperator는 파이썬 함수를, BashOperator는 셸 명령을, SQL 계열은 쿼리를 실행하고, 센서(Sensor)는 조금 특별하다 — "외부 조건이 만족될 때까지 기다리는" 태스크다(예: S3에 파일이 올라올 때까지 대기). 매번 op = PythonOperator(python_callable=...)로 감싸는 게 번거로워서, 요즘은 TaskFlow API(@task 데코레이터)로 평범한 파이썬 함수에 데코레이터만 붙이면 태스크가 된다. 함수의 return 값은 XCom(cross-communication)에 자동 저장되어 다음 태스크가 인자로 받는다 — 태스크 간 "작은 데이터"를 넘기는 통로다(대용량은 스토리지 경로만 넘긴다).',
+        panel: 'operators',
+        engine: 'operator', engineDetail: 'Python·Bash·SQL·Sensor + @task',
+        actor: '⚙️ 오퍼레이터가 노드의 실체',
+        highlightTasks: ['extract', 'wait_file', 'stage', 'transform'],
+        alert: { tone: 'info', text: '센서는 "폴링하며 기다리는 태스크"다 — 파일·파티션·다른 DAG 완료를 조건으로 삼는다. 오래 기다릴 땐 mode="reschedule"로 워커 슬롯을 놓아줘 자원 낭비를 막는다. XCom은 작은 값 전용(대용량 금지).' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'etl_dag.py — ③ 오퍼레이터 · TaskFlow · 센서',
+          lines: [
+            '# ③ 오퍼레이터: 태스크가 "실제로 하는 일"을 정한다',
+            'from airflow.decorators import task',
+            'from airflow.operators.bash import BashOperator',
+            'from airflow.sensors.filesystem import FileSensor',
+            '',
+            '# (a) 전통 방식 — PythonOperator 를 명시적으로 감싼다',
+            'from airflow.operators.python import PythonOperator',
+            'def _extract():',
+            '    return {"rows": 12000}          # 반환값은 XCom 에 저장',
+            'extract = PythonOperator(',
+            '    task_id="extract", python_callable=_extract,',
+            ')',
+            '',
+            '# (b) TaskFlow API — @task 만 붙이면 함수가 곧 태스크',
+            '@task',
+            'def transform(payload: dict) -> int:',
+            '    """앞 태스크의 XCom(payload)을 인자로 받는다."""',
+            '    return payload["rows"] * 2      # 다음 태스크로 XCom 전달',
+            '',
+            '# (c) 센서 — 외부 조건(파일 도착)을 기다리는 태스크',
+            'wait_csv = FileSensor(',
+            '    task_id="wait_for_csv",',
+            '    filepath="/data/in/orders.csv",',
+            '    poke_interval=60, mode="reschedule",  # 60초마다 확인',
+            ')',
+            '',
+            '# (d) BashOperator — 셸 명령을 태스크로',
+            'notify = BashOperator(task_id="notify", bash_command="echo done")',
+          ],
+          highlight: [6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 4. 실행 모델 — 스케줄러 + 익스큐터 + 워커',
+        desc: 'DAG 파일은 그냥 파이썬 코드일 뿐, 실제 실행은 세 역할이 나눠 맡는다. 스케줄러는 DAG 파일을 주기적으로 파싱하고, 의존성이 충족된 태스크를 찾아 큐에 넣는다. 익스큐터는 그 큐를 워커에 배분하는 방식이다 — LocalExecutor(한 머신 프로세스), CeleryExecutor(여러 워커 분산), KubernetesExecutor(태스크마다 파드 생성)로 규모에 맞춰 고른다. 워커가 실제로 태스크를 실행한다. 여기서 반드시 짚을 개념이 execution_date(논리적 실행일)다 — "지금 시각"이 아니라 "이 실행이 담당하는 데이터 구간"을 뜻한다. 2월 1일 새벽에 도는 실행의 execution_date는 1월 31일이며, 백필(III-2-2)에서 과거 날짜를 다시 돌릴 때 이 값이 파티션 경계가 된다. 각 태스크 인스턴스는 queued→running→success/failed/up_for_retry 상태를 오간다.',
+        panel: 'architecture',
+        engine: 'exec', engineDetail: 'Scheduler → Executor → Worker',
+        actor: '🏗️ 파싱·큐잉 → 배분 → 실행',
+        highlightTasks: ['extract', 'stage', 'transform', 'load'],
+        alert: { tone: 'warn', text: 'execution_date 는 "논리적 데이터 구간"이지 실제 실행 시각이 아니다. 2/1 02:00에 도는 일배치의 execution_date는 1/31 — 백필(III-2-2)로 과거를 재실행할 때 이 값으로 "그날 데이터"만 정확히 다시 만든다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'etl_dag.py — ④ 실행 모델 · execution_date',
+          lines: [
+            '# ④ 실행 모델: DAG 코드는 "설계도", 실행은 3역할이 나눈다',
+            '#',
+            '#   [Scheduler]  DAG 파싱 → 의존성 충족 태스크를 큐잉',
+            '#        │',
+            '#   [Executor]   Local / Celery / Kubernetes 로 워커에 배분',
+            '#        │',
+            '#   [Worker]     실제 태스크 코드를 실행',
+            '',
+            '# 태스크 인스턴스 상태 전이:',
+            '#   queued → running → success',
+            '#                   ↘ failed → up_for_retry → running ...',
+            '',
+            '# execution_date = "논리적 실행일" (실제 시각 아님!)',
+            '@task',
+            'def transform_dw(**context):',
+            '    # 2/1 새벽에 도는 실행이라도 ds 는 "1/31"',
+            '    ds = context["ds"]              # 담당 데이터 구간의 날짜',
+            '    sql = f"""',
+            '        INSERT INTO dw.fact_orders',
+            '        SELECT * FROM stg.orders',
+            '        WHERE order_date = \'{ds}\'  -- 그날 파티션만',
+            '    """',
+            '    return ds',
+            '',
+            '# 백필(III-2-2): 과거 execution_date 로 다시 돌리면',
+            '#   위 WHERE 가 그날 데이터만 정확히 재생성한다 → 멱등의 기반',
+          ],
+          highlight: [3, 5, 7, 9, 10, 11, 13, 15, 16, 17, 20, 21, 25, 26],
+        },
+      },
+      {
+        title: 'Step 5. 실전 DAG 조립 — 원천→스테이징→변환→적재',
+        desc: '이제 배운 조각을 하나의 완성 DAG로 조립한다: 센서로 외부 CSV를 기다리고, 원천을 추출하고, 스테이징에 적재하고, SQL로 변환하고, DW에 적재한다. 실무에서 지켜야 할 두 원칙이 있다. 첫째는 멱등(idempotent) 태스크다(III-2-2 회수) — 같은 execution_date로 몇 번을 재실행해도 결과가 동일해야 재시도·백필이 안전하다. 그래서 적재는 append가 아니라 "그날 파티션을 지우고 다시 넣는(delete-insert)" 식으로 짠다. 둘째는 파라미터화 — 날짜·경로를 코드에 박지 말고 {{ ds }} 같은 템플릿으로 주입한다. DAG 설계 원칙은 "작게 나누고(태스크 하나=한 가지 일), 재시도 가능하게(retries·retry_delay)"다. 다음 장에서는 이 DAG가 실패했을 때 어떻게 알림·재시도·복구하는지(실패 처리)를 다룬다.',
+        panel: 'finalDag',
+        engine: 'final', engineDetail: '완성 ETL DAG — 멱등·파라미터화',
+        actor: '✅ 재시도 가능한 프로덕션 DAG',
+        highlightTasks: ['wait_file', 'extract', 'stage', 'transform', 'load'],
+        alert: { tone: 'good', text: '프로덕션 체크리스트: ① 멱등 태스크(delete-insert)로 재시도·백필 안전 ② {{ ds }} 템플릿으로 날짜 파라미터화 ③ 태스크 하나=한 가지 일(작게) ④ retries·retry_delay 설정. 다음 장: 실패 처리(알림·재시도·복구).' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'etl_dag.py — ⑤ 완성 ETL DAG',
+          lines: [
+            '# ⑤ 완성: 원천→스테이징→변환→적재, 멱등 + 파라미터화',
+            'from datetime import datetime, timedelta',
+            'from airflow import DAG',
+            'from airflow.decorators import task',
+            'from airflow.sensors.filesystem import FileSensor',
+            '',
+            'default_args = {',
+            '    "retries": 3,                       # 실패 시 3회 재시도',
+            '    "retry_delay": timedelta(minutes=5),',
+            '}',
+            '',
+            'with DAG(',
+            '    dag_id="etl_orders_daily",',
+            '    start_date=datetime(2024, 1, 1),',
+            '    schedule="0 2 * * *", catchup=False,',
+            '    default_args=default_args,',
+            ') as dag:',
+            '',
+            '    wait_csv = FileSensor(',
+            '        task_id="wait_for_csv", filepath="/data/in/{{ ds }}.csv",',
+            '        poke_interval=60, mode="reschedule",',
+            '    )',
+            '',
+            '    @task',
+            '    def extract(): return {"rows": 12000}',
+            '',
+            '    @task',
+            '    def load_dw(ds=None):',
+            '        # 멱등: 그날 파티션을 지우고 다시 넣는다 (delete-insert)',
+            '        run(f"DELETE FROM dw.fact_orders WHERE ds = \'{ds}\'")',
+            '        run(f"INSERT INTO dw.fact_orders SELECT * FROM stg WHERE ds=\'{ds}\'")',
+            '',
+            '    wait_csv >> extract() >> load_dw()',
+            '',
+            '# 설계 원칙: 작게 나누고(태스크 1개=1가지 일), 재시도 가능하게.',
+            '# ▶ 다음 장(IV-1-2): 이 DAG 가 실패하면? — 알림·재시도·복구',
+          ],
+          highlight: [7, 8, 9, 12, 15, 16, 19, 20, 21, 27, 28, 29, 30, 31, 33, 36],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌: DAG 그래프 다이어그램 — 태스크(노드) + 의존성(엣지), 상태 애니메이션
+    // ─────────────────────────────────────────────────────
+    const OP_STYLE = {
+      Python: 'bg-teal-100 text-teal-800 border-teal-300',
+      SQL:    'bg-indigo-100 text-indigo-800 border-indigo-300',
+      Sensor: 'bg-amber-100 text-amber-800 border-amber-300',
+      Bash:   'bg-slate-100 text-slate-700 border-slate-300',
+    };
+
+    // 태스크 실행 상태 전이 애니메이션용 — 순서(레벨) 정의
+    // 레벨0: extract, wait_file (병렬) → 레벨1: stage → 레벨2: transform → 레벨3: load
+    const TASK_LEVEL = { extract: 0, wait_file: 0, stage: 1, transform: 2, load: 3 };
+
+    function DagGraph({ highlightTasks, runStage }) {
+      const hi = new Set(highlightTasks);
+      // runStage: -1(정지) 또는 0~3 진행 레벨. 상태 판정
+      const stateOf = (key) => {
+        if (runStage < 0) return hi.has(key) ? 'ready' : 'idle';
+        const lv = TASK_LEVEL[key];
+        if (lv < runStage) return 'success';
+        if (lv === runStage) return 'running';
+        return 'wait';
+      };
+      const CELL = {
+        idle:    'border-slate-200 bg-white opacity-60',
+        ready:   'border-teal-400 bg-teal-50',
+        wait:    'border-slate-300 bg-white text-slate-400',
+        running: 'border-amber-500 bg-amber-50 shadow ring-2 ring-amber-300',
+        success: 'border-emerald-500 bg-emerald-50',
+      };
+      const BADGE = { wait: '⏳ 대기', running: '▶ 실행', success: '✓ 성공', ready: '● 준비', idle: '· 대기' };
+      const BADGE_C = {
+        wait: 'text-slate-400', running: 'text-amber-700', success: 'text-emerald-700',
+        ready: 'text-teal-600', idle: 'text-slate-300',
+      };
+      // 레벨별로 묶어서 병렬을 나란히
+      const levels = [[], [], [], []];
+      TASKS.forEach((t) => levels[TASK_LEVEL[t.key]].push(t));
+      return (
+        <div className="rounded-lg border-2 border-teal-300 bg-white p-2.5">
+          <div className="text-[11px] font-bold text-teal-900 mb-2">🔗 ETL DAG — 태스크(노드) + 의존성(엣지)</div>
+          <div className="space-y-1">
+            {levels.map((lvTasks, li) => (
+              <React.Fragment key={li}>
+                {li > 0 && (
+                  <div className="flex justify-center leading-none">
+                    <span className={`text-[11px] ${runStage >= li ? 'text-teal-500' : 'text-slate-300'}`}>▼</span>
+                  </div>
+                )}
+                <div className="flex gap-1.5 justify-center">
+                  {lvTasks.map((t) => {
+                    const st = stateOf(t.key);
+                    return (
+                      <div key={t.key} className={`flex-1 rounded-lg border-2 px-2 py-1.5 transition-all ${CELL[st]}`}>
+                        <div className="flex items-center gap-1">
+                          <span className="text-base">{t.icon}</span>
+                          <span className={`text-[10px] font-bold ${st === 'idle' || st === 'wait' ? 'text-slate-500' : 'text-slate-800'}`}>{t.name}</span>
+                        </div>
+                        <div className="flex items-center justify-between mt-0.5">
+                          <span className={`text-[8px] font-bold px-1 rounded border ${OP_STYLE[t.op]}`}>{t.op}</span>
+                          <span className={`text-[9px] font-bold ${BADGE_C[st]}`}>{BADGE[st]}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 크론 vs DAG 비교
+    // ─────────────────────────────────────────────────────
+    function CronVsDagBox() {
+      const [failed, setFailed] = useState(false);
+      // failed=false: 추출 정상 / true: 추출 실패했지만 크론은 변환 강행
+      const cronJobs = [
+        { t: '02:00', name: 'extract.py', st: failed ? 'fail' : 'ok' },
+        { t: '02:30', name: 'transform.py', st: failed ? 'garbage' : 'ok' },
+        { t: '03:00', name: 'load.py', st: failed ? 'garbage' : 'ok' },
+      ];
+      const ST = {
+        ok: 'bg-emerald-50 border-emerald-300 text-emerald-800',
+        fail: 'bg-red-100 border-red-500 text-red-900',
+        garbage: 'bg-amber-50 border-amber-400 text-amber-900',
+      };
+      return (
+        <div className="mt-3 rounded-lg border-2 border-red-300 bg-red-50 p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-red-800">🧪 크론 — 추출이 실패하면?</div>
+            <button
+              onClick={() => setFailed((f) => !f)}
+              className={`text-[10px] font-bold px-2 py-1 rounded border ${failed ? 'bg-red-600 text-white border-red-700' : 'bg-white text-red-700 border-red-400'}`}
+            >{failed ? '■ 정상 복구' : '▶ 추출 실패 주입'}</button>
+          </div>
+          <div className="space-y-1">
+            {cronJobs.map((j) => (
+              <div key={j.name} className={`rounded border px-2 py-1 text-[10px] font-mono flex justify-between ${ST[j.st]}`}>
+                <span>{j.t} · {j.name}</span>
+                <span className="font-bold">
+                  {j.st === 'ok' ? '✓ 정상' : j.st === 'fail' ? '✗ 실패' : '⚠️ 반쪽 데이터로 강행'}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-red-900">
+            {failed
+              ? '추출이 실패했는데도 크론은 시각(02:30)만 보고 변환을 실행 → 오염된 데이터가 DW까지 번진다. 크론은 "성공 여부"를 모른다.'
+              : '평시엔 순서가 맞아 보인다. 문제는 "앞 작업이 실패하는 순간" 크론이 그걸 모른 채 뒤를 강행한다는 것.'}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 오퍼레이터 종류 카드
+    // ─────────────────────────────────────────────────────
+    function OperatorsBox() {
+      const rows = [
+        { icon: '🐍', name: 'PythonOperator', op: 'Python', detail: '파이썬 함수 실행 · @task 로 간결화' },
+        { icon: '💻', name: 'BashOperator', op: 'Bash', detail: '셸 명령 실행 (스크립트·CLI)' },
+        { icon: '🗃️', name: 'SQLOperator', op: 'SQL', detail: 'DB에 쿼리 실행 (변환·적재)' },
+        { icon: '⏳', name: 'Sensor', op: 'Sensor', detail: '외부 조건 대기 (파일·파티션·DAG)' },
+      ];
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-300 bg-white p-3">
+          <div className="text-xs font-bold text-teal-900 mb-2">⚙️ 오퍼레이터 — 태스크가 실제로 하는 일</div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {rows.map((r) => (
+              <div key={r.name} className={`rounded border px-2 py-1.5 ${OP_STYLE[r.op]}`}>
+                <div className="flex items-center gap-1.5">
+                  <span>{r.icon}</span>
+                  <span className="text-[11px] font-bold">{r.name}</span>
+                </div>
+                <div className="text-[9px] opacity-90 mt-0.5">{r.detail}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 rounded border border-teal-300 bg-teal-50 p-2 text-[10px] text-teal-900">
+            <b>XCom</b>: @task 함수의 <span className="font-mono">return</span> 값은 XCom에 저장되어 다음 태스크가 인자로 받는다 — 태스크 간 <b>작은 데이터</b> 통로. 대용량은 스토리지 경로만 넘긴다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 실행 아키텍처 (Scheduler / Executor / Worker)
+    // ─────────────────────────────────────────────────────
+    function ArchitectureBox() {
+      const layers = [
+        { icon: '🧭', name: 'Scheduler', role: 'DAG 파싱 → 의존성 충족 태스크 큐잉', c: 'border-teal-400 bg-teal-50 text-teal-900' },
+        { icon: '🚦', name: 'Executor', role: 'Local / Celery / Kubernetes 로 워커 배분', c: 'border-indigo-400 bg-indigo-50 text-indigo-900' },
+        { icon: '🛠️', name: 'Worker', role: '실제 태스크 코드 실행', c: 'border-emerald-400 bg-emerald-50 text-emerald-900' },
+      ];
+      const execs = [
+        { name: 'Local', d: '한 머신 프로세스 · 소규모' },
+        { name: 'Celery', d: '여러 워커 분산 · 대규모' },
+        { name: 'Kubernetes', d: '태스크마다 파드 · 격리·탄력' },
+      ];
+      const states = ['queued', 'running', 'success', 'failed', 'up_for_retry'];
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-400 bg-white p-3">
+          <div className="text-xs font-bold text-teal-900 mb-2">🏗️ 실행 아키텍처 — 3역할 분업</div>
+          <div className="space-y-1">
+            {layers.map((l, i) => (
+              <React.Fragment key={l.name}>
+                {i > 0 && <div className="flex justify-center leading-none"><span className="text-[11px] text-teal-500">▼</span></div>}
+                <div className={`rounded-lg border-2 px-2 py-1.5 flex items-center gap-2 ${l.c}`}>
+                  <span className="text-base">{l.icon}</span>
+                  <span className="text-[11px] font-bold w-20">{l.name}</span>
+                  <span className="text-[10px] opacity-90 flex-1">{l.role}</span>
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-1.5">
+            {execs.map((e) => (
+              <div key={e.name} className="rounded border border-indigo-200 bg-indigo-50 px-1.5 py-1">
+                <div className="text-[10px] font-bold text-indigo-800">{e.name}</div>
+                <div className="text-[8px] text-indigo-700">{e.d}</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 flex items-center flex-wrap gap-1 text-[9px]">
+            <span className="text-slate-600 font-bold">태스크 상태:</span>
+            {states.map((s, i) => (
+              <React.Fragment key={s}>
+                {i > 0 && <span className="text-slate-400">→</span>}
+                <span className={`px-1.5 py-0.5 rounded border font-mono ${s === 'success' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' : s === 'failed' ? 'bg-red-100 text-red-800 border-red-300' : s === 'running' ? 'bg-amber-100 text-amber-800 border-amber-300' : 'bg-slate-100 text-slate-700 border-slate-300'}`}>{s}</span>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 최종 DAG 요약 (멱등·파라미터화·설계 원칙)
+    // ─────────────────────────────────────────────────────
+    function FinalDagBox() {
+      const principles = [
+        { icon: '♻️', name: '멱등 태스크', d: 'delete-insert · 몇 번 재실행해도 동일 (III-2-2)' },
+        { icon: '🔧', name: '파라미터화', d: '{{ ds }} 템플릿 · 날짜·경로 주입' },
+        { icon: '🧩', name: '작게 나누기', d: '태스크 1개 = 한 가지 일' },
+        { icon: '🔁', name: '재시도 가능', d: 'retries · retry_delay 설정' },
+      ];
+      return (
+        <div className="mt-3 space-y-2">
+          <div className="rounded-lg border-2 border-emerald-300 bg-white p-3">
+            <div className="text-xs font-bold text-emerald-900 mb-2">✅ 프로덕션 DAG 설계 원칙</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {principles.map((p) => (
+                <div key={p.name} className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1.5">
+                  <div className="flex items-center gap-1">
+                    <span>{p.icon}</span>
+                    <span className="text-[11px] font-bold text-emerald-900">{p.name}</span>
+                  </div>
+                  <div className="text-[9px] text-emerald-800 mt-0.5">{p.d}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-teal-500 bg-gradient-to-br from-teal-50 to-emerald-50 p-3">
+            <div className="text-xs font-bold text-teal-900 mb-1">▶ 다음 장 — IV-1-2 실패 처리</div>
+            <div className="text-[10px] text-teal-900">이 DAG가 실패하면? 알림(Slack·이메일)·자동 재시도·부분 재실행·SLA 감시로 복구하는 법을 다룬다. 지금 DAG를 "재시도 가능"하게 짠 것이 그 토대다.</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-teal-50',    border: 'border-teal-300',    text: 'text-teal-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — DAG 그래프 + 단계별 특수 패널 (teal 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      cron:     { icon: '⏰', label: '크론 (무질서)' },
+      dag:      { icon: '🔗', label: 'DAG 구조' },
+      operator: { icon: '⚙️', label: '오퍼레이터' },
+      exec:     { icon: '🏗️', label: '실행 모델' },
+      final:    { icon: '✅', label: '완성 DAG' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.dag;
+      // 태스크 상태 전이 애니메이션 — DAG 그래프가 보이는 단계에서만
+      const showsGraph = state.panel !== 'cronVsDag';
+      const [runStage, setRunStage] = useState(-1);
+      useEffect(() => {
+        if (!showsGraph) { setRunStage(-1); return; }
+        setRunStage(0);
+        const timer = setInterval(() => {
+          setRunStage((s) => (s >= 3 ? 0 : s + 1));
+        }, 1100);
+        return () => clearInterval(timer);
+      }, [showsGraph, state.panel]);
+
+      return (
+        <div className="rounded-xl border border-teal-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-teal-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>오케스트레이션 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-teal-700 font-mono mb-2 px-2 py-1 rounded bg-teal-50 border border-teal-200">
+            현재 처리: {state.engineDetail}
+          </div>
+
+          {showsGraph && <DagGraph highlightTasks={state.highlightTasks} runStage={runStage} />}
+
+          {state.panel === 'cronVsDag' && <CronVsDagBox />}
+          {state.panel === 'operators' && <OperatorsBox />}
+          {state.panel === 'architecture' && <ArchitectureBox />}
+          {state.panel === 'finalDag' && <FinalDagBox />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      const tabs = [
+        { id: 'py', name: 'etl_dag.py' },
+      ];
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <div className="ml-3 flex gap-1">
+              {tabs.map((t) => (
+                <span
+                  key={t.id}
+                  className={`text-[11px] font-mono px-2 py-0.5 rounded-t ${code.file === t.id ? 'bg-[#282c34] text-teal-300 border-t border-x border-slate-600' : 'text-slate-500'}`}
+                >{t.name}</span>
+              ))}
+            </div>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="px-3 pt-1.5 text-[10px] text-slate-400 font-mono border-b border-slate-700/50">{code.filename}</div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-teal-400/15 border-l-2 border-teal-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-teal-50 to-cyan-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-teal-600 text-white font-bold">Ⅳ</span>
+              <div>
+                <h1 className="text-2xl font-bold text-teal-900">IV-1-1. Airflow DAG 해부</h1>
+                <p className="text-sm text-teal-800/80">크론으로는 안 되는 이유 — 의존성이 있는 작업들을 그래프로 지휘하기</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-teal-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-teal-500' : 'bg-teal-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-teal-800 text-teal-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-teal-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-teal-800 text-white' : 'bg-teal-600 text-white hover:bg-teal-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-teal-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-teal-500 bg-white px-4 py-3 text-sm text-teal-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                크론은 "시각"만 알 뿐 작업 사이의 의존성·성공 여부·재시도·모니터링을 모른다 — 그래서 오케스트레이터가 필요하다.
+                Airflow의 단위는 DAG(방향 비순환 그래프)로, 태스크(노드)와 의존성(엣지)을 <span className="font-mono">task1 &gt;&gt; task2</span>로 "선언"하면 스케줄러가 순서·병렬·대기를 스스로 판단한다.
+                각 노드는 오퍼레이터(Python·Bash·SQL·Sensor)로 실제 일을 하고, XCom으로 태스크 간 작은 데이터를 넘긴다.
+                실행은 스케줄러(파싱·큐잉)+익스큐터(Local/Celery/K8s)+워커로 분업하며, execution_date(논리적 실행일)가 백필의 파티션 경계가 된다.
+                프로덕션 DAG는 멱등·파라미터화·작은 태스크·재시도 가능을 지켜야 한다 — 다음 장은 실패 처리다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Airflow', 'DAG', '오케스트레이션', 'Operator', 'Sensor', 'TaskFlow', 'XCom', 'execution_date', 'Executor', '멱등성'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-teal-100 text-teal-900 border border-teal-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-teal-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./IV-1-2.html" className="underline hover:no-underline">다음: IV-1-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

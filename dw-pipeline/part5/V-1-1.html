@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DW Pipeline 학습 — V-1-1. 데이터 품질 검증</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🧪</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DW Pipeline V-1-1 — 데이터 품질 검증
+    학습 목표: "파이프라인은 성공(exit 0)했는데 대시보드 숫자가 이상하다"는 조용한
+              데이터 오염이 왜 코드 버그보다 무서운지 체험하고, 5개 품질 차원 검사 →
+              파이프라인 각 지점의 품질 게이트 → dbt/Great Expectations 자동화 →
+              품질 운영 체계(데이터 계약·인시던트 대응)까지 5단계로 쌓는다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 오염 전파 vs 게이트 차단 비교 + 5차원 검사 카드(실계산)
+                       + 검사 위치 다이어그램 + 기대→검증 흐름)
+                       우(VSCode CodeViewer: data_quality.py 진화)
+    색상: teal (data 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5개 품질 차원 — "무엇을 검사할지"의 지도
+    //   key   : 차원 식별자
+    //   check : 대표 검사
+    //   ex    : 실무 실패 예시
+    // ─────────────────────────────────────────────────────
+    const DIMENSIONS = [
+      { key: 'comp', icon: '🕳️', name: '완전성 (Completeness)', check: '널·누락 없음', ex: 'customer_id NULL 급증 → 매출 미집계' },
+      { key: 'uniq', icon: '🔁', name: '유일성 (Uniqueness)',  check: 'PK 중복 없음',  ex: 'order_id 중복 → 매출 2배로 뻥튀기' },
+      { key: 'valid', icon: '📏', name: '유효성 (Validity)',    check: '범위·형식 준수', ex: 'amount < 0, email 형식 깨짐' },
+      { key: 'consist', icon: '🔗', name: '정합성 (Consistency)', check: '참조 무결성',   ex: 'orders.customer_id 가 고객에 없음(고아)' },
+      { key: 'fresh', icon: '⏱️', name: '적시성 (Timeliness)',  check: '신선도(지연)',  ex: '어제 배치 실패 → 데이터가 24h 낡음' },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계 시나리오
+    //   panel : 좌측 특수 패널 종류
+    //   stage : 검사 위치 다이어그램에서 강조할 게이트
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 조용한 데이터 오염 — 파이프라인은 성공했는데 숫자가 틀리다',
+        desc: '코드 버그는 예외를 던지고 멈추니 금방 눈에 띈다. 데이터 오염은 정반대다 — 파이프라인은 exit 0으로 "성공"하고, 로그도 초록불인데 안에 흐르는 값이 틀렸다. 어제부터 customer_id가 절반이 NULL이 되어도 INSERT는 성공하고, order_id가 중복돼도 적재는 끝난다. 이 조용한 오류가 마트·대시보드·ML 피처까지 하류로 번진 뒤, 며칠 후 "매출이 왜 2배죠?"라는 현업 문의로 뒤늦게 터진다. 그래서 첫 번째 원칙은 "파이프라인 성공 ≠ 데이터 정상"이며, 값 자체를 능동적으로 검사하는 품질 게이트가 필요하다.',
+        panel: 'spread',
+        gate: 'source',
+        actor: '⚠️ 오염이 하류로 조용히 전파',
+        alert: { tone: 'danger', text: '"성공(exit 0)"은 "코드가 안 죽었다"는 뜻일 뿐, "데이터가 옳다"는 보장이 아니다. 검증이 없으면 오염은 마트→대시보드→ML까지 소리 없이 퍼진 뒤 신뢰 사고로 터진다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'data_quality.py — ① 성공했지만 오염된 적재',
+          lines: [
+            '"""',
+            'data_quality.py — "성공했는데 틀린" 데이터를 잡는 품질 검증',
+            '',
+            'Step 1: 코드 버그와 달리 데이터 오염은 조용하다.',
+            '        적재는 성공(exit 0)하지만 값이 틀린 채 하류로 흐른다.',
+            '"""',
+            'import pandas as pd',
+            '',
+            '',
+            'def load_orders(df: pd.DataFrame) -> int:',
+            '    """주문을 마트에 적재한다. 검증이 없으면 무엇이든 통과한다."""',
+            '    # ⚠️ 아무 검사 없이 그대로 적재 → 항상 "성공" 한다',
+            '    df.to_sql("mart_orders", ENGINE, if_exists="append", index=False)',
+            '    return len(df)                       # exit 0, 로그는 초록불',
+            '',
+            '',
+            '# 오늘 새벽 배치가 받은 데이터 — 겉보기엔 멀쩡하다',
+            'today = pd.DataFrame({',
+            '    "order_id":    [1001, 1002, 1002, 1003],   # 🔁 1002 중복',
+            '    "customer_id": [7, None, 9, None],         # 🕳️ NULL 급증',
+            '    "amount":      [12000, 40000, -5000, 8000],# 📏 음수 금액',
+            '})',
+            '',
+            'n = load_orders(today)',
+            'print(f"적재 성공: {n} rows")           # → "적재 성공: 4 rows"',
+            '',
+            '# 🔥 파이프라인은 성공했다. 그러나:',
+            '#   · order_id 1002 중복 → 매출이 이중 계상된다',
+            '#   · customer_id NULL 2건 → 고객별 집계에서 통째로 누락',
+            '#   · amount -5000 → 환불도 아닌데 매출을 깎는다',
+            '# 이 값들이 대시보드·ML 피처까지 조용히 번진다.',
+            '#',
+            '# 결론: "성공" 을 믿지 말고 값 자체를 검사하는 게이트가 필요하다.',
+          ],
+          highlight: [12, 13, 14, 19, 20, 21, 22, 27, 28, 29, 30, 31, 34],
+        },
+      },
+      {
+        title: 'Step 2. 품질 차원 — 무엇을 검사할지의 지도(5차원)',
+        desc: '"데이터 품질을 검사하라"는 막연하다. 그래서 무엇을 볼지 5개 차원으로 나눈다. 완전성(널·누락이 없는가), 유일성(PK가 중복되지 않는가), 유효성(값이 허용 범위·형식 안에 있는가 — amount≥0, email 패턴), 정합성(참조 무결성 — 주문의 customer_id가 실제 고객 테이블에 있는가, 고아 레코드 없는가), 적시성(데이터가 충분히 신선한가 — 어제치가 제때 도착했는가). 각 차원은 검사 방법이 다르고 실패의 파급도 다르다. 예컨대 유일성 위반은 매출을 뻥튀기하고, 완전성 위반은 매출을 누락시킨다. 이 5차원이 곧 체크리스트의 뼈대다.',
+        panel: 'dimensions',
+        gate: 'source',
+        actor: '📋 5차원 실측 검사 (통과/실패)',
+        alert: { tone: 'info', text: '5차원은 우선순위가 아니라 "빠뜨리지 않기 위한 지도"다. 유일성·정합성 위반은 값을 부풀리고, 완전성 위반은 값을 누락시킨다 — 방향이 반대라 둘 다 봐야 한다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'data_quality.py — ② 차원별 검사 함수',
+          lines: [
+            '# ② 품질 차원별 검사 함수 — 각 함수는 (통과여부, 상세) 를 반환',
+            'from dataclasses import dataclass',
+            '',
+            '',
+            '@dataclass',
+            'class CheckResult:',
+            '    dim: str          # 품질 차원',
+            '    passed: bool',
+            '    detail: str',
+            '',
+            '',
+            'def check_completeness(df, col: str) -> CheckResult:',
+            '    """완전성: 필수 컬럼에 NULL 이 없어야 한다."""',
+            '    n_null = int(df[col].isna().sum())',
+            '    return CheckResult("완전성", n_null == 0,',
+            '                       f"{col} NULL {n_null}건")',
+            '',
+            '',
+            'def check_uniqueness(df, col: str) -> CheckResult:',
+            '    """유일성: PK 는 중복되면 안 된다 (매출 이중계상 방지)."""',
+            '    n_dup = int(df[col].duplicated().sum())',
+            '    return CheckResult("유일성", n_dup == 0,',
+            '                       f"{col} 중복 {n_dup}건")',
+            '',
+            '',
+            'def check_validity(df, col: str, lo=0) -> CheckResult:',
+            '    """유효성: 값이 허용 범위 안에 있어야 한다 (amount >= 0)."""',
+            '    n_bad = int((df[col] < lo).sum())',
+            '    return CheckResult("유효성", n_bad == 0,',
+            '                       f"{col} 범위이탈 {n_bad}건")',
+            '',
+            '',
+            'def check_consistency(df, col, ref_ids) -> CheckResult:',
+            '    """정합성: FK 가 참조 테이블에 실제로 존재해야 한다."""',
+            '    orphans = int((~df[col].isin(ref_ids) & df[col].notna()).sum())',
+            '    return CheckResult("정합성", orphans == 0,',
+            '                       f"{col} 고아 {orphans}건")',
+            '',
+            '',
+            'def check_timeliness(max_ts, now, sla_hours=6) -> CheckResult:',
+            '    """적시성: 최신 데이터가 SLA 안에 도착했어야 한다."""',
+            '    lag_h = (now - max_ts).total_seconds() / 3600',
+            '    return CheckResult("적시성", lag_h <= sla_hours,',
+            '                       f"신선도 지연 {lag_h:.1f}h")',
+          ],
+          highlight: [12, 13, 14, 15, 19, 20, 21, 22, 27, 28, 29, 30, 35, 36, 37, 38, 43, 44, 45, 46],
+        },
+      },
+      {
+        title: 'Step 3. 테스트 배치 위치 — 파이프라인 곳곳에 품질 게이트',
+        desc: '검사는 한 곳이 아니라 파이프라인의 여러 지점에 둔다. ① 소스 착지 시점(스테이징에 방금 내려앉은 원본을 바로 검사 — 여기서 막으면 오염이 애초에 안 퍼진다), ② 변환 후(dbt test로 조인·집계 결과의 정합성 확인 — III-2-1에서 다룬 dbt를 여기서 회수한다), ③ 적재 후(마트가 대시보드에 노출되기 직전 최종 게이트). 각 게이트에서 정할 것은 "실패하면 어떻게 할까"다. 결정적 검사(PK 중복·필수 NULL)는 파이프라인을 중단(circuit breaker)해 오염 전파를 끊고, 경고성 검사(경미한 신선도 지연)는 알림만 보내고 진행한다 — 모든 실패를 중단으로 처리하면 사소한 문제로 파이프라인이 멈춰 오히려 신뢰를 잃는다.',
+        panel: 'gates',
+        gate: 'all',
+        actor: '🚦 소스·변환후·적재후 3중 게이트',
+        alert: { tone: 'warn', text: '핵심 판단: 실패 시 "중단(circuit breaker)" vs "경고 후 진행". PK 중복 같은 치명 오류는 중단해 전파를 끊고, 경미한 지연은 경고만 — 과잉 중단은 alert 피로와 신뢰 저하를 부른다.' },
+        code: {
+          lang: 'yaml', file: 'yaml',
+          filename: 'schema.yml — ③ dbt test (변환 후 게이트)',
+          lines: [
+            '# ③ 테스트 배치 위치 — dbt 는 "변환 후" 게이트를 선언으로 건다',
+            '# models/marts/schema.yml  (III-2-1 에서 만든 dbt 프로젝트에 추가)',
+            'version: 2',
+            '',
+            'models:',
+            '  - name: mart_orders',
+            '    description: "주문 마트 — 대시보드 노출 직전 최종 게이트"',
+            '    columns:',
+            '      - name: order_id',
+            '        tests:',
+            '          - unique          # 🔁 유일성: PK 중복 차단',
+            '          - not_null        # 🕳️ 완전성: 필수값',
+            '      - name: customer_id',
+            '        tests:',
+            '          - not_null',
+            '          - relationships:  # 🔗 정합성: 참조 무결성',
+            '              to: ref(\'dim_customer\')',
+            '              field: customer_id',
+            '      - name: amount',
+            '        tests:',
+            '          - dbt_utils.accepted_range:   # 📏 유효성: 범위',
+            '              min_value: 0',
+            '',
+            '# 실패 시 동작(severity)을 검사마다 다르게 건다:',
+            '#   error(기본)  → 파이프라인 중단(circuit breaker), 배포 차단',
+            '#   warn         → 리포트에 남기고 진행 (경미한 지연 등)',
+            '      - name: updated_at',
+            '        tests:',
+            '          - dbt_utils.recency:          # ⏱️ 적시성',
+            '              datepart: hour',
+            '              field: updated_at',
+            '              interval: 6',
+            '              config: { severity: warn } # 경고만, 중단 안 함',
+            '',
+            '# 게이트 위치: 소스착지(스테이징) → 변환후(dbt test) → 적재후(마트)',
+            '# 각 지점에서 막을수록 오염이 하류로 덜 번진다.',
+          ],
+          highlight: [9, 10, 11, 12, 15, 16, 17, 18, 20, 21, 24, 25, 26, 33, 36],
+        },
+      },
+      {
+        title: 'Step 4. 도구와 자동화 — 기대치를 코드로 선언하고 자동 검증',
+        desc: '검사 함수를 매번 손으로 짜는 대신, 도구로 "기대치(expectation)"를 선언하고 자동 검증·문서화한다. dbt test는 변환 파이프라인에 딱 붙어 unique·not_null·relationships를 YAML로 건다. Great Expectations는 더 풍부한 기대(값 집합·분포·정규식)를 정의하고 검증 결과를 Data Docs로 자동 문서화한다. Soda는 SodaCL이라는 간결한 문법으로 같은 일을 한다. 여기에 이상 자동 감지를 얹는다 — 행 수가 평소의 3배로 튀거나(볼륨 급변), NULL 비율 분포가 어제와 확 달라지면(분포 이동) 규칙을 일일이 안 걸어도 감지한다. 이 "분포가 슬금슬금 변하는" 감시는 ML의 데이터 드리프트 탐지와 사실상 같은 아이디어다.',
+        panel: 'expectations',
+        gate: 'transform',
+        actor: '🤖 기대 선언 → 자동 검증 → 리포트',
+        alert: { tone: 'good', text: 'dbt test(변환 밀착) · Great Expectations(풍부한 기대+Data Docs 문서화) · Soda(간결한 SodaCL). 위에 볼륨 급변·분포 이동 같은 이상 자동 감지를 얹으면 — 이는 ml 드리프트 탐지와 같은 원리다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'data_quality.py — ④ Great Expectations + 이상 감지',
+          lines: [
+            '# ④ 도구로 "기대치" 를 선언 → 자동 검증 → 문서화',
+            'import great_expectations as gx',
+            '',
+            'ctx = gx.get_context()',
+            'batch = ctx.sources.pandas_default.read_dataframe(today)',
+            '',
+            '# 기대(expectation)를 코드로 선언한다 — 사람이 읽는 규격서이자 검사',
+            'batch.expect_column_values_to_not_be_null("customer_id")',
+            'batch.expect_column_values_to_be_unique("order_id")',
+            'batch.expect_column_values_to_be_between("amount", min_value=0)',
+            'batch.expect_column_values_to_match_regex(',
+            '    "email", r"^[^@]+@[^@]+\\.[^@]+$")',
+            '',
+            'result = batch.validate()          # 자동 검증',
+            'ctx.build_data_docs()              # 결과를 HTML 문서로 자동 생성',
+            'print("검증 통과:", result.success)',
+            '',
+            '',
+            '# ── 규칙을 일일이 안 걸어도 잡는 "이상 자동 감지" ──────',
+            'def detect_anomaly(today_rows, history_rows, today_null, hist_null):',
+            '    """볼륨 급변·분포 이동을 통계로 감지 (ml 드리프트와 동형)."""',
+            '    baseline = sum(history_rows) / len(history_rows)',
+            '    vol_ratio = today_rows / baseline',
+            '    null_shift = abs(today_null - hist_null)',
+            '    alerts = []',
+            '    if vol_ratio > 2 or vol_ratio < 0.5:      # 볼륨 급변',
+            '        alerts.append(f"행 수 {vol_ratio:.1f}배 급변")',
+            '    if null_shift > 0.10:                      # 분포 이동',
+            '        alerts.append(f"NULL 비율 {null_shift:.0%}p 이동")',
+            '    return alerts',
+            '',
+            '',
+            'print(detect_anomaly(9800, [3000, 3200, 3100], 0.42, 0.02))',
+            '#  → ["행 수 3.1배 급변", "NULL 비율 40%p 이동"]  ← 규칙 없이 포착',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 14, 15, 20, 21, 25, 26, 27, 28, 33, 34],
+        },
+      },
+      {
+        title: 'Step 5. 품질 운영 체계 — 지표·데이터 계약·인시던트 대응',
+        desc: '검사를 걸었다고 끝이 아니라 운영으로 굴려야 한다. 첫째, 품질 지표 대시보드 — 테스트 통과율·신선도·차원별 실패 추이를 매일 본다(품질도 하나의 SLI다). 둘째, 데이터 계약(data contract) — 생산자(상류 팀)와 소비자가 스키마·의미·품질 기준을 약속으로 못 박아, 상류가 컬럼을 말없이 바꿔 하류를 깨뜨리는 사고를 예방한다. 셋째, 인시던트 대응 절차 — 오염을 발견하면 (1) 오염된 파티션을 격리하고, (2) 원인을 고친 뒤, (3) 해당 구간을 백필(III-2-2)로 재적재해 복구한다. 이 모두를 신뢰도 SLA로 묶어 "이 데이터는 매일 06시까지 99% 통과 보장" 같은 약속을 만든다. 다음 장(리니지)에서는 오염이 어디서 와서 어디까지 번졌는지를 계보로 추적한다.',
+        panel: 'ops',
+        gate: 'load',
+        actor: '📊 지표·계약·인시던트 → 신뢰 SLA',
+        alert: { tone: 'good', text: '품질은 일회성 검사가 아니라 운영이다: 지표 대시보드(SLI) + 데이터 계약(상류 변경 사고 예방) + 인시던트 절차(격리→수정→백필 III-2-2). 다음 장 리니지에서 "오염이 어디까지 번졌나"를 계보로 추적한다.' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'data_quality.py — ⑤ 품질 게이트 + 리포트',
+          lines: [
+            '# ⑤ 운영: 검사들을 묶어 circuit breaker 로 게이트를 세우고 리포트',
+            'from datetime import datetime',
+            '',
+            '',
+            'def run_quality_gate(df, ref_ids, now) -> dict:',
+            '    """모든 차원을 검사하고, 치명 실패면 파이프라인을 중단시킨다."""',
+            '    checks = [',
+            '        check_completeness(df, "customer_id"),',
+            '        check_uniqueness(df, "order_id"),',
+            '        check_validity(df, "amount", lo=0),',
+            '        check_consistency(df, "customer_id", ref_ids),',
+            '        check_timeliness(df["updated_at"].max(), now, sla_hours=6),',
+            '    ]',
+            '    passed = sum(c.passed for c in checks)',
+            '    report = {',
+            '        "ts": now.isoformat(),',
+            '        "pass_rate": round(passed / len(checks), 3),  # 품질 SLI',
+            '        "failed": [c.detail for c in checks if not c.passed],',
+            '    }',
+            '',
+            '    # 치명 차원(완전성·유일성·정합성) 실패 → circuit breaker',
+            '    fatal = {"완전성", "유일성", "정합성"}',
+            '    blockers = [c for c in checks if not c.passed and c.dim in fatal]',
+            '    if blockers:',
+            '        # 하류 적재를 막고 인시던트를 연다(격리 → 수정 → 백필)',
+            '        raise QualityGateError(               # 파이프라인 중단',
+            '            f"품질 게이트 차단: {[c.detail for c in blockers]}")',
+            '    return report                             # 경미한 실패는 통과+경고',
+            '',
+            '',
+            'class QualityGateError(Exception):',
+            '    """치명 품질 실패 시 하류 전파를 끊는 예외."""',
+            '',
+            '',
+            '# 신뢰도 SLA: "매일 06시까지 통과율 99% 보장" 을 지표로 관리한다.',
+            '# 다음 장(리니지): 오염이 어디서 와 어디까지 번졌는지 계보로 추적.',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 21, 22, 23, 24, 26, 27, 28, 35, 36],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌: 파이프라인 검사 위치 다이어그램 (소스·변환후·적재후 게이트)
+    // ─────────────────────────────────────────────────────
+    const PIPE_NODES = [
+      { key: 'source',    icon: '📥', name: '소스 착지',   sub: '스테이징 원본', gate: '게이트 ①' },
+      { key: 'transform', icon: '🔧', name: '변환 후',     sub: 'dbt test',      gate: '게이트 ②' },
+      { key: 'load',      icon: '🏛️', name: '적재 후',     sub: '마트 노출 직전', gate: '게이트 ③' },
+      { key: 'dash',      icon: '📊', name: '대시보드·ML', sub: '최종 소비',     gate: null },
+    ];
+
+    function GateDiagram({ active }) {
+      const isOn = (k) => active === 'all' || active === k;
+      return (
+        <div className="rounded-lg border-2 border-teal-300 bg-white p-2.5">
+          <div className="text-[11px] font-bold text-teal-900 mb-2">🚦 품질 게이트 위치 — 막을수록 오염이 덜 번진다</div>
+          <div className="flex items-stretch gap-1">
+            {PIPE_NODES.map((n, i) => (
+              <React.Fragment key={n.key}>
+                {i > 0 && (
+                  <div className="flex items-center">
+                    <span className="text-teal-400 text-sm">→</span>
+                  </div>
+                )}
+                <div className={`flex-1 rounded-lg border-2 px-1.5 py-1.5 text-center transition-all ${n.gate && isOn(n.key) ? 'border-teal-500 bg-teal-50 shadow' : 'border-slate-200 bg-white opacity-70'}`}>
+                  <div className="text-base leading-none">{n.icon}</div>
+                  <div className="text-[10px] font-bold text-teal-900 mt-0.5">{n.name}</div>
+                  <div className="text-[8px] text-slate-500 font-mono truncate">{n.sub}</div>
+                  {n.gate && (
+                    <span className={`inline-block mt-0.5 text-[8px] font-bold px-1 rounded ${isOn(n.key) ? 'bg-teal-600 text-white' : 'bg-slate-200 text-slate-500'}`}>{n.gate}</span>
+                  )}
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 오염 전파 vs 게이트 차단 비교
+    // ─────────────────────────────────────────────────────
+    function SpreadSim() {
+      const [gate, setGate] = useState(false);
+      // gate=false: 검증 없음 → 오염이 끝까지 전파 / true: 게이트가 중간에 차단
+      const stops = [
+        { icon: '📥', name: '스테이징' },
+        { icon: '🔧', name: '변환/마트' },
+        { icon: '📊', name: '대시보드' },
+        { icon: '🤖', name: 'ML 피처' },
+      ];
+      // 게이트 ON이면 index 1(변환)에서 차단, 그 뒤는 깨끗
+      const blockedFrom = gate ? 1 : 99;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-300 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-teal-900">🧪 오염 전파 시뮬레이션 — 게이트가 있으면?</div>
+            <button
+              onClick={() => setGate((g) => !g)}
+              className={`text-[10px] font-bold px-2 py-1 rounded border ${gate ? 'bg-teal-600 text-white border-teal-700' : 'bg-white text-red-700 border-red-400'}`}
+            >{gate ? '🛡️ 품질 게이트 ON' : '⚠️ 게이트 없음'}</button>
+          </div>
+          <div className="flex items-stretch gap-1">
+            {stops.map((s, i) => {
+              const polluted = i < blockedFrom;
+              const blocked = gate && i === blockedFrom;
+              return (
+                <React.Fragment key={s.name}>
+                  {i > 0 && (
+                    <div className="flex items-center">
+                      <span className={`text-sm ${i <= blockedFrom ? (gate && i === blockedFrom ? 'text-teal-500' : 'text-red-400') : 'text-emerald-400'}`}>
+                        {gate && i === blockedFrom ? '⛔' : '→'}
+                      </span>
+                    </div>
+                  )}
+                  <div className={`flex-1 rounded-lg border-2 px-1 py-1.5 text-center ${polluted ? 'border-red-400 bg-red-50' : blocked ? 'border-teal-500 bg-teal-50' : 'border-emerald-300 bg-emerald-50'}`}>
+                    <div className="text-base leading-none">{s.icon}</div>
+                    <div className="text-[9px] font-bold text-slate-700 mt-0.5">{s.name}</div>
+                    <div className={`text-[8px] font-bold mt-0.5 ${polluted ? 'text-red-700' : blocked ? 'text-teal-700' : 'text-emerald-700'}`}>
+                      {polluted ? '🔴 오염' : blocked ? '🛡️ 차단' : '🟢 깨끗'}
+                    </div>
+                  </div>
+                </React.Fragment>
+              );
+            })}
+          </div>
+          <div className="mt-2 text-[10px] text-slate-700">
+            {gate
+              ? '변환 후 게이트가 오염을 잡아 파이프라인을 중단 → 대시보드·ML은 깨끗하게 지킨다.'
+              : '검증이 없으니 스테이징의 오염이 마트·대시보드·ML까지 조용히 번진다. "성공"했는데 전부 틀렸다.'}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — 5차원 실측 검사 카드 (오늘 배치 데이터로 실제 계산)
+    // ─────────────────────────────────────────────────────
+    function DimensionCards() {
+      // Step 1의 오염 데이터로 실제 통과/실패를 계산 (하드코딩 아님)
+      const orderIds = [1001, 1002, 1002, 1003];
+      const customerIds = [7, null, 9, null];
+      const amounts = [12000, 40000, -5000, 8000];
+      const refIds = new Set([7, 8, 9, 10]);        // dim_customer 존재 id
+      const lagHours = 26;                            // 어제 배치 실패 → 26h 지연
+
+      const nNull = customerIds.filter((v) => v == null).length;
+      const nDup = orderIds.length - new Set(orderIds).size;
+      const nBadRange = amounts.filter((v) => v < 0).length;
+      const nOrphan = customerIds.filter((v) => v != null && !refIds.has(v)).length;
+
+      const results = [
+        { d: DIMENSIONS[0], pass: nNull === 0, detail: `customer_id NULL ${nNull}건` },
+        { d: DIMENSIONS[1], pass: nDup === 0, detail: `order_id 중복 ${nDup}건` },
+        { d: DIMENSIONS[2], pass: nBadRange === 0, detail: `amount 음수 ${nBadRange}건` },
+        { d: DIMENSIONS[3], pass: nOrphan === 0, detail: `customer_id 고아 ${nOrphan}건` },
+        { d: DIMENSIONS[4], pass: lagHours <= 6, detail: `신선도 지연 ${lagHours}h (SLA 6h)` },
+      ];
+      const passed = results.filter((r) => r.pass).length;
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-300 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-teal-900">📋 오늘 배치 · 5차원 실측 검사</div>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${passed === 5 ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>통과 {passed}/5</span>
+          </div>
+          <div className="space-y-1">
+            {results.map((r) => (
+              <div key={r.d.key} className={`rounded border px-2 py-1 flex items-center gap-2 ${r.pass ? 'border-emerald-300 bg-emerald-50' : 'border-red-400 bg-red-50'}`}>
+                <span>{r.d.icon}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[10px] font-bold text-slate-800">{r.d.name}</div>
+                  <div className="text-[9px] text-slate-600 font-mono truncate">{r.detail}</div>
+                </div>
+                <span className={`text-[10px] font-bold ${r.pass ? 'text-emerald-700' : 'text-red-700'}`}>{r.pass ? '✓ PASS' : '✗ FAIL'}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-slate-600">실패 4건: 중복·NULL은 값을 부풀리거나 누락시키고, 음수·지연은 집계를 왜곡한다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 게이트별 실패 정책 (중단 vs 경고)
+    // ─────────────────────────────────────────────────────
+    function GatePolicyBox() {
+      const rows = [
+        { gate: '① 소스 착지', where: '스테이징', tests: '스키마·필수 NULL', sev: 'error', act: '중단' },
+        { gate: '② 변환 후',   where: 'dbt test', tests: 'unique·relationships', sev: 'error', act: '중단' },
+        { gate: '② 변환 후',   where: 'dbt test', tests: 'recency(신선도)', sev: 'warn', act: '경고' },
+        { gate: '③ 적재 후',   where: '마트', tests: '행 수·분포 이상', sev: 'warn', act: '경고' },
+      ];
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-400 bg-white p-3">
+          <div className="text-xs font-bold text-teal-900 mb-2">🚦 게이트별 실패 정책 — 중단(circuit breaker) vs 경고</div>
+          <table className="w-full text-[10px]">
+            <thead>
+              <tr className="text-teal-900 border-b-2 border-teal-300">
+                <th className="text-left py-1">게이트</th>
+                <th className="text-left py-1 pl-1">검사</th>
+                <th className="text-left py-1 pl-1">severity</th>
+                <th className="text-left py-1 pl-1">동작</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={i} className="border-t border-teal-100">
+                  <td className="py-1 font-bold text-slate-700 whitespace-nowrap">{r.gate}</td>
+                  <td className="py-1 pl-1 text-slate-600 font-mono text-[9px]">{r.tests}</td>
+                  <td className="py-1 pl-1">
+                    <span className={`px-1 rounded text-[9px] font-bold ${r.sev === 'error' ? 'bg-red-100 text-red-800' : 'bg-amber-100 text-amber-800'}`}>{r.sev}</span>
+                  </td>
+                  <td className="py-1 pl-1">
+                    <span className={`text-[9px] font-bold ${r.act === '중단' ? 'text-red-700' : 'text-amber-700'}`}>{r.act === '중단' ? '⛔ 중단' : '⚠️ 경고'}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-2 text-[10px] text-slate-600">치명 검사만 중단으로. 모두 중단하면 사소한 지연에 파이프라인이 멈춰 alert 피로가 쌓인다.</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 기대 정의 → 검증 → 리포트 흐름 + 이상 감지
+    // ─────────────────────────────────────────────────────
+    function ExpectationsBox() {
+      const tools = [
+        { name: 'dbt test', tag: '변환 밀착', desc: 'YAML로 unique·not_null·relationships 선언', color: 'teal' },
+        { name: 'Great Expectations', tag: '문서화', desc: '풍부한 기대 + Data Docs 자동 생성', color: 'indigo' },
+        { name: 'Soda', tag: '간결', desc: 'SodaCL 문법으로 검사 선언', color: 'emerald' },
+      ];
+      const flow = ['① 기대 정의', '② 자동 검증', '③ 리포트·문서'];
+      return (
+        <div className="mt-3 space-y-2">
+          <div className="rounded-lg border-2 border-teal-300 bg-white p-3">
+            <div className="text-xs font-bold text-teal-900 mb-2">🤖 기대치를 코드로 → 자동 검증 → 문서</div>
+            <div className="flex items-center gap-1 mb-2">
+              {flow.map((f, i) => (
+                <React.Fragment key={f}>
+                  {i > 0 && <span className="text-teal-400">→</span>}
+                  <div className="flex-1 rounded border border-teal-300 bg-teal-50 px-1 py-1 text-center text-[10px] font-bold text-teal-800">{f}</div>
+                </React.Fragment>
+              ))}
+            </div>
+            <div className="space-y-1">
+              {tools.map((t) => (
+                <div key={t.name} className={`rounded border px-2 py-1 flex items-center gap-2 border-${t.color}-300 bg-${t.color}-50`}>
+                  <span className={`text-[10px] font-bold text-${t.color}-900 w-32`}>{t.name}</span>
+                  <span className={`text-[8px] px-1 rounded bg-${t.color}-200 text-${t.color}-800 font-bold`}>{t.tag}</span>
+                  <span className="text-[9px] text-slate-600 flex-1">{t.desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-amber-300 bg-white p-3">
+            <div className="text-xs font-bold text-amber-900 mb-1.5">📈 이상 자동 감지 — 규칙 없이 잡는다 (≈ ml 드리프트)</div>
+            <div className="grid grid-cols-2 gap-2 text-[10px]">
+              <div className="rounded border border-red-300 bg-red-50 p-1.5">
+                <div className="font-bold text-red-800">볼륨 급변</div>
+                <div className="text-slate-600 font-mono">평소 3,100행 → 오늘 9,800행 (3.1배)</div>
+              </div>
+              <div className="rounded border border-red-300 bg-red-50 p-1.5">
+                <div className="font-bold text-red-800">분포 이동</div>
+                <div className="text-slate-600 font-mono">NULL 2% → 42% (+40%p)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 품질 지표 대시보드 + 인시던트 대응 + 데이터 계약
+    // ─────────────────────────────────────────────────────
+    function OpsBox() {
+      const metrics = [
+        { label: '테스트 통과율', val: '96.5%', tone: 'amber', sub: 'SLA 99%' },
+        { label: '신선도', val: '4.2h', tone: 'emerald', sub: 'SLA 6h' },
+        { label: '열린 인시던트', val: '1건', tone: 'red', sub: '격리 중' },
+      ];
+      const M = {
+        amber: 'border-amber-300 bg-amber-50 text-amber-800',
+        emerald: 'border-emerald-300 bg-emerald-50 text-emerald-800',
+        red: 'border-red-300 bg-red-50 text-red-800',
+      };
+      const incident = [
+        { step: '1. 발견', desc: 'order_id 중복 감지 → 게이트 차단', icon: '🚨' },
+        { step: '2. 격리', desc: '오염 파티션 격리, 하류 노출 차단', icon: '🔒' },
+        { step: '3. 수정', desc: '상류 원인 수정 + 데이터 계약 갱신', icon: '🔧' },
+        { step: '4. 백필', desc: '해당 구간 재적재 (III-2-2)', icon: '♻️' },
+      ];
+      return (
+        <div className="mt-3 space-y-2">
+          <div className="rounded-lg border-2 border-teal-400 bg-white p-3">
+            <div className="text-xs font-bold text-teal-900 mb-2">📊 품질 지표 대시보드 (SLI)</div>
+            <div className="grid grid-cols-3 gap-2">
+              {metrics.map((m) => (
+                <div key={m.label} className={`rounded border-2 p-2 text-center ${M[m.tone]}`}>
+                  <div className="text-lg font-bold font-mono">{m.val}</div>
+                  <div className="text-[9px] font-bold">{m.label}</div>
+                  <div className="text-[8px] opacity-70">{m.sub}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-indigo-300 bg-white p-3">
+            <div className="text-xs font-bold text-indigo-900 mb-1.5">🚑 인시던트 대응 절차 (오염 발견 → 복구)</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {incident.map((s) => (
+                <div key={s.step} className="rounded border border-indigo-200 bg-indigo-50 px-2 py-1">
+                  <div className="text-[10px] font-bold text-indigo-900">{s.icon} {s.step}</div>
+                  <div className="text-[9px] text-slate-600">{s.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-emerald-400 bg-gradient-to-br from-teal-50 to-emerald-50 p-3">
+            <div className="text-xs font-bold text-emerald-900 mb-1">🤝 데이터 계약 + 신뢰도 SLA</div>
+            <div className="text-[10px] text-slate-700">
+              생산자-소비자가 <b>스키마·의미·품질 기준</b>을 약속으로 못 박아 "상류가 말없이 컬럼 변경" 사고를 예방한다.
+              이를 <b>"매일 06시까지 통과율 99% 보장"</b> 같은 신뢰도 SLA로 관리한다.
+            </div>
+            <div className="mt-1.5 text-[10px] text-teal-900 border-t border-teal-200 pt-1.5">
+              🔭 <b>다음 장(리니지)</b>: 오염이 어디서 와서 어디까지 번졌는지를 데이터 계보로 추적한다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-teal-50',    border: 'border-teal-300',    text: 'text-teal-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 게이트 다이어그램 + 단계별 특수 패널 (teal 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      spread:       { icon: '⚠️', label: '오염 전파' },
+      dimensions:   { icon: '📋', label: '5차원 검사' },
+      gates:        { icon: '🚦', label: '게이트 배치' },
+      expectations: { icon: '🤖', label: '자동 검증' },
+      ops:          { icon: '📊', label: '품질 운영' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.panel] || ENGINE_BADGE.spread;
+      return (
+        <div className="rounded-xl border border-teal-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-teal-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>데이터 품질 검증 — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-teal-700 font-mono mb-2 px-2 py-1 rounded bg-teal-50 border border-teal-200">
+            검사 지점: {PIPE_NODES.find((n) => n.key === state.gate)?.name || '전체 파이프라인'}
+          </div>
+
+          <GateDiagram active={state.gate} />
+
+          {state.panel === 'spread' && <SpreadSim />}
+          {state.panel === 'dimensions' && <DimensionCards />}
+          {state.panel === 'gates' && <GatePolicyBox />}
+          {state.panel === 'expectations' && <ExpectationsBox />}
+          {state.panel === 'ops' && <OpsBox />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      const tabs = [
+        { id: 'py', name: 'data_quality.py' },
+        { id: 'yaml', name: 'schema.yml' },
+      ];
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <div className="ml-3 flex gap-1">
+              {tabs.map((t) => (
+                <span
+                  key={t.id}
+                  className={`text-[11px] font-mono px-2 py-0.5 rounded-t ${code.file === t.id ? 'bg-[#282c34] text-teal-300 border-t border-x border-slate-600' : 'text-slate-500'}`}
+                >{t.name}</span>
+              ))}
+            </div>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="px-3 pt-1.5 text-[10px] text-slate-400 font-mono border-b border-slate-700/50">{code.filename}</div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-teal-400/15 border-l-2 border-teal-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-teal-50 to-cyan-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-teal-600 text-white font-bold">V</span>
+              <div>
+                <h1 className="text-2xl font-bold text-teal-900">V-1-1. 데이터 품질 검증</h1>
+                <p className="text-sm text-teal-800/80">"대시보드 숫자가 이상해요"의 근원 차단 — 나쁜 데이터가 하류로 흐르기 전에</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-teal-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-teal-500' : 'bg-teal-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-teal-800 text-teal-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-teal-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-teal-800 text-white' : 'bg-teal-600 text-white hover:bg-teal-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-teal-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-teal-500 bg-white px-4 py-3 text-sm text-teal-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                파이프라인 "성공(exit 0)"은 데이터가 옳다는 보장이 아니다 — 검증이 없으면 조용한 오염이 마트·대시보드·ML까지 번진다.
+                무엇을 볼지는 5차원(완전성·유일성·유효성·정합성·적시성)으로 나누고, 검사는 소스 착지·변환 후·적재 후 여러 지점에 게이트로 건다.
+                치명 검사는 중단(circuit breaker)해 전파를 끊고, 경미한 실패는 경고만 남긴다.
+                dbt test·Great Expectations·Soda로 기대치를 코드로 선언해 자동 검증·문서화하고, 볼륨 급변·분포 이동은 이상 감지(≈ ml 드리프트)로 잡는다.
+                끝으로 품질 지표(SLI)·데이터 계약·인시던트 대응(격리→수정→백필)을 신뢰도 SLA로 묶어 운영한다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['데이터품질', '품질차원', 'dbt_test', 'GreatExpectations', 'Soda', 'circuit_breaker', '이상감지', '데이터계약', '인시던트대응', '신뢰도SLA'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-teal-100 text-teal-900 border border-teal-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-teal-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-1-2.html" className="underline hover:no-underline">다음: V-1-2 (리니지) →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

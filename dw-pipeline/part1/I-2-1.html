@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DW Pipeline 학습 — I-2-1. ODS vs DW — 운영 조회와 분석 분리</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔀</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    DW Pipeline I-2-1 — ODS vs DW: 운영 조회와 분석 분리
+    학습 목표: 둘 다 "통합 데이터"인데 왜 나누는가를, 같은 고객 1명의 데이터가
+              ODS(현재 스냅샷 1행)와 DW(이력 타임라인 여러 행)에 어떻게 다르게
+              담기는지 비교하며 체험한다. 현재 중심 vs 이력 중심, 운영성 조회 vs
+              대량 분석, 갱신·접근 패턴의 차이, 그리고 Lakehouse의 현대적 변주까지 5단계.
+    패턴: fastapi v1 — 좌(LiveDataPane: 같은 고객의 ODS 스냅샷 vs DW 타임라인 비교 +
+                       접근 패턴 대비 애니메이션 + 용도별 쿼리 카드)
+                       우(VSCode CodeViewer: ods_vs_dw.sql 진화)
+    색상: teal (data 도메인)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 같은 고객 1024 의 "실제 변화 이력" — 시간에 따라 등급·주소·전화가 바뀐다
+    //   ODS 는 이 중 "마지막 한 줄" 만 갖고, DW 는 "전부" 를 쌓는다
+    // ─────────────────────────────────────────────────────
+    const HISTORY = [
+      { grade: 'bronze', region: '수도권', phone: '010-1111', from: '2022-03-01', to: '2023-05-31' },
+      { grade: 'silver', region: '수도권', phone: '010-1111', from: '2023-06-01', to: '2024-06-30' },
+      { grade: 'silver', region: '영남',   phone: '010-2222', from: '2024-07-01', to: '2025-02-14' },
+      { grade: 'gold',   region: '영남',   phone: '010-2222', from: '2025-02-15', to: '9999-12-31' },
+    ];
+    const CURRENT = HISTORY[HISTORY.length - 1]; // ODS 가 보관하는 "지금 상태"
+
+    // ─────────────────────────────────────────────────────
+    // STEPS — 5단계 시나리오
+    //   focus  : 다이어그램/비교에서 강조할 대상 ('ods' | 'dw' | 'both')
+    //   panel  : 좌측 특수 패널 종류
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 혼동의 시작 — "통합했으면 됐지 왜 둘로 나눠?"',
+        desc: 'ODS도 여러 원천을 합친 통합 데이터고, DW도 통합 데이터다. 그래서 처음 보면 "이미 통합했는데 왜 저장소를 또 만드나" 싶고, 둘의 경계가 흐릿하게 겹쳐 보인다. 하지만 결정적으로 갈리는 축이 두 개 있다 — 하나는 "시간"이다. ODS는 지금 이 순간의 최신 상태만 붙잡는 현재 중심이고, DW는 값이 바뀔 때마다 과거를 지우지 않고 쌓는 이력 중심이다. 다른 하나는 "부하 성격"이다. ODS는 한 건을 콕 집어 빠르게 읽는 운영성 조회에, DW는 수천만 행을 훑는 대량 집계 분석에 최적화된다. 이 두 축을 같은 고객 1명의 데이터로 따라가며 확인해 보자.',
+        focus: 'both',
+        panel: 'confuse',
+        engine: 'confuse', engineDetail: '같은 고객 1024 · 통합 데이터 2벌',
+        actor: '🤔 겹쳐 보이는 ODS와 DW',
+        alert: { tone: 'info', text: '둘 다 통합 데이터인 건 맞다. 갈림길은 두 축이다 — (1) 시간: 현재 상태만(ODS) vs 전체 이력(DW), (2) 부하: 소량 즉시 조회(ODS) vs 대량 스캔 분석(DW).' },
+        code: {
+          lang: 'sql', file: 'sql',
+          filename: 'ods_vs_dw.sql — ① 왜 둘로 나누나',
+          lines: [
+            '-- ods_vs_dw.sql',
+            '-- ① 혼동의 시작: ODS 도 통합, DW 도 통합 — 무엇이 다른가?',
+            '--    같은 고객 1024 를 두 저장소가 "어떻게 담는지" 로 답을 찾는다.',
+            '',
+            '-- 공통점: 둘 다 여러 원천(주문DB·결제API·회원)을 키로 통합한다.',
+            '--         → 그래서 처음엔 "중복 아냐?" 하고 헷갈린다.',
+            '',
+            '-- 결정적 차이 2축:',
+            '--   1) 시간 관점',
+            '--      ODS : 현재 중심  → 최신 상태 1건만 유지 (덮어쓰기)',
+            '--      DW  : 이력 중심  → 바뀔 때마다 과거를 "보존"하며 누적',
+            '--   2) 부하 성격',
+            '--      ODS : 소량·즉시 조회 (운영성, near-real-time)',
+            '--      DW  : 대량 스캔·집계 (분석, 배치)',
+            '',
+            '-- 앞으로의 순서:',
+            '--   Step2 ODS(지금 이 순간) → Step3 DW(모든 역사)',
+            '--   Step4 접근·갱신 패턴 대비 → Step5 현대적 변주(Lakehouse)',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 14],
+        },
+      },
+      {
+        title: 'Step 2. ODS — "지금 이 순간"의 통합 상태',
+        desc: 'ODS(Operational Data Store)는 여러 원천을 통합하되 "현재 상태 1건"만 유지한다. 고객 1024의 등급이 bronze→silver→gold로 바뀌어도 ODS 행은 계속 최신값으로 덮어써져, 항상 지금의 gold·영남만 보인다(짧은 이력만 경량 보유). 왜 이렇게 설계할까 — 콜센터 상담원이 "이 고객 지금 등급·연락처?"를 물었을 때 밀리초 안에 한 건을 정확히 집어줘야 하기 때문이다. 그래서 지연이 낮고(near-real-time으로 원천 변화를 반영), 구조도 운영 DB에 가깝게 정규화되어 있다. ODS는 흩어진 원천을 모아 만든 "고객의 현재 통합 뷰"이며, 분석이 아니라 운영 조회가 목적이다.',
+        focus: 'ods',
+        panel: 'odsSnapshot',
+        engine: 'ods', engineDetail: '여러 원천 → 최신 상태 1행 (덮어쓰기)',
+        actor: '📸 현재 스냅샷 1건',
+        alert: { tone: 'info', text: 'ODS의 정체성: "고객의 현재 통합 뷰". 콜센터가 실시간으로 한 건을 조회하는 용도라 낮은 지연·정규화 구조·최신값 덮어쓰기가 특징. 과거는 (거의) 남기지 않는다.' },
+        code: {
+          lang: 'sql', file: 'sql',
+          filename: 'ods_vs_dw.sql — ② ODS 최신 통합 뷰',
+          lines: [
+            '-- ods_vs_dw.sql',
+            '-- ② ODS: 여러 원천을 통합하되 "현재 상태 1건" 만 유지한다.',
+            '',
+            'CREATE TABLE ods.customer_current (',
+            '    customer_id  BIGINT PRIMARY KEY,   -- 고객당 딱 1행',
+            '    grade        TEXT,                 -- 지금 등급',
+            '    region       TEXT,                 -- 지금 지역',
+            '    phone        TEXT,                 -- 지금 연락처',
+            '    updated_at   TIMESTAMPTZ           -- 마지막 갱신 시각',
+            ');',
+            '',
+            '-- 원천이 바뀌면 최신값으로 "덮어쓴다" (UPSERT)',
+            'INSERT INTO ods.customer_current AS c',
+            '  (customer_id, grade, region, phone, updated_at)',
+            'VALUES (1024, \'gold\', \'영남\', \'010-2222\', NOW())',
+            'ON CONFLICT (customer_id) DO UPDATE',
+            '  SET grade      = EXCLUDED.grade,     -- 과거값은 사라진다',
+            '      region     = EXCLUDED.region,',
+            '      phone      = EXCLUDED.phone,',
+            '      updated_at = EXCLUDED.updated_at;',
+            '',
+            '-- 콜센터 상담원의 질문: "이 고객 지금 상태?"',
+            'SELECT grade, region, phone            -- 1행 즉답 (near-real-time)',
+            'FROM   ods.customer_current',
+            'WHERE  customer_id = 1024;',
+            '--  → gold · 영남 · 010-2222  (딱 지금)',
+          ],
+          highlight: [4, 5, 12, 13, 14, 15, 16, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 3. DW — "모든 역사"를 쌓는다',
+        desc: 'DW(Data Warehouse)는 반대로 값이 바뀔 때마다 과거를 지우지 않고 새 행으로 누적해, 시간에 따른 변화를 통째로 보존한다. 고객 1024는 ODS에선 1행이지만 DW에선 bronze·silver·silver(영남)·gold로 네 개의 이력 행이 된다 — 각 행은 유효기간(valid_from~valid_to)을 달고 있어 "2024년 3월 당시엔 silver·수도권이었다"는 그때의 진실을 정확히 되살린다(SCD, Part Ⅱ에서 상세). 또 주문·회원·상품을 주제 영역별로 통합하고, 대량 집계에 유리하도록 비정규화·차원 모델로 설계한다. 그래서 "최근 3년 매출 추이", "등급 승급 후 구매액 변화" 같은 시계열 분석에 강하다. ODS가 스냅샷이라면 DW는 필름 전체다.',
+        focus: 'dw',
+        panel: 'dwTimeline',
+        engine: 'dw', engineDetail: '변경마다 이력 행 누적 (유효기간 보존)',
+        actor: '🎞️ 이력 타임라인 4건',
+        alert: { tone: 'good', text: 'DW의 정체성: "모든 역사의 원장". 과거를 덮어쓰지 않고 유효기간을 끊어 이력 행으로 쌓기에, "그때 그 시점의 진실"로 추세·변화를 분석할 수 있다. 비정규화·차원 모델은 대량 집계용(Part Ⅱ).' },
+        code: {
+          lang: 'sql', file: 'sql',
+          filename: 'ods_vs_dw.sql — ③ DW 이력 누적',
+          lines: [
+            '-- ods_vs_dw.sql',
+            '-- ③ DW: 값이 바뀔 때마다 "이력 행" 을 쌓는다 (SCD Type 2).',
+            '',
+            'CREATE TABLE dw.dim_customer (',
+            '    customer_sk  BIGSERIAL PRIMARY KEY, -- 이력 행마다 새 키',
+            '    customer_id  BIGINT,                -- 같은 고객 = 여러 행',
+            '    grade        TEXT,',
+            '    region       TEXT,',
+            '    phone        TEXT,',
+            '    valid_from   DATE,                  -- 이 상태의 시작',
+            '    valid_to     DATE,                  -- 끝 (현재행=9999-12-31)',
+            '    is_current   BOOLEAN',
+            ');',
+            '',
+            '-- 고객 1024 는 ODS 에선 1행이지만, DW 에선 4개 이력 행:',
+            '--  bronze 수도권 (2022-03-01 ~ 2023-05-31)',
+            '--  silver 수도권 (2023-06-01 ~ 2024-06-30)',
+            '--  silver 영남   (2024-07-01 ~ 2025-02-14)',
+            '--  gold   영남   (2025-02-15 ~ 9999-12-31)  ← 현재',
+            '',
+            '-- "그때 그 시점" 을 정확히 되살리는 질문:',
+            'SELECT grade, region                   -- 2024-03 당시 상태는?',
+            'FROM   dw.dim_customer',
+            'WHERE  customer_id = 1024',
+            '  AND  DATE \'2024-03-15\' BETWEEN valid_from AND valid_to;',
+            '--  → silver · 수도권  (ODS 로는 절대 알 수 없다)',
+          ],
+          highlight: [4, 5, 6, 10, 11, 15, 16, 17, 18, 19, 22, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 4. 접근·갱신 패턴 대비 — 왜 스토리지·인덱스가 갈리나',
+        desc: 'ODS와 DW는 "어떻게 읽고 쓰이는가"가 근본적으로 다르고, 그 차이가 스토리지·인덱스 선택까지 결정한다. ODS는 원천이 바뀔 때마다 잦은 소량 갱신이 일어나고, 조회는 "고객 1명"처럼 소수 행을 키로 콕 집는다 — 그래서 행 지향 저장 + PK/B-tree 인덱스가 유리하다(포인트 조회 최적). 반면 DW는 하루 한 번 대량 배치로 적재하고, 조회는 "전 고객 3년 매출 합계"처럼 수천만 행의 몇 개 컬럼만 훑는다 — 그래서 열 지향 저장 + 압축·파티셔닝이 유리하다(스캔·집계 최적). 요구가 정반대라 하나의 저장소로 둘 다 잘하기 어렵고, 그래서 실무는 대개 ODS와 DW를 함께 두어 각자의 부하를 떼어 놓는다.',
+        focus: 'both',
+        panel: 'accessPattern',
+        engine: 'pattern', engineDetail: '행 지향 포인트조회 vs 열 지향 대량스캔',
+        actor: '⚖️ 정반대 부하 특성',
+        alert: { tone: 'warn', text: 'ODS(잦은 소량 갱신·행 단위 포인트 조회)와 DW(배치 적재·대량 스캔)는 부하가 정반대다. 하나로 둘 다 잘하기 어렵기에 두 계층을 함께 둔다 — 운영 부하와 분석 부하를 물리적으로 분리.' },
+        code: {
+          lang: 'sql', file: 'sql',
+          filename: 'ods_vs_dw.sql — ④ 접근·갱신 패턴',
+          lines: [
+            '-- ods_vs_dw.sql',
+            '-- ④ 접근·갱신 패턴이 정반대라, 스토리지/인덱스도 갈린다.',
+            '',
+            '-- ODS: 잦은 소량 갱신 + 키로 콕 집는 포인트 조회',
+            '--   → 행 지향(row-store) + PK/B-tree 인덱스가 유리',
+            'CREATE INDEX ix_ods_cust ON ods.customer_current (customer_id);',
+            'SELECT * FROM ods.customer_current WHERE customer_id = 1024;',
+            '--   읽는 행: 1  · 지연: 수 ms  · 목적: 운영 즉답',
+            '',
+            '-- DW: 배치 대량 적재 + 수천만 행의 몇 개 컬럼만 스캔',
+            '--   → 열 지향(column-store) + 압축 + 날짜 파티셔닝이 유리',
+            'SELECT d.region,',
+            '       DATE_TRUNC(\'month\', f.ordered_at) AS month,',
+            '       SUM(f.amount) AS revenue',
+            'FROM   dw.fact_orders f',
+            'JOIN   dw.dim_customer d ON d.customer_sk = f.customer_sk',
+            'WHERE  f.ordered_at >= \'2022-01-01\'   -- 3년 전체 스캔',
+            'GROUP  BY d.region, month;',
+            '--   읽는 행: 수천만  · 지연: 수 초  · 목적: 추세 분석',
+            '',
+            '-- 부하가 정반대 → 하나의 저장소로 둘 다 잘하긴 어렵다.',
+            '--   그래서 ODS(운영)와 DW(분석)를 "함께" 둔다.',
+          ],
+          highlight: [4, 5, 6, 7, 10, 11, 17, 18, 21, 22],
+        },
+      },
+      {
+        title: 'Step 5. 현대적 변주 — Lakehouse에서 흐려지는 경계',
+        desc: '전통적으로 ODS·DW는 물리적으로 분리된 서로 다른 저장소였지만, 현대 아키텍처에선 경계가 점점 흐려진다. Lakehouse(예: Delta/Iceberg)는 하나의 저장 계층 위에 "현재 뷰"와 "이력 테이블"을 논리적 계층으로 함께 얹어, 굳이 시스템을 물리적으로 쪼개지 않고도 ODS 성격과 DW 성격을 같이 낸다. 실시간 요구가 강하면 앞단에 스트리밍 ODS를 두기도 한다 — Kafka 토픽(주제: kafka)으로 원천 변경을 흘려보내 near-real-time 통합 상태를 계속 갱신하는 식이다. 다만 경계가 흐려져도 두 축(현재 중심 vs 이력 중심, 운영성 vs 분석성)은 사라지지 않고 "논리적 계층"으로 남는다. 핵심은 물리적 분리 자체가 아니라 부하와 목적을 분리하는 것이다. 다음 장에선 DW를 부서·목적별로 요약하는 DM(Data Mart)으로 이어진다.',
+        focus: 'both',
+        panel: 'lakehouse',
+        engine: 'modern', engineDetail: 'Lakehouse 논리 계층 + 스트리밍 ODS',
+        actor: '🌊 경계가 흐려지는 흐름',
+        alert: { tone: 'good', text: '핵심은 "물리적으로 나눠야 하나"가 아니라 "부하·목적을 나누는가"다. Lakehouse는 한 저장소에 현재 뷰·이력 테이블을 논리적 계층으로 얹고, 실시간이 필요하면 Kafka 기반 스트리밍 ODS를 앞단에 둔다. 다음 장: DM(Data Mart).' },
+        code: {
+          lang: 'python', file: 'py',
+          filename: 'streaming_ods.py — 현대적 변주',
+          lines: [
+            '"""',
+            'streaming_ods.py — Lakehouse 위에서 ODS/DW 를 논리 계층으로.',
+            '경계가 흐려져도 두 축(현재 중심 vs 이력 중심)은 남는다.',
+            '"""',
+            'from confluent_kafka import Consumer',
+            'import deltalake  # Lakehouse 테이블 (현재 뷰 + 이력 테이블)',
+            '',
+            '# 스트리밍 ODS: Kafka 토픽(주제: kafka)의 변경을 near-real-time 반영',
+            'consumer = Consumer({',
+            '    "bootstrap.servers": "kafka:9092",',
+            '    "group.id": "ods-current-view",',
+            '})',
+            'consumer.subscribe(["customer.changes"])',
+            '',
+            'while True:',
+            '    msg = consumer.poll(1.0)',
+            '    if msg is None:',
+            '        continue',
+            '    change = msg.value()  # 원천에서 바뀐 고객 1건',
+            '',
+            '    # (1) ODS 성격: 현재 뷰를 최신값으로 "덮어쓰기" (MERGE)',
+            '    upsert_current_view("lakehouse.customer_current", change)',
+            '',
+            '    # (2) DW 성격: 같은 변경을 이력 테이블에 "행 추가" (append)',
+            '    append_history("lakehouse.customer_history", change)',
+            '',
+            '# 두 테이블은 같은 Lakehouse 안의 "논리적 계층" 일 뿐.',
+            '#   물리적으로 꼭 나눌 필요는 없다 — 부하와 목적을 나누면 된다.',
+            '#',
+            '# ── 다음 장 예고 ──────────────────────────────',
+            '#   I-2-2 DM(Data Mart): DW 를 부서·목적별로 요약한다.',
+          ],
+          highlight: [5, 6, 8, 13, 21, 22, 24, 25, 27, 28],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 상단 다이어그램 — ODS(현재 스냅샷) vs DW(이력 타임라인) 대비
+    // ─────────────────────────────────────────────────────
+    function OdsDwDiagram({ focus }) {
+      const odsOn = focus === 'ods' || focus === 'both';
+      const dwOn = focus === 'dw' || focus === 'both';
+      return (
+        <div className="rounded-lg border-2 border-teal-300 bg-white p-2.5">
+          <div className="text-[11px] font-bold text-teal-900 mb-2">👤 같은 고객 <span className="font-mono">1024</span> — 두 저장소가 담는 방식이 다르다</div>
+          <div className="grid grid-cols-2 gap-2">
+            {/* ODS */}
+            <div className={`rounded-lg border-2 px-2 py-1.5 transition-all ${odsOn ? 'border-teal-500 bg-teal-50 shadow' : 'border-slate-200 bg-white opacity-60'}`}>
+              <div className="flex items-center gap-1.5 mb-1">
+                <span className="text-lg">📸</span>
+                <span className={`text-[11px] font-bold ${odsOn ? 'text-teal-900' : 'text-slate-600'}`}>ODS</span>
+                <span className="text-[9px] text-slate-500">현재 스냅샷</span>
+              </div>
+              <div className="rounded border border-teal-300 bg-white px-1.5 py-1 text-[9px] font-mono text-teal-900">
+                <div className="font-bold">gold · 영남</div>
+                <div className="text-slate-500">010-2222 · 지금</div>
+              </div>
+              <div className="text-[9px] text-slate-500 mt-1">= 1행 (덮어쓰기)</div>
+            </div>
+            {/* DW */}
+            <div className={`rounded-lg border-2 px-2 py-1.5 transition-all ${dwOn ? 'border-indigo-500 bg-indigo-50 shadow' : 'border-slate-200 bg-white opacity-60'}`}>
+              <div className="flex items-center gap-1.5 mb-1">
+                <span className="text-lg">🎞️</span>
+                <span className={`text-[11px] font-bold ${dwOn ? 'text-indigo-900' : 'text-slate-600'}`}>DW</span>
+                <span className="text-[9px] text-slate-500">이력 타임라인</span>
+              </div>
+              <div className="space-y-0.5">
+                {HISTORY.map((h, i) => (
+                  <div key={i} className={`rounded border px-1.5 py-0.5 text-[9px] font-mono ${i === HISTORY.length - 1 ? 'border-indigo-400 bg-indigo-50 text-indigo-900 font-bold' : 'border-slate-200 bg-white text-slate-500'}`}>
+                    {h.grade} · {h.region}
+                  </div>
+                ))}
+              </div>
+              <div className="text-[9px] text-slate-500 mt-1">= {HISTORY.length}행 (누적)</div>
+            </div>
+          </div>
+          <div className="mt-2 text-center text-[10px] text-teal-800">
+            현재 중심 <span className="font-mono">(ODS)</span> &nbsp;vs&nbsp; 시간 중심 <span className="font-mono">(DW)</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — 혼동: 공통점/차이 대비 카드
+    // ─────────────────────────────────────────────────────
+    function ConfuseBox() {
+      return (
+        <div className="mt-3 rounded-lg border-2 border-amber-300 bg-amber-50 p-3">
+          <div className="text-xs font-bold text-amber-900 mb-2">🤔 왜 헷갈릴까 — 겹치는 부분과 갈리는 부분</div>
+          <div className="rounded border border-amber-300 bg-white p-2 mb-2">
+            <div className="text-[10px] font-bold text-slate-700 mb-0.5">✅ 공통 (그래서 겹쳐 보인다)</div>
+            <div className="text-[10px] text-slate-600">여러 원천을 키로 통합한 "통합 데이터" — 둘 다 원천을 합친다.</div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="rounded border border-teal-300 bg-teal-50 p-2">
+              <div className="text-[10px] font-bold text-teal-800 mb-0.5">🕐 축 1 · 시간</div>
+              <div className="text-[9px] text-teal-700">ODS = 현재만 (덮어쓰기)<br/>DW = 전체 이력 (누적)</div>
+            </div>
+            <div className="rounded border border-indigo-300 bg-indigo-50 p-2">
+              <div className="text-[10px] font-bold text-indigo-800 mb-0.5">⚙️ 축 2 · 부하</div>
+              <div className="text-[9px] text-indigo-700">ODS = 소량 즉시 조회<br/>DW = 대량 스캔 집계</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — ODS 스냅샷 + 용도(콜센터) 카드
+    // ─────────────────────────────────────────────────────
+    function OdsSnapshotBox() {
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-400 bg-white p-3">
+          <div className="text-xs font-bold text-teal-900 mb-2">📸 ODS — 고객의 "현재 통합 뷰" 1행</div>
+          <table className="w-full text-[10px] font-mono">
+            <tbody>
+              <tr className="border-b border-teal-100"><td className="py-0.5 text-slate-500 w-24">customer_id</td><td className="py-0.5 text-teal-900 font-bold">1024</td></tr>
+              <tr className="border-b border-teal-100"><td className="py-0.5 text-slate-500">grade</td><td className="py-0.5 text-teal-900 font-bold">gold</td></tr>
+              <tr className="border-b border-teal-100"><td className="py-0.5 text-slate-500">region</td><td className="py-0.5 text-teal-900 font-bold">영남</td></tr>
+              <tr className="border-b border-teal-100"><td className="py-0.5 text-slate-500">phone</td><td className="py-0.5 text-teal-900 font-bold">010-2222</td></tr>
+              <tr><td className="py-0.5 text-slate-500">updated_at</td><td className="py-0.5 text-slate-600">방금 (near-real-time)</td></tr>
+            </tbody>
+          </table>
+          <div className="mt-2 rounded border border-teal-300 bg-teal-50 p-2 text-[10px] text-teal-900">
+            📞 <b>콜센터 상담원</b>: "이 고객 지금 등급·연락처?" → <b>1행 즉답</b> (밀리초). 과거는 필요 없다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — DW 이력 타임라인 + "그때 그 시점" 조회
+    // ─────────────────────────────────────────────────────
+    function DwTimelineBox() {
+      return (
+        <div className="mt-3 rounded-lg border-2 border-indigo-300 bg-white p-3">
+          <div className="text-xs font-bold text-indigo-900 mb-2">🎞️ DW — 고객 1024 의 전체 이력 (SCD Type 2)</div>
+          <table className="w-full text-[10px] font-mono">
+            <thead>
+              <tr className="text-indigo-800 border-b border-indigo-200">
+                <th className="text-left py-0.5">등급</th>
+                <th className="text-left py-0.5">지역</th>
+                <th className="text-left py-0.5">valid_from</th>
+                <th className="text-left py-0.5">valid_to</th>
+              </tr>
+            </thead>
+            <tbody>
+              {HISTORY.map((h, i) => {
+                const cur = i === HISTORY.length - 1;
+                return (
+                  <tr key={i} className={`border-t border-indigo-100 ${cur ? 'text-indigo-900 font-bold' : 'text-slate-500'}`}>
+                    <td className="py-0.5">{h.grade}</td>
+                    <td className="py-0.5">{h.region}</td>
+                    <td className="py-0.5">{h.from}</td>
+                    <td className="py-0.5">{cur ? '9999-12-31' : h.to}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          <div className="mt-2 rounded border border-indigo-300 bg-indigo-50 p-2 text-[10px] text-indigo-900">
+            📈 <b>분석가</b>: "2024-03 당시 이 고객 등급?" → 유효기간으로 <b>silver·수도권</b> 복원. "3년간 매출 추이"도 이력이 있어야 가능.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — 접근·갱신 패턴 대비 애니메이션
+    // ─────────────────────────────────────────────────────
+    function AccessPatternBox() {
+      const [mode, setMode] = useState('ods'); // 'ods' | 'dw'
+      // ods: 소량 포인트 조회 / dw: 대량 스캔
+      const rows = Array.from({ length: 40 });
+      const isDw = mode === 'dw';
+      return (
+        <div className="mt-3 rounded-lg border-2 border-teal-400 bg-white p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-teal-900">⚖️ 접근 패턴 — 읽는 범위가 정반대</div>
+            <div className="flex gap-1">
+              <button onClick={() => setMode('ods')} className={`text-[10px] font-bold px-2 py-0.5 rounded border ${!isDw ? 'bg-teal-600 text-white border-teal-700' : 'bg-white text-teal-700 border-teal-300'}`}>ODS 조회</button>
+              <button onClick={() => setMode('dw')} className={`text-[10px] font-bold px-2 py-0.5 rounded border ${isDw ? 'bg-indigo-600 text-white border-indigo-700' : 'bg-white text-indigo-700 border-indigo-300'}`}>DW 스캔</button>
+            </div>
+          </div>
+          <div className="grid grid-cols-10 gap-0.5 mb-2">
+            {rows.map((_, i) => {
+              const hit = isDw ? true : i === 12; // dw=전부 스캔, ods=한 칸만
+              return (
+                <div key={i} className={`h-3 rounded-sm transition-all duration-300 ${hit ? (isDw ? 'bg-indigo-400' : 'bg-teal-500') : 'bg-slate-100 border border-slate-200'}`} />
+              );
+            })}
+          </div>
+          <div className={`rounded border p-2 text-[10px] ${isDw ? 'border-indigo-300 bg-indigo-50 text-indigo-900' : 'border-teal-300 bg-teal-50 text-teal-900'}`}>
+            {isDw
+              ? '📊 DW: 수천만 행의 몇 개 컬럼을 훑는 대량 스캔 → 열 지향 + 압축 + 파티셔닝. 지연 수 초, 목적은 추세 분석.'
+              : '📞 ODS: 고객 1명을 키로 콕 집는 포인트 조회 → 행 지향 + PK/B-tree. 지연 수 ms, 목적은 운영 즉답.'}
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+            <div className="rounded border border-teal-300 bg-teal-50 p-1.5">
+              <div className="font-bold text-teal-800">ODS 갱신</div>
+              <div className="text-teal-700">잦은 소량 UPSERT · 행 단위</div>
+            </div>
+            <div className="rounded border border-indigo-300 bg-indigo-50 p-1.5">
+              <div className="font-bold text-indigo-800">DW 갱신</div>
+              <div className="text-indigo-700">하루 1회 대량 배치 append</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — Lakehouse 논리 계층 + 스트리밍 ODS
+    // ─────────────────────────────────────────────────────
+    function LakehouseBox() {
+      return (
+        <div className="mt-3 space-y-2">
+          <div className="rounded-lg border-2 border-cyan-400 bg-white p-3">
+            <div className="text-xs font-bold text-cyan-900 mb-2">🌊 Lakehouse — 한 저장소, 두 논리 계층</div>
+            <div className="rounded border-2 border-cyan-300 bg-cyan-50 p-2">
+              <div className="text-[10px] font-bold text-cyan-800 mb-1 text-center">단일 Lakehouse 저장 계층 (Delta / Iceberg)</div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded border border-teal-400 bg-white px-2 py-1.5 text-center">
+                  <div className="text-[10px] font-bold text-teal-800">customer_current</div>
+                  <div className="text-[9px] text-slate-600">ODS 성격 · 현재 뷰</div>
+                </div>
+                <div className="rounded border border-indigo-400 bg-white px-2 py-1.5 text-center">
+                  <div className="text-[10px] font-bold text-indigo-800">customer_history</div>
+                  <div className="text-[9px] text-slate-600">DW 성격 · 이력</div>
+                </div>
+              </div>
+              <div className="text-[9px] text-cyan-800 mt-1.5 text-center">물리 분리 대신 "논리적 계층" — 부하·목적만 나눈다</div>
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-teal-300 bg-white p-3">
+            <div className="text-xs font-bold text-teal-900 mb-1.5">⚡ 실시간 요구 → 스트리밍 ODS</div>
+            <div className="flex items-center gap-1.5 text-[10px] font-mono">
+              <span className="rounded border border-slate-300 bg-slate-50 px-1.5 py-1">원천 변경</span>
+              <span className="text-teal-500">→</span>
+              <span className="rounded border border-teal-400 bg-teal-50 px-1.5 py-1 text-teal-800 font-bold">Kafka 토픽</span>
+              <span className="text-teal-500">→</span>
+              <span className="rounded border border-teal-400 bg-teal-50 px-1.5 py-1 text-teal-800">현재 뷰 갱신</span>
+            </div>
+            <div className="text-[9px] text-slate-600 mt-1.5">Kafka(주제: kafka)로 near-real-time 통합 상태 유지. 경계는 흐려져도 두 축은 논리 계층으로 남는다.</div>
+          </div>
+          <div className="rounded-lg border-2 border-teal-500 bg-gradient-to-br from-teal-50 to-cyan-50 p-2.5 text-[10px] text-teal-900">
+            🧭 <b>다음 장 예고</b> — I-2-2 <b>DM(Data Mart)</b>: DW를 부서·목적별로 요약하면 대시보드가 빨라진다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-teal-50',    border: 'border-teal-300',    text: 'text-teal-900',    icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — ODS/DW 대비 다이어그램 + 단계별 특수 패널 (teal 톤)
+    // ─────────────────────────────────────────────────────
+    const ENGINE_BADGE = {
+      confuse: { icon: '🤔', label: '겹쳐 보임' },
+      ods:     { icon: '📸', label: 'ODS 현재' },
+      dw:      { icon: '🎞️', label: 'DW 이력' },
+      pattern: { icon: '⚖️', label: '접근 패턴' },
+      modern:  { icon: '🌊', label: '현대 변주' },
+    };
+
+    function LiveDataPane({ state }) {
+      const eng = ENGINE_BADGE[state.engine] || ENGINE_BADGE.confuse;
+      return (
+        <div className="rounded-xl border border-teal-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-teal-900 flex items-center gap-1.5">
+              <span>{eng.icon}</span>
+              <span>ODS vs DW — {eng.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-teal-700 font-mono mb-2 px-2 py-1 rounded bg-teal-50 border border-teal-200">
+            현재 초점: {state.engineDetail}
+          </div>
+
+          <OdsDwDiagram focus={state.focus} />
+
+          {state.panel === 'confuse' && <ConfuseBox />}
+          {state.panel === 'odsSnapshot' && <OdsSnapshotBox />}
+          {state.panel === 'dwTimeline' && <DwTimelineBox />}
+          {state.panel === 'accessPattern' && <AccessPatternBox />}
+          {state.panel === 'lakehouse' && <LakehouseBox />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      const tabs = [
+        { id: 'sql', name: 'ods_vs_dw.sql' },
+        { id: 'py', name: 'streaming_ods.py' },
+      ];
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <div className="ml-3 flex gap-1">
+              {tabs.map((t) => (
+                <span
+                  key={t.id}
+                  className={`text-[11px] font-mono px-2 py-0.5 rounded-t ${code.file === t.id ? 'bg-[#282c34] text-teal-300 border-t border-x border-slate-600' : 'text-slate-500'}`}
+                >{t.name}</span>
+              ))}
+            </div>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="px-3 pt-1.5 text-[10px] text-slate-400 font-mono border-b border-slate-700/50">{code.filename}</div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-teal-400/15 border-l-2 border-teal-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-teal-50 to-cyan-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-teal-600 text-white font-bold">DW</span>
+              <div>
+                <h1 className="text-2xl font-bold text-teal-900">I-2-1. ODS vs DW — 운영 조회와 분석 분리</h1>
+                <p className="text-sm text-teal-800/80">둘 다 통합 데이터인데 왜 나누나 — "지금 상태"와 "모든 역사"의 근본적 차이</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-teal-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-teal-500' : 'bg-teal-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-teal-800 text-teal-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-teal-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-teal-800 text-white' : 'bg-teal-600 text-white hover:bg-teal-700'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-teal-400 bg-white text-teal-800 hover:bg-teal-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-teal-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-teal-500 bg-white px-4 py-3 text-sm text-teal-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                ODS와 DW는 둘 다 통합 데이터지만, 두 축에서 갈린다 — 시간(현재 중심 vs 이력 중심)과 부하(운영성 조회 vs 대량 분석).
+                같은 고객 1024가 ODS에선 최신 1행(gold·영남)으로, DW에선 bronze→silver→gold 네 이력 행으로 담긴다.
+                그래서 콜센터의 "지금 상태?"는 ODS가, 분석가의 "그때 그 시점·3년 추세"는 DW가 답한다.
+                접근·갱신 패턴이 정반대(포인트 조회·행 지향 vs 대량 스캔·열 지향)라 저장소를 함께 두어 부하를 분리한다.
+                Lakehouse에선 경계가 논리 계층으로 흐려지지만 두 축은 남는다 — 핵심은 물리 분리가 아니라 부하·목적의 분리다. 다음 장은 DM.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['ODS', 'DataWarehouse', '운영조회', '이력관리', 'SCD', '현재중심', '이력중심', 'Lakehouse', '스트리밍ODS', 'OLTP분리'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-teal-100 text-teal-900 border border-teal-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-teal-800">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-2-2.html" className="underline hover:no-underline">다음: I-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
