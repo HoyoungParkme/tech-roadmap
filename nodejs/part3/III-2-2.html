@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Node.js 학습 — III-2-2. 스트림과 버퍼 — 대용량을 조각으로 다루기</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#x2B22;</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <!-- 필기노트 공통 스킨 (디자인 토큰: 종이 #fffdf7 / 잉크 #2b2b2b / 형광펜 #fde68a) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <style id="trn-note-skin">
+    body { background-color: #fffdf7 !important; font-family: Pretendard, system-ui, sans-serif; }
+    .bg-slate-50, .bg-gray-50, .bg-slate-100, .bg-gray-100, .bg-zinc-50, .bg-neutral-50, .bg-stone-50 { background-color: #faf7ef !important; }
+    .text-slate-900, .text-slate-800, .text-gray-900, .text-gray-800, .text-zinc-800, .text-neutral-800, .text-stone-800 { color: #2b2b2b !important; }
+    .text-slate-700, .text-slate-600, .text-gray-700, .text-gray-600, .text-zinc-600, .text-neutral-600, .text-stone-600 { color: #57534a !important; }
+    .text-slate-500, .text-slate-400, .text-gray-500, .text-gray-400, .text-zinc-500, .text-neutral-500, .text-stone-500 { color: #8a8578 !important; }
+    .border-slate-200, .border-slate-300, .border-gray-200, .border-gray-300, .border-zinc-200, .border-zinc-300, .border-neutral-200, .border-stone-200 { border-color: #cfc9ba !important; }
+    .shadow-sm, .shadow, .shadow-md { box-shadow: 3px 3px 0 rgba(0,0,0,.12) !important; }
+    .rounded-xl, .rounded-2xl { border-radius: 8px !important; }
+    /* 주제 액센트의 연한 배경 워시만 종이존으로 — 진한 의미색(배지/버튼/다이어그램)은 보존 */
+    .bg-emerald-50, .bg-green-50, .bg-sky-50, .bg-blue-50, .bg-indigo-50, .bg-violet-50, .bg-purple-50, .bg-rose-50, .bg-pink-50, .bg-amber-50, .bg-yellow-50, .bg-orange-50, .bg-red-50, .bg-teal-50, .bg-cyan-50, .bg-lime-50, .bg-fuchsia-50 { background-color: #faf7ef !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Node.js III-2-2 — 스트림과 버퍼: 대용량을 조각으로 다루기
+    학습 목표: 이진 데이터를 담는 Buffer(고정 크기 바이트 배열, 인코딩 변환)를 이해하고,
+              Stream 4종(Readable/Writable/Duplex/Transform)이 데이터를 청크 단위로 흘려
+              메모리를 아끼는 원리, readFile(전체 로드) 대비 메모리 그래프,
+              pipe로 읽기→쓰기를 연결하고 백프레셔로 속도를 자동 조절하는 과정,
+              그리고 data/end/error 이벤트와 실무 함정을 5단계로 뜯어본다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 버퍼 바이트·스트림 4종·메모리 대비 애니메이션·pipe/백프레셔·이벤트)
+                       우(VSCode CodeViewer: Node 스트림 예제 코드)
+    색상: Node 그린 #339933 기조 / 형광펜·배경 채움 연한 그린 #c8e6c9 / 텍스트·링크·배지 다크 그린 #1b5e20
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — 버퍼 → 스트림 4종 → 메모리 대비 → pipe·백프레셔 → 이벤트·함정
+    //   각 STEP = { title, desc, stage, 좌측 패널 데이터, 우측 code }
+    //   좌측 패널은 stage 값(buffer/kinds/memory/pipe/events)에 따라
+    //   서로 다른 시각화를 그린다. memory/pipe 단계는 애니메이션이 돈다.
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. Buffer — 이진 데이터를 담는 고정 크기 바이트 배열',
+        desc: '파일과 네트워크는 사람이 읽는 "글자"가 아니라 0~255 사이의 바이트로 흐른다. 문제는 자바스크립트의 기본 문자열·배열이 이 원시 바이트를 다루기에 불편하다는 것이다. 그래서 Node는 Buffer라는 고정 크기 바이트 배열을 제공한다 — 힙 바깥(V8 밖)에 잡히는 연속 메모리 덩어리로, 한 칸에 정확히 1바이트가 들어간다. 왜 필요할까? 이미지·PDF·동영상처럼 텍스트가 아닌 데이터, 그리고 인코딩이 섞인 파일을 손실 없이 다루려면 "글자"가 아니라 "바이트"로 봐야 하기 때문이다. Buffer는 toString("utf8") / toString("base64")처럼 인코딩을 지정해 바이트를 사람이 읽는 문자열로 바꾸거나 그 반대로 바꿔준다. 스트림이 흘려보내는 조각(청크)도 바로 이 Buffer다.',
+        actor: '🧱 Buffer · 0~255 바이트 배열 · 인코딩 변환',
+        stage: 'buffer',
+        stageLabel: '이진 데이터와 Buffer',
+        buffer: {
+          text: 'Hi🔥',
+          bytes: [72, 105, 240, 159, 148, 165],
+          note: '"Hi🔥" 를 utf8 로 인코딩 → 6바이트 (이모지는 4바이트). 글자 수와 바이트 수는 다르다.',
+          encodings: [
+            { name: 'utf8', role: '사람이 읽는 텍스트 (기본)' },
+            { name: 'base64', role: '바이너리를 텍스트로 안전 전송' },
+            { name: 'hex', role: '바이트를 16진수 문자열로' },
+          ],
+        },
+        alert: { tone: 'info', text: 'Buffer 는 "글자"가 아니라 "바이트"를 담는다. buf.length 는 글자 수가 아니라 바이트 수다 — 이모지·한글은 여러 바이트라 String.length 와 다르다. 인코딩을 틀리면 데이터가 깨진다(다음 단계에서 스트림이 이 Buffer 를 흘려보낸다).' },
+        code: {
+          lang: 'javascript',
+          filename: 'buffer-basics.js — 바이트를 직접 다뤄보기',
+          lines: [
+            '// 문자열을 utf8 바이트 배열(Buffer)로 만든다',
+            'const buf = Buffer.from("Hi\u{1F525}", "utf8");',
+            '',
+            'console.log(buf);',
+            '// => <Buffer 48 69 f0 9f 94 a5>  (16진수 6바이트)',
+            'console.log(buf.length);      // => 6  (글자 수 아님! 바이트 수)',
+            'console.log("Hi\u{1F525}".length); // => 3  (JS 문자열 길이)',
+            '',
+            '// 같은 바이트를 다른 인코딩으로 읽기',
+            'console.log(buf.toString("utf8"));   // => Hi\u{1F525}',
+            'console.log(buf.toString("base64")); // => SGnwn5Sl',
+            'console.log(buf.toString("hex"));    // => 4869f09f94a5',
+            '',
+            '// 파일·네트워크는 항상 이런 바이트(Buffer)로 오간다',
+            'const empty = Buffer.alloc(4);  // 0으로 채운 4바이트 확보',
+            '// => <Buffer 00 00 00 00>',
+          ],
+          highlight: [1, 5, 6, 7],
+        },
+      },
+      {
+        title: 'Step 2. Stream 4종 — 데이터를 청크 단위로 흘려보내는 통로',
+        desc: '스트림은 데이터를 한 번에 다 들고 있지 않고 조각(청크)으로 흘려보내는 추상화다. 종류는 넷이다. ① Readable: 데이터가 흘러 나오는 출발점 — fs.createReadStream, HTTP 요청 본문. ② Writable: 데이터가 흘러 들어가는 도착점 — fs.createWriteStream, HTTP 응답. ③ Duplex: 읽기와 쓰기를 동시에 하는 양방향 — TCP 소켓이 대표적이다. ④ Transform: 통과하면서 데이터를 변형하는 특수 Duplex — 압축(zlib.createGzip), 암호화가 여기 속한다. 핵심은 이 넷을 파이프로 이어 "읽기 → 변형 → 쓰기"의 처리 라인을 만든다는 점이다. 청크 단위로 다루기 때문에 100GB 파일이라도 메모리에는 한 조각(기본 64KB)만 올라간다 — 이것이 스트림을 쓰는 근본 이유다.',
+        actor: '🌊 Readable · Writable · Duplex · Transform',
+        stage: 'kinds',
+        stageLabel: 'Stream 4종',
+        kinds: {
+          items: [
+            { name: 'Readable', role: '데이터가 흘러 나오는 출발점', ex: 'fs.createReadStream · req', arrow: '→', tone: 'point' },
+            { name: 'Writable', role: '데이터가 흘러 들어가는 도착점', ex: 'fs.createWriteStream · res', arrow: '→', tone: 'good' },
+            { name: 'Duplex', role: '읽기 + 쓰기 양방향', ex: 'TCP 소켓 (net.Socket)', arrow: '⇄', tone: 'mid' },
+            { name: 'Transform', role: '통과하며 변형하는 Duplex', ex: 'zlib.createGzip · 암호화', ex2: '', arrow: '⤳', tone: 'mid' },
+          ],
+          note: 'read → (transform) → write 로 이어 처리 라인을 만든다',
+        },
+        alert: { tone: 'good', text: '스트림의 청크는 기본적으로 Buffer(Step 1)다. objectMode 를 켜면 객체 단위로도 흘릴 수 있다. Transform 하나로 압축·암호화·파싱을 파이프 중간에 끼워 넣는 게 스트림의 진짜 힘이다.' },
+        code: {
+          lang: 'javascript',
+          filename: 'stream-kinds.js — 4종을 한눈에',
+          lines: [
+            'const fs = require("fs");',
+            'const zlib = require("zlib");',
+            'const net = require("net");',
+            '',
+            '// ① Readable — 파일에서 데이터가 흘러 나온다',
+            'const readable = fs.createReadStream("./big.log");',
+            '',
+            '// ② Writable — 파일로 데이터가 흘러 들어간다',
+            'const writable = fs.createWriteStream("./out.log");',
+            '',
+            '// ③ Duplex — 읽기+쓰기 양방향 (TCP 소켓)',
+            'const socket = net.connect(3000);  // socket.read & socket.write',
+            '',
+            '// ④ Transform — 통과하며 변형 (여기선 gzip 압축)',
+            'const gzip = zlib.createGzip();',
+            '',
+            '// 청크 하나 크기는 기본 64KB — 100GB 파일도',
+            '// 메모리엔 한 조각만 올라간다 (다음 단계에서 비교)',
+          ],
+          highlight: [5, 6, 8, 9, 11, 12, 14, 15],
+        },
+      },
+      {
+        title: 'Step 3. readFile(전체 로드) vs Stream(청크) — 메모리 그래프로 보는 차이',
+        desc: '같은 "파일을 읽어 응답한다"라도 방법에 따라 서버의 운명이 갈린다. fs.readFile은 파일 전체를 한 번에 메모리(Buffer)로 올린 뒤 넘겨준다 — 2GB 파일이면 2GB가 통째로 RAM에 쌓인다. 요청이 몇 개만 겹쳐도 메모리가 폭발하고 프로세스가 죽는다(OOM). 반면 fs.createReadStream은 파일을 64KB 조각으로 잘라 하나씩 흘려보내므로, 파일이 아무리 커도 메모리에는 청크 한두 개(수십 KB~수 MB)만 머문다. 왼쪽 그래프를 보라 — readFile 게이지는 파일을 다 읽을 때까지 계속 차올라 한계선을 넘지만, Stream 게이지는 청크가 들어왔다 빠져나가며 낮고 평평하게 유지된다. 실무 규칙: 대용량이거나 크기를 예측할 수 없는 데이터는 무조건 스트림. readFile은 설정 파일처럼 "작고 크기를 아는" 파일에만.',
+        actor: '📈 readFile(폭발) vs Stream(일정) 메모리 대비',
+        stage: 'memory',
+        stageLabel: '메모리: 전체 로드 vs 청크',
+        memory: {
+          note: '파일이 흘러 들어오는 동안 메모리 사용량을 실시간 비교',
+        },
+        alert: { tone: 'warn', text: '대용량 파일을 fs.readFile 로 통째 로드하면 메모리가 파일 크기만큼 치솟아 OOM 으로 프로세스가 죽는다. 크기를 예측할 수 없는 업로드·다운로드는 반드시 스트림. readFile 은 작고 크기를 아는 파일(설정·템플릿)에만.' },
+        code: {
+          lang: 'javascript',
+          filename: 'copy-large-file.js — 대용량 복사',
+          lines: [
+            'const fs = require("fs");',
+            '',
+            '// ── ❌ 위험: 전체를 메모리에 올린다 ──────────',
+            'fs.readFile("./2gb-video.mp4", (err, data) => {',
+            '  // data 는 2GB Buffer 통째 — 요청 몇 개면 OOM 폭발',
+            '  fs.writeFile("./copy.mp4", data, () => {});',
+            '});',
+            '',
+            '// ── ✅ 안전: 청크로 흘려보낸다 ──────────────',
+            'const read = fs.createReadStream("./2gb-video.mp4");',
+            'const write = fs.createWriteStream("./copy.mp4");',
+            '',
+            'read.on("data", (chunk) => {',
+            '  // chunk 는 64KB Buffer 한 조각 — 메모리엔 이것만',
+            '  write.write(chunk);',
+            '});',
+            'read.on("end", () => write.end());',
+            '// => 2GB 파일도 메모리는 수십 KB 로 평평하게 유지',
+          ],
+          highlight: [4, 5, 10, 11, 13, 14],
+        },
+      },
+      {
+        title: 'Step 4. pipe와 백프레셔 — 읽기→쓰기를 잇고 속도를 자동 조절',
+        desc: 'Step 3의 read.on("data") 수동 처리에는 숨은 함정이 있다. 읽는 속도가 쓰는 속도보다 빠르면(빠른 SSD → 느린 네트워크), 미처 못 쓴 청크가 메모리에 계속 쌓여 결국 스트림을 쓰는 의미가 사라진다. 이를 막는 장치가 백프레셔(backpressure)다 — Writable의 내부 버퍼가 차면 "잠깐 멈춰"라는 신호를 Readable에 보내 생산을 멈추게 하고, 버퍼가 비면 다시 흐르게 한다. 이 조절을 손으로 하려면 write()의 반환값·drain 이벤트를 일일이 챙겨야 해서 실수하기 쉽다. 그래서 pipe가 있다 — readStream.pipe(writeStream) 한 줄이면 청크 전달, 백프레셔, end 전파까지 전부 자동으로 해준다. 왼쪽을 보라: 소비가 느려지면 파이프가 생산을 눌러(⏸) 중간 버퍼가 넘치지 않게 유지한다. 실무에서 스트림을 이을 땐 pipe(또는 pipeline)를 기본으로 쓴다.',
+        actor: '🔗 pipe 로 연결 · 백프레셔로 속도 자동 조절',
+        stage: 'pipe',
+        stageLabel: 'pipe · 백프레셔',
+        pipe: {
+          note: '생산(Readable) → 버퍼 → 소비(Writable). 소비가 느리면 백프레셔가 생산을 멈춘다',
+        },
+        alert: { tone: 'warn', text: 'pipe 없이 read.on("data")+write.write() 로 수동 처리하면 백프레셔가 무시돼 느린 소비자 앞에서 메모리가 쌓인다. readStream.pipe(writeStream) 한 줄이 청크 전달·백프레셔·end 전파를 다 해준다. 에러 전파까지 원하면 stream.pipeline 을 써라.' },
+        code: {
+          lang: 'javascript',
+          filename: 'pipe-backpressure.js — 한 줄로 잇기',
+          lines: [
+            'const fs = require("fs");',
+            'const zlib = require("zlib");',
+            '',
+            'const read = fs.createReadStream("./big.log");',
+            'const gzip = zlib.createGzip();          // Transform',
+            'const write = fs.createWriteStream("./big.log.gz");',
+            '',
+            '// ✅ pipe: 청크 전달 + 백프레셔 + end 전파 자동',
+            'read.pipe(gzip).pipe(write);',
+            '//  읽기 → 압축(Transform) → 쓰기 로 이어진다',
+            '//  소비가 느리면 백프레셔가 읽기를 자동으로 멈춘다',
+            '',
+            '// 🔒 더 안전: pipeline 은 에러까지 한 번에 전파',
+            'const { pipeline } = require("stream");',
+            'pipeline(read, gzip, write, (err) => {',
+            '  if (err) console.error("파이프 실패:", err);',
+            '});',
+          ],
+          highlight: [8, 9, 13, 14, 15],
+        },
+      },
+      {
+        title: 'Step 5. data·end·error 이벤트와 실무 함정 — error를 놓치면 프로세스가 죽는다',
+        desc: '스트림은 이벤트로 말한다. data: 청크가 하나 도착했다, end: 읽을 데이터가 끝났다, error: 문제가 생겼다(파일 없음·권한·디스크 풀). 초보가 가장 자주 밟는 지뢰가 바로 error 이벤트 미처리다 — Readable/Writable 어느 쪽이든 error 리스너가 없으면 그 에러는 잡히지 않은 예외(uncaught)가 되어 프로세스 전체를 죽인다. 그 밖의 단골 함정 넷을 정리하면: ① 대용량을 readFile로 통째 로드해 메모리 폭발, ② pipe 없이 수동 처리로 백프레셔 무시, ③ error 이벤트 미처리로 서버 다운, ④ Buffer 인코딩 실수로 데이터 깨짐(utf8 파일을 latin1로 읽는 등). 정리하면 — 대용량·실시간이면 스트림, 이을 땐 pipe/pipeline, error는 반드시 처리, 인코딩은 명시. 이 네 가지만 지켜도 스트림 사고의 대부분을 막는다.',
+        actor: '📡 data · end · error 이벤트 + 실무 함정 4',
+        stage: 'events',
+        stageLabel: '이벤트 · 실무 함정',
+        events: {
+          flow: [
+            { ev: 'data', desc: '청크 도착 (여러 번 발생)', tone: 'good' },
+            { ev: 'end', desc: '읽을 데이터 끝 (1번)', tone: 'mid' },
+            { ev: 'error', desc: '문제 발생 — 반드시 처리!', tone: 'bad' },
+          ],
+          traps: [
+            { bad: '대용량을 readFile 로 통째 로드', fix: '스트림으로 청크 처리', tone: 'bad' },
+            { bad: 'pipe 없이 수동 처리 (백프레셔 무시)', fix: 'pipe / pipeline 사용', tone: 'bad' },
+            { bad: 'error 이벤트 미처리 → 프로세스 다운', fix: '.on("error") 항상 등록', tone: 'bad' },
+            { bad: 'Buffer 인코딩 실수 → 데이터 깨짐', fix: '인코딩 명시(utf8 등)', tone: 'bad' },
+          ],
+        },
+        alert: { tone: 'good', text: '대용량·실시간이면 스트림, 이을 땐 pipe/pipeline, error 는 반드시 .on("error") 로 처리, 인코딩은 명시. 이 넷이 스트림 실무의 핵심 체크리스트다. 다음 파트 IV-1-1 에서 HTTP 서버를 다룬다 — 요청·응답도 결국 스트림이다.' },
+        code: {
+          lang: 'javascript',
+          filename: 'events-and-traps.js — 이벤트 안전하게',
+          lines: [
+            'const fs = require("fs");',
+            'const read = fs.createReadStream("./data.csv", "utf8");',
+            '//                             인코딩 명시 ↑ (함정 ④ 예방)',
+            '',
+            'let total = 0;',
+            'read.on("data", (chunk) => {   // 청크마다 여러 번 호출',
+            '  total += chunk.length;',
+            '  console.log("청크:", chunk.length, "bytes");',
+            '});',
+            '',
+            'read.on("end", () => {          // 딱 한 번',
+            '  console.log("완료, 총", total, "bytes");',
+            '});',
+            '',
+            'read.on("error", (err) => {    // ⭐ 없으면 프로세스 다운!',
+            '  console.error("읽기 실패:", err.message);',
+            '});',
+            '// => 청크: 65536 ... → 완료, 총 ... bytes',
+          ],
+          highlight: [2, 6, 11, 15, 16],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // Step 1 — Buffer 바이트 배열 + 인코딩
+    // ─────────────────────────────────────────────────────
+    function BufferView({ buffer }) {
+      return (
+        <div className="space-y-3">
+          <div className="rounded-lg border-2 border-[#339933] bg-white p-3">
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-2">🧱 "{buffer.text}" → utf8 바이트</div>
+            <div className="flex gap-1 flex-wrap">
+              {buffer.bytes.map((b, i) => (
+                <div key={i} className="flex flex-col items-center">
+                  <div className="w-10 h-10 rounded border-2 border-[#339933] bg-[#c8e6c9] flex items-center justify-center text-[11px] font-mono font-bold text-[#1b5e20]">
+                    {b.toString(16).padStart(2, '0')}
+                  </div>
+                  <span className="text-[8px] text-slate-500 mt-0.5">{b}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-[9px] text-slate-500">{buffer.note}</div>
+          </div>
+          <div className="rounded-lg border-2 border-[#81c784] bg-[#e8f5e9] p-3">
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-1.5">🔤 같은 바이트, 다른 인코딩</div>
+            <div className="space-y-1.5">
+              {buffer.encodings.map((e, i) => (
+                <div key={i} className="rounded border border-[#81c784] bg-white px-2 py-1.5 flex items-center gap-2">
+                  <span className="text-[11px] font-mono font-bold text-[#1b5e20] w-16">{e.name}</span>
+                  <span className="text-[10px] text-slate-700 flex-1">{e.role}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 2 — Stream 4종
+    // ─────────────────────────────────────────────────────
+    function KindsView({ kinds }) {
+      const TONE = {
+        point: 'border-[#339933] bg-[#c8e6c9]',
+        good: 'border-[#81c784] bg-[#e8f5e9]',
+        mid: 'border-[#81c784] bg-white',
+      };
+      return (
+        <div className="space-y-3">
+          <div className="rounded-lg border-2 border-[#339933] bg-white p-3">
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-2">🌊 Stream 4종 — 데이터가 흐르는 통로</div>
+            <div className="space-y-1.5">
+              {kinds.items.map((k, i) => (
+                <div key={i} className={`rounded border-2 px-2 py-1.5 flex items-center gap-2 ${TONE[k.tone]}`}>
+                  <span className="text-base w-6 text-center text-[#1b5e20]">{k.arrow}</span>
+                  <span className="text-[11px] font-mono font-bold text-[#1b5e20] w-24">{k.name}</span>
+                  <div className="flex-1">
+                    <div className="text-[10px] text-slate-700">{k.role}</div>
+                    <div className="text-[9px] font-mono text-slate-500">{k.ex}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-[9px] text-slate-500">{kinds.note}</div>
+          </div>
+          <div className="rounded-lg border-2 border-[#81c784] bg-[#e8f5e9] p-3">
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-1.5">🔗 처리 라인 예시</div>
+            <div className="flex items-center gap-1.5 flex-wrap text-[10px] font-mono font-bold text-[#1b5e20]">
+              <span className="px-2 py-1 rounded bg-white border border-[#339933]">Readable</span>
+              <span>→</span>
+              <span className="px-2 py-1 rounded bg-[#c8e6c9] border border-[#339933]">Transform</span>
+              <span>→</span>
+              <span className="px-2 py-1 rounded bg-white border border-[#339933]">Writable</span>
+            </div>
+            <div className="mt-1.5 text-[9px] text-slate-500">읽기 → 변형(압축·암호화) → 쓰기</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 3 — 메모리 대비 (애니메이션): readFile 폭발 vs Stream 평평
+    // ─────────────────────────────────────────────────────
+    function MemoryView({ memory, tick }) {
+      const N = 8;                       // 파일을 8조각으로 나눠 흘림
+      const loaded = tick % (N + 2);     // 0..N+1 진행
+      const progress = Math.min(loaded, N);
+      // readFile: 진행에 비례해 계속 차오른다 (한계선 초과)
+      const readFilePct = Math.min(100, (progress / N) * 130);
+      const overLimit = readFilePct >= 100;
+      // Stream: 청크 한두 개만 → 낮고 평평 (약간 출렁)
+      const streamPct = progress === 0 || progress > N ? 8 : 14 + (tick % 2) * 8;
+      const Gauge = ({ label, pct, danger, sub }) => (
+        <div className={`rounded-lg border-2 p-3 ${danger ? 'border-red-300 bg-red-50' : 'border-[#339933] bg-[#e8f5e9]'}`}>
+          <div className={`text-[11px] font-bold mb-1.5 ${danger ? 'text-red-700' : 'text-[#1b5e20]'}`}>{label}</div>
+          <div className="relative w-full h-4 rounded bg-white border border-slate-300 overflow-hidden">
+            {/* 한계선 */}
+            <div className="absolute top-0 bottom-0 border-r-2 border-dashed border-red-500" style={{ left: '77%' }} />
+            <div
+              className={`h-full transition-all ${danger ? (pct >= 100 ? 'bg-red-500' : 'bg-red-400') : 'bg-[#339933]'}`}
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <div className={`mt-1 text-[9px] ${danger ? 'text-red-600' : 'text-slate-500'}`}>{sub}</div>
+        </div>
+      );
+      return (
+        <div className="space-y-3">
+          <div className="rounded-lg border-2 border-[#339933] bg-white p-2.5">
+            <div className="text-[10px] font-bold text-[#1b5e20] mb-1">📦 파일이 흘러 들어오는 중 …</div>
+            <div className="flex gap-1">
+              {Array.from({ length: N }).map((_, i) => (
+                <div
+                  key={i}
+                  className={`flex-1 h-4 rounded text-center text-[8px] font-mono border transition
+                    ${i < progress ? 'bg-[#c8e6c9] border-[#339933] text-[#1b5e20]' : 'bg-white border-[#81c784] text-slate-400'}`}
+                >{i < progress ? '▓' : ''}</div>
+              ))}
+            </div>
+            <div className="mt-1 text-[9px] text-slate-500">청크 {progress} / {N} 도착</div>
+          </div>
+          <Gauge
+            label="① fs.readFile — 전체를 메모리에 쌓음"
+            pct={readFilePct}
+            danger={true}
+            sub={overLimit ? '🚨 한계선 초과 → OOM 위험 (프로세스 다운)' : '읽을수록 계속 차오른다 (파일 크기 = 메모리)'}
+          />
+          <Gauge
+            label="② createReadStream — 청크만 흐른다"
+            pct={streamPct}
+            danger={false}
+            sub="청크가 들어왔다 빠져나가며 낮고 평평하게 유지"
+          />
+          <div className="text-[9px] text-slate-500 text-center">{memory.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 4 — pipe + 백프레셔 (애니메이션)
+    // ─────────────────────────────────────────────────────
+    function PipeView({ pipe, tick }) {
+      // 소비(Writable)가 주기적으로 느려짐 → 백프레셔 발동
+      const slow = tick % 4 >= 2;            // 절반 주기 동안 소비가 느림
+      const bufferFill = slow ? 80 : 25;     // 중간 버퍼 채움
+      const producing = !slow;               // 느릴 땐 생산 멈춤(백프레셔)
+      return (
+        <div className="space-y-3">
+          <div className="rounded-lg border-2 border-[#339933] bg-white p-3">
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-3">🔗 readStream.pipe(writeStream)</div>
+            <div className="flex items-center gap-1.5">
+              {/* Readable */}
+              <div className={`flex-1 rounded-lg border-2 p-2 text-center transition ${producing ? 'border-[#339933] bg-[#c8e6c9]' : 'border-slate-300 bg-slate-100'}`}>
+                <div className="text-[10px] font-bold text-[#1b5e20]">Readable</div>
+                <div className="text-[9px] text-slate-600">{producing ? '생산 중 ▶' : '⏸ 멈춤(백프레셔)'}</div>
+              </div>
+              <span className="text-lg text-[#339933]">{producing ? '»' : '‖'}</span>
+              {/* 중간 버퍼 */}
+              <div className="flex-1 rounded-lg border-2 border-[#81c784] bg-white p-2">
+                <div className="text-[9px] font-bold text-[#1b5e20] text-center mb-1">내부 버퍼</div>
+                <div className="w-full h-3 rounded bg-slate-100 border border-slate-300 overflow-hidden">
+                  <div className={`h-full transition-all ${bufferFill >= 80 ? 'bg-amber-400' : 'bg-[#339933]'}`} style={{ width: `${bufferFill}%` }} />
+                </div>
+              </div>
+              <span className="text-lg text-[#339933]">»</span>
+              {/* Writable */}
+              <div className={`flex-1 rounded-lg border-2 p-2 text-center transition ${slow ? 'border-amber-400 bg-amber-50' : 'border-[#339933] bg-[#e8f5e9]'}`}>
+                <div className="text-[10px] font-bold text-[#1b5e20]">Writable</div>
+                <div className="text-[9px] text-slate-600">{slow ? '🐢 소비 느림' : '소비 중 ✅'}</div>
+              </div>
+            </div>
+          </div>
+          <div className={`rounded-lg border-2 p-3 transition ${slow ? 'border-amber-400 bg-amber-50' : 'border-[#81c784] bg-[#e8f5e9]'}`}>
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-1">
+              {slow ? '⚠️ 소비 < 생산 → 백프레셔 발동' : '✅ 균형 — 버퍼가 낮게 유지'}
+            </div>
+            <div className="text-[9px] text-slate-600">
+              {slow
+                ? '버퍼가 차자 pipe 가 Readable 에게 "멈춰" 신호 → 생산 중단 → 버퍼 넘침 방지'
+                : '소비가 따라오면 pipe 가 생산을 재개한다'}
+            </div>
+          </div>
+          <div className="text-[9px] text-slate-500 text-center">{pipe.note}</div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Step 5 — 이벤트 흐름 + 실무 함정
+    // ─────────────────────────────────────────────────────
+    function EventsView({ events }) {
+      const EV_TONE = {
+        good: 'border-[#339933] bg-[#c8e6c9] text-[#1b5e20]',
+        mid: 'border-[#81c784] bg-white text-slate-700',
+        bad: 'border-red-400 bg-red-50 text-red-700',
+      };
+      return (
+        <div className="space-y-3">
+          <div className="rounded-lg border-2 border-[#339933] bg-white p-3">
+            <div className="text-[11px] font-bold text-[#1b5e20] mb-2">📡 스트림 이벤트 흐름</div>
+            <div className="flex items-center gap-1.5">
+              {events.flow.map((e, i) => (
+                <React.Fragment key={i}>
+                  <div className={`flex-1 rounded border-2 px-1.5 py-2 text-center ${EV_TONE[e.tone]}`}>
+                    <div className="text-[11px] font-mono font-bold">{e.ev}</div>
+                    <div className="text-[8px] mt-0.5">{e.desc}</div>
+                  </div>
+                  {i < events.flow.length - 1 && <span className="text-[#339933] font-bold">→</span>}
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border-2 border-red-300 bg-red-50 p-3">
+            <div className="text-[11px] font-bold text-red-700 mb-2">🕳 실무 함정 4 + 해법</div>
+            <div className="space-y-1.5">
+              {events.traps.map((t, i) => (
+                <div key={i} className="rounded border border-red-300 bg-white px-2 py-1.5">
+                  <div className="text-[10px] text-red-700 flex items-center gap-1">
+                    <span className="font-bold">❌</span><span>{t.bad}</span>
+                  </div>
+                  <div className="text-[10px] text-[#1b5e20] flex items-center gap-1 mt-0.5">
+                    <span className="font-bold">✅</span><span>{t.fix}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-[#e8f5e9]', border: 'border-[#81c784]', text: 'text-[#1b5e20]', icon: '💡' },
+      warn:   { bg: 'bg-amber-50',  border: 'border-amber-300', text: 'text-amber-900', icon: '⚠️' },
+      danger: { bg: 'bg-red-50',    border: 'border-red-300',   text: 'text-red-900',   icon: '🚨' },
+      good:   { bg: 'bg-[#c8e6c9]', border: 'border-[#339933]', text: 'text-[#1b5e20]', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — stage 값에 따라 다른 시각화 (Node 그린 톤)
+    //   memory/pipe 단계는 tick 애니메이션이 돈다.
+    // ─────────────────────────────────────────────────────
+    const STAGE_BADGE = {
+      buffer:  { icon: '🧱', label: 'Buffer · 바이트' },
+      kinds:   { icon: '🌊', label: 'Stream 4종' },
+      memory:  { icon: '📈', label: '메모리 대비' },
+      pipe:    { icon: '🔗', label: 'pipe · 백프레셔' },
+      events:  { icon: '📡', label: '이벤트 · 함정' },
+    };
+
+    function LiveDataPane({ state }) {
+      const badge = STAGE_BADGE[state.stage] || STAGE_BADGE.buffer;
+      const [tick, setTick] = useState(0);
+
+      useEffect(() => {
+        const animated = state.stage === 'memory' || state.stage === 'pipe';
+        setTick(0);
+        if (!animated) return;
+        const id = setInterval(() => setTick((t) => t + 1), 700);
+        return () => clearInterval(id);
+      }, [state.stage]);
+
+      return (
+        <div className="rounded-xl border border-[#339933] bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-bold text-[#1b5e20] flex items-center gap-1.5">
+              <span>{badge.icon}</span>
+              <span>스트림과 버퍼 — {badge.label}</span>
+            </h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          <div className="text-[10px] text-[#1b5e20] font-mono mb-3 px-2 py-1 rounded bg-[#e8f5e9] border border-[#81c784]">
+            현재 단계: {state.stageLabel}
+          </div>
+          {state.stage === 'buffer' && <BufferView buffer={state.buffer} />}
+          {state.stage === 'kinds' && <KindsView kinds={state.kinds} />}
+          {state.stage === 'memory' && <MemoryView memory={state.memory} tick={tick} />}
+          {state.stage === 'pipe' && <PipeView pipe={state.pipe} tick={tick} />}
+          {state.stage === 'events' && <EventsView events={state.events} />}
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js / atom-one-dark)
+    // ─────────────────────────────────────────────────────
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const highlightSet = new Set(code.highlight || []);
+      // hljs.highlight 를 동기 호출 — 렌더 시점에 항상 "현재 단계" 코드가 하이라이트된다
+      const tokenLines = React.useMemo(() => {
+        try {
+          const html = window.hljs.highlight(code.lines.join('\n'), { language: code.lang }).value;
+          const split = html.split('\n');
+          return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : escapeHtml(l) }));
+        } catch (e) {
+          return code.lines.map((l) => ({ html: escapeHtml(l) }));
+        }
+      }, [code]);
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <div className={`text-slate-200 language-${code.lang}`}>
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-[#339933]/20 border-l-2 border-[#339933] -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center px-3 h-10 rounded-lg bg-[#339933] text-white font-bold text-xs">Ⅲ. 핵심 모듈</span>
+              <div>
+                <h1 className="text-2xl font-bold text-[#1b5e20]"><span className="font-mono text-lg mr-1">III-2-2</span> 스트림과 버퍼 — 대용량을 조각으로 다루기</h1>
+                <p className="text-sm text-[#1b5e20]/80">메모리에 다 안 올리고 흐르게 하는 Stream, 이진 데이터 Buffer</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-[#1b5e20] underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-[#339933]' : 'bg-green-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-[#1b5e20] text-green-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-green-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-[#339933] bg-white text-[#1b5e20] hover:bg-green-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-[#339933] bg-white text-[#1b5e20] hover:bg-green-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-[#1b5e20] text-white' : 'bg-[#339933] text-white hover:bg-[#1b5e20]'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-[#339933] bg-white text-[#1b5e20] hover:bg-green-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-[#1b5e20]/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-[#339933] bg-white px-4 py-3 text-sm text-[#1b5e20]">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Buffer 는 파일·네트워크가 주고받는 원시 바이트(0~255)를 담는 고정 크기 배열이고, 인코딩(utf8·base64·hex)으로 문자열과 오간다.
+                Stream 4종(Readable·Writable·Duplex·Transform)은 데이터를 청크로 흘려보내 100GB 파일도 메모리엔 한 조각만 올린다.
+                대용량을 readFile 로 통째 로드하면 메모리가 폭발하므로 스트림으로 청크 처리하고, 이을 땐 pipe/pipeline 한 줄로 백프레셔까지 자동 조절한다.
+                data·end·error 이벤트 중 error 는 반드시 처리해야 프로세스가 죽지 않는다. 다음 파트 IV-1-1 의 HTTP 서버도 요청·응답이 모두 스트림이다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Buffer', '바이트', '인코딩', 'Readable', 'Writable', 'Duplex', 'Transform', '청크', 'createReadStream', 'pipe', '백프레셔', 'pipeline', 'data이벤트', 'error이벤트', 'OOM'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-green-100 text-[#1b5e20] border border-green-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-[#1b5e20]">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../part4/IV-1-1.html" className="underline hover:no-underline">다음: IV-1-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
