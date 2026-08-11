@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ArgoCD 학습 — IV-2-2. 보안 강화 — 감사 · 네트워크 · 이미지</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐙</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- ArgoCD IV-2-2 — 보안 강화: 감사·네트워크·이미지 (비유: 은행 금고의 다층 보안 — CCTV·격벽·직원 권한·정품 확인) -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 프로덕션 보안 체크리스트 — 각 항목이 어느 챕터에서 왔는지 추적한다
+    const CHECKLIST = [
+      { cat: 'audit',   label: '감사 로그 (누가 sync/삭제했나)', chapter: 'IV-2-2 감사' },
+      { cat: 'network', label: '컴포넌트 네트워크 격리 (NetworkPolicy)', chapter: 'IV-2-2 네트워크' },
+      { cat: 'network', label: 'repo-server · redis 접근 제한', chapter: 'IV-2-2 네트워크' },
+      { cat: 'priv',    label: '컴포넌트별 최소 권한 ServiceAccount', chapter: 'IV-2-2 권한' },
+      { cat: 'priv',    label: 'API 서버 TLS · 노출 최소화', chapter: 'IV-2-2 노출' },
+      { cat: 'image',   label: '이미지 · 커밋 서명 검증 (policy)', chapter: 'IV-2-2 이미지' },
+      { cat: 'rbac',    label: 'RBAC 역할 분리 (읽기 / sync / admin)', chapter: 'IV-1-1 RBAC' },
+      { cat: 'sso',     label: 'SSO(OIDC) 연동 · admin 개별 계정', chapter: 'IV-1-2 SSO' },
+      { cat: 'secret',  label: '시크릿 외부 관리 (Vault · SealedSecret)', chapter: 'IV-1-x 시크릿' },
+      { cat: 'admin',   label: 'admin 계정 비활성화', chapter: 'IV-2-2 종합' },
+      { cat: 'update',  label: '취약점 스캔 · 정기 버전 업데이트', chapter: 'IV-2-2 운영' },
+    ];
+
+    const CAT_META = {
+      audit:   { label: '감사',   color: '#F59E0B', icon: '📋' },
+      network: { label: '네트워크', color: '#0EA5E9', icon: '🧱' },
+      priv:    { label: '권한',   color: '#EF7B4D', icon: '🔑' },
+      image:   { label: '이미지', color: '#8B5CF6', icon: '🔏' },
+      rbac:    { label: 'RBAC',   color: '#10B981', icon: '👥' },
+      sso:     { label: 'SSO',    color: '#14B8A6', icon: '🪪' },
+      secret:  { label: '시크릿', color: '#DB2777', icon: '🗝️' },
+      admin:   { label: '계정',   color: '#DC2626', icon: '🚫' },
+      update:  { label: '운영',   color: '#6366F1', icon: '🩹' },
+    };
+
+    const STEPS = [
+      {
+        title: 'Step 1. 감사 로그 — 누가 무엇을 sync/삭제했는가',
+        desc: '운영 사고의 첫 질문은 항상 "누가 언제 무엇을 바꿨나" 이다. ArgoCD 는 모든 sync/삭제/롤백을 Kubernetes 이벤트와 서버 로그로 남기므로, 이를 수집·보존해야 추적이 가능하다. 감사 로그가 없으면 잘못된 배포의 책임 소재와 시점을 재구성할 수 없다. argocd-server 로그를 JSON 으로 중앙 로그 시스템(Loki/ELK)에 보내고, API 서버 audit policy 로 Application 리소스 변경을 기록한다. 이것이 보안 체크리스트의 출발점이다.',
+        kind: 'audit',
+        done: [0],
+        focus: [0],
+        alert: { tone: 'info', text: '감사 로그는 "사후 추적" 이 아니라 "사전 억지력" 이다. 기록된다는 사실 자체가 실수를 줄인다.' },
+        code: {
+          lang: 'yaml',
+          filename: 'audit-logging.yaml',
+          lines: [
+            '# 1) ArgoCD 서버를 JSON 구조화 로그로 — 중앙 수집(Loki/ELK) 전제',
+            'apiVersion: v1',
+            'kind: ConfigMap',
+            'metadata:',
+            '  name: argocd-cmd-params-cm      # 컴포넌트 실행 파라미터',
+            '  namespace: argocd',
+            'data:',
+            '  server.log.format: json          # text 대신 json → 파싱 용이',
+            '  server.log.level: info           # debug 는 노이즈, 운영은 info',
+            '  controller.log.format: json      # 컨트롤러 sync 이벤트도 json',
+            '---',
+            '# 2) 누가 무엇을 했는지 이벤트로 조회 (사후 추적)',
+            '# $ kubectl get events -n argocd --sort-by=.lastTimestamp',
+            '# LAST   TYPE     REASON              OBJECT                MESSAGE',
+            '# 2m     Normal   ResourceUpdated     application/web-app   Updated sync status: Synced',
+            '# 5m     Normal   OperationStarted    application/api-app   initiated sync by alice@acme.com',
+            '# 9m     Warning  OperationCompleted  application/api-app   sync failed: image pull error',
+            '',
+            '# 3) ArgoCD 감사 이벤트만 필터 (initiated by = 실행 주체)',
+            '# $ kubectl get events -n argocd \\',
+            '#     --field-selector reason=OperationStarted -o json \\',
+            '#   | jq -r \'.items[] | .metadata.creationTimestamp+" "+.message\'',
+            '# → "initiated sync by alice@acme.com" 처럼 SSO 계정이 찍힌다',
+            '# → admin 공용 계정을 쓰면 여기가 전부 "admin" 으로만 보인다(추적 불가)',
+            '',
+            '# 4) Kubernetes API 서버 audit policy — Application 변경 기록',
+            'apiVersion: audit.k8s.io/v1',
+            'kind: Policy',
+            'rules:',
+            '  - level: RequestResponse            # 요청+응답 본문까지 기록',
+            '    verbs: ["create", "update", "patch", "delete"]',
+            '    resources:',
+            '      - group: "argoproj.io"',
+            '        resources: ["applications"]   # 누가 Application 을 바꿨나',
+            '  - level: Metadata                   # 나머지는 메타데이터만(용량 절약)',
+            '    resources:',
+            '      - group: ""',
+            '        resources: ["secrets"]        # 시크릿 접근 흔적',
+            '',
+            '# ── 보존 정책 ─────────────────────────',
+            '# - 로그 보존: 최소 90일 (사고 조사·컴플라이언스 기준)',
+            '# - 알림 연동: OperationCompleted+Warning → Slack 채널로 즉시 통보',
+            '# - 함정: 감사 미설정 → "언제부터 OutOfSync 였나" 를 영원히 모른다',
+          ],
+          highlight: [1, 5, 8, 9, 12, 16, 19, 22, 23, 26, 30, 31, 33, 34, 42, 43],
+        },
+      },
+      {
+        title: 'Step 2. 네트워크 정책 — 컴포넌트 격리 (repo-server · redis)',
+        desc: 'ArgoCD 는 여러 컴포넌트(server, application-controller, repo-server, redis)로 나뉘고, 각자 필요한 통신만 있으면 된다. 기본 네임스페이스는 모든 파드가 서로 통신 가능하므로, 침해된 파드 하나가 옆 컴포넌트로 번질 수 있다. NetworkPolicy 로 "누가 누구에게 접속 가능한가" 를 명시적으로 잠가야 한다. 특히 redis 는 세션·캐시를 들고 있어 아무나 접근하면 인증 우회로 이어지고, repo-server 는 Git 자격증명을 다루므로 controller/server 외 접근을 차단한다.',
+        kind: 'network',
+        done: [0, 1, 2],
+        focus: [1, 2],
+        alert: { tone: 'good', text: 'redis 접근 제한은 선택이 아니라 필수 — 세션 캐시 노출은 곧 인증 우회다.' },
+        code: {
+          lang: 'yaml',
+          filename: 'networkpolicy.yaml',
+          lines: [
+            '# 기본 원칙: default-deny 후 필요한 통신만 화이트리스트',
+            '# ── 0) 네임스페이스 전체 기본 차단 (인그레스) ──────',
+            'apiVersion: networking.k8s.io/v1',
+            'kind: NetworkPolicy',
+            'metadata:',
+            '  name: default-deny-ingress',
+            '  namespace: argocd',
+            'spec:',
+            '  podSelector: {}                   # argocd ns 의 모든 파드에 적용',
+            '  policyTypes: ["Ingress"]          # 들어오는 트래픽 전부 차단이 기본',
+            '---',
+            '# ── 1) redis: controller 와 server 만 접근 허용 ────',
+            'apiVersion: networking.k8s.io/v1',
+            'kind: NetworkPolicy',
+            'metadata:',
+            '  name: argocd-redis-allow',
+            '  namespace: argocd',
+            'spec:',
+            '  podSelector:',
+            '    matchLabels:',
+            '      app.kubernetes.io/name: argocd-redis',
+            '  policyTypes: ["Ingress"]',
+            '  ingress:',
+            '    - from:',
+            '        - podSelector:',
+            '            matchLabels:',
+            '              app.kubernetes.io/name: argocd-application-controller',
+            '        - podSelector:',
+            '            matchLabels:',
+            '              app.kubernetes.io/name: argocd-server',
+            '      ports:',
+            '        - port: 6379              # 그 외 파드는 redis 6379 접근 불가',
+            '---',
+            '# ── 2) repo-server: Git 자격증명 취급 → 접근 최소화 ─',
+            'apiVersion: networking.k8s.io/v1',
+            'kind: NetworkPolicy',
+            'metadata:',
+            '  name: argocd-repo-server-allow',
+            '  namespace: argocd',
+            'spec:',
+            '  podSelector:',
+            '    matchLabels:',
+            '      app.kubernetes.io/name: argocd-repo-server',
+            '  policyTypes: ["Ingress"]',
+            '  ingress:',
+            '    - from:',
+            '        - podSelector:',
+            '            matchLabels:',
+            '              app.kubernetes.io/name: argocd-application-controller',
+            '        - podSelector:',
+            '            matchLabels:',
+            '              app.kubernetes.io/name: argocd-server',
+            '      ports:',
+            '        - port: 8081              # repo-server gRPC 만, 그 외 차단',
+            '',
+            '# ── 검증 ─────────────────────────────',
+            '# $ kubectl get networkpolicy -n argocd',
+            '# $ kubectl exec deploy/other-app -n argocd -- \\',
+            '#     nc -zv argocd-redis 6379   # → 차단되면 정책 정상 동작',
+            '#',
+            '# ── 함정 ─────────────────────────────',
+            '# 1. CNI 가 NetworkPolicy 를 지원해야 함(Calico/Cilium). flannel 기본은 무시',
+            '# 2. egress 도 잠그면 repo-server 의 Git(443) 이 막힐 수 있음 → 예외 필요',
+            '# 3. 네트워크 정책 부재 = 파드 하나 침해 시 전 컴포넌트로 횡이동(lateral)',
+          ],
+          highlight: [5, 8, 9, 10, 15, 20, 24, 26, 27, 29, 32, 37, 42, 49, 54, 62, 63, 64],
+        },
+      },
+      {
+        title: 'Step 3. 최소 권한 · TLS · API 노출 최소화',
+        desc: 'ArgoCD application-controller 는 클러스터에 리소스를 배포하므로 강한 권한이 필요하지만, "필요한 만큼만" 이어야 한다. 컴포넌트별 ServiceAccount 를 분리하고, cluster-admin 을 통째로 주는 대신 대상 네임스페이스·리소스로 범위를 좁힌다. 동시에 argocd-server 는 TLS 를 강제하고(--insecure 금지), 외부 노출은 최소화한다 — LoadBalancer 로 공개 IP 에 그냥 열지 말고 내부 Ingress + WAF 뒤에 둔다. API 를 인터넷에 그대로 노출하면 크리덴셜 스터핑·무차별 대입의 표적이 된다.',
+        kind: 'priv',
+        done: [0, 1, 2, 3, 4],
+        focus: [3, 4],
+        alert: { tone: 'danger', text: 'API 공개 노출 + admin 방치 = 사고 1순위. server 는 반드시 TLS, 노출은 내부 Ingress 뒤로.' },
+        code: {
+          lang: 'yaml',
+          filename: 'least-privilege-tls.yaml',
+          lines: [
+            '# ── 1) 컴포넌트별 최소 권한 ServiceAccount ─────────',
+            '# controller 는 배포용 권한, server 는 조회 위주로 분리',
+            'apiVersion: rbac.authorization.k8s.io/v1',
+            'kind: ClusterRole',
+            'metadata:',
+            '  name: argocd-controller-limited',
+            'rules:',
+            '  - apiGroups: ["apps", ""]',
+            '    resources: ["deployments", "services", "configmaps"]',
+            '    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]',
+            '  # cluster-admin 통째 부여 금지 — 관리 대상 리소스만 나열',
+            '---',
+            'apiVersion: rbac.authorization.k8s.io/v1',
+            'kind: ClusterRoleBinding',
+            'metadata:',
+            '  name: argocd-controller-limited',
+            'roleRef:',
+            '  apiGroup: rbac.authorization.k8s.io',
+            '  kind: ClusterRole',
+            '  name: argocd-controller-limited',
+            'subjects:',
+            '  - kind: ServiceAccount',
+            '    name: argocd-application-controller   # 전용 SA',
+            '    namespace: argocd',
+            '---',
+            '# ── 2) argocd-server TLS 강제 (--insecure 금지) ────',
+            'apiVersion: v1',
+            'kind: ConfigMap',
+            'metadata:',
+            '  name: argocd-cmd-params-cm',
+            '  namespace: argocd',
+            'data:',
+            '  server.insecure: "false"          # 평문 HTTP 금지, TLS 강제',
+            '  server.disable.auth: "false"      # 인증 비활성 절대 금지',
+            '---',
+            '# ── 3) API 노출 최소화: 공개 LB 대신 내부 Ingress ──',
+            'apiVersion: networking.k8s.io/v1',
+            'kind: Ingress',
+            'metadata:',
+            '  name: argocd-server',
+            '  namespace: argocd',
+            '  annotations:',
+            '    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"',
+            '    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8"  # 사내망만',
+            'spec:',
+            '  ingressClassName: internal-nginx   # 인터넷 노출 아닌 내부 클래스',
+            '  tls:',
+            '    - hosts: ["argocd.internal.acme.com"]',
+            '      secretName: argocd-server-tls  # 사설 CA/사내 인증서',
+            '  rules:',
+            '    - host: argocd.internal.acme.com',
+            '      http:',
+            '        paths:',
+            '          - path: /',
+            '            pathType: Prefix',
+            '            backend:',
+            '              service:',
+            '                name: argocd-server',
+            '                port: { number: 443 }',
+            '',
+            '# ── 요약 ─────────────────────────────',
+            '# - 권한: 컴포넌트별 SA + 범위 좁힌 ClusterRole (cluster-admin 금지)',
+            '# - 전송: server.insecure=false → 항상 TLS',
+            '# - 노출: 공개 IP LoadBalancer 대신 사내망 Ingress + IP 화이트리스트',
+          ],
+          highlight: [5, 8, 9, 10, 11, 22, 23, 32, 33, 42, 44, 46, 48, 49, 62, 63, 64],
+        },
+      },
+      {
+        title: 'Step 4. 이미지 · 커밋 서명 검증 — 공급망 보안',
+        desc: '"Git 에 있는 대로 배포" 하는 GitOps 는, 그 Git 커밋과 컨테이너 이미지가 진짜 우리 것일 때만 안전하다. ArgoCD 는 GnuPG 로 서명된 Git 커밋만 sync 하도록 강제할 수 있어(서명 없는 커밋 = sync 거부), 리포 변조·악의적 푸시를 막는다. 이미지 쪽은 admission 단계에서 cosign 서명을 검증하는 정책 엔진(Kyverno 등)을 붙여, 서명 안 된 이미지는 클러스터에 뜨지 못하게 한다. 둘을 합치면 소스(커밋)부터 산출물(이미지)까지 공급망이 잠긴다.',
+        kind: 'image',
+        done: [0, 1, 2, 3, 4, 5],
+        focus: [5],
+        alert: { tone: 'good', text: 'ArgoCD 는 서명된 Git 커밋만 sync 하도록 프로젝트 단위로 강제할 수 있다(네이티브 기능).' },
+        code: {
+          lang: 'yaml',
+          filename: 'supply-chain-verify.yaml',
+          lines: [
+            '# ── 1) ArgoCD: 서명된 Git 커밋만 허용 (AppProject) ──',
+            'apiVersion: argoproj.io/v1alpha1',
+            'kind: AppProject',
+            'metadata:',
+            '  name: production',
+            '  namespace: argocd',
+            'spec:',
+            '  description: 운영 — 서명 커밋만 배포',
+            '  sourceRepos:',
+            '    - https://github.com/acme/*',
+            '  destinations:',
+            '    - server: https://kubernetes.default.svc',
+            '      namespace: "*"',
+            '  # 이 프로젝트의 Application 은 서명 검증된 커밋만 sync',
+            '  signatureKeys:',
+            '    - keyID: 4AEE18F83AFDEB23      # 팀 릴리스 GPG 키 ID',
+            '---',
+            '# ── 2) 신뢰할 GPG 공개키 등록 ─────────────',
+            'apiVersion: v1',
+            'kind: ConfigMap',
+            'metadata:',
+            '  name: argocd-gpg-keys-cm',
+            '  namespace: argocd',
+            'data:',
+            '  4AEE18F83AFDEB23: |',
+            '    -----BEGIN PGP PUBLIC KEY BLOCK-----',
+            '    mQINBF...팀 릴리스 서명용 공개키...',
+            '    -----END PGP PUBLIC KEY BLOCK-----',
+            '# → 서명 없는/모르는 키로 서명된 커밋은 sync 거부 (ComparisonError)',
+            '---',
+            '# ── 3) 이미지 서명 검증: Kyverno + cosign (admission) ─',
+            'apiVersion: kyverno.io/v1',
+            'kind: ClusterPolicy',
+            'metadata:',
+            '  name: verify-image-signature',
+            'spec:',
+            '  validationFailureAction: Enforce   # 미서명 이미지는 배포 차단',
+            '  rules:',
+            '    - name: check-cosign-signature',
+            '      match:',
+            '        any:',
+            '          - resources:',
+            '              kinds: ["Pod"]',
+            '      verifyImages:',
+            '        - imageReferences:',
+            '            - "registry.acme.com/*"',
+            '          attestors:',
+            '            - entries:',
+            '                - keys:',
+            '                    publicKeys: |',
+            '                      -----BEGIN PUBLIC KEY-----',
+            '                      MFkwE...cosign 공개키...',
+            '                      -----END PUBLIC KEY-----',
+            '',
+            '# ── 검증 흐름 ────────────────────────',
+            '# 1. 개발자가 GPG 서명 커밋 push → ArgoCD 서명 확인 후 sync',
+            '# 2. 이미지 빌드 시 cosign sign → 레지스트리에 서명 첨부',
+            '# 3. 파드 생성 시 Kyverno 가 cosign 서명 검증 → 통과만 실행',
+            '# 함정: 서명 강제 후 CI 파이프라인에 sign 단계 누락 → 전체 배포 실패',
+          ],
+          highlight: [1, 14, 15, 16, 24, 28, 30, 36, 43, 45, 46, 47, 53, 54, 55, 56],
+        },
+      },
+      {
+        title: 'Step 5. 종합 체크리스트 — admin 비활성화 · 스캔 · 업데이트',
+        desc: '앞의 RBAC·SSO·시크릿(이전 챕터)에 이번 감사·네트워크·권한·이미지를 더하면 프로덕션 체크리스트가 완성된다. 마지막 마무리는 세 가지다. 공용 admin 계정을 끄고 개인별 SSO 로만 로그인하게 해 추적성을 확보하고(admin.enabled: false), ArgoCD 자체와 배포 대상 이미지를 trivy 로 정기 스캔하며, 오래된 ArgoCD 버전은 알려진 CVE 의 표적이므로 정기적으로 업그레이드한다. 체크리스트의 모든 칸이 채워졌는지 릴리스 전에 한 번씩 훑는 습관이 사고를 막는다.',
+        kind: 'admin',
+        done: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        focus: [9, 10],
+        alert: { tone: 'danger', text: 'admin 계정 방치가 가장 흔한 사고 원인 — 끄거나, 못 끄면 강한 랜덤 비밀번호 + 사용 감사.' },
+        code: {
+          lang: 'bash',
+          filename: 'harden-checklist.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# 프로덕션 ArgoCD 최종 하드닝 — 릴리스 전 실행',
+            'set -euo pipefail',
+            '',
+            '# ── 1) admin 계정 비활성화 (SSO 로만 로그인) ──────',
+            '# argocd-cm 에 admin.enabled: false 를 넣는다',
+            'kubectl -n argocd patch configmap argocd-cm --type merge \\',
+            '  -p \'{"data":{"admin.enabled":"false"}}\'',
+            '# 못 끄는 환경이면 최소한 초기 비밀번호를 교체한다',
+            'argocd account update-password',
+            '# 초기 admin 시크릿은 설치 후 즉시 삭제(더 이상 필요 없음)',
+            'kubectl -n argocd delete secret argocd-initial-admin-secret',
+            '',
+            '# ── 2) 취약점 스캔 — ArgoCD 이미지 + 배포 대상 ────',
+            '# ArgoCD 컴포넌트 이미지 스캔(HIGH/CRITICAL 만)',
+            'for img in argocd-server argocd-repo-server argocd-application-controller; do',
+            '  trivy image --severity HIGH,CRITICAL \\',
+            '    quay.io/argoproj/${img}:v2.11.0',
+            'done',
+            '# 배포 대상 매니페스트의 이미지도 스캔(CI 게이트에 포함)',
+            'trivy config ./k8s/overlays/prd    # 매니페스트 오구성 점검',
+            '',
+            '# ── 3) 버전 업데이트 — 오래된 버전은 CVE 표적 ─────',
+            'argocd version --short              # 현재 서버 버전 확인',
+            '# 릴리스 노트의 보안 픽스 확인 후 업그레이드',
+            'kubectl apply -n argocd \\',
+            '  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.11.0/manifests/install.yaml',
+            '',
+            '# ── 4) 최종 점검 — 체크리스트 자동 확인 ──────────',
+            'echo "[ ] 감사 로그 수집 중인가"',
+            'kubectl -n argocd get cm argocd-cmd-params-cm -o jsonpath="{.data.server\\.log\\.format}"',
+            'echo "[ ] 네트워크 정책 존재하는가"',
+            'kubectl -n argocd get networkpolicy',
+            'echo "[ ] admin 비활성화됐는가"',
+            'kubectl -n argocd get cm argocd-cm -o jsonpath="{.data.admin\\.enabled}"',
+            'echo "[ ] 서명 검증 프로젝트가 있는가"',
+            'kubectl -n argocd get appproject production -o jsonpath="{.spec.signatureKeys}"',
+            '',
+            '# ── 운영 함정 요약 ───────────────────',
+            '# 1. admin 방치     → 공용 계정으로 추적 불가',
+            '# 2. API 공개 노출  → 무차별 대입의 표적',
+            '# 3. 네트워크 정책 X → 파드 하나 침해가 전체로 번짐',
+            '# 4. 감사 미설정    → 사고 시점·주체 재구성 불가',
+            '# 5. 오래된 버전    → 알려진 CVE 방치',
+            'echo "✅ 하드닝 체크리스트 완료 — 릴리스 승인 가능"',
+          ],
+          highlight: [4, 6, 7, 8, 11, 15, 16, 17, 22, 23, 25, 26, 39, 40, 41, 42, 43, 45],
+        },
+      },
+    ];
+
+    const ALERT_STYLE = {
+      info:   { bg: '#FFF7ED', border: '#FED7AA', text: '#9A3412', icon: '💡' },
+      warn:   { bg: '#FFFBEB', border: '#FCD34D', text: '#92400E', icon: '⚠️' },
+      danger: { bg: '#FEF2F2', border: '#FCA5A5', text: '#991B1B', icon: '🚨' },
+      good:   { bg: '#FFF7ED', border: '#EF7B4D', text: '#9A3412', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg border p-2 text-xs flex gap-2"
+             style={{ backgroundColor: s.bg, borderColor: s.border, color: s.text }}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function ChecklistRow({ item, isDone, isFocus }) {
+      const meta = CAT_META[item.cat] || CAT_META.audit;
+      return (
+        <div className="flex items-center gap-2 rounded border px-2 py-1.5 transition"
+             style={{
+               borderColor: isFocus ? meta.color : (isDone ? '#FED7AA' : '#E5E7EB'),
+               backgroundColor: isFocus ? '#FFF7ED' : (isDone ? '#FFFBF5' : '#FFFFFF'),
+               boxShadow: isFocus ? `0 0 0 2px ${meta.color}33` : 'none',
+             }}>
+          <span className="w-5 h-5 flex items-center justify-center rounded-full text-[11px] font-bold text-white shrink-0"
+                style={{ backgroundColor: isDone ? '#10B981' : '#D1D5DB' }}>
+            {isDone ? '✓' : '·'}
+          </span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 text-white" style={{ backgroundColor: meta.color }}>
+            {meta.icon} {meta.label}
+          </span>
+          <span className="text-xs flex-1" style={{ color: isDone ? '#374151' : '#9CA3AF' }}>{item.label}</span>
+          <span className="text-[10px] font-mono shrink-0" style={{ color: '#B45309' }}>{item.chapter}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const meta = CAT_META[state.kind] || CAT_META.audit;
+      const doneSet = new Set(state.done || []);
+      const focusSet = new Set(state.focus || []);
+      const doneCount = doneSet.size;
+      const total = CHECKLIST.length;
+      const pct = Math.round((doneCount / total) * 100);
+      return (
+        <div className="rounded-xl border bg-white p-4 h-full flex flex-col" style={{ borderColor: '#FED7AA' }}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{ color: '#9A3412' }}>🔒 프로덕션 보안 체크리스트</h3>
+            <span className="text-[10px] px-2 py-0.5 rounded text-white" style={{ backgroundColor: meta.color }}>
+              {meta.icon} {meta.label}
+            </span>
+          </div>
+          <div className="mb-2 flex items-center gap-2">
+            <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ backgroundColor: '#FEE4D9' }}>
+              <div className="h-full rounded-full transition-all" style={{ width: pct + '%', backgroundColor: '#10B981' }} />
+            </div>
+            <span className="text-xs font-bold" style={{ color: '#9A3412' }}>{doneCount}/{total} · {pct}%</span>
+          </div>
+          <div className="rounded-lg border-2 p-2 flex-1 space-y-1 overflow-auto" style={{ borderColor: '#EF7B4D' }}>
+            {CHECKLIST.map((item, i) => (
+              <ChecklistRow key={i} item={item} isDone={doneSet.has(i)} isFocus={focusSet.has(i)} />
+            ))}
+          </div>
+          <div className="mt-2 text-[10px]" style={{ color: '#B45309' }}>
+            우측 열은 각 항목이 유래한 챕터 — RBAC · SSO · 시크릿은 앞 챕터에서, 나머지는 이번 챕터에서 채워진다.
+          </div>
+          {state.alert && <AlertBox alert={state.alert} />}
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'border-l-2 -ml-3 pl-2' : ''}`}
+                       style={isHi ? { backgroundColor: 'rgba(239,123,77,0.15)', borderColor: '#EF7B4D' } : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+      const isLast = stepIdx === STEPS.length - 1;
+      return (
+        <div className="min-h-screen px-4 py-6" style={{ background: 'linear-gradient(135deg, #FFF7ED, #FFEDD5)' }}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: '#EF7B4D' }}>A</span>
+              <div>
+                <div className="flex items-center gap-2 mb-0.5">
+                  <span className="text-[10px] px-2 py-0.5 rounded-full text-white font-bold" style={{ backgroundColor: '#9A3412' }}>Part IV. 보안</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full font-mono" style={{ backgroundColor: '#FFF7ED', color: '#9A3412', border: '1px solid #FED7AA' }}>IV-2-2</span>
+                </div>
+                <h1 className="text-2xl font-bold" style={{ color: '#9A3412' }}>보안 강화 — 감사 · 네트워크 · 이미지</h1>
+                <p className="text-sm" style={{ color: '#7C2D12' }}>프로덕션 ArgoCD 의 종합 보안 체크리스트</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: '#9A3412' }}>← 챕터 목록</a>
+            </header>
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ backgroundColor: i <= stepIdx ? '#EF7B4D' : '#FED7AA' }} />
+              ))}
+            </div>
+            <div className="mb-4 rounded-xl text-white px-5 py-4 shadow" style={{ background: 'linear-gradient(90deg, #9A3412, #EF7B4D)' }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border bg-white hover:opacity-80" style={{ borderColor: '#EF7B4D', color: '#9A3412' }}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border bg-white hover:opacity-80 disabled:opacity-40" style={{ borderColor: '#EF7B4D', color: '#9A3412' }}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: playing ? '#9A3412' : '#EF7B4D' }}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border bg-white hover:opacity-80 disabled:opacity-40" style={{ borderColor: '#EF7B4D', color: '#9A3412' }}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: '#9A3412' }}>키보드 ←/→ · 자동재생 3초/단계</div>
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm" style={{ borderColor: '#EF7B4D', color: '#7C2D12' }}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                프로덕션 보안 = 감사(추적) · 네트워크(격리) · 최소권한/TLS(노출 축소) · 서명검증(공급망) + 앞 챕터의 RBAC · SSO · 시크릿. 마무리는 admin 비활성화 · 취약점 스캔 · 정기 업데이트. 릴리스 전 체크리스트를 한 번씩 훑는 습관이 사고를 막는다.
+              </div>
+            )}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['auditLog', 'NetworkPolicy', 'leastPrivilege', 'TLS', 'signatureKeys', 'cosign', 'adminDisabled', 'trivy'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border" style={{ backgroundColor: '#FFF7ED', color: '#9A3412', borderColor: '#FED7AA' }}>#{k}</span>
+              ))}
+            </div>
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: '#9A3412' }}>
+              <a href="./IV-2-1.html" className="underline hover:no-underline">← 이전: IV-2-1</a>
+              <a href="../part5/V-1-1.html" className="underline hover:no-underline">다음: V-1-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
