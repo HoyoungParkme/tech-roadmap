@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault 학습 — V-2-2. backup (Raft snapshot)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Vault V-2-2 — backup (Raft snapshot)
+    비유: 금고 통째로 사진 찍어 금고 밖 창고에 보관 → 사고 나면 그 사진으로 금고 재건
+    5단계: 왜 백업 → snapshot save → 오프사이트 자동화(cron+S3) → 장애 발생 후 restore(auto-unseal) → 종합 운영 체크리스트
+    좌 LiveDataPane(백업/복구 타임라인 + 마지막 운영 대시보드) / 우 CodeViewer(bash)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#FFCC33';
+    const DARK  = '#7c5e00';
+    const SUB   = '#b8860b';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — Vault 가 죽으면 모든 시크릿이 사라진다',
+        desc: 'Integrated Storage(Raft) 는 Vault 의 상태(시크릿, 정책, 토큰, 마운트 설정)를 자체 데이터 디렉터리에 저장한다. 그런데 이 노드들이 동시에 죽거나(정전, 디스크 손상, 잘못된 삭제), 클러스터가 복구 불가 상태에 빠지면 조직의 모든 시크릿이 함께 사라진다. Vault 는 이 상태를 한 파일로 통째로 떠내는 raft snapshot 기능을 제공한다. 정기적으로 스냅샷을 떠서 클러스터 밖에 보관해 두면, 재해가 나도 그 파일 하나로 클러스터를 다시 세울 수 있다.',
+        scene: 'problem',
+        flow: 'off',
+        items: [
+          { who: '디스크 손상', what: 'raft 데이터 디렉터리 파손', risk: '🚨 시크릿 전부 유실' },
+          { who: '잘못된 삭제', what: 'vault secrets disable 실수', risk: '🚨 되돌릴 수 없음' },
+          { who: '전 노드 다운', what: '리전 정전 / 클러스터 붕괴', risk: '🚨 복구 재료 없음' },
+        ],
+        alert: { tone: 'danger', text: '백업이 없으면 클러스터 붕괴 = 모든 시크릿 영구 유실. Raft snapshot 이 유일한 복구 재료다.' },
+        code: {
+          lang: 'bash',
+          filename: 'why-backup.sh',
+          lines: [
+            '# Vault 상태는 Integrated Storage(Raft) 에 들어 있다',
+            '',
+            '# 현재 스토리지 확인',
+            'vault status | grep -i storage',
+            '#   Storage Type    raft',
+            '',
+            '# Raft 는 이 디렉터리에 클러스터 상태를 저장',
+            '#   /opt/vault/data   (vault.db, raft/ ...)',
+            '#   → 시크릿 · 정책 · 토큰 · 마운트 설정이 모두 여기',
+            '',
+            '# 만약 이 데이터가 손상되거나 전 노드가 죽으면?',
+            '#   - kv 시크릿, 발급된 정책, auth 설정 전부 유실',
+            '#   - unseal 키가 있어도 복구할 "데이터" 자체가 없다',
+            '',
+            '# → 유일한 방어: 정기적으로 상태를 통째로 떠내 보관',
+            '# → vault operator raft snapshot save / restore',
+            '# → 스냅샷 = 클러스터 상태의 완전한 스냅사진(암호화 포함)',
+          ],
+          highlight: [3, 4, 5, 11, 12, 13, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 2. snapshot save — 클러스터 상태를 한 파일로 떠낸다',
+        desc: 'vault operator raft snapshot save <file> 한 줄이면 현재 리더 노드가 클러스터의 일관된 상태를 하나의 파일로 떠낸다. 이 스냅샷에는 저장소 데이터가 그대로(암호화된 상태로) 들어간다 — 즉 스냅샷 파일만으로는 시크릿을 읽을 수 없고, 복구 시 원래의 unseal/recovery 키가 있어야 한다. 저장은 리더에서 일어나므로 root 토큰 또는 충분한 권한이 있는 토큰이 필요하다. 파일 이름에는 날짜/시각을 넣어 언제 뜬 스냅샷인지 알 수 있게 한다.',
+        scene: 'save',
+        flow: 'save',
+        items: [
+          { who: '실행', what: 'raft snapshot save vault.snap', risk: '리더 노드에서' },
+          { who: '내용', what: '저장소 데이터(암호화된 상태)', risk: '🔒 평문 아님' },
+          { who: '산출물', what: 'vault-2026-08-11.snap (수십 MB)', risk: '✓ 한 파일' },
+        ],
+        alert: { tone: 'info', text: '스냅샷은 암호화된 저장소를 통째로 담는다. 파일만으로는 못 읽고, 복구엔 원래 키가 필요하다.' },
+        code: {
+          lang: 'bash',
+          filename: 'snapshot-save.sh',
+          lines: [
+            '# 클러스터 상태를 스냅샷 파일로 저장',
+            '',
+            '# 1) 인증 (권한 있는 토큰 필요)',
+            'export VAULT_ADDR="https://vault.internal:8200"',
+            'vault login   # root 또는 스냅샷 권한 토큰',
+            '',
+            '# 2) 스냅샷 저장 — 리더가 일관된 상태를 떠낸다',
+            'vault operator raft snapshot save vault-2026-08-11.snap',
+            '#   (완료되면 조용히 프롬프트로 돌아온다)',
+            '',
+            '# 3) 파일 확인',
+            'ls -lh vault-2026-08-11.snap',
+            '#   -rw-------  1 vault vault  42M  vault-2026-08-11.snap',
+            '',
+            '# 스냅샷 안에 들어 있는 것',
+            '#   - kv 시크릿 · 동적 엔진 설정',
+            '#   - 정책(policy) · auth method 설정',
+            '#   - 토큰 · lease 정보 · 마운트 테이블',
+            '#   → 전부 "암호화된 상태" 그대로 (평문 아님)',
+            '',
+            '# 그래서 스냅샷 파일이 유출돼도 시크릿은 바로 안 열린다',
+            '# 단, 복구하려면 원래 unseal/recovery 키가 반드시 필요',
+          ],
+          highlight: [3, 4, 5, 7, 8, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 3. 자동화 + 오프사이트 — cron 으로 정기 스냅샷, S3 로 원격 보관',
+        desc: '스냅샷은 "사람이 기억날 때" 뜨면 의미가 없다. cron 같은 스케줄러로 정기(예: 매시간/매일) 자동 실행하고, 뜬 파일은 반드시 클러스터와 다른 곳 — 다른 리전의 S3 버킷 등 오프사이트에 올려야 한다. 같은 서버에만 두면 그 서버가 죽을 때 스냅샷도 함께 죽는다. 버킷에는 버전 관리와 수명 주기(오래된 스냅샷 자동 삭제)를 걸고, 최근 N개는 남겨 세대 관리를 한다. 스냅샷 파일은 저장소가 암호화돼 있어도 접근 통제(IAM, 암호화)를 별도로 건다.',
+        scene: 'offsite',
+        flow: 'offsite',
+        items: [
+          { who: 'cron', what: '매시간 snapshot save 실행', risk: '⏰ 정기 자동' },
+          { who: 'S3', what: 's3://vault-backups/ 업로드', risk: '☁️ 오프사이트' },
+          { who: 'lifecycle', what: '30일 지난 스냅샷 자동 삭제', risk: '♻️ 세대 관리' },
+        ],
+        alert: { tone: 'info', text: '정기 스케줄 + 다른 리전 보관이 핵심. 같은 서버에만 두면 그 서버와 함께 사라진다.' },
+        code: {
+          lang: 'bash',
+          filename: 'backup-cron.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# 정기 스냅샷 → S3 오프사이트 업로드 스크립트',
+            'set -euo pipefail',
+            '',
+            'STAMP="2026-08-11-0300"            # 실무: 날짜/시각 자동 삽입',
+            'SNAP="/backup/vault-${STAMP}.snap"',
+            'BUCKET="s3://vault-backups/prod"',
+            '',
+            '# 1) 스냅샷 저장 (토큰은 안전한 곳에서 주입)',
+            'vault operator raft snapshot save "$SNAP"',
+            '',
+            '# 2) 오프사이트(S3, 다른 리전)로 업로드 + 서버측 암호화',
+            'aws s3 cp "$SNAP" "$BUCKET/" --sse aws:kms',
+            '',
+            '# 3) 로컬 임시 파일 정리',
+            'rm -f "$SNAP"',
+            '',
+            '# --- crontab 등록 (매시간 정각) ---',
+            '#   0 * * * * /opt/vault/backup-cron.sh >> /var/log/vault-backup.log 2>&1',
+            '',
+            '# --- S3 버킷 권장 설정 ---',
+            '#   - Versioning 활성화 (덮어쓰기 사고 방지)',
+            '#   - Lifecycle: 30일 후 자동 만료 (세대 관리)',
+            '#   - Bucket Policy: 최소 권한 IAM 만 접근',
+            '#   - 다른 리전 복제(CRR)로 리전 장애까지 대비',
+          ],
+          highlight: [5, 6, 7, 9, 10, 12, 13, 18, 19],
+        },
+      },
+      {
+        title: 'Step 4. 장애 발생 → restore — 스냅샷으로 클러스터를 다시 세운다',
+        desc: '재해가 났다고 하자. 새(혹은 초기화된) Raft 클러스터를 띄운 뒤 vault operator raft snapshot restore <file> 로 스냅샷을 밀어 넣으면, 클러스터 상태가 스냅샷 시점으로 되돌아간다. 주의: 복구는 현재 데이터를 스냅샷 내용으로 덮어쓴다. 이때 seal 방식이 관건이다 — Shamir(수동 unseal)면 복구 후 원래 unseal 키로 다시 열어야 하고, auto-unseal(KMS/Transit)이면 같은 KMS 키에 접근 가능한 환경에서 복구 후 자동으로 unseal 된다. 그래서 recovery key(auto-unseal 시)와 KMS 키 접근을 함께 백업 계획에 넣어야 한다.',
+        scene: 'restore',
+        flow: 'restore',
+        items: [
+          { who: '💥 장애', what: 'raft 데이터 손상 / 클러스터 붕괴', risk: '🚨 복구 시작' },
+          { who: 'restore', what: 'snapshot restore vault.snap', risk: '기존 데이터 덮어씀' },
+          { who: 'auto-unseal', what: '같은 KMS 접근 → 자동 unseal', risk: '🔓 recovery key' },
+        ],
+        alert: { tone: 'warn', text: 'restore 는 현재 데이터를 덮어쓴다. auto-unseal 이면 같은 KMS 키 환경에서 복구 후 자동 open.' },
+        code: {
+          lang: 'bash',
+          filename: 'snapshot-restore.sh',
+          lines: [
+            '# 재해 복구 — 스냅샷으로 클러스터 재구성',
+            '',
+            '# 0) 준비: 새 Raft 클러스터를 기동 (초기화 상태)',
+            '#    - 같은 KMS/Transit auto-unseal 설정으로 띄운다',
+            '#    - 오프사이트(S3)에서 최신 스냅샷을 내려받는다',
+            'aws s3 cp s3://vault-backups/prod/vault-2026-08-11.snap .',
+            '',
+            '# 1) 스냅샷으로 복구 (현재 상태를 덮어쓴다)',
+            'vault operator raft snapshot restore vault-2026-08-11.snap',
+            '#   → 클러스터 상태가 스냅샷 시점으로 되돌아감',
+            '',
+            '# 2) seal 방식에 따라 unseal',
+            '#   (a) Shamir  : 원래 unseal 키로 수동 unseal',
+            '#       vault operator unseal   # 임계값만큼 반복',
+            '#   (b) auto-unseal(KMS) : 같은 키 접근 시 자동 unseal',
+            '#       → recovery key 는 root 재생성/키 회전용으로 보관',
+            '',
+            '# 3) 복구 검증',
+            'vault status               # Sealed=false 확인',
+            'vault kv get secret/prod/db   # 시크릿 복원 확인',
+            '',
+            '# → 복구는 반드시 "리허설"로 미리 연습해 둔다',
+            '# → 스냅샷만 있고 복구 절차를 모르면 재해 때 못 쓴다',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 12, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 5. 종합 운영 체크리스트 — seal · HA · audit · backup 을 한 판에',
+        desc: '백업은 Vault 운영의 마지막 조각이다. Part V 전체를 한 장으로 묶으면 이렇게 된다 — seal/auto-unseal(어떻게 여는가), HA(리더 장애 시 자동 승계), audit(누가 무엇을 했는가), backup(무너지면 어떻게 되살리는가). 특히 backup 은 "스냅샷을 뜨는 것"에서 끝나지 않고 정기 스케줄, 오프사이트 보관, 그리고 복구 리허설까지 갖춰야 진짜 완성이다. Enterprise 라면 DR replication 으로 대기 클러스터를 상시 동기화해 RTO 를 더 줄일 수 있다. 아래 대시보드로 우리 클러스터의 운영 성숙도를 점검하자.',
+        scene: 'checklist',
+        flow: 'off',
+        checklist: [
+          { area: 'seal', label: 'auto-unseal(KMS/Transit) 구성', ok: true,  note: '수동 unseal 의존 제거' },
+          { area: 'HA',   label: '3+ 노드 Raft, 리더 자동 승계', ok: true,  note: 'quorum 유지' },
+          { area: 'audit',label: '최소 2개 audit device 이중화', ok: true,  note: 'fail-closed' },
+          { area: 'backup', label: '정기 스냅샷(cron) + 오프사이트(S3)', ok: true, note: '세대 관리' },
+          { area: 'backup', label: '복구 리허설 정기 수행', ok: false, note: '⚠️ 미실시 시 재해 때 못 씀' },
+          { area: 'DR',   label: 'DR replication(Enterprise)', ok: false, note: '선택 — RTO 단축' },
+        ],
+        alert: { tone: 'good', text: '스냅샷 + 오프사이트 + 복구 리허설 3박자. seal/HA/audit/backup 을 함께 갖춰야 운영이 완성된다.' },
+        code: {
+          lang: 'bash',
+          filename: 'ops-checklist.sh',
+          lines: [
+            '# Vault 운영 종합 점검 (Part V 총정리)',
+            '',
+            '# 1) seal — 자동으로 열리는가',
+            'vault status | grep -iE "sealed|seal type"',
+            '#   Seal Type    awskms     # auto-unseal 권장',
+            '#   Sealed       false',
+            '',
+            '# 2) HA — 리더/팔로워 구성 확인',
+            'vault operator raft list-peers',
+            '#   Node   Address        State      Voter',
+            '#   n1     10.0.1.1:8201  leader     true',
+            '#   n2     10.0.1.2:8201  follower   true',
+            '#   n3     10.0.1.3:8201  follower   true',
+            '',
+            '# 3) audit — 이중화되어 있는가',
+            'vault audit list',
+            '#   file/     socket/    (최소 2개, fail-closed)',
+            '',
+            '# 4) backup — 정기 스냅샷이 도는가',
+            'crontab -l | grep snapshot',
+            '#   0 * * * * /opt/vault/backup-cron.sh',
+            'aws s3 ls s3://vault-backups/prod/ | tail -3',
+            '#   최신 스냅샷이 매시간 쌓이는지 확인',
+            '',
+            '# 핵심',
+            '#   - snapshot save/restore = 재해 복구의 뼈대',
+            '#   - 정기 스케줄 + 오프사이트 + 복구 리허설이 세트',
+            '#   - seal · HA · audit · backup 을 함께 갖춰야 운영 완성',
+            '#   - Enterprise: DR replication 으로 RTO 추가 단축',
+          ],
+          highlight: [3, 4, 8, 9, 15, 16, 19, 20, 22],
+        },
+      },
+    ];
+
+    const FLOW_STAGES = [
+      { key: 'save',    label: 'snapshot save', icon: '💾' },
+      { key: 'offsite', label: '오프사이트 보관', icon: '☁️' },
+      { key: 'fault',   label: '장애 발생', icon: '💥' },
+      { key: 'restore', label: 'restore', icon: '♻️' },
+      { key: 'unseal',  label: 'auto-unseal', icon: '🔓' },
+    ];
+
+    function FlowStrip({ flow }) {
+      if (flow === 'off') return null;
+      const active = {
+        save:    { on: ['save'], fault: false },
+        offsite: { on: ['save', 'offsite'], fault: false },
+        restore: { on: ['save', 'offsite', 'fault', 'restore', 'unseal'], fault: true },
+      }[flow] || { on: ['save'], fault: false };
+
+      return (
+        <div className="rounded-lg p-3 mb-2" style={{background:'#fffbe6', border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between">
+            {FLOW_STAGES.map((st, i) => {
+              const isOn = active.on.includes(st.key);
+              const isFault = active.fault && st.key === 'fault';
+              return (
+                <React.Fragment key={st.key}>
+                  <div className="flex flex-col items-center gap-1 text-center" style={{opacity: isOn ? 1 : 0.35}}>
+                    <div className="w-9 h-9 rounded-full flex items-center justify-center text-base"
+                         style={{background: isFault ? '#fee2e2' : (isOn ? BRAND : '#fde68a'), color:DARK, border: isFault ? '2px solid #dc2626' : 'none'}}>{st.icon}</div>
+                    <span className="text-[9px] font-bold" style={{color:DARK}}>{st.label}</span>
+                  </div>
+                  {i < FLOW_STAGES.length - 1 && (
+                    <span className="text-sm font-bold px-0.5" style={{color:SUB}}>&rarr;</span>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </div>
+          {flow === 'restore' && (
+            <div className="mt-2 text-[10px] font-bold text-center" style={{color:'#dc2626'}}>
+              장애 발생 → 오프사이트 스냅샷으로 restore → auto-unseal 로 자동 복구
+            </div>
+          )}
+          {flow === 'offsite' && (
+            <div className="mt-2 text-[10px] font-bold text-center" style={{color:DARK}}>
+              cron 으로 정기 save → 다른 리전 S3 로 업로드
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function ChecklistDashboard({ items }) {
+      const AREA = {
+        seal:   '#fef9c3', HA: '#dbeafe', audit: '#fce7f3', backup: '#dbf3e6', DR: '#ede9fe',
+      };
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>🧭</span><span>운영 성숙도 체크리스트 — seal · HA · audit · backup</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="rounded-md p-2 text-xs flex items-center gap-2"
+                   style={{background: it.ok ? '#dbf3e6' : '#fef3c7', border:`1px solid ${it.ok ? '#86efac' : '#fde68a'}`, color: it.ok ? '#166534' : '#92400e'}}>
+                <span className="font-mono font-bold px-1.5 py-0.5 rounded shrink-0 text-[10px]" style={{background:AREA[it.area] || '#fffbe6', color:DARK}}>{it.area}</span>
+                <span className="flex-1">{it.label}</span>
+                <span className="text-[10px] shrink-0">{it.ok ? '✅' : '⬜'} {it.note}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function ScenePanel({ scene, items }) {
+      const TONE = {
+        problem:  { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨', title:'백업 없는 Vault — 붕괴하면 끝' },
+        save:     { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💾', title:'raft snapshot save — 상태를 한 파일로' },
+        offsite:  { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'☁️', title:'자동화 + 오프사이트 — cron & S3' },
+        restore:  { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'♻️', title:'재해 복구 — snapshot restore & unseal' },
+      };
+      const s = TONE[scene] || TONE.save;
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>{s.icon}</span>
+            <span>{s.title}</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="rounded-md p-2 text-xs flex items-start gap-2"
+                   style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+                <span className="font-mono font-bold w-28 shrink-0">{it.who}</span>
+                <span className="flex-1 font-mono break-all">{it.what}</span>
+                <span className="text-[10px] shrink-0">{it.risk}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DARK}}>백업 · 복구 타임라인</h3>
+            <span className="text-[10px] text-slate-500">scene: {state.scene}</span>
+          </div>
+          <FlowStrip flow={state.flow} />
+          {state.scene === 'checklist'
+            ? <ChecklistDashboard items={state.checklist} />
+            : <ScenePanel scene={state.scene} items={state.items} />}
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(255,204,51,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#fffbe6 0%,#fef3c7 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg font-bold" style={{background:BRAND, color:DARK}}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DARK}}>V-2-2. backup — Raft snapshot</h1>
+                <p className="text-sm" style={{color:SUB}}>비유: 금고를 통째로 사진 찍어 밖에 보관. 재해가 나면 그 사진 한 장으로 클러스터를 다시 세운다.</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:SUB}}>&larr; 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#fde68a'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow" style={{background:BRAND, color:DARK}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>&larr; 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold" style={{background:BRAND, color:DARK}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>다음 &rarr;</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:SUB}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                backup = Integrated Storage(Raft) 상태를 한 파일로 떠내는 재해 복구의 뼈대. vault operator raft snapshot save 로 암호화된 저장소를 통째로 떠내고, restore 로 클러스터를 다시 세운다. 스냅샷은 파일만으론 못 읽고 복구엔 원래 unseal/recovery 키가 필요하며, auto-unseal 이면 같은 KMS 키 환경에서 복구 후 자동 unseal 된다. cron 정기 스냅샷 + 오프사이트(S3) 보관 + 복구 리허설이 한 세트다. 마지막으로 seal · HA · audit · backup 을 함께 갖춰야 운영이 완성되고, Enterprise 는 DR replication 으로 RTO 를 더 줄인다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Vault', 'raft-snapshot', 'backup', 'restore', 'auto-unseal', 'recovery-key', 'offsite', 'DR-replication'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#fffbe6', color:DARK, border:'1px solid #fde68a'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:SUB}}>
+              <a href="../index.html" className="underline hover:no-underline">&larr; 목차</a>
+              <a href="./V-2-1.html" className="underline hover:no-underline">&larr; 이전: V-2-1</a>
+              <a href="../index.html" className="underline hover:no-underline">전체 목차 &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

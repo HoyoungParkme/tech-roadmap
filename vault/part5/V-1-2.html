@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault 학습 — V-1-2. seal / unseal (Shamir vs auto-unseal)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Vault V-1-2 — seal / unseal (Shamir vs auto-unseal)
+    비유: 금고 다이얼(마스터 키)을 여러 조각으로 쪼갠 열쇠(Shamir) vs 자동 개폐 장치(KMS auto-unseal)
+    5단계: sealed 문제 → Shamir 조각 → threshold 모아 unseal → auto-unseal(KMS) → 실무 운영
+    좌 LiveDataPane(SealView) / 우 CodeViewer(bash + hcl)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#FFCC33';
+    const DARK  = '#7c5e00';
+    const SUB   = '#b8860b';
+
+    const STEPS = [
+      {
+        title: 'Step 1. sealed 상태 — Vault는 켜도 아무것도 못 읽는다',
+        desc: 'Vault 프로세스를 시작하면 곧바로 쓸 수 있는 게 아니다. 저장소(storage)의 모든 데이터는 암호화 키(encryption key)로 암호화되어 있고, 그 암호화 키는 다시 마스터 키(root key)로 감싸져 있다. 시작 직후 Vault는 마스터 키를 메모리에 가지고 있지 않다 — 이 상태를 sealed(봉인)라 부른다. sealed 상태에서는 로그인도, 시크릿 읽기도 전부 거부된다. 누가 서버를 훔쳐 디스크를 통째로 떠가도 마스터 키가 없으면 평문을 볼 수 없다. 그래서 재시작 때마다 "봉인 해제(unseal)"가 필요하다.',
+        scene: 'sealed',
+        seal: { sealed: true, have: 0, threshold: 3, shares: 5 },
+        items: [
+          { who: 'storage (디스크)', what: '전부 암호화된 바이트', risk: '🔒 읽기 불가' },
+          { who: 'encryption key', what: '데이터 암복호화 키', risk: '🔒 마스터 키로 봉인' },
+          { who: 'master key', what: '메모리에 없음', risk: '🚨 sealed' },
+        ],
+        alert: { tone: 'danger', text: 'sealed = 마스터 키가 메모리에 없는 상태. 모든 API가 거부된다. 디스크를 떠가도 안전하다.' },
+        code: {
+          lang: 'bash',
+          filename: 'sealed-status.sh',
+          lines: [
+            '# Vault 서버를 막 띄운 직후',
+            'vault status',
+            '#   Key                Value',
+            '#   ---                -----',
+            '#   Seal Type          shamir',
+            '#   Initialized        true',
+            '#   Sealed             true          # 👈 봉인됨',
+            '#   Total Shares       5',
+            '#   Threshold          3',
+            '#   Unseal Progress    0/3',
+            '',
+            '# sealed 상태에서는 아무 작업도 안 된다',
+            'vault kv get secret/app/db',
+            '#   Error: Vault is sealed',
+            '',
+            'vault login',
+            '#   Error: Vault is sealed',
+            '',
+            '# 왜? 저장소는 전부 암호화 → 복호화하려면 encryption key',
+            '#      encryption key 는 master key(root key) 로 봉인',
+            '#      master key 는 지금 메모리에 없다',
+            '# → 디스크를 통째로 훔쳐가도 평문은 못 본다',
+            '# → 재시작마다 unseal 로 master key 를 다시 조립해야 한다',
+          ],
+          highlight: [5, 6, 7, 8, 9, 12, 13, 14, 18, 19, 20, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 2. Shamir Secret Sharing — 마스터 키를 조각내다',
+        desc: '마스터 키 하나를 한 사람이 통째로 들고 있으면 그 사람이 곧 단일 실패 지점이 된다. Vault는 초기화(operator init) 때 마스터 키를 Shamir Secret Sharing 알고리즘으로 N개의 unseal key 조각으로 쪼갠다. 예를 들어 5개(shares)로 쪼개되, 그 중 아무 3개(threshold)만 모으면 수학적으로 마스터 키를 복원할 수 있다. 2개까지는 아무 정보도 얻지 못한다. 조각들은 5명의 담당자에게 나눠 보관한다 — 한두 명이 자리를 비워도, 한두 조각이 유출돼도 안전하다.',
+        scene: 'split',
+        seal: { sealed: true, have: 0, threshold: 3, shares: 5 },
+        items: [
+          { who: 'unseal key 1', what: '담당: 보안팀 A', risk: '🧩 조각' },
+          { who: 'unseal key 2', what: '담당: 인프라 B', risk: '🧩 조각' },
+          { who: 'unseal key 3', what: '담당: 리드 C', risk: '🧩 조각' },
+          { who: 'unseal key 4', what: '담당: 매니저 D', risk: '🧩 조각' },
+          { who: 'unseal key 5', what: '금고 보관(비상)', risk: '🧩 조각' },
+        ],
+        alert: { tone: 'info', text: 'threshold(3) 미만으로는 아무 정보도 못 얻는다. 5명 중 3명만 모이면 복원 — 분산 + 내결함성.' },
+        code: {
+          lang: 'bash',
+          filename: 'operator-init.sh',
+          lines: [
+            '# 최초 1회 — Vault 초기화 + 마스터 키 조각내기',
+            'vault operator init \\',
+            '  -key-shares=5 \\',
+            '  -key-threshold=3',
+            '',
+            '#   Unseal Key 1: nYbQ4x...AA   👈 5개 조각 출력',
+            '#   Unseal Key 2: 7mKp2v...BB',
+            '#   Unseal Key 3: qR9sLd...CC',
+            '#   Unseal Key 4: Zx1tWe...DD',
+            '#   Unseal Key 5: fH8uYo...EE',
+            '#',
+            '#   Initial Root Token: hvs.CAESIJ...',
+            '#',
+            '#   Vault initialized with 5 key shares and a key',
+            '#   threshold of 3. Please securely distribute the',
+            '#   key shares printed above.',
+            '',
+            '# ⚠️ 이 출력은 딱 한 번만 나온다 — 잃어버리면 복구 불가',
+            '# → 조각 5개를 서로 다른 사람/금고에 나눠 보관',
+            '# → threshold 3 = 아무 3개만 모으면 마스터 키 복원',
+            '# → 2개까지는 수학적으로 아무 정보도 주지 않는다',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 10, 12, 18, 19, 20, 21, 22],
+        },
+      },
+      {
+        title: 'Step 3. unseal — threshold만큼 조각을 모아 봉인 해제',
+        desc: 'unseal은 조각을 하나씩 제출하는 과정이다. vault operator unseal을 실행하면 조각 하나를 넣고, 진행률(Unseal Progress)이 1/3, 2/3로 올라간다. 서로 다른 담당자가 각자 자기 조각을 제출한다 — 한 사람이 모든 조각을 다 갖지 않는 게 핵심이다. threshold(3)번째 조각이 들어오는 순간 Vault는 메모리에서 마스터 키를 재조립하고, 그 키로 encryption key를 풀어 저장소를 읽을 수 있게 된다. 이제 Sealed=false, 정상 서비스 시작이다. 비상 시에는 vault operator seal로 다시 즉시 봉인할 수 있다.',
+        scene: 'unseal',
+        seal: { sealed: false, have: 3, threshold: 3, shares: 5 },
+        items: [
+          { who: 'unseal #1', what: '보안팀 A 제출', risk: '✓ 1/3' },
+          { who: 'unseal #2', what: '인프라 B 제출', risk: '✓ 2/3' },
+          { who: 'unseal #3', what: '리드 C 제출', risk: '✅ 마스터 키 복원' },
+          { who: 'master key', what: '메모리에 재조립됨', risk: '🔓 unsealed' },
+        ],
+        alert: { tone: 'good', text: 'threshold 번째 조각이 들어오면 마스터 키 복원 → encryption key 해제 → Sealed=false. 서비스 시작.' },
+        code: {
+          lang: 'bash',
+          filename: 'unseal.sh',
+          lines: [
+            '# 서로 다른 담당자가 각자 조각을 하나씩 제출',
+            '',
+            'vault operator unseal        # 보안팀 A',
+            '#   Unseal Key (will be hidden): ****',
+            '#   Sealed             true',
+            '#   Unseal Progress    1/3          # 👈 진행',
+            '',
+            'vault operator unseal        # 인프라 B',
+            '#   Sealed             true',
+            '#   Unseal Progress    2/3',
+            '',
+            'vault operator unseal        # 리드 C (threshold 도달)',
+            '#   Sealed             false        # 👈 봉인 해제!',
+            '#   Unseal Progress    0/3',
+            '#   Active Node Address https://10.0.1.5:8200',
+            '',
+            '# 이제 정상 동작',
+            'vault kv get secret/app/db   # ✓ 읽힌다',
+            '',
+            '# 비상 시 즉시 다시 봉인 (침해 의심 등)',
+            'vault operator seal',
+            '#   Success! Vault is sealed.',
+            '# → 메모리의 master key 폐기 → 다시 sealed',
+          ],
+          highlight: [3, 5, 6, 8, 10, 12, 13, 14, 18, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 4. auto-unseal — KMS에게 봉인 해제를 맡긴다',
+        desc: 'Shamir 방식은 안전하지만 운영이 번거롭다. 노드가 재시작될 때마다 사람 3명이 모여 조각을 제출해야 한다 — 새벽 3시 자동 장애 복구 상황에서는 치명적이다. auto-unseal은 마스터 키를 사람이 아니라 클라우드 KMS(AWS KMS, GCP KMS, Azure Key Vault, HSM/Transit)에 맡긴다. 설정 파일의 seal 스탠자에 KMS 키를 지정하면, Vault는 시작 시 KMS를 호출해 자동으로 봉인을 해제한다. 재시작·오토스케일·장애 복구가 사람 개입 없이 자동으로 이어진다. 프로덕션의 사실상 표준이다.',
+        scene: 'auto',
+        seal: { sealed: false, have: 3, threshold: 3, shares: 5, mode: 'kms' },
+        items: [
+          { who: 'Vault 시작', what: 'seal 스탠자 읽음', risk: '⚙️ 자동' },
+          { who: 'AWS KMS 호출', what: 'Decrypt(암호화된 root key)', risk: '☁️ 위임' },
+          { who: 'master key', what: 'KMS가 풀어서 반환', risk: '🔓 자동 unseal' },
+          { who: '사람 개입', what: '없음', risk: '✅ 무중단 복구' },
+        ],
+        alert: { tone: 'good', text: 'auto-unseal = 마스터 키 보호를 KMS/HSM에 위임. 재시작·오토스케일·장애 복구가 사람 없이 자동.' },
+        code: {
+          lang: 'hcl',
+          filename: 'vault.hcl',
+          lines: [
+            '# AWS KMS 로 auto-unseal — 설정 파일',
+            'storage "raft" {',
+            '  path    = "/opt/vault/data"',
+            '  node_id = "node-1"',
+            '}',
+            '',
+            'listener "tcp" {',
+            '  address     = "0.0.0.0:8200"',
+            '  tls_disable = false',
+            '}',
+            '',
+            '# 👇 이 블록이 auto-unseal 의 핵심',
+            'seal "awskms" {',
+            '  region     = "ap-northeast-2"',
+            '  kms_key_id = "arn:aws:kms:ap-northeast-2:111122223333:key/abc-123"',
+            '}',
+            '',
+            '# 시작하면 사람 개입 없이 자동 unseal',
+            '#   vault server -config=vault.hcl',
+            '#   → Vault 가 KMS Decrypt 호출 → master key 획득',
+            '#   → Sealed=false 로 바로 서비스',
+            '# GCP=gcpckms · Azure=azurekeyvault · HSM=pkcs11 · Transit=transit',
+          ],
+          highlight: [12, 13, 14, 15, 16, 19, 20, 21, 22, 23],
+        },
+      },
+      {
+        title: 'Step 5. 실무 운영 — recovery key · rekey · rotate',
+        desc: 'auto-unseal을 쓰면 사람용 unseal key는 사라지고, 대신 recovery key가 발급된다. 이것은 봉인 해제용이 아니라, root token 재생성이나 일부 위험한 작업을 위한 비상 열쇠다(역시 Shamir로 쪼갠다). 운영에서는 두 가지 회전을 구분해야 한다: rekey는 unseal/recovery 조각 자체를 새로 쪼개는 것(담당자 교체·유출 대응)이고, rotate는 저장소를 감싸는 encryption key를 교체하는 것(데이터 재암호화 없이 이후 쓰기부터 새 키 적용)이다. 프로덕션 권장 구성은 auto-unseal + recovery key 안전 보관 + 정기 rekey/rotate다.',
+        scene: 'ops',
+        seal: { sealed: false, have: 3, threshold: 3, shares: 5, mode: 'kms' },
+        items: [
+          { who: 'recovery key', what: 'root token 재생성용', risk: '🗝️ Shamir 분산' },
+          { who: 'rekey', what: 'unseal/recovery 조각 재분배', risk: '👥 담당자 교체' },
+          { who: 'rotate', what: 'encryption key 교체', risk: '🔁 이후 쓰기부터' },
+          { who: 'seal(비상)', what: '침해 의심 시 즉시 봉인', risk: '🚨 operator seal' },
+          { who: '권장 구성', what: 'auto-unseal + recovery key', risk: '✅ 프로덕션 표준' },
+        ],
+        alert: { tone: 'good', text: 'auto-unseal + recovery key 보관 + 정기 rekey/rotate = 프로덕션 표준. seal 은 비상 차단 버튼.' },
+        code: {
+          lang: 'bash',
+          filename: 'ops.sh',
+          lines: [
+            '# auto-unseal 초기화 시 — recovery key 가 발급된다',
+            'vault operator init \\',
+            '  -recovery-shares=5 \\',
+            '  -recovery-threshold=3',
+            '#   Recovery Key 1: ...   (unseal 이 아니라 비상용)',
+            '#   Initial Root Token: hvs.CAESIJ...',
+            '',
+            '# 1) rekey — 조각을 새로 쪼개 재분배 (담당자 교체/유출)',
+            'vault operator rekey -init -key-shares=5 -key-threshold=3',
+            '#   ... 기존 threshold 만큼 조각 제출해 승인 ...',
+            '',
+            '# 2) rotate — 저장소 encryption key 교체',
+            'vault operator rotate',
+            '#   Key Term        2            # 새 키 버전',
+            '#   → 과거 데이터 재암호화 없이, 이후 쓰기부터 새 키',
+            '',
+            '# 3) 비상 봉인 — 침해 의심 시 즉시 차단',
+            'vault operator seal',
+            '',
+            '# 핵심',
+            '#   - Shamir: 사람이 조각을 모아 unseal (분산·감사)',
+            '#   - auto-unseal: KMS 가 자동 unseal (무중단 운영)',
+            '#   - 프로덕션 표준 = auto-unseal + recovery key',
+            '#   - rekey(조각 회전) ≠ rotate(암호화 키 회전)',
+          ],
+          highlight: [2, 3, 4, 5, 8, 9, 12, 13, 14, 17, 18, 21, 22, 23, 24, 25],
+        },
+      },
+    ];
+
+    function SealStatus({ seal }) {
+      const sealed = seal.sealed;
+      const pct = Math.min(100, Math.round((seal.have / seal.threshold) * 100));
+      return (
+        <div className="rounded-lg p-3 mb-2" style={{background: sealed ? '#fee2e2' : '#dbf3e6', border:`1px solid ${sealed ? '#fecaca' : '#86efac'}`}}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-bold" style={{color: sealed ? '#991b1b' : '#166534'}}>
+              {sealed ? '🔒 Sealed = true' : '🔓 Sealed = false'}
+            </span>
+            <span className="text-[10px] font-mono" style={{color: sealed ? '#991b1b' : '#166534'}}>
+              {seal.mode === 'kms' ? 'auto-unseal (KMS)' : `Unseal Progress ${seal.have}/${seal.threshold}`}
+            </span>
+          </div>
+          <div className="h-2 rounded-full bg-white overflow-hidden" style={{border:'1px solid rgba(0,0,0,0.1)'}}>
+            <div className="h-full rounded-full transition-all" style={{width:`${pct}%`, background: sealed ? '#f87171' : '#34d399'}} />
+          </div>
+          <div className="flex gap-1 mt-2">
+            {Array.from({length: seal.shares}).map((_, i) => (
+              <span key={i} className="flex-1 text-center text-[10px] py-0.5 rounded font-mono"
+                    style={{background: i < seal.have ? BRAND : '#fff', color: i < seal.have ? DARK : '#9ca3af', border:`1px solid ${i < seal.have ? BRAND : '#e5e7eb'}`}}>
+                {i < seal.have ? '🧩' : '·'}
+              </span>
+            ))}
+          </div>
+          <div className="text-[10px] mt-1 text-center" style={{color: SUB}}>
+            {seal.mode === 'kms' ? 'KMS가 master key를 풀어 자동 봉인 해제' : `shares ${seal.shares} · threshold ${seal.threshold} (Shamir)`}
+          </div>
+        </div>
+      );
+    }
+
+    function ScenePanel({ scene, items }) {
+      const TONE = {
+        sealed: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🔒', title:'sealed — 마스터 키가 없다' },
+        split:  { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'🧩', title:'Shamir — 마스터 키 5조각' },
+        unseal: { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'🔓', title:'unseal — 조각을 모아 복원' },
+        auto:   { bg:'#e0f2fe', bd:'#7dd3fc', tx:'#075985', icon:'☁️', title:'auto-unseal — KMS 위임' },
+        ops:    { bg:'#fef9c3', bd:'#fde68a', tx:'#7c5e00', icon:'🛠️', title:'실무 운영 — recovery/rekey/rotate' },
+      };
+      const s = TONE[scene] || TONE.sealed;
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>{s.icon}</span>
+            <span>{s.title}</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="rounded-md p-2 text-xs flex items-start gap-2"
+                   style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+                <span className="font-mono font-bold w-28 shrink-0">{it.who}</span>
+                <span className="flex-1 font-mono break-all">{it.what}</span>
+                <span className="text-[10px] shrink-0">{it.risk}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DARK}}>Vault 봉인/해제 상태</h3>
+            <span className="text-[10px] text-slate-500">scene: {state.scene}</span>
+          </div>
+          <SealStatus seal={state.seal} />
+          <ScenePanel scene={state.scene} items={state.items} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(255,204,51,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#fffbe6 0%,#fef3c7 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg font-bold" style={{background:BRAND, color:DARK}}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DARK}}>V-1-2. seal / unseal — Shamir vs auto-unseal</h1>
+                <p className="text-sm" style={{color:SUB}}>비유: 금고 다이얼을 5조각으로 쪼갠 열쇠(Shamir) vs 자동 개폐 장치(KMS auto-unseal). 재시작마다 봉인을 어떻게 풀 것인가.</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:SUB}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#fde68a'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow" style={{background:BRAND, color:DARK}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold" style={{background:BRAND, color:DARK}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:SUB}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Vault는 시작 시 sealed 상태로, 저장소를 여는 마스터 키(root key)가 메모리에 없다. Shamir Secret Sharing은 마스터 키를 N개 조각으로 쪼개 threshold개(예: 5개 중 3개)를 모아야 복원하게 만든다 — 분산·감사에 강하지만 재시작마다 사람이 모여야 한다. auto-unseal은 그 마스터 키 보호를 AWS/GCP/Azure KMS나 HSM에 위임해 재시작·장애 복구를 자동화한다. 프로덕션 표준은 auto-unseal + recovery key 안전 보관이며, rekey(조각 회전)와 rotate(암호화 키 회전)를 구분해 운영한다. 다음 파트는 재해 복구/성능 복제.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Vault', 'seal', 'unseal', 'Shamir', 'auto-unseal', 'KMS', 'recovery-key', 'rekey', 'rotate'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#fffbe6', color:DARK, border:'1px solid #fde68a'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:SUB}}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <a href="./V-1-1.html" className="underline hover:no-underline">← 이전: V-1-1</a>
+              <a href="./V-2-1.html" className="underline hover:no-underline">다음: V-2-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

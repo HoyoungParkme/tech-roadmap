@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault 학습 — IV-2-2. External Secrets Operator (ESO)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Vault IV-2-2 — External Secrets Operator (ESO)
+    비유: Vault 값을 K8s Secret 으로 자동 동기화하는 "배달원 오퍼레이터"
+    5단계: 문제(외부 시크릿을 앱에 어떻게) → ESO 소개(CRD 동기화) → SecretStore(Vault 연결/인증) → ExternalSecret(매핑 → 동기화 흐름) → vs Agent Injector + refreshInterval + 실무
+    좌 LiveDataPane(ExternalSecret→ESO가 Vault 조회→K8s Secret 생성→파드 사용) / 우 CodeViewer(yaml+bash)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#FFCC33';
+    const DARK  = '#7c5e00';
+    const SUB   = '#b8860b';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — 외부 시크릿을 파드에 어떻게 넣을까',
+        desc: '시크릿의 진짜 원본은 Vault(또는 AWS Secrets Manager) 에 있다. 그런데 대부분의 쿠버네티스 앱은 "표준 K8s Secret" 을 환경변수나 볼륨으로 읽도록 만들어져 있다. 개발자가 매번 손으로 kubectl 로 Secret 을 만들면, Vault 원본이 바뀌어도 K8s Secret 은 옛 값 그대로 남는다. 결국 사람이 복사·붙여넣기 하는 지점이 사고의 출발점이 된다. "Vault 원본 → K8s Secret" 을 자동으로 이어 줄 다리가 필요하다.',
+        scene: 'problem',
+        items: [
+          { who: 'Vault 원본', what: 'secret/data/app/db (password=v2)', risk: '📦 진짜 원본' },
+          { who: '개발자 손', what: 'kubectl create secret ...', risk: '🚨 복붙 실수' },
+          { who: 'K8s Secret', what: 'password=v1 (옛 값)', risk: '🚨 원본과 불일치' },
+        ],
+        alert: { tone: 'danger', text: '사람이 손으로 옮기면 원본이 바뀌어도 K8s Secret 은 낡은 값 그대로다.' },
+        code: {
+          lang: 'bash',
+          filename: 'before-eso.sh',
+          lines: [
+            '# ESO 없이 손으로 옮기던 흔한 풍경',
+            '',
+            '# 1) Vault 에서 값을 꺼내',
+            'vault kv get -field=password secret/app/db',
+            '#   super-secret-v2',
+            '',
+            '# 2) 사람이 손으로 K8s Secret 을 만든다',
+            'kubectl create secret generic app-db \\',
+            '  --from-literal=password=super-secret-v2',
+            '',
+            '# 3) 며칠 뒤 Vault 원본을 회전(rotate)',
+            'vault kv put secret/app/db password=super-secret-v3',
+            '',
+            '# 4) 하지만 K8s Secret 은 그대로 v2...',
+            'kubectl get secret app-db -o jsonpath="{.data.password}" | base64 -d',
+            '#   super-secret-v2   # 💥 원본과 불일치',
+            '',
+            '# → 누가 언제 다시 동기화? 아무도 모른다',
+            '# → GitOps 로 Secret 을 커밋하면 평문 유출 위험',
+            '',
+            '# 필요한 것: "Vault 원본 -> K8s Secret" 자동 동기화',
+            '# → External Secrets Operator(ESO) 가 그 다리다',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 10, 11, 13, 14, 15, 17, 18, 20, 21],
+        },
+      },
+      {
+        title: 'Step 2. ESO — CRD 로 Vault 값을 K8s Secret 으로 동기화',
+        desc: 'External Secrets Operator(ESO) 는 클러스터에 상주하는 컨트롤러다. 두 개의 CRD(사용자 정의 리소스) 로 동작한다. SecretStore 는 "어느 외부 저장소에 어떻게 인증해 붙을지" 를 정의하고, ExternalSecret 은 "그 저장소의 어떤 키를 어느 K8s Secret 으로 매핑할지" 를 정의한다. ESO 는 이 두 리소스를 감시하다가 Vault 에서 값을 읽어 표준 K8s Secret 을 만들고, 원본이 바뀌면 주기적으로 다시 맞춰 준다.',
+        scene: 'eso',
+        items: [
+          { who: 'ESO 컨트롤러', what: 'external-secrets 네임스페이스에 상주', risk: '👀 감시' },
+          { who: 'SecretStore', what: '어느 저장소 · 어떤 인증(Vault)', risk: 'CRD 1' },
+          { who: 'ExternalSecret', what: '어떤 키 → 어떤 K8s Secret', risk: 'CRD 2' },
+          { who: '결과', what: 'kind: Secret 자동 생성/갱신', risk: '✓ 네이티브' },
+        ],
+        alert: { tone: 'info', text: 'ESO = SecretStore(연결) + ExternalSecret(매핑) 두 CRD 로 동기화하는 컨트롤러.' },
+        code: {
+          lang: 'bash',
+          filename: 'install-eso.sh',
+          lines: [
+            '# ESO 설치 (Helm)',
+            'helm repo add external-secrets \\',
+            '  https://charts.external-secrets.io',
+            '',
+            'helm install external-secrets \\',
+            '  external-secrets/external-secrets \\',
+            '  -n external-secrets --create-namespace',
+            '',
+            '# 컨트롤러가 상주하며 CRD 를 감시한다',
+            'kubectl get pods -n external-secrets',
+            '#   external-secrets-xxxx          Running',
+            '#   external-secrets-webhook-xxxx  Running',
+            '',
+            '# 새로 생긴 CRD 종류 확인',
+            'kubectl api-resources | grep external-secrets',
+            '#   secretstores          SecretStore',
+            '#   clustersecretstores   ClusterSecretStore',
+            '#   externalsecrets       ExternalSecret',
+            '',
+            '# 다음: SecretStore 로 Vault 에 붙는 법을 정의한다',
+          ],
+          highlight: [1, 2, 3, 5, 6, 7, 9, 10, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 3. SecretStore — Vault 연결·인증을 정의',
+        desc: 'SecretStore 는 "어느 Vault 서버에, 어떤 방식으로 인증해 붙을지" 를 담는 CRD 다. 서버 주소, KV 마운트 경로, 인증 방식(여기서는 쿠버네티스 인증) 을 적는다. 한 네임스페이스에만 유효한 SecretStore 와, 클러스터 전체에서 공유하는 ClusterSecretStore 두 종류가 있다. 여러 팀·여러 네임스페이스가 같은 Vault 를 쓰면 ClusterSecretStore 하나로 공용 연결을 정의해 중복을 줄인다.',
+        scene: 'store',
+        items: [
+          { who: 'server', what: 'https://vault.svc:8200', risk: '주소' },
+          { who: 'path / version', what: 'secret · v2 (KV v2)', risk: 'KV 마운트' },
+          { who: 'auth', what: 'kubernetes (role: eso-role)', risk: '🔑 인증' },
+          { who: '범위', what: 'SecretStore(ns) / ClusterSecretStore(전역)', risk: '스코프' },
+        ],
+        alert: { tone: 'info', text: 'SecretStore=한 네임스페이스, ClusterSecretStore=클러스터 전역 공용 연결.' },
+        code: {
+          lang: 'yaml',
+          filename: 'secret-store.yaml',
+          lines: [
+            '# ClusterSecretStore — Vault 연결·인증 정의',
+            'apiVersion: external-secrets.io/v1beta1',
+            'kind: ClusterSecretStore',
+            'metadata:',
+            '  name: vault-backend',
+            'spec:',
+            '  provider:',
+            '    vault:',
+            '      server: "https://vault.default.svc:8200"',
+            '      path: "secret"          # KV 마운트 경로',
+            '      version: "v2"            # KV v2',
+            '      auth:',
+            '        # 파드의 ServiceAccount 토큰으로 Vault 인증',
+            '        kubernetes:',
+            '          mountPath: "kubernetes"',
+            '          role: "eso-role"     # Vault 쪽 role',
+            '          serviceAccountRef:',
+            '            name: "external-secrets"',
+            '            namespace: "external-secrets"',
+            '---',
+            '# 확인',
+            '#   kubectl get clustersecretstore vault-backend',
+            '#   STATUS: Valid  (Vault 에 붙음)',
+          ],
+          highlight: [1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 4. ExternalSecret — 매핑을 적으면 K8s Secret 이 태어난다',
+        desc: 'ExternalSecret 은 "SecretStore 를 통해 Vault 의 어떤 키를, 어떤 K8s Secret 의 어떤 필드로 넣을지" 를 적는 매핑표다. 이 리소스를 만드는 순간 ESO 가 흐름을 시작한다 — Vault 에서 값을 읽고, target 이름의 표준 K8s Secret 을 생성한다. 파드는 이 Secret 을 평범한 env/volume 으로 마운트하면 끝이다. Vault 를 전혀 몰라도 되는 기존 앱과 그대로 호환된다.',
+        scene: 'flow',
+        items: [
+          { who: '① ExternalSecret', what: 'db-secret 생성됨', risk: '매핑 선언' },
+          { who: '② ESO 조회', what: 'vault: secret/app/db 읽기', risk: 'Vault 접근' },
+          { who: '③ K8s Secret', what: 'kind: Secret app-db 생성', risk: '✓ 네이티브' },
+          { who: '④ 파드', what: 'envFrom: app-db (표준 마운트)', risk: '앱 무변경' },
+        ],
+        alert: { tone: 'good', text: 'ExternalSecret 선언 → ESO 가 Vault 조회 → 표준 K8s Secret 생성 → 파드는 그냥 마운트.' },
+        code: {
+          lang: 'yaml',
+          filename: 'external-secret.yaml',
+          lines: [
+            '# ExternalSecret — 어떤 키를 어느 Secret 으로',
+            'apiVersion: external-secrets.io/v1beta1',
+            'kind: ExternalSecret',
+            'metadata:',
+            '  name: db-secret',
+            '  namespace: app',
+            'spec:',
+            '  refreshInterval: "1h"        # 주기 동기화',
+            '  secretStoreRef:',
+            '    name: vault-backend',
+            '    kind: ClusterSecretStore',
+            '  target:',
+            '    name: app-db               # 만들어질 K8s Secret 이름',
+            '  data:',
+            '    - secretKey: password       # K8s Secret 의 필드',
+            '      remoteRef:',
+            '        key: secret/app/db      # Vault 경로',
+            '        property: password      # Vault 내부 필드',
+            '---',
+            '# ESO 가 자동 생성한 결과물',
+            'apiVersion: v1',
+            'kind: Secret',
+            'metadata:',
+            '  name: app-db',
+            'data:',
+            '  password: c3VwZXItc2VjcmV0LXYz   # base64(v3)',
+          ],
+          highlight: [1, 2, 3, 8, 9, 10, 12, 13, 14, 15, 16, 17, 20, 21, 22, 25],
+        },
+      },
+      {
+        title: 'Step 5. vs Agent Injector · refreshInterval · 실무',
+        desc: 'Agent Injector(앞 장) 는 사이드카가 시크릿을 "파일" 로 파드 안에 떨어뜨린다 — Vault 를 아는 방식이다. ESO 는 반대로 "표준 K8s Secret" 을 만든다 — 앱은 Vault 를 몰라도 되고 기존 매니페스트를 그대로 쓴다. refreshInterval 마다 ESO 가 원본을 다시 읽어 Secret 을 갱신하므로 회전이 자동 반영된다. GitOps 와도 잘 맞는다: 평문 없이 ExternalSecret(매핑만) 을 커밋하면, 실제 값은 클러스터 안에서 ESO 가 채운다. 여러 백엔드(Vault·AWS·GCP·Azure) 를 같은 CRD 문법으로 통합할 수 있다.',
+        scene: 'compare',
+        items: [
+          { who: 'Agent Injector', what: '사이드카가 파일 주입', risk: '앱이 Vault 인지' },
+          { who: 'ESO', what: '표준 K8s Secret 생성', risk: '✓ 앱 무변경' },
+          { who: 'refreshInterval', what: '주기마다 원본 재조회', risk: '🔄 회전 반영' },
+          { who: 'GitOps', what: '매핑만 커밋(평문 X)', risk: '✓ 안전' },
+          { who: '멀티 백엔드', what: 'Vault · AWS · GCP · Azure', risk: '같은 CRD' },
+        ],
+        alert: { tone: 'good', text: 'ESO = 네이티브 K8s Secret + 자동 회전 + GitOps 친화 + 여러 백엔드 통합.' },
+        code: {
+          lang: 'bash',
+          filename: 'eso-in-practice.sh',
+          lines: [
+            '# 1) ExternalSecret 상태 확인',
+            'kubectl get externalsecret db-secret -n app',
+            '#   STATUS: SecretSynced   READY: True',
+            '',
+            '# 2) ESO 가 만든 표준 Secret 확인',
+            'kubectl get secret app-db -n app',
+            '#   TYPE: Opaque   DATA: 1',
+            '',
+            '# 3) 파드는 그냥 표준 Secret 을 마운트',
+            '#   envFrom:',
+            '#     - secretRef:',
+            '#         name: app-db',
+            '',
+            '# 4) Vault 원본을 회전하면?',
+            'vault kv put secret/app/db password=super-secret-v4',
+            '#   -> refreshInterval(1h) 안에 ESO 가 재동기화',
+            '#   -> app-db Secret 이 v4 로 자동 갱신',
+            '',
+            '# 5) GitOps: 평문 없이 매핑만 커밋',
+            'git add external-secret.yaml   # 값은 Vault 에만',
+            '',
+            '# 핵심',
+            '#   - Agent Injector = 파일 주입(앱이 Vault 인지)',
+            '#   - ESO           = 네이티브 Secret(앱 무변경)',
+            '#   - refreshInterval 로 회전 자동 반영, 멀티 백엔드',
+          ],
+          highlight: [0, 1, 2, 4, 5, 6, 13, 14, 15, 16, 18, 19, 22, 23, 24],
+        },
+      },
+    ];
+
+    function ScenePanel({ scene, items }) {
+      const TONE = {
+        problem:  { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨', title:'손으로 옮기던 시절' },
+        eso:      { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'🤖', title:'ESO — 두 CRD 로 동기화' },
+        store:    { bg:'#fef9c3', bd:'#fde68a', tx:'#7c5e00', icon:'🔌', title:'SecretStore — Vault 연결' },
+        flow:     { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'🔄', title:'ExternalSecret → K8s Secret 흐름' },
+        compare:  { bg:'#fef9c3', bd:'#fde68a', tx:'#7c5e00', icon:'⚖️', title:'Injector vs ESO · 실무' },
+      };
+      const s = TONE[scene] || TONE.eso;
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>{s.icon}</span>
+            <span>{s.title}</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="rounded-md p-2 text-xs flex items-start gap-2"
+                   style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+                <span className="font-mono font-bold w-32 shrink-0">{it.who}</span>
+                <span className="flex-1 font-mono break-all">{it.what}</span>
+                <span className="text-[10px] shrink-0">{it.risk}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DARK}}>ExternalSecret → K8s Secret 동기화 흐름</h3>
+            <span className="text-[10px] text-slate-500">scene: {state.scene}</span>
+          </div>
+          <ScenePanel scene={state.scene} items={state.items} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(255,204,51,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#fffbe6 0%,#fef3c7 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg font-bold" style={{background:BRAND, color:DARK}}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DARK}}>IV-2-2. External Secrets Operator (ESO)</h1>
+                <p className="text-sm" style={{color:SUB}}>비유: Vault 값을 표준 K8s Secret 으로 자동 배달하는 오퍼레이터. SecretStore + ExternalSecret 두 CRD 로 동기화한다.</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:SUB}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#fde68a'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow" style={{background:BRAND, color:DARK}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold" style={{background:BRAND, color:DARK}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:SUB}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                External Secrets Operator(ESO) 는 SecretStore(어느 저장소·어떤 인증) 와 ExternalSecret(어떤 키 → 어떤 Secret) 두 CRD 로 Vault 값을 표준 K8s Secret 으로 동기화하는 컨트롤러다. Agent Injector 가 파일을 주입해 앱이 Vault 를 인지해야 하는 것과 달리, ESO 는 네이티브 Secret 을 만들어 기존 앱을 그대로 쓴다. refreshInterval 로 원본 회전이 자동 반영되고, 평문 없이 매핑만 커밋하는 GitOps 와 잘 맞으며, Vault·AWS·GCP·Azure 를 같은 CRD 문법으로 통합한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Vault', 'ESO', 'SecretStore', 'ExternalSecret', 'K8s-Secret', 'refreshInterval', 'GitOps'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#fffbe6', color:DARK, border:'1px solid #fde68a'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:SUB}}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <span className="flex gap-3">
+                <a href="./IV-2-1.html" className="underline hover:no-underline">← 이전: IV-2-1</a>
+                <a href="../part5/V-1-1.html" className="underline hover:no-underline">다음: V-1-1 →</a>
+              </span>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

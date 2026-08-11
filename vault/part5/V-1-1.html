@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault 학습 — V-1-1. HA — Raft consensus</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Vault V-1-1 — HA: Integrated Storage(Raft) consensus
+    비유: 이사회 의결(리더 1명 + 이사진 과반수 찬성으로 안건 확정)
+    5단계: 단일 노드 SPOF → Raft 클러스터 구성 → 로그 복제·과반수 커밋 → 리더 장애·재선출 → 운영(홀수 노드·retry_join·list-peers)
+    좌 LiveDataPane(RaftClusterView) / 우 CodeViewer
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#FFCC33';
+    const DARK  = '#7c5e00';
+    const SUB   = '#b8860b';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 단일 노드의 문제 — 한 대가 죽으면 전부 멈춘다',
+        desc: 'Vault 서버 한 대만 띄우면 구조는 단순하다. 하지만 그 한 대가 재시작·디스크 장애·네트워크 단절로 죽는 순간, 모든 서비스가 시크릿을 못 읽는다. 이걸 SPOF(단일 장애점)라 부른다. 게다가 노드가 죽으면서 아직 디스크에 안 내려간 데이터는 사라질 수도 있다. 운영 환경에서 Vault는 반드시 여러 대로 묶어(HA) 무중단·데이터 안정성을 확보해야 한다.',
+        scene: 'single',
+        cluster: {
+          nodes: [
+            { id: 'vault-0', role: 'single', log: 5, committed: 5, up: true },
+          ],
+          note: '노드 1대 — 이 서버가 죽으면 클러스터 전체가 중단(SPOF)',
+        },
+        alert: { tone: 'danger', text: '단일 노드 = 단일 장애점. 재시작 한 번에 전 서비스가 시크릿을 못 읽는다.' },
+        code: {
+          lang: 'bash',
+          filename: 'single-node.sh',
+          lines: [
+            '# 단일 노드 Vault — 개발용으로는 편하지만 운영엔 위험',
+            '',
+            '# 1) 서버 한 대만 기동',
+            'vault server -config=/etc/vault.d/vault.hcl',
+            '#   ==> Vault server started! Log data will stream in below:',
+            '',
+            '# 2) 상태 확인 — HA 아님',
+            'vault status',
+            '#   Key             Value',
+            '#   ---             -----',
+            '#   Initialized     true',
+            '#   Sealed          false',
+            '#   HA Enabled      false          # 👈 고가용성 없음',
+            '',
+            '# 3) 이 노드가 죽으면?',
+            'systemctl stop vault            # 또는 장애로 다운',
+            'vault kv get secret/app/db',
+            '#   Error: connection refused    # 💥 전 서비스 시크릿 조회 실패',
+            '',
+            '# → 무중단 + 데이터 안정성을 위해 여러 노드로 묶어야 한다',
+            '# → Vault Integrated Storage(Raft) 의 차례',
+          ],
+          highlight: [3, 4, 7, 8, 12, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 2. Integrated Storage(Raft) — 여러 노드로 클러스터 구성',
+        desc: 'Vault 1.4부터 별도 백엔드(Consul) 없이도 노드끼리 데이터를 복제하는 Integrated Storage(Raft)를 내장한다. storage "raft" stanza 하나로 각 노드가 데이터를 자기 디스크에 저장하고 서로 복제한다. 클러스터에는 리더(active) 1개와 팔로워(standby) N개가 있고, 모든 쓰기는 리더가 받는다. Consul을 따로 운영할 필요가 없어 구성이 단순해지는 것이 핵심 장점이다.',
+        scene: 'form',
+        cluster: {
+          nodes: [
+            { id: 'vault-0', role: 'leader',   log: 0, committed: 0, up: true },
+            { id: 'vault-1', role: 'follower', log: 0, committed: 0, up: true },
+            { id: 'vault-2', role: 'follower', log: 0, committed: 0, up: true },
+          ],
+          note: '3 노드 클러스터 형성 — 리더 1 + 팔로워 2, 데이터는 각 노드 디스크에 복제',
+        },
+        alert: { tone: 'info', text: 'storage "raft" 한 줄이면 Consul 없이 내장 스토리지로 HA 클러스터 구성.' },
+        code: {
+          lang: 'ruby',
+          filename: 'vault.hcl',
+          lines: [
+            '# Integrated Storage(Raft) — 각 노드 공통 설정',
+            '',
+            'storage "raft" {',
+            '  path    = "/opt/vault/data"   # 이 노드의 로컬 데이터 경로',
+            '  node_id = "vault-0"            # 노드마다 고유 (vault-1, vault-2 ...)',
+            '}',
+            '',
+            'listener "tcp" {',
+            '  address     = "0.0.0.0:8200"',
+            '  cluster_address = "0.0.0.0:8201"  # 노드 간 복제 통신 포트',
+            '  tls_disable = false',
+            '}',
+            '',
+            '# 클러스터가 자기 주소를 광고하는 값 (필수)',
+            'api_addr     = "https://10.0.0.10:8200"',
+            'cluster_addr = "https://10.0.0.10:8201"',
+            '',
+            '# vs 외부 스토리지(Consul) 백엔드',
+            '#   storage "consul" { ... }  → Consul 클러스터를 따로 운영해야 함',
+            '#   storage "raft"   { ... }  → Vault 내장, 운영 단순 (권장)',
+          ],
+          highlight: [3, 4, 5, 6, 18, 19, 20, 21],
+        },
+      },
+      {
+        title: 'Step 3. 로그 복제 + 과반수 커밋 — 이사회 의결처럼',
+        desc: '쓰기 요청은 항상 리더가 받는다. 리더는 그 변경을 "로그 엔트리"로 만들어 팔로워들에게 복제한다. 과반수(3노드면 2대) 노드가 로그를 받아 저장했다고 응답하면, 그 엔트리를 커밋(commit)하고 클라이언트에 성공을 반환한다. 과반수 규칙 덕분에 소수 노드가 뒤처지거나 죽어도 데이터 일관성이 깨지지 않는다. standby 노드로 온 요청은 리더로 forward/redirect 된다.',
+        scene: 'replicate',
+        cluster: {
+          nodes: [
+            { id: 'vault-0', role: 'leader',   log: 5, committed: 5, up: true },
+            { id: 'vault-1', role: 'follower', log: 5, committed: 5, up: true },
+            { id: 'vault-2', role: 'follower', log: 3, committed: 3, up: true },
+          ],
+          note: '리더가 로그를 복제 → 과반수(2/3) 저장 확인 시 커밋. vault-2는 뒤처져도 커밋에 지장 없음',
+        },
+        alert: { tone: 'good', text: '과반수만 응답하면 커밋. 소수 노드가 느리거나 죽어도 일관성 유지.' },
+        code: {
+          lang: 'bash',
+          filename: 'replicate.sh',
+          lines: [
+            '# 쓰기는 리더가 받아 로그로 복제 → 과반수 커밋',
+            '',
+            '# 1) 클라이언트가 standby 노드로 요청해도',
+            'VAULT_ADDR=https://10.0.0.11:8200 vault kv put secret/app/db pw=abc',
+            '#   → standby 는 처리하지 않고 리더(10.0.0.10)로 redirect',
+            '',
+            '# 2) 리더가 로그 엔트리 생성 → 팔로워에 복제',
+            '#   [leader]   append index=5  ─▶ vault-1, vault-2',
+            '#   [vault-1]  stored index=5  ─▶ ack',
+            '#   [vault-2]  (조금 뒤처짐)',
+            '#   과반수(리더 + vault-1 = 2/3) ack → index=5 커밋',
+            '',
+            '# 3) 클러스터 구성원과 복제 상태 확인',
+            'vault operator raft list-peers',
+            '#   Node       Address           State       Voter',
+            '#   ----       -------           -----       -----',
+            '#   vault-0    10.0.0.10:8201    leader      true',
+            '#   vault-1    10.0.0.11:8201    follower    true',
+            '#   vault-2    10.0.0.12:8201    follower    true',
+            '',
+            '# → Voter=true 노드들의 과반수가 커밋 정족수(quorum)',
+          ],
+          highlight: [3, 4, 5, 7, 8, 9, 10, 11, 14, 15, 18, 19, 20],
+        },
+      },
+      {
+        title: 'Step 4. 리더 장애 → 자동 재선출(leader election)',
+        desc: '리더가 죽으면 팔로워들은 일정 시간(election timeout) 동안 리더의 신호(heartbeat)가 없음을 감지하고, 스스로 후보(candidate)가 되어 투표를 요청한다. 과반수 표를 받은 노드가 새 리더가 되어 즉시 쓰기를 이어받는다. 이 과정은 수 초 안에 자동으로 끝나 무중단에 가깝다. 그래서 노드는 홀수(3, 5)로 두는데, 짝수는 표가 갈려(split vote) 정족수를 못 만드는 상황을 피하기 위해서다.',
+        scene: 'election',
+        cluster: {
+          nodes: [
+            { id: 'vault-0', role: 'down',     log: 5, committed: 5, up: false },
+            { id: 'vault-1', role: 'leader',   log: 5, committed: 5, up: true },
+            { id: 'vault-2', role: 'follower', log: 5, committed: 5, up: true },
+          ],
+          note: 'vault-0(옛 리더) 다운 → vault-1이 과반수 표를 받아 새 리더로 승격, 쓰기 재개',
+        },
+        alert: { tone: 'warn', text: '리더 다운 시 남은 과반수가 새 리더를 자동 선출. 홀수 노드여야 표가 안 갈린다.' },
+        code: {
+          lang: 'bash',
+          filename: 'failover.sh',
+          lines: [
+            '# 리더 장애 → 자동 재선출',
+            '',
+            '# 1) 옛 리더(vault-0) 다운',
+            'ssh vault-0 systemctl stop vault      # 또는 장애',
+            '',
+            '# 2) 팔로워가 heartbeat 끊김 감지 → 선출 시작',
+            '#   [vault-1] election timeout! become candidate, term+1',
+            '#   [vault-1] request vote ─▶ vault-2',
+            '#   [vault-2] grant vote',
+            '#   [vault-1] got 2/2 among live nodes → become LEADER',
+            '',
+            '# 3) 승격 후 상태 — 리더가 바뀌어 있다',
+            'VAULT_ADDR=https://10.0.0.11:8200 vault operator raft list-peers',
+            '#   Node       Address           State       Voter',
+            '#   ----       -------           -----       -----',
+            '#   vault-1    10.0.0.11:8201    leader      true    # 👈 새 리더',
+            '#   vault-2    10.0.0.12:8201    follower    true',
+            '#   vault-0    10.0.0.10:8201    follower    true    # 복귀 후 팔로워',
+            '',
+            '# → 쓰기는 수 초 내 재개. 클라이언트는 새 리더로 redirect',
+            '# → 짝수 노드면 split vote 로 정족수 실패 위험 → 홀수 권장',
+          ],
+          highlight: [3, 4, 6, 7, 8, 9, 10, 13, 16, 17, 18, 20, 21],
+        },
+      },
+      {
+        title: 'Step 5. 운영 — 홀수 노드 · retry_join · 정족수',
+        desc: '실무에서는 노드를 3대(소규모) 또는 5대(대규모)로 둔다. 3대는 1대, 5대는 2대까지 죽어도 과반수가 유지된다. 새 노드는 retry_join으로 기존 노드들을 가리키게 두면 부팅 시 알아서 클러스터에 합류한다. 운영 중에는 operator raft list-peers로 구성원과 리더를 확인하고, 스냅샷으로 백업한다. Raft는 Consul 백엔드 대비 별도 클러스터가 없어 운영 부담이 작다 — 무중단과 데이터 안정성을 가장 단순하게 얻는 방법이다.',
+        scene: 'operate',
+        cluster: {
+          nodes: [
+            { id: 'vault-0', role: 'leader',   log: 8, committed: 8, up: true },
+            { id: 'vault-1', role: 'follower', log: 8, committed: 8, up: true },
+            { id: 'vault-2', role: 'follower', log: 8, committed: 8, up: true },
+          ],
+          note: '3 노드 정상 — 1대까지 장애 허용(과반수 2 유지). 5 노드면 2대까지 허용',
+        },
+        alert: { tone: 'good', text: '홀수 노드(3/5) + retry_join 자동 합류. Consul 없이 무중단·데이터 안정성 확보.' },
+        code: {
+          lang: 'ruby',
+          filename: 'vault-with-join.hcl',
+          lines: [
+            '# 새 노드가 부팅 시 자동으로 클러스터에 합류',
+            '',
+            'storage "raft" {',
+            '  path    = "/opt/vault/data"',
+            '  node_id = "vault-2"',
+            '',
+            '  # 기존 노드들을 가리키면 부팅 때 알아서 합류',
+            '  retry_join { leader_api_addr = "https://10.0.0.10:8200" }',
+            '  retry_join { leader_api_addr = "https://10.0.0.11:8200" }',
+            '}',
+            '',
+            '# 정족수(quorum) — 과반수가 살아있어야 쓰기 가능',
+            '#   3 노드: 과반수 2 → 1대 장애 허용',
+            '#   5 노드: 과반수 3 → 2대 장애 허용 (짝수는 이점 없음)',
+            '',
+            '# 운영 명령 (bash)',
+            '#   vault operator raft list-peers        # 구성원/리더 확인',
+            '#   vault operator raft snapshot save backup.snap   # 백업',
+            '#   vault operator raft remove-peer vault-2         # 노드 제거',
+            '',
+            '# 핵심: raft = Vault 내장 스토리지. Consul 클러스터 불필요 → 운영 단순',
+          ],
+          highlight: [3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 17, 18, 19, 21],
+        },
+      },
+    ];
+
+    function RaftClusterView({ cluster, scene }) {
+      const ROLE = {
+        leader:   { badge:'👑 LEADER',   bg:'#fffbe6', bd:BRAND,     tx:DARK,      dot:'#16a34a' },
+        follower: { badge:'🔵 FOLLOWER', bg:'#eff6ff', bd:'#93c5fd', tx:'#1e3a8a', dot:'#3b82f6' },
+        single:   { badge:'🖥️ SINGLE',   bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', dot:'#f59e0b' },
+        down:     { badge:'💥 DOWN',     bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', dot:'#ef4444' },
+      };
+      const maxLog = Math.max(1, ...cluster.nodes.map((n) => n.log));
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>🗳️</span>
+            <span>Raft 클러스터 — 리더 + 팔로워, 로그 복제 / 과반수 커밋</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {cluster.nodes.map((n, i) => {
+              const s = ROLE[n.role] || ROLE.follower;
+              return (
+                <div key={i} className="rounded-md p-2.5" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx, opacity: n.up ? 1 : 0.6}}>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full" style={{background:s.dot}}></span>
+                    <span className="font-mono font-bold text-xs w-20 shrink-0">{n.id}</span>
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded" style={{background:'rgba(255,255,255,0.6)'}}>{s.badge}</span>
+                    <span className="ml-auto text-[10px] font-mono">log {n.log} · commit {n.committed}</span>
+                  </div>
+                  <div className="flex gap-0.5">
+                    {Array.from({length: maxLog}).map((_, k) => {
+                      const idx = k + 1;
+                      const filled = idx <= n.committed;
+                      const replicating = idx > n.committed && idx <= n.log;
+                      return (
+                        <span key={k} className="flex-1 h-3 rounded-sm"
+                          style={{background: filled ? BRAND : replicating ? '#fde68a' : '#e5e7eb',
+                                  border: replicating ? `1px dashed ${SUB}` : '1px solid transparent'}} />
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="px-3 pb-3 -mt-1">
+            <div className="rounded-md px-2 py-1.5 text-[11px]" style={{background:'#fffbe6', border:'1px solid #fde68a', color:DARK}}>
+              {cluster.note}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-3 text-[10px]" style={{color:SUB}}>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{background:BRAND}}></span> 커밋됨</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{background:'#fde68a', border:`1px dashed ${SUB}`}}></span> 복제 중</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm inline-block" style={{background:'#e5e7eb'}}></span> 미보유</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DARK}}>Vault HA — Raft 합의 시뮬레이션</h3>
+            <span className="text-[10px] text-slate-500">scene: {state.scene}</span>
+          </div>
+          <RaftClusterView cluster={state.cluster} scene={state.scene} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(255,204,51,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#fffbe6 0%,#fef3c7 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg font-bold" style={{background:BRAND, color:DARK}}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DARK}}>V-1-1. HA — Raft consensus</h1>
+                <p className="text-sm" style={{color:SUB}}>비유: 이사회 의결(리더 1명 + 과반수 찬성으로 안건 확정). Integrated Storage로 무중단·데이터 안정성을 얻는다.</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:SUB}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#fde68a'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow" style={{background:BRAND, color:DARK}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold" style={{background:BRAND, color:DARK}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:SUB}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Vault HA는 Integrated Storage(Raft)로 여러 노드를 묶어 만든다. 리더(active) 1개가 모든 쓰기를 받아 로그로 만들고, 팔로워(standby)에 복제해 과반수가 저장하면 커밋한다. 리더가 죽으면 남은 과반수가 자동으로 새 리더를 선출해 무중단에 가깝게 이어간다. 노드는 홀수(3/5)로 두어 split vote를 피하고, retry_join으로 새 노드를 자동 합류시킨다. Consul 백엔드와 달리 Vault 내장이라 운영이 단순하다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Vault', 'HA', 'Raft', 'Integrated-Storage', 'leader-election', 'quorum', 'retry_join'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#fffbe6', color:DARK, border:'1px solid #fde68a'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:SUB}}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <a href="../part4/IV-2-2.html" className="underline hover:no-underline">← 이전: IV-2-2</a>
+              <a href="./V-1-2.html" className="underline hover:no-underline">다음: V-1-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

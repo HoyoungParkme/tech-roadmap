@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault 학습 — III-2-2. SSH CA — 짧은 수명 인증서</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Vault III-2-2 — SSH CA (signed certificate) 짧은 수명 인증서
+    비유: 출입 도장 대신 "유효기간 붙은 사원증"을 즉석 발급
+    5단계: SSH 접근 관리 문제 → Vault가 SSH CA → 서버가 CA 신뢰(TrustedUserCAKeys) → 사용자 공개키 서명·접속 → OTP vs CA 비교
+    좌 LiveDataPane(SshCaView) / 우 CodeViewer
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#FFCC33';
+    const DARK  = '#7c5e00';
+    const SUB   = '#b8860b';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — 서버마다 authorized_keys 를 뿌리는 지옥',
+        desc: '전통적인 SSH 접근 관리는 각 서버의 ~/.ssh/authorized_keys 에 사용자 공개키를 넣는 방식이다. 서버가 100대, 사용자가 50명이면 5000개의 키 배포·회수를 관리해야 한다. 퇴사자의 키를 모든 서버에서 지웠는지 확신하기 어렵고, 키는 만료가 없어 한 번 새면 영원히 유효하다. Vault SSH secret engine 은 이 문제를 두 가지 모드로 푼다 — OTP 와 CA. 이 페이지는 표준 OpenSSH 인증서를 쓰는 CA 모드를 다룬다.',
+        scene: 'problem',
+        items: [
+          { who: 'web-01..99', what: '~/.ssh/authorized_keys 에 50명 공개키 복사', risk: '🚨 5000개 배포' },
+          { who: '퇴사자 alice', what: '모든 서버에서 키 삭제해야 함', risk: '🚨 누락 시 영구 접근' },
+          { who: 'SSH 공개키', what: '만료(expiry) 개념이 없음', risk: '🚨 새면 영원히 유효' },
+        ],
+        alert: { tone: 'danger', text: '키를 서버마다 배포/회수하면 규모가 커질수록 통제 불능. 중앙에서 짧은 수명 인증서를 발급해야 한다.' },
+        code: {
+          lang: 'bash',
+          filename: 'before-ssh-ca.sh',
+          lines: [
+            '# Vault 없는 흔한 SSH 접근 관리',
+            '',
+            '# 1) 서버마다 사용자 공개키를 직접 추가',
+            'ssh web-01 "cat >> ~/.ssh/authorized_keys" < alice.pub',
+            'ssh web-02 "cat >> ~/.ssh/authorized_keys" < alice.pub',
+            '#   ... web-99 까지 반복 (설정 관리 도구로도 힘들다)',
+            '',
+            '# 2) 문제: 키에는 만료가 없다',
+            '#   - alice.pub 는 한 번 넣으면 영원히 유효',
+            '#   - 유출되어도 서버에서 지우기 전까지 접속 가능',
+            '',
+            '# 3) 퇴사자 회수',
+            '#   - 모든 서버에서 authorized_keys 편집',
+            '#   - 한 대라도 빠뜨리면 뒷문이 열려 있다',
+            '',
+            '# 4) 감사: 누가 언제 어느 키로 들어왔나?',
+            '#   - 공개키 지문만 로그에 남아 사람 매핑이 번거롭다',
+            '',
+            '# → "중앙에서 발급 + 짧은 수명 + 자동 만료" 가 필요',
+            '# → Vault SSH secret engine 의 CA 모드',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15, 19, 20],
+        },
+      },
+      {
+        title: 'Step 2. Vault 가 SSH CA 가 된다 — 서명용 키쌍 생성',
+        desc: 'CA(Certificate Authority) 모드에서는 Vault 가 하나의 신뢰 기관이 된다. ssh secret engine 을 CA 타입으로 켜면 Vault 안에 서명용 키쌍이 만들어진다. 개인키는 Vault 밖으로 절대 나오지 않고, 공개키(CA public key)만 꺼내서 서버에 심는다. 앞으로 사용자 공개키에 이 CA 개인키로 "짧은 수명 인증서"를 서명해 발급한다. 핵심은 서버가 개별 사용자 키가 아니라 이 CA 하나만 신뢰하면 된다는 점이다.',
+        scene: 'ca',
+        items: [
+          { who: 'ssh (engine)', what: 'type=ca 로 활성화', risk: '✓ 서명 준비' },
+          { who: 'CA private key', what: 'Vault 내부 저장, 반출 불가', risk: '🔒 안전' },
+          { who: 'CA public key', what: 'ssh-rsa AAAAB3Nza... (서버에 배포)', risk: '📤 공개 배포' },
+        ],
+        alert: { tone: 'info', text: 'CA 개인키는 Vault 안에만. 서버에는 CA 공개키 하나만 심으면 된다 — 사용자별 키 배포 끝.' },
+        code: {
+          lang: 'bash',
+          filename: 'ssh-ca-setup.sh',
+          lines: [
+            '# SSH secret engine 을 CA 모드로 활성화',
+            '',
+            '# 1) client-signer 경로에 ssh engine 켜기',
+            'vault secrets enable -path=ssh-client-signer ssh',
+            '#   Success! Enabled the ssh secrets engine',
+            '',
+            '# 2) 서명용 CA 키쌍 생성 (개인키는 Vault 내부)',
+            'vault write ssh-client-signer/config/ca \\',
+            '  generate_signing_key=true',
+            '#   Key           Value',
+            '#   ----          -----',
+            '#   public_key    ssh-rsa AAAAB3NzaC1yc2E...  (CA 공개키)',
+            '',
+            '# 3) CA 공개키만 따로 추출 → 서버 배포용',
+            'vault read -field=public_key \\',
+            '  ssh-client-signer/config/ca > trusted-user-ca-keys.pem',
+            '',
+            'cat trusted-user-ca-keys.pem',
+            '#   ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB...',
+            '',
+            '# → 개인키는 절대 나오지 않는다 (서명은 Vault가 수행)',
+            '# → 이제 이 공개키를 대상 서버가 신뢰하게 만든다',
+          ],
+          highlight: [3, 4, 7, 8, 9, 11, 14, 15, 16, 21, 22],
+        },
+      },
+      {
+        title: 'Step 3. 서버가 CA 를 신뢰 — TrustedUserCAKeys',
+        desc: '대상 서버(sshd)에 CA 공개키를 신뢰하도록 설정한다. sshd_config 에 TrustedUserCAKeys 항목으로 CA 공개키 파일 경로를 지정하고 sshd 를 재시작하면 끝이다. 이제 서버는 "이 CA 가 서명한 인증서라면 통과" 시킨다. 개별 사용자 공개키를 authorized_keys 에 넣을 필요가 사라진다 — 신규 사용자가 100명 늘어도 서버 설정은 그대로다. 서버 쪽 배포 부담이 사용자 수와 무관해지는 것이 CA 모드의 확장성이다.',
+        scene: 'trust',
+        items: [
+          { who: 'sshd_config', what: 'TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem', risk: '✓ CA 신뢰' },
+          { who: '서버 web-01', what: 'authorized_keys 관리 불필요', risk: '✓ 배포 0건' },
+          { who: '신규 사용자', what: '서버 재설정 없이 즉시 접근 가능', risk: '✓ 무한 확장' },
+        ],
+        alert: { tone: 'good', text: '서버는 CA 하나만 신뢰하면 된다. 사용자가 늘어도 서버 설정은 그대로 — 이것이 CA 모드의 확장성.' },
+        code: {
+          lang: 'ini',
+          filename: '/etc/ssh/sshd_config',
+          lines: [
+            '# 대상 서버(sshd) — CA 공개키를 신뢰하도록 설정',
+            '',
+            '# 1) Vault CA 공개키를 서버로 복사',
+            '#   scp trusted-user-ca-keys.pem \\',
+            '#     web-01:/etc/ssh/trusted-user-ca-keys.pem',
+            '',
+            '# 2) sshd_config 에 신뢰 CA 지정',
+            'TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem',
+            '',
+            '# (선택) 인증서에 박힌 principal 만 로그인 허용',
+            'AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u',
+            '',
+            '# 3) 설정 반영',
+            '#   sudo systemctl restart sshd',
+            '',
+            '# 효과',
+            '#   - 이 CA 가 서명한 인증서면 로그인 통과',
+            '#   - authorized_keys 에 개별 공개키 등록 불필요',
+            '#   - 사용자 50명 -> 500명 늘어도 이 파일은 그대로',
+          ],
+          highlight: [7, 8, 10, 11, 16, 17, 18, 19],
+        },
+      },
+      {
+        title: 'Step 4. 사용자 공개키 서명 → 짧은 수명 인증서로 접속',
+        desc: '사용자는 자기 공개키를 Vault 에 보내 서명을 요청한다. sign role 은 발급 규칙(허용 principal, TTL, 허용 확장)을 정의한다. vault write ssh-client-signer/sign/my-role 로 서명하면 짧은 수명(예: 30분) 인증서(id_rsa-cert.pub)가 발급된다. 이 인증서를 개인키와 함께 ssh 에 주면 서버는 CA 신뢰로 통과시킨다. 인증서는 곧 만료되므로 회수가 필요 없다 — 유출되어도 시간이 스스로 무효화한다. 개인키는 사용자 손을 떠나지 않는다.',
+        scene: 'sign',
+        items: [
+          { who: 'alice', what: 'id_rsa.pub 를 sign 요청', risk: '공개키만 전송' },
+          { who: 'Vault CA', what: 'principal=alice, valid_principals 검증 후 서명', risk: 'TTL 30m' },
+          { who: 'id_rsa-cert.pub', what: '짧은 수명 인증서 발급', risk: '30분 후 자동 만료' },
+          { who: 'ssh web-01', what: '인증서 제시 → CA 신뢰로 접속 허용', risk: '✓ 로그인' },
+        ],
+        alert: { tone: 'good', text: '인증서는 30분이면 만료. 유출돼도 곧 무효 → 별도 회수 불필요. 개인키는 사용자 로컬에만.' },
+        code: {
+          lang: 'bash',
+          filename: 'sign-and-ssh.sh',
+          lines: [
+            '# 발급 규칙(role) 정의 + 사용자 공개키 서명 + 접속',
+            '',
+            '# 1) sign role — principal / TTL / 확장 제한',
+            'vault write ssh-client-signer/roles/my-role - <<EOF',
+            '{',
+            '  "algorithm_signer": "rsa-sha2-256",',
+            '  "allow_user_certificates": true,',
+            '  "allowed_users": "alice,bob",',
+            '  "default_user": "alice",',
+            '  "ttl": "30m0s",',
+            '  "default_extensions": { "permit-pty": "" }',
+            '}',
+            'EOF',
+            '',
+            '# 2) 사용자 공개키를 서명 요청 (개인키는 안 보냄)',
+            'vault write -field=signed_key \\',
+            '  ssh-client-signer/sign/my-role \\',
+            '  public_key=@$HOME/.ssh/id_rsa.pub \\',
+            '  valid_principals=alice > ~/.ssh/id_rsa-cert.pub',
+            '',
+            '# 3) 발급된 인증서 내용 확인 (유효기간 확인)',
+            'ssh-keygen -Lf ~/.ssh/id_rsa-cert.pub',
+            '#   Valid: from 2026-08-11T09:00 to 2026-08-11T09:30',
+            '#   Principals: alice',
+            '#   Extensions: permit-pty',
+            '',
+            '# 4) 인증서로 접속 (id_rsa 개인키 + cert 자동 사용)',
+            'ssh -i ~/.ssh/id_rsa alice@web-01',
+            '#   → 서버는 CA 신뢰만으로 통과, 30분 후 인증서 만료',
+          ],
+          highlight: [3, 4, 7, 8, 10, 15, 16, 17, 18, 19, 22, 23, 24, 25, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 5. OTP vs CA — 언제 무엇을 쓰나',
+        desc: 'SSH engine 에는 두 모드가 있다. OTP 모드는 접속마다 일회용 비밀번호를 발급하지만, 서버에 vault-ssh-helper 를 설치해야 하고 표준 SSH 흐름이 아니다. CA 모드는 표준 OpenSSH 인증서를 쓰므로 서버에 helper 가 필요 없고, TrustedUserCAKeys 한 줄이면 된다. 대규모 서버 접근을 인증서로 중앙 관리하려면 CA 모드가 사실상 표준이다. principal 로 접근 대상을 제한하고, 짧은 TTL 로 자동 만료시키며, 확장(permit-pty 등)으로 권한을 좁힌다.',
+        scene: 'compare',
+        items: [
+          { who: 'OTP 모드', what: '접속마다 일회용 비번, vault-ssh-helper 필요', risk: '비표준·helper 설치' },
+          { who: 'CA 모드', what: '표준 OpenSSH 인증서, helper 불필요', risk: '✓ 대규모 표준' },
+          { who: 'principals', what: '인증서에 허용 대상 계정 명시', risk: '접근 대상 제한' },
+          { who: 'TTL', what: '30m 등 짧은 수명 → 자동 만료', risk: '회수 불필요' },
+          { who: 'extensions', what: 'permit-pty / permit-port-forwarding 제한', risk: '권한 최소화' },
+        ],
+        alert: { tone: 'good', text: 'CA 모드 = helper 없이 표준 인증서 + 짧은 TTL + principal/확장 제한. 대규모 SSH 중앙 관리의 표준.' },
+        code: {
+          lang: 'bash',
+          filename: 'otp-vs-ca.sh',
+          lines: [
+            '# OTP 모드 vs CA 모드 비교',
+            '',
+            '# ── OTP 모드 (참고) ──────────────────',
+            '# vault write ssh/creds/otp-role ip=10.0.0.5',
+            '#   → 일회용 비밀번호 발급',
+            '#   → 단, 서버에 vault-ssh-helper 설치 필수',
+            '#   → PAM 연동 등 비표준 흐름',
+            '',
+            '# ── CA 모드 (이 페이지) ──────────────',
+            '#   서버: TrustedUserCAKeys 한 줄, helper 불필요',
+            '#   표준 OpenSSH 인증서 그대로 사용',
+            '',
+            '# 확장을 좁힌 role 예 (포트포워딩 금지)',
+            'vault write ssh-client-signer/roles/restricted - <<EOF',
+            '{',
+            '  "allow_user_certificates": true,',
+            '  "allowed_users": "alice",',
+            '  "ttl": "15m0s",',
+            '  "default_extensions": { "permit-pty": "" }',
+            '}',
+            'EOF',
+            '#   → permit-port-forwarding 없음 = 터널링 차단',
+            '',
+            '# 감사: 발급 이력은 Vault audit log 에 남는다',
+            '#   - 누가(alice) 언제 어떤 principal 로 서명받았는지',
+            '#   - 서버는 CA 신뢰만, 사용자 키 배포/회수 0건',
+            '',
+            '# 핵심',
+            '#   - 대규모 서버 SSH = CA 모드로 중앙 관리',
+            '#   - 짧은 TTL 로 자동 만료, principal/확장으로 최소권한',
+          ],
+          highlight: [2, 3, 4, 5, 6, 8, 9, 10, 13, 14, 15, 16, 17, 18, 21, 27, 28, 29],
+        },
+      },
+    ];
+
+    function ScenePanel({ scene, items }) {
+      const TONE = {
+        problem: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨', title:'authorized_keys 배포 지옥' },
+        ca:      { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'🏛️', title:'Vault = SSH CA (서명 기관)' },
+        trust:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'🤝', title:'서버가 CA 를 신뢰' },
+        sign:    { bg:'#fef9c3', bd:'#fde68a', tx:'#7c5e00', icon:'📜', title:'공개키 서명 → 짧은 수명 인증서' },
+        compare: { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚖️', title:'OTP vs CA 비교' },
+      };
+      const s = TONE[scene] || TONE.ca;
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>{s.icon}</span>
+            <span>{s.title}</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="rounded-md p-2 text-xs flex items-start gap-2"
+                   style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+                <span className="font-mono font-bold w-36 shrink-0">{it.who}</span>
+                <span className="flex-1 font-mono break-all">{it.what}</span>
+                <span className="text-[10px] shrink-0">{it.risk}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DARK}}>SSH CA 서명·접속 흐름</h3>
+            <span className="text-[10px] text-slate-500">scene: {state.scene}</span>
+          </div>
+          <ScenePanel scene={state.scene} items={state.items} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(255,204,51,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#fffbe6 0%,#fef3c7 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg font-bold" style={{background:BRAND, color:DARK}}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DARK}}>III-2-2. SSH CA — 짧은 수명 인증서</h1>
+                <p className="text-sm" style={{color:SUB}}>비유: 키 배포 대신 "유효기간 붙은 사원증"을 즉석 발급. Vault 가 SSH CA 가 되어 짧은 수명 인증서를 서명한다.</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:SUB}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#fde68a'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow" style={{background:BRAND, color:DARK}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold" style={{background:BRAND, color:DARK}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:SUB}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                SSH CA 모드는 Vault 가 서명 기관이 되어 사용자 공개키에 짧은 수명 인증서를 서명한다. 서버는 TrustedUserCAKeys 로 CA 하나만 신뢰하면 되므로 사용자별 키 배포/회수가 사라진다. OTP 모드와 달리 helper 가 필요 없고 표준 OpenSSH 인증서를 쓴다. principal 로 접근 대상을, 짧은 TTL 로 자동 만료를, 확장(permit-pty 등)으로 권한을 좁힌다. 대규모 서버 SSH 접근을 인증서로 중앙 관리하는 실무 표준이다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Vault', 'ssh', 'CA', 'signed-certificate', 'TrustedUserCAKeys', 'principals', 'TTL'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#fffbe6', color:DARK, border:'1px solid #fde68a'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:SUB}}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <span className="flex gap-3">
+                <a href="./III-2-1.html" className="underline hover:no-underline">← 이전: III-2-1</a>
+                <a href="../part4/IV-1-1.html" className="underline hover:no-underline">다음: IV-1-1 →</a>
+              </span>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vault 학습 — II-1-1. database secret (PostgreSQL 동적 사용자)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Vault II-1-1 — database secret engine (PostgreSQL 동적 사용자)
+    비유: 정문 마스터키 공유 vs 방문객용 1회용 출입증 발급기
+    5단계: 정적 공유의 위험 → connection 설정 → role(생성 SQL/TTL) → creds 발급(CREATE ROLE) → lease 만료(DROP ROLE)
+    좌 LiveDataPane(동적 사용자 생명주기) / 우 CodeViewer(bash + sql)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#FFCC33';
+    const DARK  = '#7c5e00';
+    const SUB   = '#b8860b';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — DB 비밀번호 하나를 모두가 공유',
+        desc: 'PostgreSQL 접속용 계정 app / prod-pass 하나를 모든 서비스가 .env 에 넣어 쓴다. 인스턴스 100개가 같은 계정으로 붙으니, DB 로그에는 전부 user=app 으로만 찍힌다. 비밀번호가 유출되어도 누구에게서 새어 나갔는지 알 수 없고, 회수하려면 비밀번호를 바꾼 뒤 전 서비스를 재배포해야 한다. database secret engine 은 이 정적 공유를 없애고, 요청할 때마다 짧은 수명의 전용 DB 계정을 동적 발급한다.',
+        scene: 'problem',
+        items: [
+          { who: 'app-1',  what: 'DB_USER=app / DB_PASS=prod-pass', risk: '🚨 공유 계정' },
+          { who: 'app-2',  what: 'DB_USER=app / DB_PASS=prod-pass', risk: '🚨 같은 값' },
+          { who: 'app-99', what: 'DB_USER=app / DB_PASS=prod-pass', risk: '🚨 유출 출처 불명' },
+        ],
+        alert: { tone: 'danger', text: '정적 공유 계정은 유출 추적이 불가능하고, 회수하려면 전 서비스 재배포가 필요하다.' },
+        code: {
+          lang: 'bash',
+          filename: 'before-dynamic.sh',
+          lines: [
+            '# database secret engine 이 없을 때 흔한 풍경',
+            '',
+            '# 1) 모든 서비스가 같은 DB 계정을 공유',
+            'cat app/.env',
+            '#   DB_HOST=db.internal',
+            '#   DB_USER=app',
+            '#   DB_PASSWORD=prod-super-secret',
+            '',
+            '# 2) DB 로그에는 전부 user=app 로만 찍힌다',
+            'psql -c "SELECT usename, count(*) FROM pg_stat_activity GROUP BY 1;"',
+            '#   usename | count',
+            '#   --------+-------',
+            '#   app     |   137        <- 누가 무엇을 했는지 구분 불가',
+            '',
+            '# 3) 비밀번호가 유출되면?',
+            '#   - 누가 유출했는지 알 수 없다 (100개 인스턴스)',
+            '#   - 비밀번호 변경 → 전 서비스 재배포 → 그동안 장애',
+            '#   - 퇴사자가 비밀번호를 그대로 기억하고 있을 수도',
+            '',
+            '# → 요청마다 "그 요청 전용" 짧은 수명 계정을 발급하면?',
+            '# → database secret engine 이 그 일을 한다',
+          ],
+          highlight: [3, 4, 9, 10, 15, 16, 17, 18, 20, 21],
+        },
+      },
+      {
+        title: 'Step 2. connection — Vault 를 PostgreSQL 관리자로 연결',
+        desc: 'database engine 을 켜고, Vault 가 PostgreSQL 에 사용자를 만들 수 있도록 관리자 계정으로 연결(connection)을 등록한다. connection_url 의 {{username}}/{{password}} 는 Vault 가 채우는 자리표시자다. allowed_roles 로 이 연결을 사용할 수 있는 role 을 제한한다. 여기서 준 vault-admin 계정은 임시 계정을 CREATE / DROP 할 권한만 있으면 된다. 앱은 이 관리자 계정을 절대 직접 쓰지 않는다.',
+        scene: 'config',
+        items: [
+          { who: 'engine',     what: 'vault secrets enable database', risk: '✓ 활성화' },
+          { who: 'connection', what: 'my-postgres → db:5432/app', risk: '관리자 연결' },
+          { who: 'admin',      what: 'vault-admin (CREATE/DROP ROLE)', risk: '앱은 미사용' },
+        ],
+        alert: { tone: 'info', text: 'Vault 가 DB 관리자로 붙어, 요청이 올 때 임시 계정을 대신 만들어 준다.' },
+        code: {
+          lang: 'bash',
+          filename: 'db-connection.sh',
+          lines: [
+            '# 1) database secret engine 활성화 (한 번만)',
+            'vault secrets enable database',
+            '#   Success! Enabled the database secrets engine at: database/',
+            '',
+            '# 2) PostgreSQL 연결 등록',
+            'vault write database/config/my-postgres \\',
+            '  plugin_name=postgresql-database-plugin \\',
+            '  allowed_roles="my-role" \\',
+            '  connection_url="postgresql://{{username}}:{{password}}@db:5432/app" \\',
+            '  username="vault-admin" \\',
+            '  password="admin-only-secret"',
+            '#   Success! Data written to: database/config/my-postgres',
+            '',
+            '# 자리표시자 설명',
+            '#   {{username}} {{password}} → Vault 가 연결 시 채운다',
+            '#   allowed_roles            → 이 연결을 쓸 수 있는 role 화이트리스트',
+            '',
+            '# 3) 등록 확인 (비밀번호는 노출되지 않는다)',
+            'vault read database/config/my-postgres',
+            '#   Key              Value',
+            '#   ----             -----',
+            '#   allowed_roles    [my-role]',
+            '#   connection_url   postgresql://...@db:5432/app',
+            '',
+            '# → Vault 가 DB 관리자로 연결됨. 다음은 "무엇을 발급할지" role 정의',
+          ],
+          highlight: [1, 2, 5, 6, 7, 8, 9, 10, 11, 19, 20],
+        },
+      },
+      {
+        title: 'Step 3. role — 어떤 임시 계정을 만들지 SQL 로 정의',
+        desc: 'role 은 "creds 요청이 오면 어떤 임시 계정을 만들지" 를 정하는 규칙이다. creation_statements 에 CREATE ROLE SQL 을 넣으면, 발급 시 {{name}}(임시 사용자명), {{password}}(임의 비밀번호), {{expiration}}(만료 시각)을 Vault 가 채워 실행한다. default_ttl / max_ttl 로 임시 계정의 수명을 정한다. GRANT 로 필요한 최소 권한만 준다. revocation_statements 로 만료 시 DROP 방식도 지정할 수 있다.',
+        scene: 'role',
+        items: [
+          { who: 'creation',  what: 'CREATE ROLE + GRANT SELECT', risk: '최소 권한' },
+          { who: 'default_ttl', what: '1h', risk: '기본 수명' },
+          { who: 'max_ttl',   what: '24h', risk: '최대 수명' },
+        ],
+        alert: { tone: 'warn', text: 'TTL 은 짧게, 권한은 최소로. 유출되어도 곧 만료되고 피해 범위가 제한된다.' },
+        code: {
+          lang: 'sql',
+          filename: 'role-statements.sql',
+          lines: [
+            '-- role 에 등록할 creation_statements (임시 계정 생성 SQL)',
+            '-- Vault 가 발급할 때 {{name}} {{password}} {{expiration}} 을 채운다',
+            '',
+            'CREATE ROLE "{{name}}"',
+            '  WITH LOGIN',
+            '  PASSWORD \'{{password}}\'',
+            '  VALID UNTIL \'{{expiration}}\';',
+            '',
+            '-- 임시 계정에 딱 필요한 최소 권한만 부여',
+            'GRANT SELECT ON ALL TABLES IN SCHEMA public',
+            '  TO "{{name}}";',
+            '',
+            '-- (선택) 만료 시 실행할 revocation_statements',
+            '--   DROP ROLE IF EXISTS "{{name}}";',
+            '',
+            '-- 요약',
+            '--   {{name}}       임의 임시 사용자명 (예: v-token-my-role-Ab12..)',
+            '--   {{password}}   임의 강력한 비밀번호',
+            '--   {{expiration}} default_ttl 기준 만료 시각',
+          ],
+          highlight: [4, 5, 6, 7, 10, 11, 13, 14],
+        },
+      },
+      {
+        title: 'Step 4. 발급 — read database/creds 로 임시 계정 즉석 생성',
+        desc: '앱은 vault read database/creds/my-role 한 줄이면 된다. Vault 는 role 의 CREATE ROLE SQL 을 PostgreSQL 에 실행해 그 요청만을 위한 새 사용자/비밀번호를 만들고, lease_id 와 함께 돌려준다. 앱은 이 계정으로 DB 에 붙어 쓴다. lease_duration(TTL) 동안만 유효하고, 누가 가져갔는지는 lease_id 로 추적된다. 같은 명령을 또 실행하면 또 다른 새 계정이 나온다 — 인스턴스마다, 사용마다 계정이 다르다.',
+        scene: 'issue',
+        items: [
+          { who: 'app-1 요청', what: 'v-token-my-role-Ab12 / A1!xYz9', risk: '🎟️ lease Hk9.. TTL 1h' },
+          { who: 'app-2 요청', what: 'v-token-my-role-Cd34 / B2@wQr8', risk: '🎟️ lease Lm3.. TTL 1h' },
+          { who: 'PostgreSQL', what: 'CREATE ROLE 로 실제 계정 생성됨', risk: '✓ 즉석 생성' },
+        ],
+        alert: { tone: 'good', text: '요청마다 다른 전용 계정 + 짧은 TTL. 유출돼도 곧 무효, lease_id 로 출처 추적.' },
+        code: {
+          lang: 'bash',
+          filename: 'issue-creds.sh',
+          lines: [
+            '# 1) role 등록 (Step 3 의 SQL 을 한 줄로)',
+            'vault write database/roles/my-role \\',
+            '  db_name=my-postgres \\',
+            '  creation_statements=@role-statements.sql \\',
+            '  default_ttl="1h" \\',
+            '  max_ttl="24h"',
+            '#   Success! Data written to: database/roles/my-role',
+            '',
+            '# 2) 앱이 자격증명 요청 → 즉석에서 임시 계정 발급',
+            'vault read database/creds/my-role',
+            '#   Key                Value',
+            '#   ----               -----',
+            '#   lease_id           database/creds/my-role/Hk9aB...',
+            '#   lease_duration     1h',
+            '#   username           v-token-my-role-Ab12Cd34-1691...',
+            '#   password           A1!xYz9LpQrStU',
+            '',
+            '# 3) 방금 만들어진 계정으로 DB 접속 (앱이 사용)',
+            'psql "postgresql://v-token-my-role-Ab12...:A1!xYz9@db/app"',
+            '',
+            '# → 같은 명령을 다시 하면 또 다른 새 계정이 발급된다',
+            '# → 인스턴스마다, 사용마다 계정이 다르다 = 출처 추적 가능',
+          ],
+          highlight: [1, 2, 3, 4, 5, 6, 9, 10, 13, 14, 15, 16, 18, 19],
+        },
+      },
+      {
+        title: 'Step 5. 만료 — lease 가 끝나면 Vault 가 DROP ROLE 로 회수',
+        desc: 'lease TTL 이 끝나면 Vault 가 알아서 그 임시 계정을 PostgreSQL 에서 DROP ROLE 로 삭제한다. 앱이 필요 없어지면 vault lease revoke 로 즉시 회수할 수도 있고, 더 오래 필요하면 max_ttl 한도 안에서 renew 한다. 결과적으로 DB 에는 "지금 살아 있는 앱을 위한" 계정만 남고, 유출 위험은 TTL 만큼으로 줄며, 모든 발급/회수가 감사 로그에 남는다. 정적 공유 비밀번호를 자동 로테이션되는 임시 계정으로 대체하는 것이 database secret engine 의 핵심이다.',
+        scene: 'lease',
+        items: [
+          { who: 'renew',  what: 'vault lease renew (max_ttl 까지)', risk: '연장' },
+          { who: 'revoke', what: 'vault lease revoke → 즉시 DROP', risk: '즉시 회수' },
+          { who: 'expire', what: 'TTL 종료 → 자동 DROP ROLE', risk: '✓ 자동 회수' },
+        ],
+        alert: { tone: 'good', text: 'TTL 만료·revoke 시 DROP ROLE 로 자동 회수. 유출 위험 최소화 + 감사 추적 확보.' },
+        code: {
+          lang: 'bash',
+          filename: 'lease-lifecycle.sh',
+          lines: [
+            '# lease = 발급된 임시 계정의 "임대 계약"',
+            '',
+            '# 1) 더 오래 필요하면 연장 (max_ttl 한도 내)',
+            'vault lease renew database/creds/my-role/Hk9aB...',
+            '#   lease_duration    1h  (재설정)',
+            '',
+            '# 2) 필요 없어지면 즉시 회수 → 바로 DROP ROLE',
+            'vault lease revoke database/creds/my-role/Hk9aB...',
+            '#   Success! Revoked lease',
+            '#   → PostgreSQL: DROP ROLE "v-token-my-role-Ab12...";',
+            '',
+            '# 3) 아무것도 안 하면? TTL 만료 시 Vault 가 자동 DROP',
+            'psql -c "SELECT rolname FROM pg_roles WHERE rolname LIKE \'v-token%\';"',
+            '#   (0 rows)     <- 만료된 계정은 사라지고 없다',
+            '',
+            '# 4) 모든 발급/갱신/회수는 감사 로그에 남는다',
+            'vault audit list',
+            '#   Path      Type    Description',
+            '#   file/     file    발급·회수 전부 기록',
+            '',
+            '# 핵심',
+            '#   - 정적 공유 계정 → 요청별 짧은 수명 임시 계정으로 대체',
+            '#   - TTL 만료/revoke 시 DROP ROLE 자동 회수 = 로테이션 자동화',
+            '#   - lease_id + 감사 로그로 "누가 언제" 추적 가능',
+          ],
+          highlight: [3, 4, 7, 8, 9, 10, 12, 13, 14, 16, 17],
+        },
+      },
+    ];
+
+    function ScenePanel({ scene, items }) {
+      const TONE = {
+        problem:  { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨', title:'정적 공유 계정의 위험' },
+        config:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'🔌', title:'connection — Vault ↔ PostgreSQL' },
+        role:     { bg:'#fef9c3', bd:'#fde68a', tx:'#7c5e00', icon:'📜', title:'role — 발급 규칙(SQL·TTL)' },
+        issue:    { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'🎟️', title:'creds 발급 — 임시 계정 즉석 생성' },
+        lease:    { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'♻️', title:'lease 만료 — 자동 DROP ROLE' },
+      };
+      const s = TONE[scene] || TONE.config;
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold flex items-center gap-2" style={{background:BRAND, color:DARK}}>
+            <span>{s.icon}</span>
+            <span>{s.title}</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="rounded-md p-2 text-xs flex items-start gap-2"
+                   style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+                <span className="font-mono font-bold w-28 shrink-0">{it.who}</span>
+                <span className="flex-1 font-mono break-all">{it.what}</span>
+                <span className="text-[10px] shrink-0">{it.risk}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#fffbe6', bd:'#fde68a', tx:'#7c5e00', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DARK}}>동적 DB 사용자 생명주기</h3>
+            <span className="text-[10px] text-slate-500">scene: {state.scene}</span>
+          </div>
+          <ScenePanel scene={state.scene} items={state.items} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(255,204,51,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#fffbe6 0%,#fef3c7 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg font-bold" style={{background:BRAND, color:DARK}}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DARK}}>II-1-1. database secret — PostgreSQL 동적 사용자</h1>
+                <p className="text-sm" style={{color:SUB}}>비유: 마스터키 공유(정적) vs 방문객용 1회용 출입증 발급기(동적). 요청마다 짧은 수명의 전용 DB 계정을 발급한다.</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:SUB}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#fde68a'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow" style={{background:BRAND, color:DARK}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold" style={{background:BRAND, color:DARK}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:SUB}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                database secret engine 은 정적 공유 비밀번호를 없앤다. connection 으로 Vault 를 DB 관리자로 연결하고, role 의 CREATE ROLE SQL + TTL 로 "어떤 임시 계정을 만들지" 정한다. 앱이 vault read database/creds/my-role 하면 그 요청 전용 계정이 즉석 발급되고, lease TTL 이 끝나면 Vault 가 DROP ROLE 로 자동 회수한다. 짧은 TTL 로 유출 위험을 최소화하고, lease_id·감사 로그로 "누가 언제" 를 추적한다 = 비밀번호 로테이션 자동화. 다음: II-1-2.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Vault', 'database', 'PostgreSQL', 'dynamic-secret', 'lease', 'TTL', 'CREATE-ROLE'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#fffbe6', color:DARK, border:'1px solid #fde68a'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:SUB}}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <span className="flex gap-3">
+                <a href="../part1/I-2-2.html" className="underline hover:no-underline">← 이전: I-2-2</a>
+                <a href="./II-1-2.html" className="underline hover:no-underline">다음: II-1-2 →</a>
+              </span>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
