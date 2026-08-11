@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spring Cloud — III-1-2. Gateway 인증 + Rate Limit</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔐</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Spring Cloud Chapter III-1-2 — Gateway 인증 + Rate Limit
+    학습 목표: JWT 검증 글로벌 필터, RequestRateLimiter + Redis, TokenRelay.
+    패턴: fastapi v1 — 좌(보안 메트릭) / 우(코드)
+    색상: #4A8C2A
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#4A8C2A';
+    const BRAND_DARK = '#2F5C19';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 인증을 어디서 하나 — Gateway vs 서비스',
+        desc: '각 서비스에서 JWT 검증 = 8개 서비스에 같은 로직 복붙, key rotate 시 8번 배포. Gateway 에서 검증 = 통과한 요청만 백엔드로, 백엔드는 X-User-Id 헤더만 신뢰. 단, 서비스 간 mTLS 또는 네트워크 격리 필요 (헤더 위조 방지).',
+        authPos: 'service',
+        rateLimit: 0,
+        rejected: 0,
+        verdict: '서비스마다 검증',
+        verdictTone: 'warn',
+        diagram: 'auth-each',
+        keyPoint: 'Gateway 에서 인증 + 백엔드에서 신뢰 = 표준. 단, 백엔드는 외부에서 직접 접근 불가해야.',
+        code: {
+          lang: 'yaml',
+          filename: 'auth-architecture.yaml',
+          lines: [
+            '# 인증 위치 — 2가지 모델 비교',
+            '',
+            '# ❌ 모델 A: 각 서비스가 JWT 검증',
+            'model_a:',
+            '  pros:',
+            '    - "서비스가 외부에 직접 노출돼도 안전"',
+            '    - "Gateway 우회 공격 방어"',
+            '  cons:',
+            '    - "8개 서비스에 같은 JWKS 로직 복붙"',
+            '    - "공개키 rotate 시 8번 배포"',
+            '    - "권한 정책 변경이 어려움"',
+            '    - "성능 저하 — 매 서비스가 서명 검증"',
+            '',
+            '# ✅ 모델 B: Gateway 에서만 JWT 검증',
+            'model_b:',
+            '  pros:',
+            '    - "검증 로직 1곳"',
+            '    - "key rotate 시 Gateway 만 배포"',
+            '    - "X-User-Id, X-Roles 헤더로 백엔드 전달"',
+            '    - "백엔드는 단순화 — 헤더만 신뢰"',
+            '  cons:',
+            '    - "백엔드 직접 노출 시 헤더 위조 가능"',
+            '    - "내부망 격리 또는 mTLS 필수"',
+            '',
+            '# 권장: 모델 B + zero-trust 보조',
+            'recommended:',
+            '  layer1:',
+            '    where: "API Gateway"',
+            '    do: "JWT 서명 검증 + claim 추출 + 헤더 주입"',
+            '  layer2:',
+            '    where: "각 서비스"',
+            '    do: "X-User-Id 신뢰 (mTLS 또는 ServiceMesh 로 출처 보장)"',
+            '  layer3:',
+            '    where: "각 서비스 권한 체크"',
+            '    do: "X-Roles 기반 메서드 권한만 — JWT 재검증은 안 함"',
+            '',
+            '# 네트워크 토폴로지',
+            'network:',
+            '  internet: "Gateway 만"',
+            '  internal_only: "user, order, catalog, payment 모두"',
+            '  policy: "K8s NetworkPolicy 또는 VPC private subnet"',
+            '  mtls: "Istio / Linkerd 옵션"',
+            '',
+            '# JWT vs Opaque Token',
+            '# JWT 검증 = stateless (Gateway 만으로 충분)',
+            '# Opaque = Auth Server 콜백 필요 → Gateway 가 캐시',
+          ],
+          highlight: [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+        },
+      },
+      {
+        title: 'Step 2. JWT 글로벌 필터 — 검증 + 헤더 주입',
+        desc: 'GlobalFilter 로 Authorization 헤더에서 Bearer 토큰을 꺼내 JWKS 로 서명 검증 → 통과하면 sub, roles 를 X-User-Id, X-Roles 헤더로 백엔드 전달. 실패하면 401. 로그인/회원가입 같은 public path 는 매칭 제외.',
+        authPos: 'gateway',
+        rateLimit: 0,
+        rejected: 12,
+        verdict: 'Gateway 검증',
+        verdictTone: 'good',
+        diagram: 'auth-gw',
+        keyPoint: 'Gateway 가 JWT 1차 검증, 백엔드는 헤더만 신뢰. 키 rotate 가 한 곳.',
+        code: {
+          lang: 'java',
+          filename: 'JwtAuthGlobalFilter.java',
+          lines: [
+            '// JWT 검증 글로벌 필터',
+            '',
+            'package com.example.gateway.security;',
+            '',
+            'import com.nimbusds.jose.JWSObject;',
+            'import com.nimbusds.jwt.SignedJWT;',
+            'import org.springframework.cloud.gateway.filter.GatewayFilterChain;',
+            'import org.springframework.cloud.gateway.filter.GlobalFilter;',
+            'import org.springframework.core.Ordered;',
+            'import org.springframework.http.HttpHeaders;',
+            'import org.springframework.http.HttpStatus;',
+            'import org.springframework.http.server.reactive.ServerHttpRequest;',
+            'import org.springframework.stereotype.Component;',
+            'import org.springframework.web.server.ServerWebExchange;',
+            'import reactor.core.publisher.Mono;',
+            '',
+            'import java.util.List;',
+            'import java.util.Set;',
+            '',
+            '@Component',
+            'public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {',
+            '',
+            '    /** 인증 없이 통과시킬 public path. */',
+            '    private static final Set<String> PUBLIC_PATHS = Set.of(',
+            '        "/api/auth/login",',
+            '        "/api/auth/signup",',
+            '        "/api/auth/refresh",',
+            '        "/actuator/health"',
+            '    );',
+            '',
+            '    private final JwksVerifier verifier;',
+            '',
+            '    public JwtAuthGlobalFilter(JwksVerifier verifier) {',
+            '        this.verifier = verifier;',
+            '    }',
+            '',
+            '    @Override',
+            '    public Mono<Void> filter(ServerWebExchange exchange,',
+            '                             GatewayFilterChain chain) {',
+            '        String path = exchange.getRequest().getURI().getPath();',
+            '        if (PUBLIC_PATHS.contains(path)) {',
+            '            return chain.filter(exchange);',
+            '        }',
+            '',
+            '        // 1. Authorization 헤더에서 Bearer 추출',
+            '        List<String> authH = exchange.getRequest().getHeaders()',
+            '            .get(HttpHeaders.AUTHORIZATION);',
+            '        if (authH == null || authH.isEmpty()',
+            '                || !authH.get(0).startsWith("Bearer ")) {',
+            '            return unauthorized(exchange, "missing token");',
+            '        }',
+            '        String token = authH.get(0).substring(7);',
+            '',
+            '        // 2. JWKS 로 서명 검증 (캐시된 공개키)',
+            '        try {',
+            '            SignedJWT jwt = SignedJWT.parse(token);',
+            '            if (!verifier.verify(jwt)) {',
+            '                return unauthorized(exchange, "bad signature");',
+            '            }',
+            '            // 3. claim 추출',
+            '            String userId = jwt.getJWTClaimsSet().getSubject();',
+            '            List<String> roles =',
+            '                (List<String>) jwt.getJWTClaimsSet().getClaim("roles");',
+            '            String rolesStr = roles == null ? "" : String.join(",", roles);',
+            '',
+            '            // 4. 백엔드로 전달할 헤더 주입',
+            '            ServerHttpRequest mutated = exchange.getRequest().mutate()',
+            '                .header("X-User-Id", userId)',
+            '                .header("X-Roles", rolesStr)',
+            '                .build();',
+            '',
+            '            return chain.filter(exchange.mutate().request(mutated).build());',
+            '        } catch (Exception e) {',
+            '            return unauthorized(exchange, "invalid token");',
+            '        }',
+            '    }',
+            '',
+            '    private Mono<Void> unauthorized(ServerWebExchange exchange,',
+            '                                    String reason) {',
+            '        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);',
+            '        exchange.getResponse().getHeaders()',
+            '            .add("X-Auth-Failure", reason);',
+            '        return exchange.getResponse().setComplete();',
+            '    }',
+            '',
+            '    @Override',
+            '    public int getOrder() {',
+            '        // 라우팅 전, 다른 글로벌 필터 후',
+            '        return -50;',
+            '    }',
+            '}',
+          ],
+          highlight: [1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24, 25, 26, 27, 28, 29, 31, 33, 34, 35, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 56, 57, 58, 59, 60, 62, 63, 64, 65, 67, 68, 69, 70, 71, 73, 74, 75, 76, 77, 80, 81, 82, 83, 84, 85, 87, 88, 89, 90, 91, 92],
+        },
+      },
+      {
+        title: 'Step 3. RequestRateLimiter — Redis 기반 토큰 버킷',
+        desc: 'Gateway 의 RequestRateLimiter 필터 = Redis + Lua 로 토큰 버킷 알고리즘 구현. KeyResolver 로 "누구를 기준으로 제한" 결정 (IP, User, API Key). replenishRate / burstCapacity / requestedTokens 3 파라미터.',
+        authPos: 'gateway',
+        rateLimit: 10,
+        rejected: 28,
+        verdict: 'Rate Limit 활성',
+        verdictTone: 'good',
+        diagram: 'rate-limit',
+        keyPoint: 'Redis 가 분산 카운터. Gateway 여러 대여도 한 사용자 = 한 버킷 공유.',
+        code: {
+          lang: 'yaml',
+          filename: 'rate-limit.yml',
+          lines: [
+            '# Spring Cloud Gateway — Redis Rate Limiter',
+            '',
+            'spring:',
+            '  data:',
+            '    redis:',
+            '      host: redis-master',
+            '      port: 6379',
+            '  cloud:',
+            '    gateway:',
+            '      routes:',
+            '        - id: orders',
+            '          uri: http://order-service:8082',
+            '          predicates:',
+            '            - Path=/api/orders/**',
+            '          filters:',
+            '            - name: RequestRateLimiter',
+            '              args:',
+            '                # 초당 10개 충전, 최대 20개 버킷',
+            '                redis-rate-limiter.replenishRate: 10',
+            '                redis-rate-limiter.burstCapacity: 20',
+            '                redis-rate-limiter.requestedTokens: 1',
+            '                # KeyResolver 빈 이름',
+            '                key-resolver: "#{@userKeyResolver}"',
+            '            - StripPrefix=1',
+            '',
+            '        - id: search',
+            '          uri: http://search-service:8086',
+            '          predicates:',
+            '            - Path=/api/search/**',
+            '          filters:',
+            '            - name: RequestRateLimiter',
+            '              args:',
+            '                # 검색은 더 빡세게',
+            '                redis-rate-limiter.replenishRate: 5',
+            '                redis-rate-limiter.burstCapacity: 10',
+            '                key-resolver: "#{@ipKeyResolver}"',
+            '            - StripPrefix=1',
+            '',
+            '# 알고리즘: 토큰 버킷',
+            '# - replenishRate: 초당 N개 토큰 충전',
+            '# - burstCapacity: 버킷 최대 토큰 수 (순간 트래픽 허용)',
+            '# - requestedTokens: 요청 1건이 쓰는 토큰 (보통 1)',
+            '#',
+            '# 예: 10/20/1',
+            '#   평상시 초당 10 req 처리',
+            '#   유휴 시 20개 모임 → 순간 20 req burst 허용',
+            '#   그 이후엔 다시 초당 10개 제한',
+            '',
+            '# 응답',
+            '# 통과: 백엔드 호출',
+            '# 초과: HTTP 429 Too Many Requests',
+            '#        X-RateLimit-Remaining: 0',
+            '#        X-RateLimit-Burst-Capacity: 20',
+            '#        X-RateLimit-Replenish-Rate: 10',
+            '',
+            '# Redis key 형식',
+            '# request_rate_limiter.{user-42}.tokens',
+            '# request_rate_limiter.{user-42}.timestamp',
+            '# Lua script 로 GET + UPDATE 원자성 보장',
+          ],
+          highlight: [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 44, 45, 47, 48, 49, 50, 52, 53, 54, 55, 56, 57, 59, 60, 61, 62],
+        },
+      },
+      {
+        title: 'Step 4. KeyResolver — "누구를 기준으로" 제한할까',
+        desc: 'KeyResolver bean 이 한 요청의 "버킷 키" 를 결정. IP 기준이면 같은 IP 의 모든 사용자가 한 버킷. User 기준이면 사용자마다 별도. API Key 기준은 외부 API 용. 보통 User-Key 우선, 없으면 IP-Key fallback.',
+        authPos: 'gateway',
+        rateLimit: 10,
+        rejected: 35,
+        verdict: 'User 기반',
+        verdictTone: 'good',
+        diagram: 'key-resolver',
+        keyPoint: 'KeyResolver 가 "공정성" 을 결정. 한 IP 뒤 NAT 100명이면 IP 기준은 함께 막힘.',
+        code: {
+          lang: 'java',
+          filename: 'KeyResolverConfig.java',
+          lines: [
+            '// KeyResolver 빈 — 어떤 키로 rate limit 할지',
+            '',
+            'package com.example.gateway.ratelimit;',
+            '',
+            'import org.springframework.cloud.gateway.filter.ratelimit.KeyResolver;',
+            'import org.springframework.context.annotation.Bean;',
+            'import org.springframework.context.annotation.Configuration;',
+            'import reactor.core.publisher.Mono;',
+            '',
+            '@Configuration',
+            'public class KeyResolverConfig {',
+            '',
+            '    /**',
+            '     * 사용자 ID 기반 — Gateway JWT 필터가 주입한 X-User-Id 헤더 사용.',
+            '     * 로그인 안 한 요청은 "anonymous" 버킷 공유 (보호용).',
+            '     */',
+            '    @Bean',
+            '    public KeyResolver userKeyResolver() {',
+            '        return exchange -> {',
+            '            String userId = exchange.getRequest().getHeaders()',
+            '                .getFirst("X-User-Id");',
+            '            return Mono.just(userId != null ? userId : "anonymous");',
+            '        };',
+            '    }',
+            '',
+            '    /**',
+            '     * IP 기반 — public path, 비인증 API 용.',
+            '     */',
+            '    @Bean',
+            '    public KeyResolver ipKeyResolver() {',
+            '        return exchange -> {',
+            '            String ip = exchange.getRequest().getRemoteAddress() != null',
+            '                ? exchange.getRequest().getRemoteAddress()',
+            '                    .getAddress().getHostAddress()',
+            '                : "unknown";',
+            '            return Mono.just(ip);',
+            '        };',
+            '    }',
+            '',
+            '    /**',
+            '     * API Key 기반 — 외부 파트너 API 용.',
+            '     * 키마다 별도 SLA / quota 적용.',
+            '     */',
+            '    @Bean',
+            '    public KeyResolver apiKeyResolver() {',
+            '        return exchange -> {',
+            '            String key = exchange.getRequest().getHeaders()',
+            '                .getFirst("X-API-Key");',
+            '            return Mono.just(key != null ? key : "noapikey");',
+            '        };',
+            '    }',
+            '',
+            '    /**',
+            '     * User 우선, 없으면 IP fallback — 가장 흔한 패턴.',
+            '     */',
+            '    @Bean',
+            '    public KeyResolver userOrIpResolver() {',
+            '        return exchange -> {',
+            '            String userId = exchange.getRequest().getHeaders()',
+            '                .getFirst("X-User-Id");',
+            '            if (userId != null) {',
+            '                return Mono.just("u:" + userId);',
+            '            }',
+            '            String ip = exchange.getRequest().getRemoteAddress() != null',
+            '                ? exchange.getRequest().getRemoteAddress()',
+            '                    .getAddress().getHostAddress()',
+            '                : "unknown";',
+            '            return Mono.just("ip:" + ip);',
+            '        };',
+            '    }',
+            '}',
+            '',
+            '// 운영 노트',
+            '// - X-Forwarded-For 헤더 사용 시 Trusted Proxy 설정 필요',
+            '//   (안 그러면 클라이언트가 IP 위조 가능)',
+            '// - K8s 환경에서는 ingress 통과 후 진짜 IP 확인',
+            '// - User 기반 + IP fallback 조합이 실무 기본',
+            '// - tier 별 차등 (free / pro / enterprise) 가 필요하면',
+            '//   route 를 tier 마다 분리하거나 동적 KeyResolver 구현',
+          ],
+          highlight: [1, 3, 5, 6, 7, 8, 10, 11, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79, 80, 81, 82],
+        },
+      },
+      {
+        title: 'Step 5. 통합 — JWT + Rate Limit + 모니터링',
+        desc: '실전 Gateway 는 JWT (auth) → Rate Limit (보호) → Circuit Breaker (장애 격리) → Route (백엔드 전달) 순서로 흐른다. 429/401/503 응답을 Prometheus 메트릭으로 export 해서 Grafana 대시보드로 본다.',
+        authPos: 'gateway',
+        rateLimit: 10,
+        rejected: 42,
+        verdict: '완전체',
+        verdictTone: 'good',
+        diagram: 'pipeline',
+        summary: {
+          title: 'Gateway 보호 계층',
+          rows: [
+            { metric: '1. 인증', before: '서비스 산재', after: 'JWT 글로벌 필터' },
+            { metric: '2. 보호', before: '없음', after: 'Redis Rate Limit' },
+            { metric: '3. 격리', before: '연쇄 장애', after: 'Circuit Breaker' },
+            { metric: '4. 가시성', before: '서버 로그 grep', after: 'Prometheus 메트릭' },
+            { metric: '5. 키 관리', before: '8서비스 복붙', after: '한 곳' },
+            { metric: '권한 변경', before: '재배포 8회', after: 'Gateway 1회' },
+          ],
+        },
+        keyPoint: '인증·보호·격리·관측 4계층이 Gateway 의 진짜 가치. 라우팅은 기본 기능일 뿐.',
+        code: {
+          lang: 'yaml',
+          filename: 'gateway-full.yml',
+          lines: [
+            '# 완성형 Gateway 설정 — JWT + RateLimit + CB + 메트릭',
+            '',
+            'spring:',
+            '  cloud:',
+            '    gateway:',
+            '      default-filters:',
+            '        # 모든 응답에 X-Powered-By',
+            '        - AddResponseHeader=X-Powered-By, gateway',
+            '        # 백엔드에 트레이스 ID 전달',
+            '        - AddRequestHeader=X-Trace-Id, ${random.uuid}',
+            '',
+            '      routes:',
+            '        - id: orders-protected',
+            '          uri: lb://order-service     # Eureka 부하분산',
+            '          predicates:',
+            '            - Path=/api/orders/**',
+            '          filters:',
+            '            - StripPrefix=1',
+            '            # 1. Rate Limit',
+            '            - name: RequestRateLimiter',
+            '              args:',
+            '                redis-rate-limiter.replenishRate: 20',
+            '                redis-rate-limiter.burstCapacity: 40',
+            '                key-resolver: "#{@userOrIpResolver}"',
+            '            # 2. Circuit Breaker',
+            '            - name: CircuitBreaker',
+            '              args:',
+            '                name: ordersCb',
+            '                fallbackUri: forward:/fallback/orders',
+            '            # 3. Retry (idempotent only)',
+            '            - name: Retry',
+            '              args:',
+            '                retries: 3',
+            '                methods: GET',
+            '                backoff:',
+            '                  firstBackoff: 100ms',
+            '                  maxBackoff: 2s',
+            '                  factor: 2',
+            '',
+            '# 메트릭 + 관측',
+            'management:',
+            '  endpoints:',
+            '    web:',
+            '      exposure:',
+            '        include: health, info, gateway, prometheus, metrics',
+            '  endpoint:',
+            '    gateway:',
+            '      access: read-only',
+            '  metrics:',
+            '    tags:',
+            '      application: ${spring.application.name}',
+            '    distribution:',
+            '      percentiles-histogram:',
+            '        http.server.requests: true',
+            '',
+            '# Prometheus 가 수집할 메트릭',
+            '# spring_cloud_gateway_requests_seconds — route 별 latency',
+            '# spring_cloud_gateway_requests_seconds_count — RPS',
+            '# resilience4j_circuitbreaker_state — CB 상태 (CLOSED/OPEN)',
+            '# resilience4j_ratelimiter_calls — rate limit 통과/거부',
+            '#',
+            '# Grafana 대시보드',
+            '# 1. RPS / 에러율 / p95/p99 latency (route 별)',
+            '# 2. 4xx / 5xx 비율',
+            '# 3. CB OPEN 횟수 + 자동 HALF_OPEN 전환',
+            '# 4. Rate Limit 거부율 (사용자별 / IP별)',
+            '#',
+            '# 알림 (Alertmanager)',
+            '# - 5xx > 5% 5분 지속',
+            '# - p99 > 1000ms 5분 지속',
+            '# - CB OPEN 30초 지속',
+            '# - 한 사용자가 1시간 1만건 초과',
+          ],
+          highlight: [1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 27, 28, 29, 30, 32, 33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 58, 59, 60, 61, 62, 63, 65, 66, 67, 68, 70, 71, 72, 73, 74],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800', bar: 'bg-emerald-400' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800',     bar: 'bg-amber-400' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800',       bar: 'bg-rose-400' },
+    };
+
+    function MetricCard({ label, value, unit, max, current, tone }) {
+      const t = TONE[tone] || TONE.warn;
+      const pct = Math.min(100, (current / max) * 100);
+      return (
+        <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+          <div className="flex justify-between items-baseline mb-1">
+            <span className={`text-xs ${t.text}`}>{label}</span>
+            <span className={`text-sm font-mono font-bold ${t.text}`}>
+              {value}<span className="text-xs opacity-70">{unit}</span>
+            </span>
+          </div>
+          <div className="h-1.5 bg-white/60 rounded overflow-hidden">
+            <div className={`h-full ${t.bar}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+
+    function GwDiagram({ variant }) {
+      if (variant === 'auth-each') {
+        return (
+          <div className="mt-2 rounded bg-amber-50 border border-amber-200 p-2 text-[10px] font-mono text-amber-900">
+            user-svc JWT · order-svc JWT · catalog-svc JWT · payment-svc JWT<br/>
+            <span className="opacity-70">같은 로직 4번 복붙</span>
+          </div>
+        );
+      }
+      if (variant === 'auth-gw') {
+        return (
+          <div className="mt-2 rounded bg-lime-50 border border-lime-200 p-2 text-[10px] font-mono text-lime-900">
+            Gateway JWT 검증 → 백엔드 X-User-Id 신뢰<br/>
+            <span className="opacity-70">키 rotate 1곳</span>
+          </div>
+        );
+      }
+      if (variant === 'rate-limit') {
+        return (
+          <div className="mt-2 grid grid-cols-3 gap-1">
+            {['replenish:10/s', 'burst:20', 'reject:429'].map((s) => (
+              <div key={s} className="rounded bg-lime-100 border border-lime-300 text-[9px] text-center py-1 text-lime-900 font-mono">
+                {s}
+              </div>
+            ))}
+          </div>
+        );
+      }
+      if (variant === 'key-resolver') {
+        return (
+          <div className="mt-2 rounded bg-lime-50 border border-lime-200 p-2 text-[10px] font-mono text-lime-900">
+            user-id 우선 → IP fallback → anonymous<br/>
+            <span className="opacity-70">공정성 = KeyResolver 가 결정</span>
+          </div>
+        );
+      }
+      if (variant === 'pipeline') {
+        return (
+          <div className="mt-2 rounded bg-lime-50 border border-lime-200 p-2 text-[10px] font-mono text-lime-900">
+            JWT → RateLimit → CB → Retry → backend<br/>
+            <span className="opacity-70">+ Prometheus + Grafana</span>
+          </div>
+        );
+      }
+      return null;
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 p-3 bg-white" style={{borderColor: BRAND}}>
+          <div className="text-sm font-bold mb-2" style={{color: BRAND_DARK}}>📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left border-b" style={{color: BRAND_DARK, borderColor: '#bbf7d0'}}>
+                <th className="py-1 pr-2">측면</th><th className="py-1 pr-2">없음</th><th className="py-1">Gateway</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b" style={{borderColor: '#dcfce7'}}>
+                  <td className="py-1 pr-2 font-medium" style={{color: BRAND_DARK}}>{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-800 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 text-emerald-800 font-mono text-[10px]">{r.after}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border bg-white p-4 h-full flex flex-col" style={{borderColor: '#86efac'}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color: BRAND_DARK}}>보안 + 보호 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2">
+            <MetricCard label="인증 위치" value={state.authPos === 'gateway' ? 1 : 8} unit="곳" max={8} current={state.authPos === 'gateway' ? 1 : 8} tone={state.authPos === 'gateway' ? 'good' : 'warn'} />
+            <MetricCard label="Rate Limit (req/s)" value={state.rateLimit} unit="" max={50} current={state.rateLimit} tone="good" />
+            <MetricCard label="차단된 요청" value={state.rejected} unit="개/분" max={50} current={state.rejected} tone="warn" />
+          </div>
+
+          <GwDiagram variant={state.diagram} />
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-auto pt-3 text-xs rounded p-2" style={{backgroundColor: '#f7fee7', borderWidth: 1, borderColor: '#bef264', color: BRAND_DARK}}>
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border bg-[#282c34] h-full flex flex-col shadow-lg" style={{borderColor: BRAND_DARK}}>
+          <div className="flex items-center gap-2 px-3 py-2 border-b" style={{backgroundColor: BRAND_DARK, borderColor: BRAND_DARK}}>
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-lime-100 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-lime-200">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-lime-500/25 border-l-2 border-lime-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 border-t flex items-center justify-between text-[10px] text-lime-200" style={{backgroundColor: BRAND_DARK, borderColor: BRAND_DARK}}>
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background: 'linear-gradient(to bottom right, #f7fee7, #ecfccb)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap" style={{padding:'0.5rem'}}>
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{backgroundColor: BRAND}}>SC</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color: BRAND_DARK}}>Chapter III-1-2. Gateway 인증 + Rate Limit</h1>
+                <p className="text-sm" style={{color: BRAND_DARK, opacity: 0.8}}>JWT 글로벌 필터 · Redis Rate Limiter · KeyResolver</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color: BRAND_DARK}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{backgroundColor: i <= stepIdx ? BRAND : '#d9f99d'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-white px-5 py-4 shadow" style={{backgroundColor: BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed" style={{color: '#f7fee7'}}>{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50" style={{borderColor: '#86efac', color: BRAND_DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50 disabled:opacity-40" style={{borderColor: '#86efac', color: BRAND_DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{backgroundColor: playing ? BRAND_DARK : BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50 disabled:opacity-40" style={{borderColor: '#86efac', color: BRAND_DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color: BRAND_DARK}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm" style={{borderColor: BRAND, color: BRAND_DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                JWT 는 Gateway 글로벌 필터 한 곳. Redis Rate Limit = 분산 토큰 버킷. KeyResolver 가 공정성. CB + Retry + Prometheus 까지 합치면 완전체.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['JWT', 'JWKS', 'GlobalFilter', 'RequestRateLimiter', 'KeyResolver', 'Redis', 'Token Bucket'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border" style={{backgroundColor: '#ecfccb', color: BRAND_DARK, borderColor: '#bef264'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color: BRAND_DARK}}>
+              <a href="./III-1-1.html" className="underline hover:no-underline">← 이전: III-1-1 Gateway 기본</a>
+              <a href="./III-2-1.html" className="underline hover:no-underline">다음: III-2-1 Eureka →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spring Cloud — IV-1-4. Bulkhead</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌿</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Spring Cloud Chapter IV-1-4 — Bulkhead (스레드풀/동시성 격리)
+    학습 목표: SemaphoreBulkhead vs ThreadPoolBulkhead, 자원 격리로 장애 전파 차단.
+    패턴: fastapi v1 — 좌(LiveDataPane: 서비스별 격리 풀 시뮬레이션) / 우(CodeViewer)
+    색상: #4A8C2A (Spring Cloud green)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#4A8C2A';
+    const BRAND_DARK = '#2F5C19';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 격벽이 없으면 — 느린 서비스 하나가 전체를 마비시킨다',
+        desc: 'order-service 가 결제(payment)를 동기 호출하는데 payment 가 5초씩 느려졌다. 톰캣 워커 스레드(기본 200개)가 payment 응답을 기다리며 전부 점유된다. 그 결과 상품 조회·유저 조회처럼 멀쩡한 요청도 스레드가 없어 대기 → 전체 서비스 마비(장애 전파).',
+        pools: [
+          { svc: 'catalog', used: 10, cap: 10, mode: 'shared', rejected: 0, status: 'starved' },
+          { svc: 'user', used: 10, cap: 10, mode: 'shared', rejected: 0, status: 'starved' },
+          { svc: 'payment(느림)', used: 10, cap: 10, mode: 'shared', rejected: 0, status: 'blocked' },
+        ],
+        sharedPool: { used: 200, cap: 200 },
+        verdict: '전체 마비',
+        verdictTone: 'danger',
+        keyPoint: '자원을 공유하면 한 다운스트림 장애가 전체 스레드를 잠식한다. 배가 격벽 없이 침수되는 것과 같다.',
+        code: {
+          lang: 'java',
+          filename: 'OrderService.java',
+          lines: [
+            '// ❌ 격리 없음 — 톰캣 워커 스레드를 모두가 공유',
+            '',
+            'package com.example.order;',
+            '',
+            'import org.springframework.stereotype.Service;',
+            'import org.springframework.web.client.RestTemplate;',
+            '',
+            '@Service',
+            'public class OrderService {',
+            '',
+            '    private final RestTemplate rest = new RestTemplate();',
+            '',
+            '    // payment 가 5초씩 느려지면?',
+            '    // 이 메서드를 호출한 톰캣 워커 스레드가',
+            '    // 5초 동안 반환되지 못하고 묶인다.',
+            '    public String checkout(String orderId) {',
+            '        // 동기 블로킹 호출',
+            '        return rest.getForObject(',
+            '            "http://payment-service:8084/pay/" + orderId,',
+            '            String.class);',
+            '    }',
+            '}',
+            '',
+            '// 무슨 일이 벌어지나',
+            '// 1) payment 지연 5s × 초당 요청 40건',
+            '// 2) 200개 워커 스레드가 순식간에 payment 대기로 소진',
+            '// 3) catalog / user 요청도 처리할 스레드가 없음',
+            '// 4) 헬스체크 실패 → 인스턴스 전체가 죽은 것으로 판정',
+            '',
+            '// server.tomcat.threads.max = 200 (기본값)',
+            '// → 이 200개가 "공용 자원". 격벽이 없다.',
+            '// → 느린 한 곳이 전부를 굶긴다 (thread starvation)',
+          ],
+          highlight: [1, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28, 30, 31, 32],
+        },
+      },
+      {
+        title: 'Step 2. SemaphoreBulkhead — 동시 호출 수를 제한',
+        desc: '가장 가벼운 격리. 세마포어로 "이 서비스에 동시에 나갈 수 있는 호출 수(maxConcurrentCalls)"를 제한한다. 슬롯이 꽉 차면 새 요청은 대기하거나(maxWaitDuration) 즉시 거절된다. 호출 스레드를 그대로 쓰므로 오버헤드가 거의 없다. 단, 호출 자체가 블로킹이면 그 스레드는 여전히 묶인다.',
+        pools: [
+          { svc: 'catalog', used: 3, cap: 25, mode: 'sema', rejected: 0, status: 'ok' },
+          { svc: 'user', used: 4, cap: 25, mode: 'sema', rejected: 0, status: 'ok' },
+          { svc: 'payment(느림)', used: 10, cap: 10, mode: 'sema', rejected: 6, status: 'full' },
+        ],
+        verdict: '동시 10 제한',
+        verdictTone: 'good',
+        keyPoint: 'payment 세마포어가 10개로 상한. 11번째부터는 즉시 거절(BulkheadFullException) → 톰캣 스레드가 payment 에 10개 넘게 묶이지 않는다.',
+        code: {
+          lang: 'yaml',
+          filename: 'application.yml',
+          lines: [
+            '# SemaphoreBulkhead — 동시 호출 수 제한 (기본 타입)',
+            '',
+            'resilience4j:',
+            '  bulkhead:',
+            '    instances:',
+            '      paymentService:',
+            '        # 동시에 나갈 수 있는 호출 수',
+            '        maxConcurrentCalls: 10',
+            '        # 슬롯이 없을 때 최대 대기 시간',
+            '        # 0 이면 즉시 거절(BulkheadFullException)',
+            '        maxWaitDuration: 0ms',
+            '',
+            '      catalogService:',
+            '        maxConcurrentCalls: 25',
+            '        maxWaitDuration: 10ms',
+            '',
+            '      userService:',
+            '        maxConcurrentCalls: 25',
+            '        maxWaitDuration: 10ms',
+            '',
+            '# 핵심',
+            '# - 서비스마다 별도 세마포어(격벽)를 가진다',
+            '# - payment 가 꽉 차도 catalog / user 세마포어는 무관',
+            '# - 즉시 거절이므로 스레드가 무한정 쌓이지 않는다',
+            '# - 호출 스레드를 그대로 사용 → 오버헤드 최소',
+            '# - 단, 블로킹 I/O 면 그 스레드는 응답까지 묶임',
+            '#   (스레드 자체를 분리하려면 ThreadPoolBulkhead)',
+          ],
+          highlight: [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 17, 18, 21, 22, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 3. ThreadPoolBulkhead — 서비스별 별도 스레드풀',
+        desc: '더 강한 격리. 서비스마다 전용 스레드풀(maxThreadPoolSize)과 대기 큐(queueCapacity)를 둔다. 호출이 별도 풀의 스레드에서 실행되므로 톰캣 워커 스레드는 즉시 반환된다. 풀도 큐도 꽉 차면 거절. payment 풀이 포화되어도 톰캣 워커와 다른 서비스 풀은 완전히 무관 — 진짜 격벽.',
+        pools: [
+          { svc: 'catalog-pool', used: 2, cap: 10, mode: 'pool', queued: 0, qcap: 20, rejected: 0, status: 'ok' },
+          { svc: 'user-pool', used: 3, cap: 10, mode: 'pool', queued: 0, qcap: 20, rejected: 0, status: 'ok' },
+          { svc: 'payment-pool(느림)', used: 5, cap: 5, mode: 'pool', queued: 10, qcap: 10, rejected: 8, status: 'full' },
+        ],
+        verdict: '풀 완전 격리',
+        verdictTone: 'good',
+        keyPoint: 'payment 전용 풀(스레드5+큐10)이 꽉 차 8건 거절되어도, 톰캣 워커와 catalog/user 풀은 멀쩡. 호출은 풀 스레드에서 돌아 워커 스레드는 바로 해방된다.',
+        code: {
+          lang: 'yaml',
+          filename: 'application.yml',
+          lines: [
+            '# ThreadPoolBulkhead — 서비스별 전용 스레드풀 격리',
+            '',
+            'resilience4j:',
+            '  thread-pool-bulkhead:',
+            '    instances:',
+            '      paymentService:',
+            '        # 전용 풀의 최대 스레드 수',
+            '        maxThreadPoolSize: 5',
+            '        coreThreadPoolSize: 5',
+            '        # 스레드가 다 찼을 때 대기 큐 크기',
+            '        queueCapacity: 10',
+            '',
+            '      catalogService:',
+            '        maxThreadPoolSize: 10',
+            '        coreThreadPoolSize: 10',
+            '        queueCapacity: 20',
+            '',
+            '      userService:',
+            '        maxThreadPoolSize: 10',
+            '        coreThreadPoolSize: 10',
+            '        queueCapacity: 20',
+            '',
+            '# 거절 규칙',
+            '# - 풀 스레드(5) 모두 사용중 + 큐(10)도 가득 차면',
+            '#   → BulkheadFullException 즉시 발생',
+            '# - payment 최대 부담 = 5 실행 + 10 대기 = 15 로 고정',
+            '#   그 이상은 절대 payment 에 묶이지 않는다',
+            '',
+            '# Semaphore vs ThreadPool',
+            '# - Semaphore : 호출 스레드 그대로, 가벼움, 카운트만 제한',
+            '# - ThreadPool: 별도 스레드로 위임, 워커 스레드 즉시 반환',
+            '#               → 격리 강함, 비동기(CompletableFuture) 기반',
+          ],
+          highlight: [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 23, 24, 25, 26, 27, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 4. @Bulkhead + TimeLimiter + fallback — 실무 조합',
+        desc: '어노테이션으로 서비스 메서드에 격벽을 건다. ThreadPoolBulkhead 는 비동기라 반환 타입이 CompletableFuture. TimeLimiter 와 조합해 "느린 호출은 타임아웃으로 잘라내고", Bulkhead 로 "동시성을 가둔다". 풀이 꽉 차 BulkheadFullException 이 나면 fallback 메서드가 즉시 대체 응답을 준다 — 사용자는 전체 장애 대신 부분 저하만 겪는다.',
+        pools: [
+          { svc: 'catalog-pool', used: 2, cap: 10, mode: 'pool', queued: 0, qcap: 20, rejected: 0, status: 'ok' },
+          { svc: 'user-pool', used: 1, cap: 10, mode: 'pool', queued: 0, qcap: 20, rejected: 0, status: 'ok' },
+          { svc: 'payment-pool(느림)', used: 5, cap: 5, mode: 'pool', queued: 10, qcap: 10, rejected: 12, status: 'fallback' },
+        ],
+        verdict: 'fallback 대응',
+        verdictTone: 'good',
+        summary: {
+          title: 'Semaphore vs ThreadPool Bulkhead',
+          rows: [
+            { metric: '격리 단위', before: '동시 호출 수', after: '전용 스레드풀' },
+            { metric: '호출 스레드', before: '그대로 사용', after: '별도 풀로 위임' },
+            { metric: '워커 반환', before: '응답까지 묶임', after: '즉시 반환' },
+            { metric: '오버헤드', before: '거의 없음', after: '풀 컨텍스트 스위칭' },
+            { metric: '반환 타입', before: '동기 값', after: 'CompletableFuture' },
+            { metric: 'TimeLimiter', before: '조합 불필요', after: '조합 권장' },
+          ],
+        },
+        keyPoint: '느린 서비스는 타임아웃으로 자르고, 동시성은 풀로 가두고, 초과분은 fallback 으로 흘린다. 세 겹으로 장애가 톰캣 워커까지 올라오지 못한다.',
+        code: {
+          lang: 'java',
+          filename: 'PaymentClient.java',
+          lines: [
+            '// @Bulkhead(THREADPOOL) + @TimeLimiter + fallback',
+            '',
+            'package com.example.order;',
+            '',
+            'import io.github.resilience4j.bulkhead.annotation.Bulkhead;',
+            'import io.github.resilience4j.timelimiter.annotation.TimeLimiter;',
+            'import org.springframework.stereotype.Service;',
+            'import org.springframework.web.client.RestTemplate;',
+            '',
+            'import java.util.concurrent.CompletableFuture;',
+            '',
+            '@Service',
+            'public class PaymentClient {',
+            '',
+            '    private final RestTemplate rest = new RestTemplate();',
+            '',
+            '    // ThreadPoolBulkhead 는 비동기 → CompletableFuture 반환',
+            '    @Bulkhead(name = "paymentService",',
+            '              type = Bulkhead.Type.THREADPOOL,',
+            '              fallbackMethod = "payFallback")',
+            '    @TimeLimiter(name = "paymentService")',
+            '    public CompletableFuture<String> pay(String orderId) {',
+            '        // 이 코드는 payment 전용 풀 스레드에서 실행됨',
+            '        return CompletableFuture.supplyAsync(() ->',
+            '            rest.getForObject(',
+            '                "http://payment-service:8084/pay/" + orderId,',
+            '                String.class));',
+            '    }',
+            '',
+            '    // 풀 포화(BulkheadFullException) 또는 타임아웃 시 호출',
+            '    private CompletableFuture<String> payFallback(',
+            '            String orderId, Throwable t) {',
+            '        // 전체 장애 대신 부분 저하: 나중에 처리하도록 큐잉',
+            '        return CompletableFuture.completedFuture(',
+            '            "{\"status\":\"PENDING\",\"reason\":\"" +',
+            '            t.getClass().getSimpleName() + "\"}");',
+            '    }',
+            '}',
+            '',
+            '# application.yml (타임리미터 조합)',
+            '# resilience4j:',
+            '#   timelimiter:',
+            '#     instances:',
+            '#       paymentService:',
+            '#         timeoutDuration: 2s        # 2초 넘으면 잘라냄',
+            '#         cancelRunningFuture: true',
+            '',
+            '// 방어선 3겹',
+            '// 1) TimeLimiter  : 느린 호출을 2초에서 절단',
+            '// 2) Bulkhead     : 동시성 5 + 큐 10 으로 격리',
+            '// 3) fallback     : 초과분을 PENDING 응답으로 흘림',
+            '// → 톰캣 워커 스레드는 결코 payment 에 잠식되지 않는다',
+          ],
+          highlight: [1, 12, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35, 36, 48, 49, 50, 51, 52],
+        },
+      },
+      {
+        title: 'Step 5. 정리 — 서비스별 격벽으로 장애를 가둔다',
+        desc: 'Bulkhead 는 자원(스레드/동시성)을 서비스 단위로 나눠, 한 다운스트림의 장애가 격벽을 넘지 못하게 한다. 가벼운 격리는 Semaphore, 강한 격리는 ThreadPool. TimeLimiter·CircuitBreaker 와 함께 쓰면 느린 호출 절단 + 반복 실패 차단 + 자원 격리가 완성된다.',
+        pools: [
+          { svc: 'catalog-pool', used: 2, cap: 10, mode: 'pool', queued: 0, qcap: 20, rejected: 0, status: 'ok' },
+          { svc: 'user-pool', used: 2, cap: 10, mode: 'pool', queued: 0, qcap: 20, rejected: 0, status: 'ok' },
+          { svc: 'payment-pool', used: 3, cap: 5, mode: 'pool', queued: 0, qcap: 10, rejected: 0, status: 'ok' },
+        ],
+        verdict: '격리 완성',
+        verdictTone: 'good',
+        keyPoint: '격벽마다 상한을 두면 "최악의 경우 이 서비스가 먹을 수 있는 자원"이 계산 가능해진다. 예측 가능한 저하가 예측 불가능한 마비보다 낫다.',
+        code: {
+          lang: 'java',
+          filename: 'Summary.java',
+          lines: [
+            '// IV-1-4. Bulkhead — 핵심 요약',
+            '',
+            '// 1. 왜?',
+            '//    느린 다운스트림 1개가 톰캣 워커 200개를 다 먹으면',
+            '//    멀쩡한 요청까지 굶어 전체가 마비된다 (장애 전파).',
+            '',
+            '// 2. 배의 격벽처럼 자원을 칸막이',
+            '//    서비스마다 별도 슬롯/풀 → 침수가 한 칸에 갇힌다.',
+            '',
+            '// 3. 두 가지 타입',
+            '//    SemaphoreBulkhead',
+            '//      - maxConcurrentCalls 로 동시 호출 수 제한',
+            '//      - 호출 스레드 그대로, 가볍다',
+            '//    ThreadPoolBulkhead',
+            '//      - maxThreadPoolSize + queueCapacity',
+            '//      - 별도 풀로 위임, 워커 스레드 즉시 반환 (강한 격리)',
+            '',
+            '// 4. 한계 초과 = 즉시 거절',
+            '//    BulkheadFullException → fallback 으로 대체 응답',
+            '',
+            '// 5. 실무 조합',
+            '//    @Bulkhead(THREADPOOL) + @TimeLimiter + @CircuitBreaker',
+            '//    - TimeLimiter    : 느린 호출 절단',
+            '//    - Bulkhead       : 동시성 격리',
+            '//    - CircuitBreaker : 반복 실패 차단',
+            '//    - fallback       : 부분 저하 응답',
+            '',
+            '// 결론',
+            '//   격리는 "장애를 없애는 것"이 아니라',
+            '//   "장애를 한 칸에 가두는 것"이다.',
+            '//   예측 가능한 저하 > 예측 불가능한 전체 마비.',
+          ],
+          highlight: [1, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15, 16, 18, 19, 21, 22, 23, 24, 25, 26, 28, 29, 30, 31],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800', bar: 'bg-emerald-400' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800',     bar: 'bg-amber-400' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800',       bar: 'bg-rose-400' },
+    };
+
+    const STATUS_META = {
+      ok:       { label: '정상',     color: '#4A8C2A', slot: 'bg-lime-500',  empty: 'bg-lime-100' },
+      full:     { label: '풀 포화',  color: '#b45309', slot: 'bg-amber-500', empty: 'bg-amber-100' },
+      fallback: { label: 'fallback', color: '#b45309', slot: 'bg-amber-500', empty: 'bg-amber-100' },
+      blocked:  { label: '블로킹',   color: '#be123c', slot: 'bg-rose-500',  empty: 'bg-rose-100' },
+      starved:  { label: '스레드 굶음', color: '#be123c', slot: 'bg-rose-400', empty: 'bg-rose-100' },
+    };
+
+    function SlotRow({ count, cap, slotCls, emptyCls, maxShow }) {
+      const shown = Math.min(cap, maxShow);
+      const cells = [];
+      for (let i = 0; i < shown; i++) {
+        const filled = i < count;
+        cells.push(<span key={i} className={`inline-block w-2.5 h-3 rounded-sm ${filled ? slotCls : emptyCls}`} />);
+      }
+      return (
+        <div className="flex flex-wrap gap-0.5 items-center">
+          {cells}
+          {cap > maxShow && <span className="text-[9px] text-zinc-500 ml-1">…{cap}</span>}
+        </div>
+      );
+    }
+
+    function PoolCard({ pool }) {
+      const meta = STATUS_META[pool.status] || STATUS_META.ok;
+      const isolated = pool.mode !== 'shared';
+      return (
+        <div className="rounded-lg border bg-white px-2.5 py-2" style={{ borderColor: isolated ? '#bef264' : '#fca5a5' }}>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[11px] font-bold font-mono" style={{ color: BRAND_DARK }}>{pool.svc}</span>
+            <span className="text-[9px] px-1.5 py-0.5 rounded font-bold text-white" style={{ backgroundColor: meta.color }}>{meta.label}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[9px] text-zinc-500 w-10">실행 {pool.used}/{pool.cap}</span>
+            <SlotRow count={pool.used} cap={pool.cap} slotCls={meta.slot} emptyCls={meta.empty} maxShow={12} />
+          </div>
+          {pool.mode === 'pool' && pool.qcap > 0 && (
+            <div className="flex items-center gap-2 mt-1">
+              <span className="text-[9px] text-zinc-500 w-10">큐 {pool.queued}/{pool.qcap}</span>
+              <SlotRow count={pool.queued} cap={pool.qcap} slotCls="bg-sky-400" emptyCls="bg-sky-100" maxShow={12} />
+            </div>
+          )}
+          {pool.rejected > 0 && (
+            <div className="text-[9px] text-rose-700 font-mono mt-1">✕ 거절 {pool.rejected}건 → fallback</div>
+          )}
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 p-3 bg-white" style={{borderColor: BRAND}}>
+          <div className="text-sm font-bold mb-2" style={{color: BRAND_DARK}}>📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left border-b" style={{color: BRAND_DARK, borderColor: '#bbf7d0'}}>
+                <th className="py-1 pr-2">항목</th><th className="py-1 pr-2">Semaphore</th><th className="py-1">ThreadPool</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b" style={{borderColor: '#dcfce7'}}>
+                  <td className="py-1 pr-2 font-medium" style={{color: BRAND_DARK}}>{r.metric}</td>
+                  <td className="py-1 pr-2 text-zinc-700 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 text-emerald-800 font-mono text-[10px]">{r.after}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      return (
+        <div className="rounded-xl border bg-white p-4 h-full flex flex-col" style={{borderColor: '#86efac'}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color: BRAND_DARK}}>Bulkhead 자원 격리 시뮬레이션</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {state.sharedPool && (
+            <div className="mb-2 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-2">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[11px] font-bold text-rose-800">공용 톰캣 워커 풀 (격벽 없음)</span>
+                <span className="text-[10px] font-mono text-rose-800">{state.sharedPool.used}/{state.sharedPool.cap}</span>
+              </div>
+              <div className="h-2 bg-white/70 rounded overflow-hidden">
+                <div className="h-full bg-rose-500" style={{ width: `${(state.sharedPool.used / state.sharedPool.cap) * 100}%` }} />
+              </div>
+              <div className="text-[9px] text-rose-700 mt-1">payment 대기가 워커 200개를 전부 점유 → catalog·user 도 굶음</div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 gap-2">
+            {state.pools.map((p) => <PoolCard key={p.svc} pool={p} />)}
+          </div>
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-auto pt-3 text-xs rounded p-2" style={{backgroundColor: '#f7fee7', borderWidth: 1, borderColor: '#bef264', color: BRAND_DARK}}>
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border bg-[#282c34] h-full flex flex-col shadow-lg" style={{borderColor: BRAND_DARK}}>
+          <div className="flex items-center gap-2 px-3 py-2 border-b" style={{backgroundColor: BRAND_DARK, borderColor: BRAND_DARK}}>
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-lime-100 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-lime-200">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-lime-500/25 border-l-2 border-lime-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 border-t flex items-center justify-between text-[10px] text-lime-200" style={{backgroundColor: BRAND_DARK, borderColor: BRAND_DARK}}>
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background: 'linear-gradient(to bottom right, #f7fee7, #ecfccb)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap" style={{padding:'0.5rem'}}>
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{backgroundColor: BRAND}}>SC</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color: BRAND_DARK}}>Chapter IV-1-4. Bulkhead</h1>
+                <p className="text-sm" style={{color: BRAND_DARK, opacity: 0.8}}>스레드풀/동시성 격리 · SemaphoreBulkhead · ThreadPoolBulkhead</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color: BRAND_DARK}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{backgroundColor: i <= stepIdx ? BRAND : '#d9f99d'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-white px-5 py-4 shadow" style={{backgroundColor: BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed" style={{color: '#f7fee7'}}>{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50" style={{borderColor: '#86efac', color: BRAND_DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50 disabled:opacity-40" style={{borderColor: '#86efac', color: BRAND_DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{backgroundColor: playing ? BRAND_DARK : BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50 disabled:opacity-40" style={{borderColor: '#86efac', color: BRAND_DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color: BRAND_DARK}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm" style={{borderColor: BRAND, color: BRAND_DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Bulkhead 는 자원을 서비스별로 칸막이해 장애 전파를 막는다. 가벼운 격리는 Semaphore(maxConcurrentCalls), 강한 격리는 ThreadPool(maxThreadPoolSize + queueCapacity). 한계 초과 시 BulkheadFullException → fallback. TimeLimiter·CircuitBreaker 와 조합하면 느린 호출 절단 + 반복 실패 차단 + 자원 격리가 완성된다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Bulkhead', 'SemaphoreBulkhead', 'ThreadPoolBulkhead', 'maxConcurrentCalls', 'queueCapacity', 'BulkheadFullException', 'TimeLimiter', 'Resilience4j'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border" style={{backgroundColor: '#ecfccb', color: BRAND_DARK, borderColor: '#bef264'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color: BRAND_DARK}}>
+              <a href="./IV-1-3.html" className="underline hover:no-underline">← 이전: IV-1-3</a>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <a href="../part5/V-1-1.html" className="underline hover:no-underline">다음: V-1-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

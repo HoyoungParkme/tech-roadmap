@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spring Cloud — IV-1-2. CircuitBreaker 상태 전이</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌿</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Spring Cloud Chapter IV-1-2 — CircuitBreaker 상태 전이
+    학습 목표: Resilience4j CircuitBreaker 의 Closed / Open / Half-Open 상태 머신.
+    패턴: fastapi v1 — 좌(LiveDataPane: 상태 머신 시뮬레이션) / 우(CodeViewer)
+    색상: #4A8C2A (Spring Cloud green)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#4A8C2A';
+    const BRAND_DARK = '#2F5C19';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 왜 CircuitBreaker 인가 — 폭포 장애(cascading failure)',
+        desc: '주문 서비스가 결제 서비스를 호출한다. 결제가 느려지거나 죽으면? 주문의 스레드가 타임아웃까지 대기하며 쌓인다. 스레드 풀 고갈 → 주문도 죽음 → 그 위 Gateway 도 죽음. 하나의 다운스트림 장애가 전체로 번지는 폭포 장애. 서킷브레이커는 빠르게 실패(fail fast)시켜 자원을 지킨다.',
+        stateName: 'CLOSED',
+        failRate: 5,
+        threshold: 50,
+        blocked: false,
+        verdict: '정상',
+        verdictTone: 'good',
+        keyPoint: '느린 다운스트림을 계속 기다리면 내 스레드부터 죽는다. 빠른 실패가 곧 자기 방어.',
+        code: {
+          lang: 'yaml',
+          filename: 'the-problem.yaml',
+          lines: [
+            '# ❌ CircuitBreaker 없음 — 폭포 장애 시나리오',
+            '',
+            '# 정상 흐름',
+            '#   Gateway → order-service → payment-service (50ms)',
+            '',
+            '# payment-service 장애 발생 (응답 30초 후 timeout)',
+            'order-service:',
+            '  threadpool:',
+            '    max: 200          # 톰캣 워커 스레드',
+            '  call: payment-service',
+            '  timeout: 30s        # 실패해도 30초 대기',
+            '',
+            '# 무슨 일이 벌어지나',
+            '# 1) payment 가 느려짐 → order 스레드가 30초씩 점유',
+            '# 2) 초당 100 요청 × 30초 = 3000 대기 스레드 필요',
+            '# 3) 스레드 풀 200개 → 즉시 고갈',
+            '# 4) order-service 가 새 요청을 못 받음 → 사실상 다운',
+            '# 5) Gateway 도 order 를 기다리다 스레드 고갈',
+            '# 6) payment 하나의 장애가 전체 시스템으로 번짐',
+            '',
+            '# → 다운스트림 장애를 "빠르게 실패" 로 격리해야 한다',
+            '# → 이것이 CircuitBreaker (회로 차단기)',
+          ],
+          highlight: [1, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 21, 22],
+        },
+      },
+      {
+        title: 'Step 2. CLOSED — 정상, 실패율을 집계한다',
+        desc: '초기 상태는 CLOSED(닫힘=전류가 흐름=요청 통과). 모든 요청을 다운스트림으로 보내면서, sliding window 에 성공/실패를 기록한다. failureRateThreshold(예: 50%)를 넘기 전까지는 계속 통과. window 가 count-based(최근 N건) 또는 time-based(최근 N초)로 실패율을 계산한다.',
+        stateName: 'CLOSED',
+        failRate: 22,
+        threshold: 50,
+        blocked: false,
+        verdict: '집계 중',
+        verdictTone: 'good',
+        keyPoint: 'CLOSED = 요청 통과 + 실패율 집계. 임계치 넘기 전까지는 평소처럼 다 보낸다.',
+        code: {
+          lang: 'yaml',
+          filename: 'application.yml',
+          lines: [
+            '# Resilience4j CircuitBreaker 설정 (application.yml)',
+            '',
+            'resilience4j:',
+            '  circuitbreaker:',
+            '    instances:',
+            '      paymentService:',
+            '        # 슬라이딩 윈도우 방식',
+            '        sliding-window-type: COUNT_BASED   # 또는 TIME_BASED',
+            '        sliding-window-size: 20            # 최근 20건으로 집계',
+            '        minimum-number-of-calls: 10        # 10건 모여야 판정 시작',
+            '',
+            '        # 실패율 임계치',
+            '        failure-rate-threshold: 50         # 50% 넘으면 OPEN',
+            '',
+            '        # 느린 호출도 실패로 취급',
+            '        slow-call-duration-threshold: 2s   # 2초 넘으면 slow',
+            '        slow-call-rate-threshold: 80       # slow 80% 넘어도 OPEN',
+            '',
+            '        # OPEN 유지 시간 / Half-Open 시험 횟수',
+            '        wait-duration-in-open-state: 10s',
+            '        permitted-number-of-calls-in-half-open-state: 3',
+            '',
+            '# 판정 로직 (CLOSED 상태)',
+            '# - 매 호출 결과를 최근 20건 윈도우에 기록',
+            '# - 최소 10건이 모이기 전에는 절대 OPEN 안 됨',
+            '# - 실패율 >= 50% 또는 slow율 >= 80% → OPEN 전이',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 13, 16, 17, 20, 21, 24, 25, 26, 27],
+        },
+      },
+      {
+        title: 'Step 3. OPEN — 임계치 초과, 즉시 차단하고 fallback',
+        desc: '실패율이 threshold 를 넘는 순간 OPEN(열림=전류 끊김=요청 차단)으로 전이. 이제 다운스트림을 아예 호출하지 않는다. 모든 요청은 즉시 CallNotPermittedException 으로 떨어지고 fallback 메서드가 대신 응답한다. 다운스트림에 부하를 주지 않고, 내 스레드도 대기 없이 즉시 반환 → 자원 보호.',
+        stateName: 'OPEN',
+        failRate: 68,
+        threshold: 50,
+        blocked: true,
+        verdict: '차단',
+        verdictTone: 'danger',
+        keyPoint: 'OPEN = 다운스트림 호출 0 + 즉시 fallback. 기다리지 않으니 스레드가 살아남는다.',
+        code: {
+          lang: 'java',
+          filename: 'PaymentClient.java',
+          lines: [
+            '// @CircuitBreaker + fallbackMethod — OPEN 시 즉시 대체 응답',
+            '',
+            'package com.example.order;',
+            '',
+            'import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;',
+            'import org.springframework.stereotype.Service;',
+            'import org.springframework.web.client.RestClient;',
+            '',
+            '@Service',
+            'public class PaymentClient {',
+            '',
+            '    private final RestClient restClient;',
+            '',
+            '    public PaymentClient(RestClient restClient) {',
+            '        this.restClient = restClient;',
+            '    }',
+            '',
+            '    // name 은 application.yml 의 instance 이름과 일치',
+            '    @CircuitBreaker(name = "paymentService",',
+            '                    fallbackMethod = "payFallback")',
+            '    public PayResult pay(PayRequest req) {',
+            '        // OPEN 상태면 이 본문은 아예 실행되지 않는다',
+            '        return restClient.post()',
+            '            .uri("http://payment-service/pay")',
+            '            .body(req)',
+            '            .retrieve()',
+            '            .body(PayResult.class);',
+            '    }',
+            '',
+            '    // fallback 은 원본과 시그니처 동일 + 마지막에 예외 파라미터',
+            '    private PayResult payFallback(PayRequest req, Throwable t) {',
+            '        // CallNotPermittedException(OPEN) 또는 실제 호출 실패 시',
+            '        // 결제를 \'보류\' 상태로 큐에 넣고 즉시 응답',
+            '        return PayResult.pending(req.orderId());',
+            '    }',
+            '}',
+            '',
+            '// 동작 정리',
+            '// - CLOSED: pay() 본문 실행, 실패하면 payFallback 호출',
+            '// - OPEN  : pay() 본문 건너뜀 → 곧장 payFallback (fail fast)',
+            '// - fallback 은 캐시/기본값/보류처리 등 \'그럴듯한 대안\' 을 반환',
+          ],
+          highlight: [1, 18, 19, 20, 21, 30, 31, 32, 33, 34, 35, 39, 40, 41, 42],
+        },
+      },
+      {
+        title: 'Step 4. HALF-OPEN — 시험 호출로 회복을 타진',
+        desc: 'OPEN 상태로 waitDurationInOpenState(예: 10초)가 지나면 자동으로 HALF-OPEN 으로 전이. 이제 permittedNumberOfCallsInHalfOpenState(예: 3건)만 시험 삼아 통과시킨다. 이 시험 호출들의 성공률로 판정: 성공하면 다운스트림이 회복된 것 → CLOSED 복귀. 여전히 실패하면 → 다시 OPEN 으로 돌아가 또 대기.',
+        stateName: 'HALF_OPEN',
+        failRate: 33,
+        threshold: 50,
+        blocked: false,
+        verdict: '시험 호출',
+        verdictTone: 'warn',
+        keyPoint: 'HALF-OPEN = 소수의 시험 호출로 회복 여부만 확인. 성공→CLOSED, 실패→OPEN.',
+        code: {
+          lang: 'java',
+          filename: 'CircuitStateListener.java',
+          lines: [
+            '// 상태 전이 관측 + actuator 노출',
+            '',
+            'package com.example.order;',
+            '',
+            'import io.github.resilience4j.circuitbreaker.CircuitBreaker;',
+            'import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;',
+            'import jakarta.annotation.PostConstruct;',
+            'import org.slf4j.Logger;',
+            'import org.slf4j.LoggerFactory;',
+            'import org.springframework.stereotype.Component;',
+            '',
+            '@Component',
+            'public class CircuitStateListener {',
+            '',
+            '    private static final Logger log =',
+            '        LoggerFactory.getLogger(CircuitStateListener.class);',
+            '',
+            '    private final CircuitBreakerRegistry registry;',
+            '',
+            '    public CircuitStateListener(CircuitBreakerRegistry registry) {',
+            '        this.registry = registry;',
+            '    }',
+            '',
+            '    @PostConstruct',
+            '    public void register() {',
+            '        CircuitBreaker cb = registry.circuitBreaker("paymentService");',
+            '        cb.getEventPublisher()',
+            '            // CLOSED → OPEN → HALF_OPEN → CLOSED 전이 로깅',
+            '            .onStateTransition(e -> log.warn("[CB] {} : {} -> {}",',
+            '                e.getCircuitBreakerName(),',
+            '                e.getStateTransition().getFromState(),',
+            '                e.getStateTransition().getToState()));',
+            '    }',
+            '}',
+            '',
+            '# application.yml — actuator 로 상태 관측',
+            '# management:',
+            '#   endpoints.web.exposure.include: health,circuitbreakers',
+            '#   endpoint.health.show-details: always',
+            '#   health.circuitbreakers.enabled: true',
+            '#',
+            '# GET /actuator/circuitbreakers 로 현재 state,',
+            '# failureRate, bufferedCalls, notPermittedCalls 확인',
+          ],
+          highlight: [1, 24, 25, 26, 27, 28, 29, 30, 31, 35, 36, 37, 38, 39, 41, 42],
+        },
+      },
+      {
+        title: 'Step 5. 전이 한눈에 — 상태 머신과 실무 설정',
+        desc: 'CLOSED(집계) → 실패율 초과 → OPEN(차단·fallback) → wait 경과 → HALF-OPEN(시험) → 성공이면 CLOSED, 실패면 OPEN. 이 순환이 다운스트림 장애를 자동으로 격리하고 자동으로 회복 판정한다. 실무에서는 Gateway 의 CircuitBreaker 필터 또는 서비스의 @CircuitBreaker 로 적용하고 actuator 로 모니터링한다.',
+        stateName: 'CLOSED',
+        failRate: 8,
+        threshold: 50,
+        blocked: false,
+        verdict: '회복 완료',
+        verdictTone: 'good',
+        summary: {
+          title: 'CircuitBreaker 없음 vs 있음',
+          rows: [
+            { metric: '다운스트림 장애 시', before: '30초 대기', after: '즉시 fallback' },
+            { metric: '스레드 풀', before: '고갈 → 다운', after: '보호됨' },
+            { metric: '장애 전파', before: '폭포 장애', after: '장애 격리' },
+            { metric: '회복', before: '수동 재시작', after: 'Half-Open 자동' },
+            { metric: '사용자 경험', before: '전체 타임아웃', after: '대체 응답' },
+            { metric: '관측', before: '로그 뒤짐', after: 'actuator 실시간' },
+          ],
+        },
+        keyPoint: 'Closed↔Open↔Half-Open 순환이 장애 격리와 자동 회복을 동시에 해결한다.',
+        code: {
+          lang: 'yaml',
+          filename: 'gateway-circuitbreaker.yml',
+          lines: [
+            '# 실무 1 — Spring Cloud Gateway 의 CircuitBreaker 필터',
+            'spring:',
+            '  cloud:',
+            '    gateway:',
+            '      routes:',
+            '        - id: payment-route',
+            '          uri: http://payment-service',
+            '          predicates:',
+            '            - Path=/api/payments/**',
+            '          filters:',
+            '            - name: CircuitBreaker',
+            '              args:',
+            '                name: paymentCb',
+            '                fallbackUri: forward:/fallback/payment',
+            '',
+            '# 실무 2 — 상태 전이 파라미터 (프로덕션 권장 시작값)',
+            'resilience4j:',
+            '  circuitbreaker:',
+            '    instances:',
+            '      paymentCb:',
+            '        sliding-window-size: 20',
+            '        minimum-number-of-calls: 10',
+            '        failure-rate-threshold: 50',
+            '        slow-call-rate-threshold: 80',
+            '        slow-call-duration-threshold: 2s',
+            '        wait-duration-in-open-state: 10s',
+            '        permitted-number-of-calls-in-half-open-state: 3',
+            '        # 예외를 실패로 셀지 여부도 지정 가능',
+            '        record-exceptions:',
+            '          - java.io.IOException',
+            '          - java.util.concurrent.TimeoutException',
+            '',
+            '# 상태 머신 요약',
+            '# CLOSED     : 통과 + 집계 (fail% >= 50 → OPEN)',
+            '# OPEN       : 차단 + fallback (wait 10s → HALF_OPEN)',
+            '# HALF_OPEN  : 시험 3건 (성공 → CLOSED / 실패 → OPEN)',
+          ],
+          highlight: [1, 10, 11, 12, 13, 14, 16, 22, 23, 25, 26, 33, 34, 35, 36],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800', bar: 'bg-emerald-400' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800',     bar: 'bg-amber-400' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800',       bar: 'bg-rose-400' },
+    };
+
+    function MetricCard({ label, value, unit, max, current, tone }) {
+      const t = TONE[tone] || TONE.warn;
+      const pct = Math.min(100, (current / max) * 100);
+      return (
+        <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+          <div className="flex justify-between items-baseline mb-1">
+            <span className={`text-xs ${t.text}`}>{label}</span>
+            <span className={`text-sm font-mono font-bold ${t.text}`}>
+              {value}<span className="text-xs opacity-70">{unit}</span>
+            </span>
+          </div>
+          <div className="h-1.5 bg-white/60 rounded overflow-hidden">
+            <div className={`h-full ${t.bar}`} style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      );
+    }
+
+    // 상태 머신 다이어그램 — 현재 활성 상태를 강조
+    function StateMachine({ active, blocked }) {
+      const nodes = [
+        { key: 'CLOSED',    label: 'CLOSED',    sub: '통과·집계',    tone: 'good' },
+        { key: 'OPEN',      label: 'OPEN',      sub: '차단·fallback', tone: 'danger' },
+        { key: 'HALF_OPEN', label: 'HALF-OPEN', sub: '시험 호출',    tone: 'warn' },
+      ];
+      const box = (n) => {
+        const t = TONE[n.tone];
+        const on = active === n.key;
+        return (
+          <div key={n.key}
+            className={`flex-1 rounded-lg border-2 px-2 py-2 text-center transition ${on ? t.bg + ' ' + t.border : 'bg-white border-zinc-200'}`}
+            style={on ? { boxShadow: '0 0 0 3px rgba(74,140,42,0.25)' } : {}}>
+            <div className={`text-xs font-bold ${on ? t.text : 'text-zinc-400'}`}>{n.label}</div>
+            <div className={`text-[9px] ${on ? t.text : 'text-zinc-300'}`}>{n.sub}</div>
+            {on && <div className="text-[9px] mt-0.5 font-bold" style={{ color: BRAND_DARK }}>● 현재</div>}
+          </div>
+        );
+      };
+      return (
+        <div className="mt-2">
+          <div className="flex items-stretch gap-1">
+            {box(nodes[0])}
+            <div className="flex items-center text-[9px] font-mono text-zinc-400">&rarr;</div>
+            {box(nodes[1])}
+            <div className="flex items-center text-[9px] font-mono text-zinc-400">&rarr;</div>
+            {box(nodes[2])}
+          </div>
+          <div className="mt-1 text-[9px] font-mono text-center" style={{ color: BRAND_DARK }}>
+            실패율 초과 &rarr; OPEN · wait 경과 &rarr; HALF-OPEN · 성공 &rarr; CLOSED
+          </div>
+          <div className={`mt-2 rounded p-2 text-[10px] font-mono text-center ${blocked ? 'bg-rose-50 border border-rose-200 text-rose-900' : 'bg-lime-50 border border-lime-200 text-lime-900'}`}>
+            {blocked
+              ? '요청 &rarr; ✂ 즉시 차단 &rarr; fallback 응답 (다운스트림 호출 0)'
+              : '요청 &rarr; 다운스트림 호출 &rarr; 결과를 윈도우에 집계'}
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 p-3 bg-white" style={{borderColor: BRAND}}>
+          <div className="text-sm font-bold mb-2" style={{color: BRAND_DARK}}>📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left border-b" style={{color: BRAND_DARK, borderColor: '#bbf7d0'}}>
+                <th className="py-1 pr-2">항목</th><th className="py-1 pr-2">없음</th><th className="py-1">있음</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b" style={{borderColor: '#dcfce7'}}>
+                  <td className="py-1 pr-2 font-medium" style={{color: BRAND_DARK}}>{r.metric}</td>
+                  <td className="py-1 pr-2 text-rose-800 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 text-emerald-800 font-mono text-[10px]">{r.after}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const rateTone = state.failRate >= state.threshold ? 'danger' : (state.failRate >= state.threshold * 0.6 ? 'warn' : 'good');
+      return (
+        <div className="rounded-xl border bg-white p-4 h-full flex flex-col" style={{borderColor: '#86efac'}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color: BRAND_DARK}}>CircuitBreaker 상태 머신</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2">
+            <MetricCard label="현재 실패율" value={state.failRate} unit="%" max={100} current={state.failRate} tone={rateTone} />
+            <MetricCard label="임계치 (threshold)" value={state.threshold} unit="%" max={100} current={state.threshold} tone="warn" />
+          </div>
+
+          <StateMachine active={state.stateName} blocked={state.blocked} />
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-auto pt-3 text-xs rounded p-2" style={{backgroundColor: '#f7fee7', borderWidth: 1, borderColor: '#bef264', color: BRAND_DARK}}>
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border bg-[#282c34] h-full flex flex-col shadow-lg" style={{borderColor: BRAND_DARK}}>
+          <div className="flex items-center gap-2 px-3 py-2 border-b" style={{backgroundColor: BRAND_DARK, borderColor: BRAND_DARK}}>
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-lime-100 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-lime-200">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-zinc-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-lime-500/25 border-l-2 border-lime-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-zinc-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 border-t flex items-center justify-between text-[10px] text-lime-200" style={{backgroundColor: BRAND_DARK, borderColor: BRAND_DARK}}>
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background: 'linear-gradient(to bottom right, #f7fee7, #ecfccb)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap" style={{padding:'0.5rem'}}>
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{backgroundColor: BRAND}}>SC</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color: BRAND_DARK}}>Chapter IV-1-2. CircuitBreaker 상태 전이</h1>
+                <p className="text-sm" style={{color: BRAND_DARK, opacity: 0.8}}>Resilience4j · Closed / Open / Half-Open · fallback</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color: BRAND_DARK}}>← 목차</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{backgroundColor: i <= stepIdx ? BRAND : '#d9f99d'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-white px-5 py-4 shadow" style={{backgroundColor: BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed" style={{color: '#f7fee7'}}>{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50" style={{borderColor: '#86efac', color: BRAND_DARK}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50 disabled:opacity-40" style={{borderColor: '#86efac', color: BRAND_DARK}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{backgroundColor: playing ? BRAND_DARK : BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border bg-white hover:bg-lime-50 disabled:opacity-40" style={{borderColor: '#86efac', color: BRAND_DARK}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color: BRAND_DARK}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm" style={{borderColor: BRAND, color: BRAND_DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                CircuitBreaker 는 폭포 장애를 막는 회로 차단기. CLOSED(통과·집계) → 실패율 초과 → OPEN(차단·fallback) → wait → HALF-OPEN(시험) → 성공이면 CLOSED, 실패면 OPEN. failureRateThreshold·slidingWindowSize·waitDurationInOpenState 로 튜닝하고, fallbackMethod 로 대체 응답, actuator 로 상태를 관측한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Resilience4j', 'CircuitBreaker', 'Closed/Open/Half-Open', 'failureRateThreshold', 'slidingWindow', 'fallbackMethod', 'actuator', 'fail fast'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border" style={{backgroundColor: '#ecfccb', color: BRAND_DARK, borderColor: '#bef264'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color: BRAND_DARK}}>
+              <a href="./IV-1-1.html" className="underline hover:no-underline">← 이전: IV-1-1</a>
+              <a href="./IV-1-3.html" className="underline hover:no-underline">다음: IV-1-3 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
