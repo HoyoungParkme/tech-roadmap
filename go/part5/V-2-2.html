@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Go 학습 — V-2-2. 통합 테스트 — testcontainers</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐹</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Go V-2-2 — 통합 테스트 : testcontainers
+    mock 단위테스트의 한계 → 진짜 DB/큐를 컨테이너로 띄우는 통합테스트.
+    생명주기: 기동 → 연결 → 마이그레이션 → 테스트 → teardown. 병렬/CI/함정.
+    5단계 · Go 마지막 장 (Go 완주).
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#00ADD8';
+
+    const STEPS = [
+      {
+        title: 'Step 1. 단위 테스트의 한계 — mock 은 진짜 DB 가 아니다',
+        desc: 'Repository 를 mock 으로 대체하면 테스트는 빠르지만, 실제 DB 가 하는 일을 흉내만 낸다. UNIQUE 제약, 트랜잭션 롤백, JSON 컬럼, 타임존, SQL 문법 오류는 mock 이 절대 못 잡는다. "테스트는 다 초록불인데 배포하니 터졌다" 의 단골 원인이다. 그래서 핵심 경로만이라도 진짜 Postgres 를 상대로 검증해야 신뢰가 생긴다.',
+        stage: 'contrast',
+        rows: [
+          { name: 'mock 단위테스트', detail: 'DB 인터페이스를 가짜 구현으로 치환', trust: 30, note: 'SQL·제약·트랜잭션 검증 불가', color: '#fee2e2' },
+          { name: '통합테스트', detail: '진짜 Postgres 컨테이너 상대로 실행', trust: 95, note: '실제 쿼리·제약·마이그레이션 검증', color: '#dbf3e6' },
+        ],
+        alert: { tone: 'warn', text: 'mock 은 "내가 상상한 DB" 를 테스트한다. 통합테스트는 "실제로 돌 DB" 를 테스트한다.' },
+        code: {
+          lang: 'go',
+          filename: 'why_integration_test.go',
+          lines: [
+            '// mock 은 이런 버그를 못 잡는다',
+            'type mockRepo struct{ users map[int]User }',
+            '',
+            'func (m *mockRepo) Save(u User) error {',
+            '    m.users[u.ID] = u   // 그냥 map 에 저장',
+            '    return nil          // => UNIQUE 위반? 모름',
+            '}',
+            '',
+            '// 실제 DB 라면 이런 게 걸린다:',
+            '//  - email UNIQUE 제약 위반',
+            '//  - NOT NULL 컬럼 누락',
+            '//  - 트랜잭션 롤백 동작',
+            '//  - "SELCT" 같은 SQL 오타',
+            '//  - 타임존 / JSONB 직렬화',
+            '',
+            '// => 핵심 경로는 진짜 DB 로 검증해야 안심',
+          ],
+          highlight: [3, 4, 5, 6, 8, 9, 10, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 2. testcontainers-go — 코드로 진짜 컨테이너를 띄운다',
+        desc: 'testcontainers-go 는 테스트가 시작될 때 실제 Postgres 컨테이너를 코드로 띄우고, 끝나면 자동으로 정리한다. 개발자마다 로컬 DB 를 세팅할 필요도, 다른 테스트와 데이터가 섞일 걱정도 없다. 컨테이너는 매번 깨끗한 상태로 시작하므로 격리와 재현성이 보장된다. 필요한 건 Docker 데몬 하나뿐이다.',
+        stage: 'lifecycle',
+        active: 0,
+        alert: { tone: 'info', text: 'testcontainers.GenericContainer 로 어떤 이미지든 띄운다. postgres 모듈은 마이그레이션·연결 헬퍼까지 제공한다.' },
+        code: {
+          lang: 'go',
+          filename: 'container_setup.go',
+          lines: [
+            'import (',
+            '    "context"',
+            '    "github.com/testcontainers/testcontainers-go"',
+            '    "github.com/testcontainers/testcontainers-go/modules/postgres"',
+            '    "github.com/testcontainers/testcontainers-go/wait"',
+            ')',
+            '',
+            '// 테스트용 Postgres 컨테이너를 띄운다',
+            'func startPostgres(ctx context.Context) (*postgres.PostgresContainer, error) {',
+            '    return postgres.Run(ctx,',
+            '        "postgres:16-alpine",',
+            '        postgres.WithDatabase("app_test"),',
+            '        postgres.WithUsername("test"),',
+            '        postgres.WithPassword("test"),',
+            '        testcontainers.WithWaitStrategy(',
+            '            wait.ForListeningPort("5432/tcp"),  // 준비될 때까지 대기',
+            '        ),',
+            '    )',
+            '}',
+            '// => 로컬에 Postgres 설치 불필요. Docker 만 있으면 됨',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 3. 생명주기 — 기동 → 연결 → 마이그레이션 → 테스트 → 정리',
+        desc: 'TestMain 에서 컨테이너를 한 번 띄우고 연결 정보(host, port)를 받아 DB 에 붙는다. 그다음 스키마 마이그레이션을 적용해 테이블을 만들고, 실제 테스트들을 돌린 뒤, 마지막에 반드시 Terminate 로 컨테이너를 정리한다. 이 순서를 지켜야 매 테스트가 동일한 초기 상태에서 재현 가능하게 실행된다.',
+        stage: 'lifecycle',
+        active: 2,
+        alert: { tone: 'good', text: 'defer container.Terminate(ctx) 를 컨테이너 기동 직후에 걸어라. 테스트가 panic 해도 정리가 보장된다.' },
+        code: {
+          lang: 'go',
+          filename: 'main_test.go',
+          lines: [
+            'func TestMain(m *testing.M) {',
+            '    ctx := context.Background()',
+            '',
+            '    pg, err := startPostgres(ctx)   // 1) 기동',
+            '    if err != nil { log.Fatal(err) }',
+            '    defer pg.Terminate(ctx)         // 5) 정리 (반드시!)',
+            '',
+            '    dsn, _ := pg.ConnectionString(ctx, "sslmode=disable")',
+            '    db, err = sql.Open("pgx", dsn)  // 2) 연결',
+            '    if err != nil { log.Fatal(err) }',
+            '',
+            '    if err := migrate(db); err != nil {  // 3) 마이그레이션',
+            '        log.Fatal(err)',
+            '    }',
+            '',
+            '    code := m.Run()                 // 4) 테스트 실행',
+            '    os.Exit(code)',
+            '}',
+            '// => 기동 1회 → 여러 테스트 공유 → 종료 시 정리',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 15, 16],
+        },
+      },
+      {
+        title: 'Step 4. 실제 테스트 — 진짜 쿼리가 제약까지 검증한다',
+        desc: '이제 테스트는 진짜 Postgres 를 상대로 INSERT/SELECT 를 실행한다. mock 이 못 잡던 UNIQUE 제약 위반이 여기서는 실제 에러로 돌아온다. 각 테스트는 t.Cleanup 으로 자기 데이터를 지워 서로 간섭하지 않게 한다. 이것이 앞 장의 Repository(V-1-1) 와 테스트 기초(IV-1-2) 가 실제 환경에서 검증되는 지점이다.',
+        stage: 'lifecycle',
+        active: 3,
+        alert: { tone: 'good', text: 'mock 이면 통과했을 중복 email 이 여기서는 진짜 제약 위반으로 잡힌다 — 이게 통합테스트의 값어치다.' },
+        code: {
+          lang: 'go',
+          filename: 'user_repo_test.go',
+          lines: [
+            'func TestSaveUser_DuplicateEmail(t *testing.T) {',
+            '    repo := NewUserRepo(db)',
+            '    t.Cleanup(func() { db.Exec("TRUNCATE users") })',
+            '',
+            '    err := repo.Save(User{Email: "a@x.com"})',
+            '    if err != nil {',
+            '        t.Fatalf("first save failed: %v", err)  // => nil',
+            '    }',
+            '',
+            '    // 같은 email 재삽입 — 진짜 UNIQUE 제약이 막는다',
+            '    err = repo.Save(User{Email: "a@x.com"})',
+            '    if err == nil {',
+            '        t.Fatal("expected UNIQUE violation, got nil")',
+            '    }',
+            '    // => pq: duplicate key value violates unique constraint',
+            '}',
+          ],
+          highlight: [1, 2, 3, 5, 6, 10, 11, 12, 13, 14, 15],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 & CI — 느림·누수·포트 충돌을 잡는다',
+        desc: '통합테스트는 강력하지만 대가가 있다. 컨테이너 정리를 빠뜨리면 리소스가 새고, 매 테스트마다 새로 띄우면 느리다 — 그래서 기동은 재사용하고 테스트는 병렬로 돌린다. CI 러너에는 Docker 데몬이 있어야 하며, 고정 포트 대신 testcontainers 가 매핑한 랜덤 포트를 써야 충돌이 없다. 이 장으로 Go 백엔드의 테스트→서비스→운영이 하나로 검증된다.',
+        stage: 'pitfall',
+        active: 4,
+        pitfalls: [
+          { bad: 'Terminate 누락 → 컨테이너·볼륨 누수', good: 'defer pg.Terminate(ctx) 를 기동 직후 등록' },
+          { bad: '테스트마다 새 컨테이너 → 매우 느림', good: 'TestMain 에서 1회 기동 후 공유 · t.Parallel()' },
+          { bad: '고정 포트 5432 사용 → 포트 충돌', good: 'ConnectionString 이 준 매핑 포트만 사용' },
+          { bad: 'CI 에 Docker 없음 → 전체 실패', good: 'CI 러너에 docker 서비스 / DinD 활성화' },
+        ],
+        alert: { tone: 'good', text: 'Go 완주 — 언어 기초부터 동시성·서비스·운영·통합테스트까지, 이제 실무에 바로 투입할 수 있는 백엔드 개발자다. 🐹' },
+        code: {
+          lang: 'yaml',
+          filename: '.github/workflows/test.yml',
+          lines: [
+            'jobs:',
+            '  test:',
+            '    runs-on: ubuntu-latest   # Docker 데몬 포함',
+            '    steps:',
+            '      - uses: actions/checkout@v4',
+            '      - uses: actions/setup-go@v5',
+            '        with: { go-version: "1.22" }',
+            '      # testcontainers 가 Docker 소켓을 자동 사용',
+            '      - run: go test ./... -race -parallel 4',
+            '',
+            '# 실무 체크리스트',
+            '#  [x] defer Terminate 로 정리 보장',
+            '#  [x] TestMain 1회 기동 + 병렬 실행',
+            '#  [x] 매핑 포트 사용 (고정 포트 금지)',
+            '#  [x] CI 러너에 Docker 필요',
+          ],
+          highlight: [2, 3, 8, 9, 11, 12, 13, 14, 15],
+        },
+      },
+    ];
+
+    // 생명주기 단계 정의
+    const PHASES = [
+      { key: 'boot', label: '기동', icon: '🐳', sub: '컨테이너 start' },
+      { key: 'conn', label: '연결', icon: '🔌', sub: 'DSN 획득' },
+      { key: 'migrate', label: '마이그레이션', icon: '📐', sub: '스키마 적용' },
+      { key: 'test', label: '테스트', icon: '🧪', sub: '실제 쿼리 실행' },
+      { key: 'teardown', label: '정리', icon: '🧹', sub: 'Terminate' },
+    ];
+
+    function LifecycleMock({ active }) {
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white flex items-center gap-2" style={{background:BRAND}}>
+            <span>🔄</span>
+            <span>testcontainers 생명주기</span>
+          </div>
+          <div className="p-3 space-y-1.5">
+            {PHASES.map((p, i) => {
+              const isNow = i === active;
+              const isDone = i < active;
+              return (
+                <div key={p.key} className="flex items-center gap-2">
+                  <div className="w-6 text-center text-[10px] font-mono" style={{color:'#94a3b8'}}>{i + 1}</div>
+                  <div className="flex-1 rounded p-2 flex items-center gap-2 transition"
+                    style={{
+                      background: isNow ? '#dbf3e6' : isDone ? '#e6f7fb' : '#f8fafc',
+                      border: isNow ? `2px solid ${BRAND}` : '1px solid #e2e8f0',
+                      opacity: (isDone || isNow) ? 1 : 0.5,
+                    }}>
+                    <span className="text-lg">{p.icon}</span>
+                    <div className="flex-1">
+                      <div className="text-xs font-bold" style={{color:'#0a5a6a'}}>{p.label}</div>
+                      <div className="text-[10px] text-slate-500">{p.sub}</div>
+                    </div>
+                    {isNow && <span className="text-[10px] font-bold px-1.5 py-0.5 rounded text-white" style={{background:BRAND}}>진행중</span>}
+                    {isDone && <span className="text-[10px]" style={{color:'#16a34a'}}>✓</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function ContrastMock({ rows }) {
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white flex items-center gap-2" style={{background:BRAND}}>
+            <span>⚖️</span>
+            <span>mock 단위테스트 vs 컨테이너 통합테스트</span>
+          </div>
+          <div className="p-3 space-y-3">
+            {rows.map((r, i) => (
+              <div key={i} className="rounded p-2.5" style={{background:r.color}}>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs font-bold" style={{color:'#0a5a6a'}}>{r.name}</span>
+                  <span className="text-[10px] font-mono" style={{color:'#0a5a6a'}}>신뢰도 {r.trust}%</span>
+                </div>
+                <div className="h-2 rounded-full bg-white/60 overflow-hidden mb-1">
+                  <div className="h-full rounded-full transition-all" style={{width:`${r.trust}%`, background: r.trust > 60 ? '#16a34a' : '#dc2626'}} />
+                </div>
+                <div className="text-[10px] text-slate-600">{r.detail}</div>
+                <div className="text-[10px] mt-0.5" style={{color:'#0a5a6a'}}>→ {r.note}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function PitfallMock({ pitfalls }) {
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white flex items-center gap-2" style={{background:BRAND}}>
+            <span>🚧</span>
+            <span>실무 함정 → 해결</span>
+          </div>
+          <div className="p-3 space-y-2">
+            {pitfalls.map((p, i) => (
+              <div key={i} className="rounded p-2 grid grid-cols-2 gap-2" style={{background:'#f8fafc', border:'1px solid #e2e8f0'}}>
+                <div className="text-[10px] flex gap-1" style={{color:'#991b1b'}}>
+                  <span>🚨</span><span>{p.bad}</span>
+                </div>
+                <div className="text-[10px] flex gap-1" style={{color:'#166534'}}>
+                  <span>✅</span><span>{p.good}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg:'#e6f7fb', bd:'#9bdaea', tx:'#0a5a6a', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:'#0a5a6a'}}>통합 테스트 라이브</h3>
+            <span className="text-[10px] text-slate-500">진짜 DB · 격리 · 재현성</span>
+          </div>
+          {state.stage === 'contrast' && <ContrastMock rows={state.rows} />}
+          {state.stage === 'lifecycle' && <LifecycleMock active={state.active} />}
+          {state.stage === 'pitfall' && <PitfallMock pitfalls={state.pitfalls} />}
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(0,173,216,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#e6f7fb 0%,#cdeef6 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{background:BRAND}}>Go</span>
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full text-white" style={{background:'#0a5a6a'}}>Part V. 실전</span>
+                  <span className="text-[10px] font-mono text-slate-500">V-2-2</span>
+                </div>
+                <h1 className="text-2xl font-bold" style={{color:'#0a5a6a'}}>통합 테스트 — testcontainers</h1>
+                <p className="text-sm" style={{color:'#00ADD8'}}>진짜 의존성(DB·큐)을 컨테이너로 띄워 신뢰할 수 있는 통합 테스트</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:BRAND}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#9bdaea'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow text-white" style={{background:BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:BRAND}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{background:BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:'#00ADD8aa'}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:'#0a5a6a'}}>
+                <div className="font-bold mb-1">🏁 Go 완주 — 핵심 정리</div>
+                통합 테스트는 mock 이 흉내 낼 수 없는 실제 DB 의 제약·트랜잭션·SQL 을 검증한다. testcontainers-go 로 기동→연결→마이그레이션→테스트→정리 생명주기를 코드로 관리하면, 격리와 재현성을 갖춘 신뢰할 수 있는 테스트가 된다. 이로써 언어 기초 · 동시성 · 서비스 · 운영 · 통합테스트까지 Go 백엔드 전 과정을 완주했다. 이제 실무 프로젝트에 바로 투입할 준비가 됐다. 🐹
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['통합테스트', 'testcontainers', 'Postgres', 'TestMain', '격리', '재현성', 'CI', 'Docker'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#e6f7fb', color:'#0a5a6a', border:'1px solid #9bdaea'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:BRAND}}>
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../index.html" className="underline hover:no-underline">🏁 Go 완주 — 챕터 목록으로</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

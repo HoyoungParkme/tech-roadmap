@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Go 학습 — III-2-1. 미들웨어 패턴</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐹</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Go III-2-1 — 미들웨어 패턴 (Logger / Auth / CORS / RateLimit / Recovery)
+    학습 목표: 횡단 관심사를 미들웨어 체인으로 분리.
+    비유: 공항 보안 게이트 — 여러 검색대를 순서대로 통과한다.
+    패턴: fastapi v1 — 좌(LiveDataPane: 미들웨어 체인) / 우(VSCode CodeViewer 5탭)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#00ADD8';
+    const DEEP = '#0a5a6a';
+    const LIGHT = '#9bdaea';
+    const SOFT = '#e6f7fb';
+
+    const CHAIN = [
+      { id: 'recovery', label: 'Recovery',  role: 'panic 복구',     icon: '🛡️' },
+      { id: 'logger',   label: 'Logger',    role: '요청 로깅',       icon: '📝' },
+      { id: 'cors',     label: 'CORS',      role: '브라우저 허용',   icon: '🌐' },
+      { id: 'auth',     label: 'Auth',      role: '토큰 검증',       icon: '🔑' },
+      { id: 'rate',     label: 'RateLimit', role: '초당 요청 제한',  icon: '🚦' },
+      { id: 'handler',  label: 'Handler',   role: '비즈니스 로직',   icon: '⚙️' },
+    ];
+
+    const STEPS = [
+      {
+        title: 'Step 1. Logger — 요청 한 줄 + 응답 시간 측정',
+        desc: '모든 요청을 한 줄로 로깅하는 게 첫 단계. 메서드 / 경로 / 상태 코드 / 응답 시간 / 요청 ID 5가지가 표준이다. c.Next() 호출 전후로 time.Now() 차이를 재면 latency 가 나온다. zap/zerolog 같은 구조화 로거를 쓰면 JSON 으로 출력해서 Loki/CloudWatch 가 바로 쿼리할 수 있다.',
+        active: ['logger'],
+        summary: 'Logger = 첫 번째 미들웨어. 메서드/경로/상태/지연 5필드 구조화 로깅.',
+        keyPoint: 'Logger 가 없으면 운영 디버깅이 불가능. 가장 먼저 깐다.',
+        tabIdx: 0,
+      },
+      {
+        title: 'Step 2. Recovery — panic 자동 복구',
+        desc: 'Go 의 panic 은 goroutine 전체를 죽인다. HTTP 핸들러에서 panic 이 나면 서버가 통째로 죽는다. Recovery 미들웨어는 defer recover() 로 panic 을 잡아서 500 응답으로 변환한다. gin.Default() 에 기본 포함. 직접 짤 때도 가장 바깥 미들웨어로 둬야 한다.',
+        active: ['recovery'],
+        summary: 'Recovery = panic → 500 변환. 가장 바깥 미들웨어 (최우선).',
+        keyPoint: 'panic 한 번에 서버가 죽으면 안 된다. 무조건 Recovery 가 가장 먼저.',
+        tabIdx: 1,
+      },
+      {
+        title: 'Step 3. CORS — 브라우저 cross-origin 허용',
+        desc: 'SPA(React/Vue) 가 별도 도메인에서 API 를 호출하면 브라우저가 CORS 정책으로 막는다. 서버는 Access-Control-Allow-Origin 헤더를 응답에 포함해야 한다. preflight OPTIONS 요청도 처리. github.com/gin-contrib/cors 패키지를 쓰면 한 줄. 운영에서는 와일드카드(*) 대신 정확한 origin 만 허용.',
+        active: ['cors'],
+        summary: 'CORS = SPA/외부 도메인 호출 허용. preflight OPTIONS 도 처리.',
+        keyPoint: '운영 origin 화이트리스트 명시. * 는 보안 사고의 시작.',
+        tabIdx: 2,
+      },
+      {
+        title: 'Step 4. Auth — JWT 검증 + context 주입',
+        desc: 'Authorization 헤더에서 Bearer 토큰 추출 → JWT 라이브러리로 서명 검증 → 페이로드의 user_id 를 c.Set("userID", id) 로 context 에 저장. 다음 핸들러들은 c.GetInt("userID") 로 꺼내 쓴다. 인증 실패는 c.AbortWithStatusJSON(401, ...) 으로 즉시 중단. 보호 그룹에만 Use(AuthMiddleware()) 로 적용.',
+        active: ['auth'],
+        summary: 'Auth = JWT 검증 → context 에 userID 저장 → 다음 핸들러가 사용.',
+        keyPoint: '인증 실패는 Abort 로 즉시 중단. 핸들러에 도달하면 안 된다.',
+        tabIdx: 3,
+      },
+      {
+        title: 'Step 5. RateLimit — 토큰 버킷으로 초당 요청 제한',
+        desc: 'golang.org/x/time/rate 표준 라이브러리의 Limiter 가 토큰 버킷 알고리즘을 제공한다. IP 별 / 사용자별 limiter map 을 들고 다니면서 Allow() 가 false 면 429 응답. 운영에서는 redis 기반 분산 RateLimit (예: ulule/limiter) 으로 여러 서버 인스턴스 간 카운터를 공유한다.',
+        active: ['rate'],
+        summary: 'RateLimit = 토큰 버킷. 단일 서버는 메모리, 멀티 서버는 redis.',
+        keyPoint: '폭주 트래픽은 미들웨어에서 차단. 핸들러까지 도달하기 전에 막는다.',
+        tabIdx: 4,
+      },
+    ];
+
+    const TABS = [
+      {
+        lang: 'go',
+        filename: 'logger.go',
+        lines: [
+          '// Logger 미들웨어 — 구조화 로그 + RequestID',
+          'package middleware',
+          '',
+          'import (',
+          '    "log/slog"',
+          '    "time"',
+          '',
+          '    "github.com/gin-gonic/gin"',
+          '    "github.com/google/uuid"',
+          ')',
+          '',
+          'func Logger() gin.HandlerFunc {',
+          '    return func(c *gin.Context) {',
+          '        start := time.Now()',
+          '',
+          '        // 요청 ID 발급 (혹은 헤더에서 받기)',
+          '        reqID := c.GetHeader("X-Request-Id")',
+          '        if reqID == "" {',
+          '            reqID = uuid.New().String()',
+          '        }',
+          '        c.Set("reqID", reqID)',
+          '        c.Header("X-Request-Id", reqID)',
+          '',
+          '        c.Next()  // ← 다음 미들웨어/핸들러로',
+          '',
+          '        // 응답 후 — 구조화 로그',
+          '        slog.Info("http",',
+          '            "reqID",   reqID,',
+          '            "method",  c.Request.Method,',
+          '            "path",    c.Request.URL.Path,',
+          '            "status",  c.Writer.Status(),',
+          '            "latency", time.Since(start).Milliseconds(),',
+          '            "ip",      c.ClientIP(),',
+          '            "ua",      c.Request.UserAgent(),',
+          '        )',
+          '    }',
+          '}',
+          '',
+          '// 출력 예시 (JSON):',
+          '// {"level":"INFO","msg":"http","reqID":"...",',
+          '//  "method":"GET","path":"/api/v1/users",',
+          '//  "status":200,"latency":12,"ip":"1.2.3.4"}',
+        ],
+        highlight: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36],
+      },
+      {
+        lang: 'go',
+        filename: 'recovery.go',
+        lines: [
+          '// Recovery 미들웨어 — panic → 500 변환',
+          'package middleware',
+          '',
+          'import (',
+          '    "log/slog"',
+          '    "net/http"',
+          '    "runtime/debug"',
+          '',
+          '    "github.com/gin-gonic/gin"',
+          ')',
+          '',
+          'func Recovery() gin.HandlerFunc {',
+          '    return func(c *gin.Context) {',
+          '        defer func() {',
+          '            if r := recover(); r != nil {',
+          '                stack := string(debug.Stack())',
+          '',
+          '                slog.Error("panic recovered",',
+          '                    "error", r,',
+          '                    "stack", stack,',
+          '                    "path",  c.Request.URL.Path,',
+          '                )',
+          '',
+          '                // 500 응답 + 체인 중단',
+          '                c.AbortWithStatusJSON(http.StatusInternalServerError,',
+          '                    gin.H{"error": "internal server error"})',
+          '            }',
+          '        }()',
+          '',
+          '        c.Next()',
+          '    }',
+          '}',
+          '',
+          '// 적용 — 무조건 가장 바깥에',
+          'func setup() *gin.Engine {',
+          '    r := gin.New()           // gin.Default() 대신',
+          '    r.Use(Recovery())        // ← 1순위',
+          '    r.Use(Logger())          // ← 2순위',
+          '    return r',
+          '}',
+          '',
+          '// 흔한 panic 원인:',
+          '//   - nil 포인터 역참조',
+          '//   - map 에 nil 키 쓰기',
+          '//   - 슬라이스 인덱스 초과',
+          '//   - 외부 라이브러리의 버그',
+          '',
+          '// Recovery 가 없으면:',
+          '//   panic → goroutine 종료 → 서버 종료 → 503',
+          '//   K8s 가 재시작하지만 그 사이 모든 요청 실패',
+        ],
+        highlight: [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 36, 37, 38],
+      },
+      {
+        lang: 'go',
+        filename: 'cors.go',
+        lines: [
+          '// CORS 미들웨어 — SPA 도메인 허용',
+          'package middleware',
+          '',
+          'import (',
+          '    "net/http"',
+          '',
+          '    "github.com/gin-gonic/gin"',
+          ')',
+          '',
+          '// 허용 origin 목록 (운영에서는 환경변수)',
+          'var allowedOrigins = map[string]bool{',
+          '    "https://app.example.com":   true,',
+          '    "https://admin.example.com": true,',
+          '    "http://localhost:3000":     true,  // 개발용',
+          '}',
+          '',
+          'func CORS() gin.HandlerFunc {',
+          '    return func(c *gin.Context) {',
+          '        origin := c.GetHeader("Origin")',
+          '',
+          '        if allowedOrigins[origin] {',
+          '            c.Header("Access-Control-Allow-Origin", origin)',
+          '            c.Header("Access-Control-Allow-Methods",',
+          '                "GET, POST, PUT, DELETE, OPTIONS")',
+          '            c.Header("Access-Control-Allow-Headers",',
+          '                "Origin, Content-Type, Authorization")',
+          '            c.Header("Access-Control-Allow-Credentials", "true")',
+          '            c.Header("Access-Control-Max-Age", "86400")  // 24h',
+          '        }',
+          '',
+          '        // preflight 요청은 여기서 종료',
+          '        if c.Request.Method == http.MethodOptions {',
+          '            c.AbortWithStatus(http.StatusNoContent)',
+          '            return',
+          '        }',
+          '',
+          '        c.Next()',
+          '    }',
+          '}',
+          '',
+          '// 운영 주의:',
+          '//   - Allow-Origin: * 는 절대 금지 (특히 Credentials 와 함께)',
+          '//   - origin 화이트리스트는 env 로 주입',
+          '//   - preflight 캐시(Max-Age) 로 OPTIONS 호출 횟수 감소',
+          '',
+          '// 라이브러리 대안:',
+          '//   github.com/gin-contrib/cors',
+        ],
+        highlight: [10, 11, 12, 13, 14, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33, 34],
+      },
+      {
+        lang: 'go',
+        filename: 'auth.go',
+        lines: [
+          '// JWT Auth 미들웨어',
+          'package middleware',
+          '',
+          'import (',
+          '    "errors"',
+          '    "net/http"',
+          '    "strings"',
+          '',
+          '    "github.com/gin-gonic/gin"',
+          '    "github.com/golang-jwt/jwt/v5"',
+          ')',
+          '',
+          'var jwtSecret = []byte("change-me-in-prod")',
+          '',
+          'type Claims struct {',
+          '    UserID int    `json:"user_id"`',
+          '    Role   string `json:"role"`',
+          '    jwt.RegisteredClaims',
+          '}',
+          '',
+          'func JWT() gin.HandlerFunc {',
+          '    return func(c *gin.Context) {',
+          '        // 1. 헤더에서 Bearer 토큰 추출',
+          '        h := c.GetHeader("Authorization")',
+          '        if !strings.HasPrefix(h, "Bearer ") {',
+          '            c.AbortWithStatusJSON(http.StatusUnauthorized,',
+          '                gin.H{"error": "missing bearer token"})',
+          '            return',
+          '        }',
+          '        raw := strings.TrimPrefix(h, "Bearer ")',
+          '',
+          '        // 2. 서명 검증 + 파싱',
+          '        claims := &Claims{}',
+          '        _, err := jwt.ParseWithClaims(raw, claims, func(t *jwt.Token) (interface{}, error) {',
+          '            if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {',
+          '                return nil, errors.New("unexpected signing method")',
+          '            }',
+          '            return jwtSecret, nil',
+          '        })',
+          '        if err != nil {',
+          '            c.AbortWithStatusJSON(http.StatusUnauthorized,',
+          '                gin.H{"error": "invalid token: " + err.Error()})',
+          '            return',
+          '        }',
+          '',
+          '        // 3. context 에 사용자 정보 주입',
+          '        c.Set("userID", claims.UserID)',
+          '        c.Set("role",   claims.Role)',
+          '        c.Next()',
+          '    }',
+          '}',
+          '',
+          '// 핸들러에서 사용',
+          'func adminOnly(c *gin.Context) {',
+          '    if c.GetString("role") != "admin" {',
+          '        c.AbortWithStatusJSON(http.StatusForbidden,',
+          '            gin.H{"error": "admin only"})',
+          '        return',
+          '    }',
+          '    c.JSON(http.StatusOK, gin.H{"ok": true})',
+          '}',
+        ],
+        highlight: [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48],
+      },
+      {
+        lang: 'go',
+        filename: 'ratelimit.go',
+        lines: [
+          '// RateLimit 미들웨어 — 토큰 버킷 (IP 별)',
+          'package middleware',
+          '',
+          'import (',
+          '    "net/http"',
+          '    "sync"',
+          '',
+          '    "github.com/gin-gonic/gin"',
+          '    "golang.org/x/time/rate"',
+          ')',
+          '',
+          '// IP 별 limiter 저장',
+          'type IPRateLimiter struct {',
+          '    mu       sync.RWMutex',
+          '    limiters map[string]*rate.Limiter',
+          '    r        rate.Limit  // 초당 토큰 보충',
+          '    b        int         // 버킷 크기',
+          '}',
+          '',
+          'func NewIPRateLimiter(r rate.Limit, b int) *IPRateLimiter {',
+          '    return &IPRateLimiter{',
+          '        limiters: make(map[string]*rate.Limiter),',
+          '        r:        r,',
+          '        b:        b,',
+          '    }',
+          '}',
+          '',
+          'func (l *IPRateLimiter) getLimiter(ip string) *rate.Limiter {',
+          '    l.mu.Lock()',
+          '    defer l.mu.Unlock()',
+          '    if lim, ok := l.limiters[ip]; ok {',
+          '        return lim',
+          '    }',
+          '    lim := rate.NewLimiter(l.r, l.b)',
+          '    l.limiters[ip] = lim',
+          '    return lim',
+          '}',
+          '',
+          'func RateLimit(l *IPRateLimiter) gin.HandlerFunc {',
+          '    return func(c *gin.Context) {',
+          '        lim := l.getLimiter(c.ClientIP())',
+          '        if !lim.Allow() {',
+          '            c.AbortWithStatusJSON(http.StatusTooManyRequests,',
+          '                gin.H{"error": "rate limit exceeded"})',
+          '            return',
+          '        }',
+          '        c.Next()',
+          '    }',
+          '}',
+          '',
+          '// 사용:',
+          '//   limiter := NewIPRateLimiter(rate.Limit(10), 20)',
+          '//   r.Use(RateLimit(limiter))',
+          '//   → IP 당 초당 10 요청, 순간 폭주 20까지 허용',
+          '',
+          '// 분산 환경 (멀티 서버):',
+          '//   - redis 기반 limiter (ulule/limiter)',
+          '//   - 모든 서버가 같은 카운터 공유',
+        ],
+        highlight: [12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+      },
+    ];
+
+    function ChainView({ step }) {
+      const active = new Set(step.active);
+      return (
+        <svg viewBox="0 0 800 400" className="w-full">
+          <defs>
+            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+              <path d="M 40 0 L 0 0 0 40" fill="none" stroke={LIGHT} strokeWidth="0.5" />
+            </pattern>
+          </defs>
+          <rect width="800" height="400" fill="url(#grid)" opacity="0.4" />
+
+          <text x={400} y={30} textAnchor="middle" fontSize="14" fontWeight="bold" fill={DEEP}>요청 → 미들웨어 체인 → 핸들러</text>
+
+          {CHAIN.map((s, i) => {
+            const y = 60 + i * 50;
+            const isAct = active.has(s.id);
+            return (
+              <g key={s.id}>
+                <rect x={150} y={y} width={500} height={40} rx={8}
+                  fill={isAct ? BRAND : '#ffffff'}
+                  stroke={isAct ? DEEP : '#cbd5e1'}
+                  strokeWidth={isAct ? 3 : 1.5} />
+                <text x={170} y={y + 27} fontSize="20">{s.icon}</text>
+                <text x={210} y={y + 27} fontSize="13" fontWeight="bold" fill={isAct ? '#ffffff' : DEEP}>{s.label}</text>
+                <text x={400} y={y + 27} fontSize="11" fill={isAct ? '#e6f7fb' : '#64748b'}>{s.role}</text>
+
+                {i < CHAIN.length - 1 && (
+                  <line x1={400} y1={y + 40} x2={400} y2={y + 50} stroke={isAct ? BRAND : '#cbd5e1'} strokeWidth="2" />
+                )}
+              </g>
+            );
+          })}
+
+          <text x={400} y={380} textAnchor="middle" fontSize="11" fill="#64748b">c.Next() = 다음 미들웨어 호출 / c.Abort = 체인 중단</text>
+        </svg>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${LIGHT}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:DEEP}}>미들웨어 체인</h3>
+            <span className="text-[10px] text-slate-500">Recovery → Logger → CORS → Auth → RateLimit → Handler</span>
+          </div>
+          <div className="flex-1 flex items-center justify-center">
+            <ChainView step={step} />
+          </div>
+          <div className="mt-3 rounded-lg px-3 py-2 text-xs" style={{background:SOFT, border:`1px solid ${LIGHT}`, color:DEEP}}>
+            <span className="font-bold">현재 단계: </span>{step.summary}
+          </div>
+          <div className="mt-2 rounded-lg px-3 py-2 text-xs" style={{background:'#cdeef6', border:`1px solid ${LIGHT}`, color:DEEP}}>
+            💡 {step.keyPoint}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
+            {step.active.map((id) => {
+              const s = CHAIN.find((x) => x.id === id);
+              return (
+                <span key={id} className="px-2 py-0.5 rounded-full text-white" style={{background:BRAND}}>
+                  {s.icon} {s.label}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ activeTab, onTabChange, stepIdx, total }) {
+      const codeRef = useRef(null);
+      const code = TABS[activeTab];
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [activeTab]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+
+          <div className="flex bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {TABS.map((t, i) => (
+              <button key={i} onClick={() => onTabChange(i)} className={`px-3 py-1.5 text-[11px] font-mono whitespace-nowrap border-r border-slate-700 transition ${
+                i === activeTab ? 'bg-[#282c34] text-cyan-300 border-t-2 border-t-cyan-400' : 'text-slate-400 hover:bg-slate-800'
+              }`}>{t.filename}</button>
+            ))}
+          </div>
+
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(0,173,216,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total} · Tab {activeTab + 1} / {TABS.length}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [activeTab, setActiveTab] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => { setActiveTab(step.tabIdx); }, [stepIdx]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#e6f7fb 0%,#cdeef6 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{background:BRAND}}>Go</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:DEEP}}>III-2-1. 미들웨어 패턴</h1>
+                <p className="text-sm" style={{color:BRAND}}>Recovery → Logger → CORS → Auth → RateLimit 표준 5종</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:BRAND}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : LIGHT}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow text-white" style={{background:BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer activeTab={activeTab} onTabChange={setActiveTab} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:BRAND}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{background:BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:`${BRAND}aa`}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:DEEP}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                미들웨어는 모든 요청에 공통 적용할 횡단 관심사를 한 곳에 모으는 패턴이다. Recovery → Logger → CORS → Auth → RateLimit 순서가 표준. c.Next() 가 체인을 잇고, c.Abort 가 끊는다. 다음 III-2-2 에서 JSON 직렬화의 struct tag 디테일을 본다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['middleware', 'Recovery', 'Logger', 'CORS', 'JWT', 'RateLimit', 'c.Next'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:SOFT, color:DEEP, border:`1px solid ${LIGHT}`}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:BRAND}}>
+              <a href="./III-1-2.html" className="underline hover:no-underline">← 이전: III-1-2</a>
+              <a href="./III-2-2.html" className="underline hover:no-underline">다음: III-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

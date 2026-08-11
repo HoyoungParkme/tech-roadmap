@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Go 학습 — II-2-2. sync — Mutex/WaitGroup/Once</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐹</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    Go II-2-2 — sync — Mutex/WaitGroup/Once (비유: 은행 창구 공동 장부)
+    여러 goroutine 이 공유 카운터를 동시에 증가 → Mutex 없으면 값 유실(race),
+    Mutex 로 원자화하면 정확. WaitGroup 이 완주를 기다린다.
+    6단계: 레이스 → Mutex → RWMutex → WaitGroup → Once/atomic → 채널 vs Mutex
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#00ADD8';
+    const GOROUTINES = 4;      // 동시에 도는 일꾼 수
+    const PER = 25;            // 각 일꾼이 시도하는 증가 횟수
+    const EXPECTED = GOROUTINES * PER; // 기대값 100
+
+    const STEPS = [
+      {
+        title: 'Step 1. 공유 상태 레이스 — 값이 조용히 사라진다',
+        desc: '여러 goroutine 이 같은 변수 counter++ 를 동시에 실행하면 문제가 생긴다. counter++ 는 사실 "읽기 → +1 → 쓰기" 세 동작이라, 두 일꾼이 같은 값을 읽고 각자 +1 해서 덮어쓰면 한 번의 증가가 사라진다. 그래서 4개 goroutine 이 각각 25번 올려도 최종값이 100 이 아니라 60~90 처럼 들쭉날쭉해진다. 이건 크래시가 아니라 "가끔 틀린 값" 이라 테스트를 통과하고 운영에서 터진다. go run -race 로 실행하면 런타임이 이 데이터 레이스를 잡아 준다.',
+        mode: 'race', showSafe: false, showUnsafe: true, wg: false,
+        alert: { tone: 'danger', text: 'race 는 "가끔" 틀린다. 반드시 go test -race / go run -race 를 CI 에 넣어 상시 탐지하라.' },
+        code: {
+          lang: 'go', filename: 'race.go',
+          lines: [
+            'package main',
+            '',
+            'import "fmt"',
+            '',
+            'func main() {',
+            '    counter := 0',
+            '    done := make(chan bool)',
+            '',
+            '    for g := 0; g < 4; g++ {',
+            '        go func() {',
+            '            for i := 0; i < 25; i++ {',
+            '                counter++          // 읽기+1+쓰기 = 원자적 아님',
+            '            }',
+            '            done <- true',
+            '        }()',
+            '    }',
+            '    for g := 0; g < 4; g++ {',
+            '        <-done',
+            '    }',
+            '    fmt.Println(counter)           // => 87 (기대 100인데 유실!)',
+            '}',
+            '',
+            '// go run -race race.go',
+            '// => WARNING: DATA RACE  (런타임이 잡아 준다)',
+          ],
+          highlight: [10, 11, 12, 13, 19, 22, 23],
+        },
+      },
+      {
+        title: 'Step 2. sync.Mutex — 한 번에 한 명만 장부를 만진다',
+        desc: 'Mutex(mutual exclusion, 상호 배제)는 임계 구역을 한 번에 한 goroutine 만 들어가게 막는 자물쇠다. Lock 으로 잠그고, 작업 후 Unlock 으로 푼다. 자물쇠를 쥔 동안 다른 일꾼은 문 앞에서 대기하므로 counter++ 가 겹치지 않아 최종값이 항상 100 이 된다. 가장 중요한 습관은 Lock 바로 다음 줄에 defer mu.Unlock 을 쓰는 것 — 중간 return 이나 panic 이 나도 반드시 풀려 데드락을 막는다. mu 는 값 복사되면 잠금이 깨지므로 항상 포인터로 넘긴다.',
+        mode: 'mutex', showSafe: true, showUnsafe: true, wg: false,
+        alert: { tone: 'good', text: 'Lock 다음 줄에 곧바로 defer mu.Unlock(). 이 한 줄 습관이 데드락 사고의 대부분을 막는다.' },
+        code: {
+          lang: 'go', filename: 'mutex.go',
+          lines: [
+            'package main',
+            '',
+            'import (',
+            '    "fmt"',
+            '    "sync"',
+            ')',
+            '',
+            'func main() {',
+            '    var mu sync.Mutex',
+            '    counter := 0',
+            '    done := make(chan bool)',
+            '',
+            '    for g := 0; g < 4; g++ {',
+            '        go func() {',
+            '            for i := 0; i < 25; i++ {',
+            '                mu.Lock()          // 자물쇠 잠금',
+            '                counter++          // 임계 구역 (혼자만)',
+            '                mu.Unlock()        // 자물쇠 해제',
+            '            }',
+            '            done <- true',
+            '        }()',
+            '    }',
+            '    for g := 0; g < 4; g++ { <-done }',
+            '    fmt.Println(counter)           // => 100 (항상 정확)',
+            '}',
+          ],
+          highlight: [9, 16, 17, 18, 24],
+        },
+      },
+      {
+        title: 'Step 3. sync.RWMutex — 읽기는 여럿, 쓰기는 혼자',
+        desc: '읽기가 압도적으로 많고 쓰기는 가끔인 캐시나 설정값에는 일반 Mutex 가 과하다. 읽기끼리는 서로를 망가뜨리지 않기 때문이다. RWMutex 는 RLock 으로 여러 reader 를 동시에 통과시키고, Lock(쓰기)은 혼자 독점한다. 읽기 트래픽이 많을수록 처리량이 눈에 띄게 오른다. 단, writer 가 자주 끼면 reader 들이 대기하다 오히려 느려질 수 있으니, 정말 읽기 위주일 때만 쓴다. 애매하면 그냥 Mutex 가 단순하고 안전하다.',
+        mode: 'rwmutex', showSafe: true, showUnsafe: false, wg: false,
+        alert: { tone: 'info', text: '읽기:쓰기 = 9:1 이상일 때 RWMutex 가 유리. 쓰기가 잦으면 그냥 Mutex 가 더 빠를 수 있다.' },
+        code: {
+          lang: 'go', filename: 'rwmutex.go',
+          lines: [
+            'type Cache struct {',
+            '    mu   sync.RWMutex',
+            '    data map[string]string',
+            '}',
+            '',
+            'func (c *Cache) Get(k string) string {',
+            '    c.mu.RLock()                   // 읽기 잠금 (여럿 동시 가능)',
+            '    defer c.mu.RUnlock()',
+            '    return c.data[k]',
+            '}',
+            '',
+            'func (c *Cache) Set(k, v string) {',
+            '    c.mu.Lock()                    // 쓰기 잠금 (혼자 독점)',
+            '    defer c.mu.Unlock()',
+            '    c.data[k] = v',
+            '}',
+            '',
+            '// Get 100개 동시 호출 => 모두 병렬 통과',
+            '// Set 1개 실행 중이면    => 모든 Get 이 잠깐 대기',
+          ],
+          highlight: [2, 7, 8, 13, 14],
+        },
+      },
+      {
+        title: 'Step 4. sync.WaitGroup — 모두 끝날 때까지 기다린다',
+        desc: 'goroutine 을 여러 개 띄운 main 은 그들이 끝나기 전에 먼저 종료되어 버릴 수 있다. WaitGroup 은 완주 카운터다. 일꾼을 띄우기 전에 wg.Add(n) 으로 인원을 등록하고, 각 goroutine 은 끝날 때 defer wg.Done() 으로 한 명씩 빠지며, main 은 wg.Wait() 에서 카운터가 0 이 될 때까지 막혀 있다가 전원 완주 후 진행한다. 가장 흔한 실수는 Add 를 goroutine 안에서 부르는 것 — 아직 시작 전에 Wait 가 0 을 보고 그냥 지나쳐 버린다. Add 는 반드시 go 전에 호출한다.',
+        mode: 'waitgroup', showSafe: true, showUnsafe: false, wg: true,
+        alert: { tone: 'warn', text: 'wg.Add() 는 go 로 띄우기 전에! goroutine 안에서 Add 하면 Wait 가 완주를 놓친다. Done 은 defer 로.' },
+        code: {
+          lang: 'go', filename: 'waitgroup.go',
+          lines: [
+            'func main() {',
+            '    var wg sync.WaitGroup',
+            '    var mu sync.Mutex',
+            '    counter := 0',
+            '',
+            '    for g := 0; g < 4; g++ {',
+            '        wg.Add(1)                  // go 전에 등록 (핵심!)',
+            '        go func() {',
+            '            defer wg.Done()        // 끝나면 한 명 빠짐',
+            '            for i := 0; i < 25; i++ {',
+            '                mu.Lock()',
+            '                counter++',
+            '                mu.Unlock()',
+            '            }',
+            '        }()',
+            '    }',
+            '',
+            '    wg.Wait()                      // 전원 완주까지 대기',
+            '    fmt.Println(counter)           // => 100',
+            '}',
+          ],
+          highlight: [2, 7, 8, 9, 18],
+        },
+      },
+      {
+        title: 'Step 5. sync.Once & atomic — 딱 한 번, 그리고 잠금 없는 카운터',
+        desc: 'sync.Once 는 여러 goroutine 이 동시에 접근해도 초기화 함수를 정확히 한 번만 실행한다. DB 커넥션 풀이나 설정 로딩 같은 싱글턴에 쓴다 — 몇 번을 호출하든 안은 딱 한 번만 돈다. 한편 단순한 정수 카운터라면 Mutex 대신 atomic 패키지가 더 빠르다. atomic.AddInt64 는 CPU 명령 하나로 읽기+증가+쓰기를 원자적으로 처리해 자물쇠 오버헤드가 없다. 규칙은 간단하다 — 정수/포인터 하나면 atomic, 여러 필드를 함께 지키거나 복합 로직이면 Mutex.',
+        mode: 'once', showSafe: true, showUnsafe: false, wg: false,
+        alert: { tone: 'good', text: '초기화 1회 = Once. 정수 카운터 = atomic. 여러 필드를 함께 보호 = Mutex. 셋의 쓰임이 다르다.' },
+        code: {
+          lang: 'go', filename: 'once_atomic.go',
+          lines: [
+            'var (',
+            '    once sync.Once',
+            '    conn *DB',
+            ')',
+            '',
+            'func GetDB() *DB {',
+            '    once.Do(func() {               // 몇 번 불러도 딱 한 번',
+            '        conn = connect()           // 무거운 초기화',
+            '    })',
+            '    return conn',
+            '}',
+            '',
+            '// 잠금 없는 카운터 — atomic',
+            'var hits int64',
+            '',
+            'func onRequest() {',
+            '    atomic.AddInt64(&hits, 1)      // Mutex 없이 원자적 증가',
+            '}',
+            '',
+            'func total() int64 {',
+            '    return atomic.LoadInt64(&hits) // 안전하게 읽기',
+            '}',
+          ],
+          highlight: [2, 7, 8, 14, 17, 21],
+        },
+      },
+      {
+        title: 'Step 6. 채널 vs Mutex — 언제 무엇을 고를까',
+        desc: '둘 다 동시성 도구지만 역할이 다르다. Mutex 는 여러 일꾼이 하나의 공유 상태를 나눠 만질 때, 그 상태를 짧게 보호하는 데 쓴다 — 카운터, 캐시, 맵 갱신처럼. 채널은 데이터의 소유권을 한 goroutine 에서 다른 goroutine 으로 넘기거나 작업을 파이프라인으로 흘려보낼 때 쓴다. Go 격언은 "메모리를 공유해 통신하지 말고, 통신으로 메모리를 공유하라" 이지만, 현장에서는 단순한 카운터 하나에 채널을 쓰면 오히려 복잡해진다. 상태 보호는 Mutex, 소유권 이전과 흐름 제어는 채널 — 이 기준이면 대부분 깔끔하게 갈린다.',
+        mode: 'decision', showSafe: false, showUnsafe: false, wg: false,
+        alert: { tone: 'info', text: '헷갈리면: "값 하나 짧게 지킨다" → Mutex. "일을 넘긴다 / 흐름을 만든다" → 채널.' },
+        code: {
+          lang: 'go', filename: 'choose.go',
+          lines: [
+            '// (A) 상태 보호 — Mutex 가 자연스럽다',
+            'type Counter struct {',
+            '    mu sync.Mutex',
+            '    n  int',
+            '}',
+            'func (c *Counter) Inc() {',
+            '    c.mu.Lock()',
+            '    defer c.mu.Unlock()',
+            '    c.n++',
+            '}',
+            '',
+            '// (B) 소유권 이전 / 파이프라인 — 채널이 자연스럽다',
+            'jobs := make(chan int, 100)',
+            'results := make(chan int, 100)',
+            'for w := 0; w < 3; w++ {',
+            '    go worker(jobs, results)       // 일을 넘겨받아 처리',
+            '}',
+            '',
+            '// 함정 정리:',
+            '//  - Unlock 누락 => 데드락',
+            '//  - Mutex 값 복사 => 잠금 깨짐 (항상 포인터)',
+            '//  - Add 를 go 안에서 => Wait 가 완주 놓침',
+            '//  - race 무시 => 운영에서 가끔 틀린 값',
+          ],
+          highlight: [3, 7, 8, 9, 13, 14, 16, 20, 21, 22, 23],
+        },
+      },
+    ];
+
+    const ALERT_STYLE = {
+      info:   { bg:'#e6f7fb', bd:'#9bdaea', tx:'#0a5a6a', icon:'💡' },
+      warn:   { bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️' },
+      danger: { bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨' },
+      good:   { bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // 공유 카운터 게이지 — 값/기대치를 막대와 숫자로
+    function CounterGauge({ label, value, expected, ok }) {
+      const pct = Math.min(100, Math.round((value / expected) * 100));
+      const barColor = ok ? '#10b981' : '#ef4444';
+      return (
+        <div className="rounded-lg bg-white p-3" style={{border:`1px solid ${ok ? '#86efac' : '#fecaca'}`}}>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs font-bold" style={{color:'#0a5a6a'}}>{label}</span>
+            <span className="font-mono text-lg font-bold" style={{color:barColor}}>{value}</span>
+          </div>
+          <div className="h-3 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-150" style={{width:`${pct}%`, background:barColor}} />
+          </div>
+          <div className="mt-1 text-[10px] flex justify-between text-slate-500">
+            <span>기대값 {expected}</span>
+            <span style={{color:barColor}}>{ok ? '정확 ✓' : `유실 ${expected - value}`}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // 4개의 일꾼(goroutine) 진행 상태
+    function WorkerRow({ progress, wgDone }) {
+      return (
+        <div className="grid grid-cols-4 gap-2">
+          {progress.map((p, i) => {
+            const pct = Math.round((p / PER) * 100);
+            const finished = p >= PER;
+            return (
+              <div key={i} className="rounded p-1.5" style={{background: finished ? '#dbf3e6' : '#e6f7fb', border:`1px solid ${finished ? '#86efac' : '#9bdaea'}`}}>
+                <div className="text-[10px] font-bold flex items-center gap-1" style={{color:'#0a5a6a'}}>
+                  <span>{finished ? '✅' : '🧑‍🍳'}</span>
+                  <span>go #{i + 1}</span>
+                </div>
+                <div className="mt-1 h-1.5 rounded-full bg-white overflow-hidden">
+                  <div className="h-full transition-all duration-150" style={{width:`${pct}%`, background:BRAND}} />
+                </div>
+                <div className="text-[9px] text-slate-500 mt-0.5">{p}/{PER}{wgDone && finished ? ' · Done' : ''}</div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function WaitGroupBar({ remaining }) {
+      const done = GOROUTINES - remaining;
+      return (
+        <div className="mt-3 rounded-lg p-3 bg-white" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between text-xs mb-1">
+            <span className="font-bold" style={{color:'#0a5a6a'}}>wg.Wait() — 완주 카운터</span>
+            <span className="font-mono" style={{color: remaining === 0 ? '#10b981' : '#92400e'}}>
+              {remaining === 0 ? 'Wait 통과 →' : `대기 중: ${remaining}명`}
+            </span>
+          </div>
+          <div className="flex gap-1">
+            {Array.from({ length: GOROUTINES }).map((_, i) => (
+              <div key={i} className="flex-1 h-2 rounded-full" style={{background: i < done ? '#10b981' : '#fde68a'}} />
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function RWMutexView({ tick }) {
+      const writing = Math.floor(tick / 30) % 2 === 1; // 주기적으로 writer 등장
+      const readers = 5;
+      return (
+        <div className="space-y-2">
+          <div className="rounded-lg bg-white p-3" style={{border:`1px solid ${BRAND}`}}>
+            <div className="text-xs font-bold mb-2" style={{color:'#0a5a6a'}}>{writing ? '✍️ Writer 독점 (Lock) — Reader 대기' : '📖 Reader 병렬 (RLock) — 동시 통과'}</div>
+            <div className="grid grid-cols-5 gap-2">
+              {Array.from({ length: readers }).map((_, i) => (
+                <div key={i} className="rounded p-1.5 text-center text-[10px]" style={{background: writing ? '#fef3c7' : '#dbf3e6', border:`1px solid ${writing ? '#fde68a' : '#86efac'}`}}>
+                  <div>{writing ? '⏳' : '✅'}</div>
+                  <div style={{color:'#0a5a6a'}}>R{i + 1}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg p-2 text-center text-xs font-bold" style={{background: writing ? '#fee2e2' : '#e6f7fb', color: writing ? '#991b1b' : '#0a5a6a', border:`1px solid ${writing ? '#fecaca' : '#9bdaea'}`}}>
+            {writing ? 'Set() 쓰기 진행 중 — 모든 Get 잠깐 멈춤' : 'Get() 100개 동시 통과 — 처리량 최대'}
+          </div>
+        </div>
+      );
+    }
+
+    function OnceAtomicView({ tick }) {
+      const fired = tick > 8; // Once 는 한 번만 초기화
+      const attempts = Math.min(GOROUTINES, Math.floor(tick / 6) + 1);
+      const hits = Math.min(EXPECTED, tick);
+      return (
+        <div className="space-y-2">
+          <div className="rounded-lg bg-white p-3" style={{border:`1px solid ${BRAND}`}}>
+            <div className="text-xs font-bold mb-2" style={{color:'#0a5a6a'}}>sync.Once — {attempts}개 goroutine 이 GetDB() 호출</div>
+            <div className="flex items-center gap-2">
+              <div className="grid grid-cols-4 gap-1 flex-1">
+                {Array.from({ length: GOROUTINES }).map((_, i) => (
+                  <div key={i} className="rounded text-center text-[10px] p-1" style={{background: i < attempts ? '#e6f7fb' : '#f1f5f9', border:'1px solid #9bdaea', color:'#0a5a6a'}}>go #{i + 1}</div>
+                ))}
+              </div>
+              <span className="text-slate-400">→</span>
+              <div className="rounded px-2 py-1 text-center text-[10px] font-bold" style={{background: fired ? '#dbf3e6' : '#fef3c7', border:`1px solid ${fired ? '#86efac' : '#fde68a'}`, color: fired ? '#166534' : '#92400e'}}>
+                connect()<br/>{fired ? '1회 실행됨 ✓' : '대기'}
+              </div>
+            </div>
+          </div>
+          <CounterGauge label="atomic.AddInt64(&hits) — 잠금 없는 카운터" value={hits} expected={EXPECTED} ok={true} />
+        </div>
+      );
+    }
+
+    function DecisionTable() {
+      const rows = [
+        { case: '카운터 / 캐시 / 맵 갱신', pick: 'Mutex', why: '공유 상태를 짧게 보호', tone: 'mutex' },
+        { case: '정수 하나만 증가', pick: 'atomic', why: '자물쇠 없이 더 빠르게', tone: 'mutex' },
+        { case: '초기화 딱 한 번', pick: 'Once', why: '싱글턴 / 커넥션 풀', tone: 'mutex' },
+        { case: '작업을 다른 goroutine 에 넘김', pick: '채널', why: '소유권 이전', tone: 'chan' },
+        { case: '파이프라인 / 워커 풀', pick: '채널', why: '흐름 제어', tone: 'chan' },
+      ];
+      return (
+        <div className="rounded-lg bg-white overflow-hidden" style={{border:`1px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white" style={{background:BRAND}}>언제 무엇을? — 선택 기준</div>
+          <div className="divide-y divide-slate-100">
+            {rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 px-3 py-2 text-[11px]">
+                <span className="flex-1" style={{color:'#0a5a6a'}}>{r.case}</span>
+                <span className="font-mono font-bold px-2 py-0.5 rounded" style={{background: r.tone === 'chan' ? '#dbeafe' : '#dbf3e6', color: r.tone === 'chan' ? '#1e40af' : '#166534'}}>{r.pick}</span>
+                <span className="w-28 text-right text-slate-500">{r.why}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state, tick }) {
+      // race/mutex/waitgroup 공통: tick 으로 각 일꾼 진행 계산
+      const progress = Array.from({ length: GOROUTINES }).map((_, i) => {
+        const start = i * 3;
+        return Math.max(0, Math.min(PER, tick - start));
+      });
+      const safeVal = progress.reduce((a, b) => a + b, 0);
+      // 레이스: 겹칠 때마다 유실 → 약 63% 만 반영
+      const unsafeVal = Math.round(safeVal * 0.63);
+      const remaining = progress.filter((p) => p < PER).length;
+
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:'#0a5a6a'}}>공유 카운터 시뮬레이션</h3>
+            <span className="text-[10px] text-slate-500">일꾼 {GOROUTINES} × 증가 {PER} = 기대 {EXPECTED}</span>
+          </div>
+
+          {(state.mode === 'race' || state.mode === 'mutex' || state.mode === 'waitgroup') && (
+            <div className="space-y-2">
+              <WorkerRow progress={progress} wgDone={state.wg} />
+              <div className="grid grid-cols-1 gap-2 mt-1">
+                {state.showUnsafe && (
+                  <CounterGauge label="Mutex 없이 (race)" value={unsafeVal} expected={EXPECTED} ok={false} />
+                )}
+                {state.showSafe && (
+                  <CounterGauge label="Mutex 있음 (safe)" value={safeVal} expected={EXPECTED} ok={true} />
+                )}
+              </div>
+              {state.wg && <WaitGroupBar remaining={remaining} />}
+            </div>
+          )}
+
+          {state.mode === 'rwmutex' && <RWMutexView tick={tick} />}
+          {state.mode === 'once' && <OnceAtomicView tick={tick} />}
+          {state.mode === 'decision' && <DecisionTable />}
+
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(0,173,216,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const [tick, setTick] = useState(0);
+      const intervalRef = useRef(null);
+      const tickRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      // 단계가 바뀌면 애니메이션 tick 재시작
+      useEffect(() => {
+        setTick(0);
+        clearInterval(tickRef.current);
+        tickRef.current = setInterval(() => {
+          setTick((t) => (t >= PER + GOROUTINES * 3 ? t : t + 1));
+        }, 60);
+        return () => clearInterval(tickRef.current);
+      }, [stepIdx]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:'linear-gradient(135deg,#e6f7fb 0%,#cdeef6 100%)'}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{background:BRAND}}>Go</span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full text-white" style={{background:'#0a5a6a'}}>Part II. 동시성</span>
+                  <span className="text-[10px] font-mono text-slate-500">II-2-2</span>
+                </div>
+                <h1 className="text-2xl font-bold" style={{color:'#0a5a6a'}}>sync — Mutex/WaitGroup/Once</h1>
+                <p className="text-sm" style={{color:'#00ADD8'}}>채널로 부족할 때 쓰는 저수준 동기화 도구들</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:BRAND}}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : '#9bdaea'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl px-5 py-4 shadow text-white" style={{background:BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} tick={tick} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:BRAND}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{background:BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:'#00ADD8aa'}}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:'#0a5a6a'}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                공유 상태를 여럿이 만지면 race 가 생기고 값이 조용히 유실된다. Mutex 로 임계 구역을 한 명씩 통과시키고(Lock 다음 줄 defer Unlock), WaitGroup 으로 완주를 기다리며(Add 는 go 전에), 초기화는 Once, 정수 카운터는 atomic 으로 처리한다. 상태 보호는 Mutex, 소유권 이전은 채널 — 이 기준으로 도구를 고르면 대부분 깔끔하다. 이것으로 Part II 동시성을 마친다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['sync', 'Mutex', 'RWMutex', 'WaitGroup', 'Once', 'atomic', 'datarace', 'go-race'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:'#e6f7fb', color:'#0a5a6a', border:'1px solid #9bdaea'}}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:BRAND}}>
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../part3/III-1-1.html" className="underline hover:no-underline">다음: III-1-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
