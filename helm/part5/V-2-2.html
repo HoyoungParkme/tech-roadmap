@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Helm 학습 — V-2-2. 실전 체크리스트 (프로덕션 배포 전 점검)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⛵</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#277A9F';
+    const BRAND_DARK = '#1f6886';
+    const BRAND_BG = '#e5f0f6';
+    const BRAND_BD = '#a8cee0';
+
+    // 체크리스트 카테고리 — 단계가 진행될수록 category 가 하나씩 채워지고 배포 준비도 점수가 오른다.
+    const STEPS = [
+      {
+        title:'Step 1. 차트 품질 — lint · 스키마 · 문서',
+        desc:'배포 전 첫 관문은 차트 자체의 품질이다. helm lint 는 문법·구조 오류를 잡고, values.schema.json 은 사용자가 잘못된 values 를 넣으면 install 을 막아준다. README 와 templates/NOTES.txt 로 "이 차트를 어떻게 쓰는지" 를 남긴다. 문서 없는 차트는 6개월 뒤 나 자신도 못 쓴다.',
+        score:20,
+        focus:'품질',
+        checks:[
+          {cat:'품질', items:[
+            {label:'helm lint 통과 (0 errors)', ok:true},
+            {label:'values.schema.json 존재·검증', ok:true},
+            {label:'README.md · NOTES.txt 문서화', ok:true},
+          ]},
+        ],
+        alert:{tone:'info', text:'helm lint 는 CI 의 첫 스텝. values.schema.json 이 있으면 잘못된 값은 install 자체가 실패한다.'},
+        code:{lang:'bash', filename:'01-quality-check.sh', lines:[
+          '# (1) 차트 문법·구조 검사 — CI 첫 관문',
+          '$ helm lint ./my-app',
+          '==> Linting ./my-app',
+          '[INFO] Chart.yaml: icon is recommended',
+          '',
+          '1 chart(s) linted, 0 chart(s) failed',
+          '',
+          '# (2) values.schema.json — 잘못된 values 면 install 실패',
+          '$ cat my-app/values.schema.json',
+          '{',
+          '  "$schema": "https://json-schema.org/draft-07/schema#",',
+          '  "type": "object",',
+          '  "required": ["image", "replicaCount"],',
+          '  "properties": {',
+          '    "replicaCount": { "type": "integer", "minimum": 1 },',
+          '    "image": {',
+          '      "type": "object",',
+          '      "required": ["repository", "tag"],',
+          '      "properties": {',
+          '        "repository": { "type": "string" },',
+          '        "tag": { "type": "string" }',
+          '      }',
+          '    }',
+          '  }',
+          '}',
+          '',
+          '# (3) 스키마 위반 시 — install 이 막힌다',
+          '$ helm install my-app ./my-app --set replicaCount=0',
+          'Error: values do not meet the specifications of the schema(s)',
+          '- replicaCount: Must be greater than or equal to 1',
+          '',
+          '# (4) 문서 존재 확인',
+          '$ ls my-app/',
+          'Chart.yaml  README.md  values.yaml  values.schema.json  templates/',
+          '$ ls my-app/templates/NOTES.txt',
+          'my-app/templates/NOTES.txt',
+        ], highlight:[1,2,5,8,12,13,26,27,28,29]},
+      },
+      {
+        title:'Step 2. 안정성 — 리소스 · 프로브 · PDB · 복제본',
+        desc:'파드가 죽거나 노드가 빠져도 서비스가 유지돼야 한다. resources requests/limits 로 스케줄러가 자리를 확보하고 OOM 을 막는다. liveness/readiness probe 로 죽은 파드는 재시작하고, 준비 안 된 파드로는 트래픽을 안 보낸다. PodDisruptionBudget 은 노드 드레인 중 최소 파드 수를 지키고, replicaCount≥2 로 단일 장애점을 없앤다.',
+        score:40,
+        focus:'안정성',
+        checks:[
+          {cat:'품질', items:[
+            {label:'helm lint 통과 (0 errors)', ok:true},
+            {label:'values.schema.json 존재·검증', ok:true},
+            {label:'README.md · NOTES.txt 문서화', ok:true},
+          ]},
+          {cat:'안정성', items:[
+            {label:'resources requests/limits 설정', ok:true},
+            {label:'liveness / readiness probe', ok:true},
+            {label:'PodDisruptionBudget 정의', ok:true},
+            {label:'replicaCount ≥ 2', ok:true},
+          ]},
+        ],
+        alert:{tone:'good', text:'requests 없는 파드는 스케줄러가 자리를 못 잡고, probe 없는 파드는 죽어도 트래픽을 계속 받는다.'},
+        code:{lang:'yaml', filename:'templates/deployment.yaml', lines:[
+          '# === 안정성 3종 세트: resources · probe · replica ===',
+          'apiVersion: apps/v1',
+          'kind: Deployment',
+          'metadata:',
+          '  name: {{ include "my-app.fullname" . }}',
+          'spec:',
+          '  replicas: {{ .Values.replicaCount }}   # 운영은 2 이상',
+          '  template:',
+          '    spec:',
+          '      containers:',
+          '        - name: app',
+          '          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"',
+          '          resources:',
+          '            requests:              # 스케줄링 보장',
+          '              cpu: 100m',
+          '              memory: 128Mi',
+          '            limits:                # OOM / CPU 폭주 방지',
+          '              cpu: 500m',
+          '              memory: 256Mi',
+          '          livenessProbe:           # 죽으면 재시작',
+          '            httpGet: { path: /healthz, port: http }',
+          '            initialDelaySeconds: 10',
+          '            periodSeconds: 10',
+          '          readinessProbe:          # 준비될 때까지 트래픽 차단',
+          '            httpGet: { path: /ready, port: http }',
+          '            initialDelaySeconds: 5',
+          '---',
+          '# === PodDisruptionBudget — 드레인 중 최소 가동 ===',
+          'apiVersion: policy/v1',
+          'kind: PodDisruptionBudget',
+          'metadata:',
+          '  name: {{ include "my-app.fullname" . }}',
+          'spec:',
+          '  minAvailable: 1',
+          '  selector:',
+          '    matchLabels:',
+          '      app.kubernetes.io/name: {{ include "my-app.name" . }}',
+        ], highlight:[7,13,14,15,16,17,18,19,20,21,22,23,24,25,26,28,29,30,34]},
+      },
+      {
+        title:'Step 3. 배포 안전 — atomic · 롤백 · hook · test',
+        desc:'배포가 실패하면 절반만 뜬 상태로 방치되면 안 된다. --atomic --wait 는 실패 시 자동으로 이전 리비전으로 되돌린다. --timeout 으로 무한 대기를 막고, helm rollback 으로 언제든 복구한다. hook(pre-install/post-upgrade) 순서로 DB 마이그레이션을 제어하고, helm test 로 배포 직후 헬스체크를 자동화한다.',
+        score:60,
+        focus:'배포 안전',
+        checks:[
+          {cat:'품질', items:[
+            {label:'helm lint 통과 (0 errors)', ok:true},
+            {label:'values.schema.json 존재·검증', ok:true},
+            {label:'README.md · NOTES.txt 문서화', ok:true},
+          ]},
+          {cat:'안정성', items:[
+            {label:'resources requests/limits 설정', ok:true},
+            {label:'liveness / readiness probe', ok:true},
+            {label:'PodDisruptionBudget 정의', ok:true},
+            {label:'replicaCount ≥ 2', ok:true},
+          ]},
+          {cat:'배포 안전', items:[
+            {label:'--atomic --wait --timeout', ok:true},
+            {label:'롤백 계획 (helm rollback)', ok:true},
+            {label:'hook 순서 (pre/post)', ok:true},
+            {label:'helm test 존재', ok:true},
+          ]},
+        ],
+        alert:{tone:'good', text:'--atomic 없이 배포하다 실패하면 절반만 뜬 상태로 남는다. 항상 --atomic --wait 를 기본으로.'},
+        code:{lang:'bash', filename:'03-safe-deploy.sh', lines:[
+          '# (1) 실패 시 자동 롤백 — 운영 배포 표준 옵션',
+          '$ helm upgrade --install my-app ./my-app \\',
+          '    --namespace prod \\',
+          '    --atomic \\        # 실패하면 이전 리비전으로 자동 복구',
+          '    --wait \\          # 모든 리소스 Ready 까지 대기',
+          '    --timeout 5m0s \\  # 무한 대기 방지',
+          '    -f values-prod.yaml',
+          '',
+          '# (2) 배포 이력 확인 → 롤백',
+          '$ helm history my-app -n prod',
+          'REVISION  STATUS      DESCRIPTION',
+          '1         superseded  Install complete',
+          '2         deployed    Upgrade complete',
+          '$ helm rollback my-app 1 -n prod',
+          'Rollback was a success!',
+          '',
+          '# (3) hook 순서 — DB 마이그레이션 제어',
+          '# templates/migration-job.yaml 상단:',
+          '#   annotations:',
+          '#     "helm.sh/hook": pre-upgrade',
+          '#     "helm.sh/hook-weight": "-5"',
+          '#     "helm.sh/hook-delete-policy": before-hook-creation',
+          '',
+          '# (4) 배포 직후 스모크 테스트',
+          '$ helm test my-app -n prod',
+          'NAME: my-app',
+          'TEST SUITE:     my-app-connection-test',
+          'Phase:          Succeeded',
+        ], highlight:[1,2,3,4,5,6,7,13,14,17,18,19,20,21,24,25,28]},
+      },
+      {
+        title:'Step 4. 보안 — 시크릿 · securityContext · 이미지 태그',
+        desc:'보안은 배포 전 마지막 방어선이다. 시크릿을 values.yaml 에 평문으로 두면 git 에 그대로 새어 나간다 — Secret 리소스나 외부 시크릿으로 뺀다. securityContext 로 runAsNonRoot·readOnlyRootFilesystem 을 강제해 컨테이너 탈취 피해를 줄인다. 이미지 태그는 latest 금지 — 언제 무엇이 배포됐는지 추적 불가해진다. 반드시 고정 태그를 쓴다.',
+        score:80,
+        focus:'보안',
+        checks:[
+          {cat:'품질', items:[
+            {label:'helm lint 통과 (0 errors)', ok:true},
+            {label:'values.schema.json 존재·검증', ok:true},
+            {label:'README.md · NOTES.txt 문서화', ok:true},
+          ]},
+          {cat:'안정성', items:[
+            {label:'resources requests/limits 설정', ok:true},
+            {label:'liveness / readiness probe', ok:true},
+            {label:'PodDisruptionBudget 정의', ok:true},
+            {label:'replicaCount ≥ 2', ok:true},
+          ]},
+          {cat:'배포 안전', items:[
+            {label:'--atomic --wait --timeout', ok:true},
+            {label:'롤백 계획 (helm rollback)', ok:true},
+            {label:'hook 순서 (pre/post)', ok:true},
+            {label:'helm test 존재', ok:true},
+          ]},
+          {cat:'보안', items:[
+            {label:'시크릿 평문 커밋 금지', ok:true},
+            {label:'securityContext runAsNonRoot', ok:true},
+            {label:'이미지 태그 고정 (latest 금지)', ok:true},
+          ]},
+        ],
+        alert:{tone:'warn', text:'image.tag: latest 는 "어제 배포한 그 버전" 을 다시 못 띄운다는 뜻. 롤백도 무의미해진다.'},
+        code:{lang:'yaml', filename:'values.yaml', lines:[
+          '# === 이미지 — 고정 태그, latest 금지 ===',
+          'image:',
+          '  repository: registry.example.com/my-app',
+          '  tag: "1.4.2"            # ✅ 고정 (latest ❌)',
+          '  pullPolicy: IfNotPresent',
+          '',
+          '# === securityContext — 최소 권한 원칙 ===',
+          'podSecurityContext:',
+          '  runAsNonRoot: true',
+          '  runAsUser: 1000',
+          '  fsGroup: 2000',
+          'securityContext:',
+          '  allowPrivilegeEscalation: false',
+          '  readOnlyRootFilesystem: true',
+          '  capabilities:',
+          '    drop: ["ALL"]',
+          '',
+          '# === 시크릿은 평문 금지 — 참조만 ===',
+          '# ❌ 이렇게 하지 말 것:',
+          '# database:',
+          '#   password: "supersecret123"   # git 에 그대로 노출!',
+          '',
+          '# ✅ 기존 Secret 참조 (외부에서 생성/주입)',
+          'database:',
+          '  existingSecret: my-app-db-credentials',
+          '  secretKeys:',
+          '    passwordKey: db-password',
+          '',
+          '# ✅ 또는 SOPS / External Secrets Operator 로 관리',
+          'externalSecrets:',
+          '  enabled: true',
+          '  backend: vault',
+        ], highlight:[1,2,3,4,7,8,9,10,11,12,13,14,15,16,18,19,20,21,23,24,25,26,27]},
+      },
+      {
+        title:'Step 5. 운영 + 종합 체크리스트',
+        desc:'마지막은 지속 가능한 운영이다. 차트 버전은 SemVer 를 지켜 변경 이력을 읽을 수 있게 하고, values-dev/staging/prod 로 환경을 분리한다. Prometheus 스크레이프 라벨과 표준 라벨(app.kubernetes.io/*)을 붙여 모니터링·검색이 가능하게 한다. 아래 종합 체크리스트가 모두 초록이면 프로덕션 배포 준비 완료다.',
+        score:100,
+        focus:'운영',
+        checks:[
+          {cat:'품질', items:[
+            {label:'helm lint 통과 (0 errors)', ok:true},
+            {label:'values.schema.json 존재·검증', ok:true},
+            {label:'README.md · NOTES.txt 문서화', ok:true},
+          ]},
+          {cat:'안정성', items:[
+            {label:'resources requests/limits 설정', ok:true},
+            {label:'liveness / readiness probe', ok:true},
+            {label:'PodDisruptionBudget 정의', ok:true},
+            {label:'replicaCount ≥ 2', ok:true},
+          ]},
+          {cat:'배포 안전', items:[
+            {label:'--atomic --wait --timeout', ok:true},
+            {label:'롤백 계획 (helm rollback)', ok:true},
+            {label:'hook 순서 (pre/post)', ok:true},
+            {label:'helm test 존재', ok:true},
+          ]},
+          {cat:'보안', items:[
+            {label:'시크릿 평문 커밋 금지', ok:true},
+            {label:'securityContext runAsNonRoot', ok:true},
+            {label:'이미지 태그 고정 (latest 금지)', ok:true},
+          ]},
+          {cat:'운영', items:[
+            {label:'차트 버전 SemVer 관리', ok:true},
+            {label:'환경별 values 분리', ok:true},
+            {label:'모니터링 · 표준 라벨', ok:true},
+          ]},
+        ],
+        wins:[
+          '품질: helm lint · values.schema.json · 문서화',
+          '안정성: resources · probe · PDB · replica≥2',
+          '배포 안전: --atomic --wait · 롤백 · hook · test',
+          '보안: 시크릿 참조 · runAsNonRoot · 태그 고정',
+          '운영: SemVer · 환경별 values · 표준 라벨',
+          '전 항목 초록 → 프로덕션 배포 준비 완료',
+        ],
+        alert:{tone:'good', text:'배포 준비도 100% — 모든 카테고리가 통과했다. 이제 자신 있게 helm upgrade --install.'},
+        code:{lang:'yaml', filename:'production-checklist.yaml', lines:[
+          '# === 프로덕션 배포 전 종합 체크리스트 ===',
+          '# ✅ = 필수 통과 항목',
+          '',
+          'quality:                       # 차트 품질',
+          '  helm_lint_pass: true         # ✅ 0 errors',
+          '  values_schema_json: true     # ✅ 스키마 검증',
+          '  documented: true             # ✅ README + NOTES.txt',
+          '',
+          'stability:                     # 안정성',
+          '  resources_set: true          # ✅ requests/limits',
+          '  probes_configured: true      # ✅ liveness/readiness',
+          '  pdb_defined: true            # ✅ PodDisruptionBudget',
+          '  replica_count: 3             # ✅ >= 2',
+          '',
+          'deploy_safety:                 # 배포 안전',
+          '  atomic_wait: true            # ✅ --atomic --wait',
+          '  rollback_plan: true          # ✅ helm rollback',
+          '  hook_ordering: true          # ✅ hook-weight',
+          '  helm_test: true              # ✅ 스모크 테스트',
+          '',
+          'security:                      # 보안',
+          '  no_plaintext_secrets: true   # ✅ Secret 참조만',
+          '  run_as_non_root: true        # ✅ securityContext',
+          '  pinned_image_tag: true       # ✅ latest 금지',
+          '',
+          'operations:                    # 운영',
+          '  semver_versioning: true      # ✅ SemVer',
+          '  env_values_split: true       # ✅ dev/staging/prod',
+          '  monitoring_labels: true      # ✅ 표준 라벨',
+          '',
+          '# 환경별 values 분리 예시',
+          '$ helm upgrade --install my-app ./my-app \\',
+          '    -f values.yaml -f values-prod.yaml \\',
+          '    --atomic --wait --timeout 5m0s -n prod',
+        ], highlight:[4,5,6,7,9,10,11,12,13,15,16,17,18,19,21,22,23,24,26,27,28,29]},
+      },
+    ];
+
+    function ScoreGauge({ score }) {
+      const done = score >= 100;
+      return (
+        <div className="rounded-lg p-3 mb-3" style={{border:`2px solid ${BRAND}`, background:BRAND_BG}}>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs font-bold" style={{color:BRAND_DARK}}>배포 준비도</span>
+            <span className="text-lg font-bold" style={{color: done ? '#166534' : BRAND_DARK}}>{score}%</span>
+          </div>
+          <div className="h-2.5 rounded-full overflow-hidden bg-white" style={{border:`1px solid ${BRAND_BD}`}}>
+            <div className="h-full rounded-full transition-all" style={{width:`${score}%`, background: done ? '#22c55e' : BRAND}} />
+          </div>
+          <div className="text-[10px] mt-1" style={{color:BRAND}}>{done ? '✅ 모든 카테고리 통과 — 배포 준비 완료' : '카테고리를 하나씩 점검 중...'}</div>
+        </div>
+      );
+    }
+
+    function ChecklistBoard({ checks, focus }) {
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{border:`2px solid ${BRAND}`}}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white" style={{background:BRAND}}>⛵ 프로덕션 배포 체크리스트</div>
+          <div className="p-2.5 space-y-2">
+            {checks.map((c, i) => {
+              const active = c.cat === focus;
+              return (
+                <div key={i} className="rounded-lg p-2" style={{border:`1px solid ${active ? BRAND : BRAND_BD}`, background: active ? BRAND_BG : '#fff'}}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-xs font-bold" style={{color:BRAND_DARK}}>{active ? '▶ ' : ''}{c.cat}</span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full font-mono" style={{background:'#dbf3e6', color:'#166534'}}>{c.items.filter((x)=>x.ok).length}/{c.items.length} 통과</span>
+                  </div>
+                  <div className="space-y-0.5">
+                    {c.items.map((it, j) => (
+                      <div key={j} className="flex items-center gap-1.5 text-[11px]" style={{color: it.ok ? '#166534' : '#991b1b'}}>
+                        <span>{it.ok ? '✅' : '❌'}</span><span className="font-mono">{it.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function WinsBox({ wins, title }) {
+      if (!wins) return null;
+      return (
+        <div className="mt-3 rounded-xl p-4" style={{border:`2px solid ${BRAND}`, background:BRAND_BG}}>
+          <div className="text-lg font-bold mb-2" style={{color:BRAND_DARK}}>⛵ {title || '핵심 정리'}</div>
+          <ul className="space-y-1.5">
+            {wins.map((w, i) => (
+              <li key={i} className="text-sm flex gap-2" style={{color:BRAND_DARK}}><span style={{color:BRAND}}>✓</span><span>{w}</span></li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:{bg:BRAND_BG, bd:BRAND_BD, tx:BRAND_DARK, icon:'💡'},
+      warn:{bg:'#fef3c7', bd:'#fde68a', tx:'#92400e', icon:'⚠️'},
+      danger:{bg:'#fee2e2', bd:'#fecaca', tx:'#991b1b', icon:'🚨'},
+      good:{bg:'#dbf3e6', bd:'#86efac', tx:'#166534', icon:'✅'},
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{background:s.bg, border:`1px solid ${s.bd}`, color:s.tx}}><span>{s.icon}</span><span>{alert.text}</span></div>;
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{border:`1px solid ${BRAND}`}}>
+          <div className="mb-3 text-sm font-bold" style={{color:BRAND_DARK}}>배포 준비도 대시보드 — 카테고리별 점검</div>
+          <ScoreGauge score={state.score} />
+          <ChecklistBoard checks={state.checks} focus={state.focus} />
+          <WinsBox wins={state.wins} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => { if (codeRef.current && window.hljs) { codeRef.current.removeAttribute('data-highlighted'); window.hljs.highlightElement(codeRef.current); } }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span><span className="w-3 h-3 rounded-full bg-yellow-400"></span><span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? {background:'rgba(39,122,159,0.18)', borderLeft:`2px solid ${BRAND}`} : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span><span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{background:`linear-gradient(135deg,${BRAND_BG} 0%,#cfe5ef 100%)`}}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{background:BRAND}}>⛵</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{color:BRAND_DARK}}>V-2-2. 실전 체크리스트</h1>
+                <p className="text-sm" style={{color:BRAND}}>비유: 비행기 이륙 전 점검표 — 프로덕션 배포 전 마지막 확인</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{color:BRAND}}>← 챕터 목록</a>
+            </header>
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{background: i <= stepIdx ? BRAND : BRAND_BD}} />
+              ))}
+            </div>
+            <div className="mb-4 rounded-xl px-5 py-4 shadow text-white" style={{background:BRAND}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{border:`1px solid ${BRAND}`, color:BRAND}}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{background:BRAND}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{border:`1px solid ${BRAND}`, color:BRAND}}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{color:`${BRAND}aa`}}>키보드 ←/→ · 자동재생 3초/단계</div>
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{border:`2px solid ${BRAND}`, color:BRAND_DARK}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                품질(lint·schema·docs) → 안정성(resources·probe·PDB·replica) → 배포 안전(atomic·rollback·hook·test) → 보안(secret·nonRoot·pinned tag) → 운영(SemVer·env 분리·라벨). 다섯 카테고리가 모두 초록이면 프로덕션 배포 준비 완료.
+              </div>
+            )}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {["Helm","Production","Checklist","Security","Rollback","Probe"].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{background:BRAND_BG, color:BRAND_DARK, border:`1px solid ${BRAND_BD}`}}>#{k}</span>
+              ))}
+            </div>
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{color:BRAND}}>
+              <a href="./V-2-1.html" className="underline hover:no-underline">← 이전</a>
+              <a href="../index.html" className="underline hover:no-underline">전체 목차 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
