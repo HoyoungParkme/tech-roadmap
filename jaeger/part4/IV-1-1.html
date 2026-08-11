@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — IV-1-1. Timeline 폭포수 읽기</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌊</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/json.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/python.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-1. Timeline 폭포수 읽기
+    학습 목표: 트레이스 타임라인(폭포수)에서 병목 span과 대기 gap을 읽어 근본 원인을 찾는다.
+    핵심 비유: "폭포수를 위에서 아래로 읽으면 어디서 물이 고이는지 보인다"
+    구조: 5단계 — 폭포수 기초 → 병목(self vs total) → 직렬 vs 병렬 → span 드릴다운(N+1) → 실무 함정(gap·clock skew)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+    const INK = '#0E7B91';
+
+    // 트레이스 총 길이(ms)
+    const TOTAL = 400;
+
+    // 서비스별 색 (색상 = 서비스)
+    const SVC_COLOR = {
+      gateway: '#0E7B91',
+      auth:    '#67CFE9',
+      catalog: '#F59E0B',
+      db:      '#10B981',
+      payment: '#8B5CF6',
+      stripe:  '#EF4444',
+    };
+
+    // 하나의 트레이스 = span 목록 (start/dur ms, depth = 들여쓰기)
+    const SPANS = [
+      { id: 'gw',     name: 'GET /checkout',    svc: 'gateway', depth: 0, start: 0,   dur: 400 },
+      { id: 'auth',   name: 'authorize()',      svc: 'auth',    depth: 1, start: 5,   dur: 40  },
+      { id: 'cat',    name: 'catalog.list',     svc: 'catalog', depth: 1, start: 50,  dur: 210 },
+      { id: 'q1',     name: 'SELECT item #1',   svc: 'db',      depth: 2, start: 55,  dur: 40  },
+      { id: 'q2',     name: 'SELECT item #2',   svc: 'db',      depth: 2, start: 100, dur: 40  },
+      { id: 'q3',     name: 'SELECT item #3',   svc: 'db',      depth: 2, start: 145, dur: 40  },
+      { id: 'q4',     name: 'SELECT item #4',   svc: 'db',      depth: 2, start: 190, dur: 40  },
+      { id: 'pay',    name: 'charge()',         svc: 'payment', depth: 1, start: 270, dur: 115 },
+      { id: 'stripe', name: 'POST api.stripe',  svc: 'stripe',  depth: 2, start: 275, dur: 105 },
+    ];
+
+    const STEPS = [
+      {
+        key: 'basic',
+        mode: 'basic',
+        title: 'Step 1. 폭포수 뷰 — 시간축 · 들여쓰기 · 막대 길이',
+        desc: '타임라인은 왼쪽→오른쪽이 시간이다. 각 span은 막대 하나이고, 막대의 왼쪽 끝=시작 시각, 길이=duration이다. 들여쓰기는 부모-자식(호출 관계)을 뜻한다. 위에서 아래로 읽으면 "요청이 어떤 순서로 어디를 거쳤는지"가 한눈에 보인다. 먼저 전체 폭(root span = 400ms)을 100%로 잡고, 어떤 자식이 그 폭의 대부분을 먹는지 감을 잡는 것이 시작이다.',
+        legend: 'root(GET /checkout) 400ms를 100%로. 들여쓰기=호출 깊이, 막대 길이=소요 시간.',
+        code: {
+          lang: 'json',
+          filename: 'trace.json — Jaeger API가 돌려주는 span 구조',
+          lines: [
+            '{',
+            '  "traceID": "a1b2c3d4e5f6",',
+            '  "spans": [',
+            '    {',
+            '      "spanID": "gw01", "operationName": "GET /checkout",',
+            '      "references": [],',
+            '      "startTime": 1000000, "duration": 400000,',
+            '      "process": { "serviceName": "gateway" }',
+            '    },',
+            '    {',
+            '      "spanID": "cat01", "operationName": "catalog.list",',
+            '      "references": [{ "refType": "CHILD_OF", "spanID": "gw01" }],',
+            '      "startTime": 1050000, "duration": 210000,',
+            '      "process": { "serviceName": "catalog" }',
+            '    }',
+            '  ]',
+            '}',
+            '',
+            '// 읽는 법',
+            '//  startTime(us) = 막대의 왼쪽 위치 (시간축)',
+            '//  duration(us)  = 막대의 길이',
+            '//  references CHILD_OF = 부모 span -> 들여쓰기 한 칸',
+            '//  process.serviceName = 막대 색상',
+          ],
+          highlight: [7, 8, 12, 13, 14],
+        },
+      },
+      {
+        key: 'bottleneck',
+        mode: 'bottleneck',
+        title: 'Step 2. 병목 찾기 — 가장 넓은 span, self-time vs total',
+        desc: '가장 먼저 "제일 넓은 막대"를 찾는다. 여기선 catalog.list(210ms)가 트레이스의 절반 이상을 먹는다. 단, 넓다고 그 span 자체가 느린 건 아니다. total(210ms)에서 자식들이 실행된 시간을 빼면 self-time(자기 코드에서 쓴 시간)이 나온다. catalog는 자식 DB 쿼리들이 대부분을 차지하므로 self-time은 작다 — 즉 범인은 catalog가 아니라 그 안의 DB 호출이다. 이 구분을 못 하면 엉뚱한 서비스를 튜닝하게 된다.',
+        legend: 'catalog.list = 최장 span(210ms). 하지만 self-time은 작다 → 자식(DB)이 진짜 범인.',
+        code: {
+          lang: 'python',
+          filename: 'self_time.py — total과 self-time을 분리해 병목을 특정',
+          lines: [
+            'from collections import defaultdict',
+            '',
+            'def self_time(spans):',
+            '    """각 span의 self-time = duration - 자식들이 점유한 시간."""',
+            '    children = defaultdict(list)',
+            '    for s in spans:',
+            '        if s.get("parent"):',
+            '            children[s["parent"]].append(s)',
+            '',
+            '    result = {}',
+            '    for s in spans:',
+            '        busy = sum(c["dur"] for c in children[s["id"]])',
+            '        result[s["id"]] = {',
+            '            "name": s["name"],',
+            '            "total": s["dur"],',
+            '            "self": s["dur"] - busy,   # 자기 코드 시간',
+            '        }',
+            '    return result',
+            '',
+            '# 출력 (ms)',
+            '#  catalog.list  total=210  self=50    <- 넓지만 self 작음',
+            '#  SELECT item*4 total=160  self=160   <- 진짜 범인(합산)',
+            '#  charge()      total=115  self=10',
+            '#',
+            '# 교훈: "가장 넓은 span"이 아니라 "self-time이 큰 span"을 고쳐라.',
+          ],
+          highlight: [11, 12, 16, 21, 22],
+        },
+      },
+      {
+        key: 'serial',
+        mode: 'serial',
+        title: 'Step 3. 직렬 vs 병렬 — 계단이면 직렬, 겹치면 병렬',
+        desc: 'catalog 아래 DB 쿼리 4개가 계단처럼 차례로 이어진다 — 이것이 직렬(serial) 패턴이다. 하나가 끝나야 다음이 시작되니 40ms×4=160ms가 그대로 지연에 더해진다. 만약 이 쿼리들이 서로 독립적이라면 병렬로 던져 막대가 겹치게(overlap) 만들 수 있고, 그러면 전체는 약 40ms로 줄어든다. 폭포수에서 계단 모양을 발견하는 순간 "이거 병렬화하거나 배치 쿼리로 묶을 수 있나?"를 자문해야 한다.',
+        legend: '계단(끝→시작 반복)=직렬 160ms. 겹치게(병렬) 바꾸면 ~40ms. N+1의 전형.',
+        code: {
+          lang: 'python',
+          filename: 'detect_serial.py — 형제 span이 직렬인지 판정',
+          lines: [
+            'def is_serial(siblings):',
+            '    """형제 span들이 겹치지 않고 순차 실행되면 True (직렬)."""',
+            '    ordered = sorted(siblings, key=lambda s: s["start"])',
+            '    for prev, cur in zip(ordered, ordered[1:]):',
+            '        prev_end = prev["start"] + prev["dur"]',
+            '        if cur["start"] < prev_end:',
+            '            return False   # 겹침 = 병렬 실행 중',
+            '    return True',
+            '',
+            'db_calls = [',
+            '    {"name": "SELECT #1", "start": 55,  "dur": 40},',
+            '    {"name": "SELECT #2", "start": 100, "dur": 40},',
+            '    {"name": "SELECT #3", "start": 145, "dur": 40},',
+            '    {"name": "SELECT #4", "start": 190, "dur": 40},',
+            ']',
+            'assert is_serial(db_calls) is True    # 계단형 = 직렬',
+            '',
+            '# 개선안',
+            '#  1) 병렬화: asyncio.gather / goroutine -> 막대가 겹침 (~40ms)',
+            '#  2) 배치:   WHERE id IN (1,2,3,4) 한 방 (N+1 제거)',
+            '#  3) 캐시:   반복 조회는 Redis 등으로 흡수',
+          ],
+          highlight: [5, 6, 7, 16, 19, 20],
+        },
+      },
+      {
+        key: 'drill',
+        mode: 'drill',
+        title: 'Step 4. span 드릴다운 — 태그 · 로그 · 에러로 원인 확정',
+        desc: '막대를 클릭하면 그 span의 태그(tags)·로그(logs)·에러가 펼쳐진다. 여기서 db.statement 태그를 보면 4개 쿼리가 동일한 SELECT를 id만 바꿔 반복한다 — N+1 쿼리가 확정된다. 폭포수 모양(계단)은 "의심"이고, 태그·로그는 "증거"다. error=true 태그나 event 로그(exception, retry)까지 확인해야 추측이 아닌 사실로 리포트할 수 있다. 넓은 막대만 보고 클릭을 건너뛰면 원인을 절반만 아는 셈이다.',
+        legend: '클릭 → tags/logs. db.statement가 반복 SELECT = N+1 확정. 모양은 의심, 태그는 증거.',
+        code: {
+          lang: 'json',
+          filename: 'span_detail.json — 클릭한 span의 tags/logs',
+          lines: [
+            '{',
+            '  "spanID": "q1",',
+            '  "operationName": "SELECT item #1",',
+            '  "duration": 40000,',
+            '  "tags": [',
+            '    { "key": "db.system",    "value": "postgresql" },',
+            '    { "key": "db.statement", "value": "SELECT * FROM item WHERE id = 1" },',
+            '    { "key": "db.rows",      "value": 1 },',
+            '    { "key": "error",        "value": false }',
+            '  ],',
+            '  "logs": [',
+            '    { "timestamp": 1055000, "fields": [',
+            '      { "key": "event", "value": "query.start" } ] },',
+            '    { "timestamp": 1095000, "fields": [',
+            '      { "key": "event", "value": "query.end" } ] }',
+            '  ]',
+            '}',
+            '',
+            '// 신호: 형제 q1..q4의 db.statement가 id만 다른 동일 쿼리',
+            '//       -> N+1 확정. error 태그/exception 로그도 함께 확인.',
+          ],
+          highlight: [7, 8, 12, 13, 19],
+        },
+      },
+      {
+        key: 'pitfall',
+        mode: 'pitfall',
+        title: 'Step 5. 실무 함정 — gap 오해 · clock skew · 넓은 span 편향',
+        desc: 'gap(막대 사이 빈 공간)을 무조건 "대기"로 읽으면 안 된다. 실제 대기(락·큐)일 수도, 계측이 안 된 구간(SDK 미적용 코드)일 수도 있다 — 둘은 다르게 고쳐야 한다. 또 서비스마다 시계가 미세하게 달라 자식 span이 부모보다 먼저 시작한 것처럼 보이는 clock skew가 생긴다(음수 gap). 마지막으로 "가장 넓은 span"만 쫓는 편향을 조심하라 — self-time·gap·로그를 함께 봐야 오진을 피한다.',
+        legend: 'gap=대기? 계측 공백? 구분하라. 음수 gap=clock skew. 넓은 span만 보지 마라.',
+        code: {
+          lang: 'python',
+          filename: 'audit_gaps.py — 의심 gap과 clock skew 자동 점검',
+          lines: [
+            'def audit(parent, children):',
+            '    """부모-자식 사이의 gap과 시계 오차를 점검."""',
+            '    ordered = sorted(children, key=lambda s: s["start"])',
+            '    warnings = []',
+            '',
+            '    for prev, cur in zip(ordered, ordered[1:]):',
+            '        gap = cur["start"] - (prev["start"] + prev["dur"])',
+            '        if gap > 20:',
+            '            warnings.append(f"gap {gap}ms: 대기? 계측 공백? 로그 확인")',
+            '        if gap < 0:',
+            '            warnings.append(f"음수 gap {gap}ms: clock skew 의심")',
+            '',
+            '    if children and children[0]["start"] < parent["start"]:',
+            '        warnings.append("자식이 부모보다 먼저 시작 = clock skew")',
+            '    return warnings',
+            '',
+            '# 체크리스트',
+            '#  [ ] 넓은 span뿐 아니라 self-time 큰 span도 봤는가',
+            '#  [ ] gap이 실제 대기인지 계측 공백인지 로그로 확인했는가',
+            '#  [ ] 음수/이상 타임스탬프(clock skew)를 걸렀는가',
+            '#  [ ] error 태그/exception 로그를 열어봤는가',
+          ],
+          highlight: [7, 8, 9, 10, 11, 14],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화 — 폭포수(Waterfall) 뷰
+    // ─────────────────────────────────────────────────────────
+
+    // 시간 눈금자
+    function TimeRuler() {
+      const marks = [0, 100, 200, 300, 400];
+      return (
+        <div className="relative h-4 ml-40 border-b border-slate-200 mb-1">
+          {marks.map((m) => (
+            <div key={m} className="absolute top-0 text-[9px] font-mono text-slate-400"
+                 style={{ left: `${(m / TOTAL) * 100}%`, transform: 'translateX(-50%)' }}>
+              {m}ms
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // 한 줄 = span 막대
+    function SpanRow({ span, i, mode }) {
+      const left = (span.start / TOTAL) * 100;
+      const width = Math.max((span.dur / TOTAL) * 100, 1.5);
+      const color = SVC_COLOR[span.svc] || BRAND;
+
+      // 모드별 강조 여부
+      const isDbSerial = span.svc === 'db';
+      let dim = false, ring = false, pulse = false;
+      if (mode === 'bottleneck') { ring = span.id === 'cat'; dim = !ring; }
+      if (mode === 'serial')     { ring = isDbSerial; dim = !isDbSerial; }
+      if (mode === 'drill')      { ring = span.id === 'q1'; pulse = ring; dim = !ring; }
+
+      return (
+        <div className="fade-in flex items-center h-6 group" style={{ animationDelay: `${i * 60}ms` }}>
+          <div className="w-40 shrink-0 flex items-center overflow-hidden"
+               style={{ paddingLeft: `${span.depth * 12 + 4}px` }}>
+            <span className="w-1.5 h-1.5 rounded-full mr-1 shrink-0" style={{ background: color }} />
+            <span className={`text-[10px] font-mono truncate ${dim ? 'text-slate-300' : 'text-slate-600'}`}>
+              {span.name}
+            </span>
+          </div>
+          <div className="relative flex-1 h-full">
+            <div className={`absolute top-1 h-4 rounded-sm ${pulse ? 'pulse-ring' : ''}`}
+                 style={{
+                   left: `${left}%`, width: `${width}%`,
+                   background: color,
+                   opacity: dim ? 0.25 : 1,
+                   outline: ring ? `2px solid ${INK}` : 'none',
+                   outlineOffset: '1px',
+                 }}>
+              <span className="absolute right-1 top-1/2 -translate-y-1/2 text-[8px] font-mono text-white/90 whitespace-nowrap">
+                {span.dur}ms
+              </span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // 병목 배지 (bottleneck 모드)
+    function BottleneckBadge() {
+      return (
+        <div className="mt-2 p-2 rounded bg-amber-50 border border-amber-300 text-[11px] text-amber-800">
+          <span className="font-bold">최장 span = catalog.list 210ms.</span> 그러나 self-time은 ~50ms.
+          진짜 시간은 자식 DB 쿼리 160ms가 먹는다.
+        </div>
+      );
+    }
+
+    // 직렬 표시 (serial 모드)
+    function SerialNote() {
+      return (
+        <div className="mt-2 p-2 rounded text-[11px]" style={{ background: '#E6F8FC', border: '1px solid #B7EAF5', color: INK }}>
+          <span className="font-bold">계단형 4회 = 직렬 160ms.</span> 병렬화하면 막대가 겹쳐 ~40ms.
+          독립 쿼리면 배치(IN)로 한 방에.
+        </div>
+      );
+    }
+
+    // 드릴다운 상세 패널 (drill 모드)
+    function DrillPanel() {
+      const rows = [
+        { k: 'db.system', v: 'postgresql' },
+        { k: 'db.statement', v: 'SELECT * FROM item WHERE id = 1' },
+        { k: 'db.rows', v: '1' },
+        { k: 'error', v: 'false' },
+      ];
+      return (
+        <div className="mt-2 rounded-lg border border-slate-200 overflow-hidden fade-in" style={{ animationDelay: '300ms' }}>
+          <div className="px-3 py-1.5 text-white text-[10px] font-bold flex items-center gap-1" style={{ background: INK }}>
+            <span>🔎</span> SELECT item #1 — tags
+          </div>
+          <div className="p-2 space-y-1 bg-white">
+            {rows.map((r) => (
+              <div key={r.k} className="flex items-center gap-2 text-[10px] font-mono">
+                <span className="text-slate-400 w-24 shrink-0">{r.k}</span>
+                <span className="text-slate-700 truncate">{r.v}</span>
+              </div>
+            ))}
+            <div className="mt-1 pt-1 border-t border-slate-100 text-[10px] text-red-600 font-bold">
+              형제 q1..q4가 id만 다른 동일 쿼리 → N+1 확정
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // gap / clock skew 표시 (pitfall 모드)
+    function PitfallNote() {
+      return (
+        <div className="mt-2 space-y-1">
+          <div className="p-2 rounded bg-slate-50 border border-slate-200 text-[11px] text-slate-600">
+            <span className="font-bold text-slate-700">gap 10ms</span> (catalog 끝 → payment 시작):
+            실제 대기인가, 계측 안 된 구간인가? 로그로 구분.
+          </div>
+          <div className="p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">
+            <span className="font-bold">음수 gap</span>이 보이면 clock skew — 자식이 부모보다 먼저 시작한 착시.
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const mode = step.mode;
+      return (
+        <div className="space-y-2">
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+            <div className="px-4 py-2 flex items-center gap-2 text-white" style={{ background: INK }}>
+              <span className="text-base">🌊</span>
+              <span className="text-xs font-bold">Trace a1b2c3d4 — Timeline (폭포수)</span>
+              <span className="ml-auto text-[10px] font-mono opacity-80">total 400ms</span>
+            </div>
+            <div className="p-3">
+              <TimeRuler />
+              <div className="space-y-0.5">
+                {SPANS.map((s, i) => (
+                  <SpanRow key={s.id} span={s} i={i} mode={mode} />
+                ))}
+              </div>
+              {mode === 'bottleneck' && <BottleneckBadge />}
+              {mode === 'serial' && <SerialNote />}
+              {mode === 'drill' && <DrillPanel />}
+              {mode === 'pitfall' && <PitfallNote />}
+            </div>
+          </div>
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes pulseRing {
+              0%,100% { outline-color: ${INK}; }
+              50%     { outline-color: #B7EAF5; }
+            }
+            .pulse-ring { animation: pulseRing 1.2s ease-in-out infinite; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: BRAND }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: BRAND }}>IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. UI &middot; 분석 &gt; Chapter 1. Timeline 뷰</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Timeline 폭포수 읽기</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                트레이스 타임라인에서 병목을 찾는 법 — <strong>가장 넓은 막대·긴 gap·직렬 계단</strong>을 읽어
+                self-time과 태그로 근본 원인을 특정한다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: INK }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl border-2 text-sm" style={{ background: '#E6F8FC', borderColor: '#B7EAF5', color: INK }}>
+                💡 다음(IV-1-2)에서는 <strong>서비스 의존성 그래프</strong> — 폭포수를 넘어 시스템 전체의 호출 관계를 본다.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: BRAND }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./IV-1-2.html" className="font-medium" style={{ color: BRAND }}>IV-1-2 서비스 의존성 그래프 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

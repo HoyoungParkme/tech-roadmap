@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — IV-2-2. Critical Path 분석</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛤️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/json.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/python.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-2-2. Critical Path 분석
+    학습 목표: 트레이스 전체 응답 시간을 실제로 결정하는 span 연쇄(임계 경로)를 찾아, 최적화 대상을 정확히 고른다.
+    핵심 비유: "여러 갈래 길에서 가장 오래 걸리는 길만 줄여야 도착이 빨라진다"
+    구조: 5단계 — 임계 경로란 → self-time·계산 → 비임계 vs 임계 최적화 대비 → 임계 경로 이동·gap → Jaeger 하이라이트·함정
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+    const INK = '#0E7B91';
+    const LIGHT = '#E6F8FC';
+    const BORDER = '#B7EAF5';
+
+    // 예제 트레이스 (총 200ms). gateway 아래 auth → 병렬 팬아웃 → render.
+    // 병렬 3개(db 60 · cache 20 · reco 130) 중 가장 느린 reco가 임계 경로.
+    const TOTAL = 200;
+    const TRACE = [
+      { id: 'gateway', label: 'gateway  POST /checkout', start: 0,   dur: 200, depth: 0, critical: true },
+      { id: 'auth',    label: 'auth.verify',             start: 0,   dur: 30,  depth: 1, critical: true },
+      { id: 'db',      label: 'db.query orders',         start: 30,  dur: 60,  depth: 1, critical: false },
+      { id: 'cache',   label: 'cache.get profile',       start: 30,  dur: 20,  depth: 1, critical: false },
+      { id: 'reco',    label: 'recommend.rank',          start: 30,  dur: 130, depth: 1, critical: true },
+      { id: 'render',  label: 'render.template',         start: 160, dur: 40,  depth: 1, critical: true },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // STEPS
+    // ─────────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        key: 'concept',
+        title: 'Step 1. 임계 경로 — 전체 응답 시간을 결정하는 span 연쇄',
+        desc: '트레이스에는 병렬로 도는 span이 뒤섞여 있어, 막대가 길다고 다 중요한 게 아니다. 임계 경로(critical path)는 각 시점에 실제로 전체 진행을 붙잡고 있던 span만 이어붙인 연쇄다. 병렬 구간에서는 가장 늦게 끝나는 하나만 임계이고, 나머지는 그 그늘에 숨는다. 이 예제에서 총 200ms를 결정하는 건 auth(30) → reco(130) → render(40)이고, db·cache는 reco보다 먼저 끝나 전체 시간에 기여하지 않는다. 최적화는 오직 이 임계 경로 위에서만 의미가 있다.',
+        legend: '색이 진한 막대가 임계 경로. 회색 db·cache는 병렬이지만 reco 그늘에 가려 전체 시간에 기여하지 않는다.',
+        code: {
+          lang: 'json',
+          filename: 'trace.json — 병렬 span이 섞인 트레이스',
+          lines: [
+            '{',
+            '  "traceID": "9f2c...ab",',
+            '  "totalDurationMs": 200,',
+            '  "spans": [',
+            '    { "id": "gateway", "op": "POST /checkout",',
+            '      "parent": null, "startMs": 0,   "durMs": 200 },',
+            '',
+            '    { "id": "auth",   "op": "auth.verify",',
+            '      "parent": "gateway", "startMs": 0,   "durMs": 30 },',
+            '',
+            '    { "id": "db",     "op": "db.query orders",',
+            '      "parent": "gateway", "startMs": 30,  "durMs": 60 },',
+            '',
+            '    { "id": "cache",  "op": "cache.get profile",',
+            '      "parent": "gateway", "startMs": 30,  "durMs": 20 },',
+            '',
+            '    { "id": "reco",   "op": "recommend.rank",',
+            '      "parent": "gateway", "startMs": 30,  "durMs": 130 },',
+            '',
+            '    { "id": "render", "op": "render.template",',
+            '      "parent": "gateway", "startMs": 160, "durMs": 40 }',
+            '  ]',
+            '}',
+            '',
+            '// 병렬 팬아웃: db·cache·reco 셋 다 startMs=30 에서 동시 시작.',
+            '// render 는 startMs=160 — 셋 중 가장 늦게 끝난 reco(30+130) 를 기다렸다.',
+            '// 즉 전체 200ms 를 만든 경로 = auth → reco → render (임계 경로).',
+          ],
+          highlight: [8, 17, 20],
+        },
+      },
+      {
+        key: 'selftime',
+        title: 'Step 2. 계산 — 끝에서부터 훑으며 self-time을 잇는다',
+        desc: '임계 경로는 트레이스 끝에서 앞으로 커서를 옮기며 계산한다. 각 순간에 "그 시점에 진행 중이면서 가장 늦게 끝난 span"을 고르고, 부모가 자식들 사이에서 스스로 일한 구간(self-time)도 임계에 포함한다. self-time이 핵심인 이유는, 자식 호출 시간을 빼고 그 span 자신이 소비한 시간만이 진짜 최적화 여지이기 때문이다. 커서가 render(160~200) → reco(30~160) → auth(0~30)를 차례로 지나며 경로가 완성된다. 이 규칙이 있어 병렬이 아무리 복잡해도 임계 경로는 항상 유일하게 결정된다.',
+        legend: '커서(세로선)가 오른쪽 끝에서 왼쪽으로 이동하며, 그 시점에 진행 중인 가장 늦게 끝난 span을 임계로 채택한다.',
+        code: {
+          lang: 'python',
+          filename: 'critical_path.py — 끝에서 앞으로 훑는 계산',
+          lines: [
+            '"""트레이스 span 목록에서 임계 경로를 계산한다."""',
+            'from collections import defaultdict',
+            'from dataclasses import dataclass',
+            '',
+            '@dataclass',
+            'class Span:',
+            '    span_id: str',
+            '    parent_id: str | None',
+            '    start_ms: float',
+            '    end_ms: float          # start_ms + dur_ms',
+            '',
+            'def critical_path(spans: list[Span]) -> list[str]:',
+            '    """임계 경로에 오른 span_id 를 순서대로 돌려준다."""',
+            '    children = defaultdict(list)',
+            '    for s in spans:',
+            '        children[s.parent_id].append(s)',
+            '    root = next(s for s in spans if s.parent_id is None)',
+            '',
+            '    path: list[str] = []',
+            '',
+            '    def walk(span: Span, lo: float, hi: float) -> None:',
+            '        # [lo, hi] 구간에서 span 의 임계 경로를 기록한다.',
+            '        kids = sorted(children[span.span_id],',
+            '                      key=lambda c: c.end_ms, reverse=True)',
+            '        cursor = hi',
+            '        for c in kids:',
+            '            if c.end_ms <= lo or c.start_ms >= cursor:',
+            '                continue                 # 구간 밖 자식은 건너뛴다',
+            '            # cursor 와 자식 끝 사이는 부모의 self-time (임계)',
+            '            path.append(span.span_id)',
+            '            walk(c, max(c.start_ms, lo), min(c.end_ms, cursor))',
+            '            cursor = c.start_ms          # 커서를 앞으로 당긴다',
+            '        path.append(span.span_id)        # 남은 앞구간 self-time',
+            '',
+            '    walk(root, root.start_ms, root.end_ms)',
+            '    return path',
+            '',
+            '# 결과: gateway 아래 render → reco → auth 가 임계 경로.',
+            '# db·cache 는 cursor 시점에 이미 끝나 있어 한 번도 채택되지 않는다.',
+          ],
+          highlight: [21, 25, 26, 30, 32],
+        },
+      },
+      {
+        key: 'contrast',
+        title: 'Step 3. 대비 — 비임계 최적화는 0, 임계 최적화만 전체를 줄인다',
+        desc: '가장 흔한 실수는 "제일 느려 보이는 db를 먼저 튜닝"하는 것이다. db(60ms)를 10ms로 줄여도 db는 애초에 임계가 아니라 전체는 200ms 그대로다 — reco가 여전히 병렬 구간을 지배하기 때문이다. 반대로 임계인 reco(130ms)를 50ms로 줄이면 병렬 구간 자체가 짧아져 전체가 120ms로 내려간다. 병렬 호출에서는 임계 경로만이 전체 지연을 만들고, 비임계 span을 아무리 최적화해도 사용자 체감은 1ms도 나아지지 않는다. 그래서 "무엇을 최적화할지"의 답은 언제나 임계 경로에서 시작한다.',
+        legend: '위: 비임계(db) 최적화 → 전체 200ms 불변. 아래: 임계(reco) 최적화 → 전체 200 → 120ms.',
+        code: {
+          lang: 'python',
+          filename: 'compare_opt.py — 두 최적화 시나리오 비교',
+          lines: [
+            '"""비임계 vs 임계 최적화가 전체 지연에 미치는 효과를 비교한다."""',
+            'from critical_path import Span, critical_path',
+            '',
+            'def total_duration(spans: list[Span]) -> float:',
+            '    """루트 span 의 길이 = 사용자 체감 응답 시간."""',
+            '    root = next(s for s in spans if s.parent_id is None)',
+            '    return root.end_ms - root.start_ms',
+            '',
+            'def with_faster(spans, span_id, new_dur):',
+            '    """span_id 의 지속시간을 new_dur 로 바꾼 트레이스를 만든다."""',
+            '    out = []',
+            '    for s in spans:',
+            '        if s.span_id == span_id:',
+            '            s = Span(s.span_id, s.parent_id, s.start_ms,',
+            '                     s.start_ms + new_dur)',
+            '        out.append(s)',
+            '    return recompute_parallel(out)   # 병렬 구간 끝 재계산',
+            '',
+            'crit = set(critical_path(TRACE))     # {gateway, auth, reco, render}',
+            '',
+            '# 1) 비임계 db 를 60 -> 10 : reco 가 여전히 병렬을 지배',
+            'assert "db" not in crit',
+            'faster_db = with_faster(TRACE, "db", 10)',
+            'print(total_duration(faster_db))     # 200.0  (효과 0)',
+            '',
+            '# 2) 임계 reco 를 130 -> 50 : 병렬 구간이 짧아짐',
+            'assert "reco" in crit',
+            'faster_reco = with_faster(TRACE, "reco", 50)',
+            'print(total_duration(faster_reco))   # 120.0  (80ms 단축)',
+            '',
+            '# 교훈: 최적화 후보는 반드시 critical_path() 안에서 고른다.',
+          ],
+          highlight: [19, 22, 24, 27, 29],
+        },
+      },
+      {
+        key: 'shift',
+        title: 'Step 4. 이동 — 임계 경로는 최적화하면 다음 병목으로 옮겨간다',
+        desc: 'reco를 50ms로 줄이는 순간, 병렬 구간에서 가장 늦게 끝나는 건 이제 db(60ms)가 된다. 즉 임계 경로가 reco에서 db로 이동한다 — 어제의 비임계가 오늘의 임계다. 최적화는 한 번으로 끝나지 않고, 임계 경로를 다시 계산해 다음 병목을 좇는 반복 과정이다. 또 하나 주의할 gap: 막대와 막대 사이의 빈 구간은 span이 없어도 시간이 흐른 것으로, 락 대기·네트워크 왕복·큐 지연 등 계측되지 않은 대기를 뜻한다. 이 gap도 임계 경로에 잡히면 반드시 원인을 계측해 채워야 한다.',
+        legend: 'reco 130 → 50 이후: 임계 경로가 db(60)로 이동. 다음 라운드의 최적화 대상이 바뀐다.',
+        code: {
+          lang: 'python',
+          filename: 'iterate.py — 임계 경로를 좇는 반복 최적화',
+          lines: [
+            '"""임계 경로가 이동하는 것을 확인하며 반복 최적화한다."""',
+            'from critical_path import critical_path',
+            '',
+            '# 라운드 0: 원본 — reco 가 병렬을 지배',
+            'print(critical_path(TRACE))',
+            '#  -> [gateway, auth, reco, render]',
+            '',
+            '# 라운드 1: reco 130 -> 50 최적화 후 다시 계산',
+            'trace_v1 = with_faster(TRACE, "reco", 50)',
+            'print(critical_path(trace_v1))',
+            '#  -> [gateway, auth, db, render]   # 임계가 db 로 이동!',
+            '',
+            '# 라운드 2: 이제 db 가 대상. 60 -> 20',
+            'trace_v2 = with_faster(trace_v1, "db", 20)',
+            'print(total_duration(trace_v2))   # 90.0',
+            '',
+            '# gap 주의 --------------------------------------------',
+            '# 막대 사이 빈 구간(gap)은 span 이 없어도 시간이 흐른 것:',
+            '#   - lock/DB connection pool 대기',
+            '#   - 네트워크 왕복 · 재시도 backoff',
+            '#   - 스레드풀 큐잉 (측정 안 된 대기)',
+            '# gap 이 임계 경로에 걸리면, 그 구간을 span 으로 계측해',
+            '# "무엇을 기다렸는지" 부터 드러내야 최적화가 가능하다.',
+          ],
+          highlight: [5, 10, 11, 14],
+        },
+      },
+      {
+        key: 'jaeger',
+        title: 'Step 5. Jaeger — critical path 하이라이트와 실무 함정',
+        desc: 'Jaeger UI는 트레이스 타임라인 위에 임계 경로를 별도 색 띠로 겹쳐 보여줘, 눈으로 바로 "줄여야 할 막대"를 짚게 해준다. 실무 함정을 정리하면: (1) 가장 긴 막대가 임계라고 단정하지 말 것 — 병렬이면 그늘에 숨은 것일 수 있다. (2) 직렬처럼 보여도 clock skew로 겹쳐 보일 수 있으니 병렬/직렬을 태그·부모관계로 확인할 것. (3) 임계 경로 하나를 잡으면 다음 병목으로 옮겨가므로 재측정할 것. (4) gap이 임계에 걸리면 코드가 아니라 대기를 계측해야 한다. 이 네 가지만 지켜도 최적화 시간을 엉뚱한 span에 낭비하지 않는다.',
+        legend: '진한 띠가 Jaeger의 임계 경로 하이라이트. 함정 4종을 체크리스트로 굳혀 두면 오최적화를 피한다.',
+        code: {
+          lang: 'json',
+          filename: 'jaeger-critical-path.json — UI 하이라이트 결과',
+          lines: [
+            '{',
+            '  "traceID": "9f2c...ab",',
+            '  "criticalPath": [',
+            '    { "spanID": "auth",   "sectionMs": [0, 30]    },',
+            '    { "spanID": "reco",   "sectionMs": [30, 160]  },',
+            '    { "spanID": "render", "sectionMs": [160, 200] }',
+            '  ],',
+            '  "notOnPath": ["db", "cache"],',
+            '  "totalMs": 200',
+            '}',
+            '',
+            '// Jaeger UI 에서 보는 법',
+            '//  - 트레이스 열고 상단 "Critical Path" 토글 ON',
+            '//  - 임계 span 위에 진한 띠가 겹쳐 표시된다',
+            '//  - 띠가 걸린 막대만 최적화 후보다',
+            '//',
+            '// 실무 함정 체크리스트',
+            '//  1) 최장 막대 != 임계 : 병렬 그늘 확인 (db 는 60 이나 비임계)',
+            '//  2) clock skew : 서버 시계 차이로 직렬이 겹쳐 보임',
+            '//  3) 임계 경로 이동 : 한 번 줄이면 재계산하고 다시 좇기',
+            '//  4) gap : 막대 사이 빈 구간은 대기 — 코드 아닌 대기를 계측',
+          ],
+          highlight: [3, 4, 5, 6, 8],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 공통 — 타임라인 막대 한 줄
+    // ─────────────────────────────────────────────────────────
+    function SpanRow({ span, total, dim, faded, delay, labelCritical }) {
+      const left = (span.start / total) * 100;
+      const width = (span.dur / total) * 100;
+      const isCrit = labelCritical ? labelCritical(span) : span.critical;
+      const bg = dim ? '#cbd5e1' : (isCrit ? INK : '#cbd5e1');
+      return (
+        <div className="flex items-center gap-2 text-[10px] font-mono">
+          <span className="w-36 shrink-0 text-right pr-1 truncate"
+                style={{ color: isCrit ? INK : '#94a3b8' }}>{span.label}</span>
+          <div className="relative flex-1 h-4 bg-slate-50 rounded">
+            <div className="absolute top-0 h-4 rounded grow-x flex items-center justify-end pr-1"
+                 style={{
+                   left: left + '%',
+                   '--target-w': width + '%',
+                   background: bg,
+                   opacity: faded ? 0.35 : 1,
+                   animationDelay: (delay || 0) + 'ms',
+                 }}>
+              <span className="text-[8px] text-white/90">{span.dur}</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // 축(0 · total ms)
+    function AxisRow({ total }) {
+      return (
+        <div className="flex items-center gap-2 text-[9px] font-mono text-slate-400 mt-1">
+          <span className="w-36 shrink-0"></span>
+          <div className="relative flex-1">
+            <span className="absolute left-0">0</span>
+            <span className="absolute left-1/2 -translate-x-1/2">{total / 2}ms</span>
+            <span className="absolute right-0">{total}ms</span>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 1 · 2: 전체 트레이스 (2는 커서 스윕 추가)
+    function TraceTimeline({ withCursor }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: INK }}>
+            <span className="text-base">🛤️</span>
+            <span className="text-xs font-bold">트레이스 타임라인 — 임계 경로 하이라이트</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">total {TOTAL}ms</span>
+          </div>
+          <div className="p-3 relative">
+            <div className="space-y-1 relative">
+              {withCursor && (
+                <div className="cursor-sweep absolute top-0 bottom-0 w-0.5 z-10"
+                     style={{ background: BRAND, left: 'calc(9rem + 0.5rem)' }} />
+              )}
+              {TRACE.map((s, i) => (
+                <SpanRow key={s.id} span={s} total={TOTAL} delay={i * 90} />
+              ))}
+            </div>
+            <AxisRow total={TOTAL} />
+            <div className="mt-3 flex items-center gap-3 text-[10px]">
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-3 rounded" style={{ background: INK }}></span> 임계 경로
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-3 rounded bg-slate-300"></span> 비임계(병렬 그늘)
+              </span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3: 대비 — 비임계 vs 임계 최적화
+    function ContrastView() {
+      // 비임계 db 60→10 : 전체 그대로 200
+      const dbOpt = TRACE.map((s) => (s.id === 'db' ? { ...s, dur: 10 } : s));
+      // 임계 reco 130→50 : reco 30~80, render 80~120, gateway 0~120
+      const recoOpt = TRACE.map((s) => {
+        if (s.id === 'reco') return { ...s, dur: 50, critical: true };
+        if (s.id === 'render') return { ...s, start: 80, dur: 40 };
+        if (s.id === 'gateway') return { ...s, dur: 120 };
+        return s;
+      });
+      const Block = ({ title, spans, total, badge, badgeColor }) => (
+        <div className="rounded-lg border border-slate-200 p-2">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-[11px] font-bold text-slate-700">{title}</span>
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded text-white"
+                  style={{ background: badgeColor }}>{badge}</span>
+          </div>
+          <div className="space-y-1">
+            {spans.map((s, i) => (
+              <SpanRow key={s.id} span={s} total={TOTAL} delay={i * 60}
+                       faded={s.id === 'db' || s.id === 'cache' ? false : false} />
+            ))}
+          </div>
+        </div>
+      );
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: INK }}>
+            <span className="text-base">⚖️</span>
+            <span className="text-xs font-bold">최적화 대비 — 어디를 줄여야 전체가 빨라지나</span>
+          </div>
+          <div className="p-3 space-y-2">
+            <Block title="비임계 db 60 → 10ms" spans={dbOpt} badge="전체 200ms · 효과 0"
+                   badgeColor="#dc2626" />
+            <Block title="임계 reco 130 → 50ms" spans={recoOpt} badge="전체 120ms · −80ms"
+                   badgeColor={INK} />
+            <div className="p-2 rounded text-[11px]" style={{ background: LIGHT, color: INK, border: '1px solid ' + BORDER }}>
+              <span className="font-bold">병렬에서는 임계 경로만 전체를 만든다.</span> db를 아무리 줄여도 reco 그늘 안이라 사용자 체감은 그대로다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: 임계 경로 이동
+    function ShiftView() {
+      // reco 130→50 이후: db(60)가 병렬에서 최장 → 임계로 승격
+      const shifted = [
+        { id: 'gateway', label: 'gateway  POST /checkout', start: 0,   dur: 130, critical: true },
+        { id: 'auth',    label: 'auth.verify',             start: 0,   dur: 30,  critical: true },
+        { id: 'db',      label: 'db.query orders',         start: 30,  dur: 60,  critical: true },
+        { id: 'cache',   label: 'cache.get profile',       start: 30,  dur: 20,  critical: false },
+        { id: 'reco',    label: 'recommend.rank (opt 50)', start: 30,  dur: 50,  critical: false },
+        { id: 'render',  label: 'render.template',         start: 90,  dur: 40,  critical: true },
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: INK }}>
+            <span className="text-base">🔀</span>
+            <span className="text-xs font-bold">임계 경로 이동 — reco 최적화 후 db가 새 병목</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">total 130ms</span>
+          </div>
+          <div className="p-3">
+            <div className="space-y-1">
+              {shifted.map((s, i) => (
+                <SpanRow key={s.id} span={s} total={130} delay={i * 80} />
+              ))}
+            </div>
+            <AxisRow total={130} />
+            <div className="mt-3 p-2 rounded text-[11px]" style={{ background: LIGHT, color: INK, border: '1px solid ' + BORDER }}>
+              <span className="font-bold">어제의 비임계가 오늘의 임계.</span> reco를 줄이자 db(60)가 병렬 최장이 되어 임계로 승격 — 다음 라운드 대상이 바뀐다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5: Jaeger 하이라이트 + 함정 체크리스트
+    function JaegerHighlight() {
+      const traps = [
+        '최장 막대 ≠ 임계 — 병렬 그늘 확인 (db는 60이나 비임계)',
+        'clock skew — 서버 시계 차로 직렬이 겹쳐 보임',
+        '임계 경로 이동 — 한 번 줄이면 재계산해 다시 좇기',
+        'gap — 막대 사이 빈 구간은 대기, 코드 아닌 대기를 계측',
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: INK }}>
+            <span className="text-base">🔦</span>
+            <span className="text-xs font-bold">Jaeger UI — Critical Path 토글</span>
+          </div>
+          <div className="p-3">
+            <div className="space-y-1 mb-3">
+              {TRACE.map((s, i) => (
+                <div key={s.id} className="relative">
+                  <SpanRow span={s} total={TOTAL} delay={i * 70} />
+                  {s.critical && s.id !== 'gateway' && (
+                    <div className="absolute top-0 h-1 rounded grow-x"
+                         style={{
+                           left: 'calc(9rem + 0.5rem + ' + (s.start / TOTAL) * 100 + '%)',
+                           '--target-w': (s.dur / TOTAL) * 100 + '%',
+                           width: (s.dur / TOTAL) * 100 + '%',
+                           background: BRAND,
+                           animationDelay: (i * 70 + 200) + 'ms',
+                         }} />
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="text-[10px] text-slate-500 mb-2">위쪽 밝은 띠 = 임계 경로 하이라이트</div>
+            <div className="rounded-lg p-2" style={{ background: LIGHT, border: '1px solid ' + BORDER }}>
+              <div className="text-[11px] font-bold mb-1" style={{ color: INK }}>실무 함정 체크리스트</div>
+              <ul className="space-y-1">
+                {traps.map((t, i) => (
+                  <li key={i} className="fade-in flex gap-1.5 text-[11px] text-slate-700"
+                      style={{ animationDelay: (i * 120) + 'ms' }}>
+                    <span className="font-bold" style={{ color: INK }}>{i + 1}.</span>
+                    <span>{t}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      let inner = null;
+      if (step.key === 'concept') inner = <TraceTimeline withCursor={false} />;
+      else if (step.key === 'selftime') inner = <TraceTimeline withCursor={true} />;
+      else if (step.key === 'contrast') inner = <ContrastView />;
+      else if (step.key === 'shift') inner = <ShiftView />;
+      else if (step.key === 'jaeger') inner = <JaegerHighlight />;
+      return (
+        <div className="space-y-2">
+          {inner}
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes growX {
+              from { width: 0; }
+              to   { width: var(--target-w); }
+            }
+            .grow-x { width: 0; animation: growX 700ms cubic-bezier(.2,.7,.3,1) forwards; }
+            .cursor-sweep { animation: sweepMove 2400ms ease-in-out infinite alternate; }
+            @keyframes sweepMove {
+              from { left: calc(100% - 0.5rem); }
+              to   { left: calc(9rem + 0.5rem); }
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: BRAND }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-2</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: BRAND }}>IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. UI &middot; 분석 &gt; Chapter 2. 고급 분석</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Critical Path 분석</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                전체 지연에 실제로 기여하는 경로를 찾는다 — <strong>병렬 span 중 전체를 결정하는 임계 경로</strong>만
+                줄여야 응답이 빨라지고, 비임계 최적화는 사용자 체감을 1ms도 바꾸지 못한다.
+              </p>
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all duration-500"
+                     style={{ width: progress + '%', background: BRAND }} />
+              </div>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: INK }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl border-2 text-sm" style={{ background: LIGHT, borderColor: BORDER, color: INK }}>
+                💡 다음(V-1-1)에서는 <strong>프로덕션 배포</strong> — Jaeger를 실제 운영 환경에 올리는 아키텍처와 설정으로 넘어간다.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: BRAND }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="../part5/V-1-1.html" className="font-medium" style={{ color: BRAND }}>V-1-1 프로덕션 배포 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

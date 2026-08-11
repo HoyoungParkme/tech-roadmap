@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — I-2-2. Instrumentation (계측)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🩺</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    I-2-2. Instrumentation (계측)
+    학습 목표: 코드에 트레이싱을 넣는 자동/수동 계측을 이해하고, OpenTelemetry SDK로 Jaeger(OTLP)에 span을 보낸다
+    핵심 비유: "청진기 붙이기" — 자동 계측은 프레임워크가 알아서, 수동 계측은 의사가 원하는 부위에 직접
+    패턴: jaeger 표준 — 좌(LiveDataPane: 자동/수동 span 생성 + 문맥 전파 애니메이션) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5 STEPS — 자동 계측 → 수동 계측 → OTLP export → 문맥 전파 → 계측 함정
+    const STEPS = [
+      {
+        title: 'Step 1. 자동 계측 — "프레임워크가 알아서 span 을 만든다"',
+        desc: '계측이란 코드가 자기 실행을 span 으로 남기게 만드는 작업이다. 자동 계측은 FastAPI·requests·psycopg 같은 라이브러리 호출을 가로채서(monkey-patch) 개발자가 손대지 않아도 HTTP 요청·DB 쿼리마다 span 을 자동 생성한다. 한 줄 instrument() 로 전체 요청 경로의 뼈대가 잡히므로, 처음 도입할 때 가장 빠르게 커버리지를 확보하는 방법이다. 다만 프레임워크가 모르는 우리 비즈니스 로직은 span 이 비어 있다.',
+        focus: 'auto',
+        legend: '자동 계측 — 라이브러리 호출을 가로채 HTTP/DB span 자동 생성 · 코드 수정 0',
+        spans: [
+          { id: 'http',  name: 'GET /checkout',    kind: 'auto', note: 'FastAPI 자동' },
+          { id: 'db',    name: 'SELECT cart',      kind: 'auto', note: 'psycopg 자동' },
+          { id: 'gap',   name: 'calc_discount()',  kind: 'gap',  note: '비즈니스 로직 — 계측 공백' },
+        ],
+        code: {
+          lang: 'python',
+          filename: 'auto_instrument.py — 자동 계측 (코드 수정 없이 span)',
+          lines: [
+            '# 자동 계측: 라이브러리를 instrument() 하면',
+            '# HTTP 요청 / DB 쿼리마다 span 이 자동으로 생긴다.',
+            'from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor',
+            'from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor',
+            'from opentelemetry.instrumentation.requests import RequestsInstrumentor',
+            'from fastapi import FastAPI',
+            '',
+            'app = FastAPI()',
+            '',
+            '# ① 프레임워크/라이브러리 계측 — 각 한 줄이면 끝',
+            'FastAPIInstrumentor.instrument_app(app)   # 모든 라우트에 서버 span',
+            'Psycopg2Instrumentor().instrument()       # 모든 SQL 에 client span',
+            'RequestsInstrumentor().instrument()       # 모든 외부 HTTP 호출에 span',
+            '',
+            '@app.get("/checkout")',
+            'def checkout(user_id: int):',
+            '    # ↓ 이 두 줄은 자동으로 span 이 생긴다 (내가 안 짜도)',
+            '    cart = db.query("SELECT * FROM cart WHERE user_id = %s", user_id)',
+            '    quote = requests.get(f"http://pricing/quote?u={user_id}")',
+            '',
+            '    # ↓ 하지만 이 함수는 순수 파이썬 — 자동 계측 대상 아님',
+            '    total = calc_discount(cart, quote.json())   # span 안 생김 (공백)',
+            '    return {"total": total}',
+            '',
+            '# → 자동 계측만으로 요청 경로의 "뼈대" span 이 잡힘',
+            '# → 단, 우리 비즈니스 로직은 blind spot 으로 남음',
+          ],
+          highlight: [10, 11, 12, 13, 17, 18, 21, 22],
+        },
+      },
+      {
+        title: 'Step 2. 수동 계측 — "비즈니스 로직에 직접 span 을 판다"',
+        desc: '자동 계측이 못 보는 구간은 수동 계측으로 채운다. tracer.start_as_current_span() 으로 원하는 코드 블록을 감싸고, set_attribute 로 user.id·discount.rule 같은 비즈니스 문맥을 태그로 박는다. 이렇게 남긴 태그는 나중에 Jaeger UI 에서 "특정 할인 규칙만 느린가?" 를 필터링하는 검색 키가 된다. 무엇을 span 으로 만들지가 곧 관측 가능성의 해상도이므로, 병목이 의심되거나 실패가 잦은 핵심 로직부터 감싼다.',
+        focus: 'manual',
+        legend: '수동 계측 — 커스텀 span + 비즈니스 태그 · 공백을 메움',
+        spans: [
+          { id: 'http',  name: 'GET /checkout',    kind: 'auto',   note: 'FastAPI 자동' },
+          { id: 'db',    name: 'SELECT cart',      kind: 'auto',   note: 'psycopg 자동' },
+          { id: 'calc',  name: 'calc_discount()',  kind: 'manual', note: '수동 span + 태그' },
+        ],
+        code: {
+          lang: 'python',
+          filename: 'manual_instrument.py — 수동 계측 (커스텀 span + 태그)',
+          lines: [
+            '# 수동 계측: 자동 계측이 못 보는 비즈니스 로직을',
+            '# 직접 span 으로 감싸고 의미 있는 태그를 붙인다.',
+            'from opentelemetry import trace',
+            '',
+            'tracer = trace.get_tracer("checkout-service")',
+            '',
+            'def calc_discount(cart: list, quote: dict) -> int:',
+            '    # ① with 블록으로 코드 구간을 span 으로 감싼다',
+            '    with tracer.start_as_current_span("calc_discount") as span:',
+            '        rule = pick_rule(cart)',
+            '',
+            '        # ② 비즈니스 문맥을 태그(attribute)로 박는다',
+            '        #    → 나중에 Jaeger UI 에서 이 값으로 검색/필터',
+            '        span.set_attribute("discount.rule", rule.name)',
+            '        span.set_attribute("cart.item_count", len(cart))',
+            '',
+            '        total = apply_rule(rule, cart, quote)',
+            '',
+            '        # ③ 실패는 span 에 기록 (UI 에서 빨간 표시)',
+            '        if total < 0:',
+            '            span.set_status(trace.StatusCode.ERROR, "negative total")',
+            '        return total',
+            '',
+            '# → 이제 UI 폭포수에서 calc_discount 의 시간/태그가 보임',
+            '# → "discount.rule=BLACK_FRIDAY 만 느리다" 같은 진단 가능',
+          ],
+          highlight: [8, 9, 13, 14, 15, 19, 20],
+        },
+      },
+      {
+        title: 'Step 3. OTLP 로 내보내기 — "SDK 가 span 을 Jaeger 로 전송"',
+        desc: 'span 을 만들었으면 어딘가로 보내야 한다. 요즘 표준은 OpenTelemetry SDK 로 계측하고 OTLP 프로토콜로 내보내는 것이며, Jaeger 는 이제 OTLP 를 직접 수신한다(옛 jaeger-thrift 대신). BatchSpanProcessor 가 span 을 모아 배치로 전송하므로 요청 지연에 영향을 거의 주지 않는다. 개발 중엔 ConsoleExporter 로 눈으로 확인하고, 운영에선 OTLPSpanExporter 의 endpoint 만 Jaeger 주소로 바꾸면 코드 변경 없이 전환된다.',
+        focus: 'export',
+        legend: 'OpenTelemetry SDK → OTLP(4317) → Jaeger 수신 · BatchProcessor 로 비동기 전송',
+        spans: [
+          { id: 'sdk',   name: 'OTel SDK (span 수집)',   kind: 'pipe', note: 'BatchSpanProcessor' },
+          { id: 'otlp',  name: 'OTLP gRPC :4317',        kind: 'pipe', note: '표준 프로토콜' },
+          { id: 'jaeger',name: 'Jaeger Collector',       kind: 'sink', note: 'span 저장·조회' },
+        ],
+        code: {
+          lang: 'python',
+          filename: 'otel_setup.py — SDK 초기화 후 OTLP 로 Jaeger 전송',
+          lines: [
+            '# OpenTelemetry SDK 를 켜고 span 을 Jaeger 로 내보낸다.',
+            'from opentelemetry import trace',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.export import BatchSpanProcessor',
+            'from opentelemetry.sdk.resources import Resource',
+            'from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (',
+            '    OTLPSpanExporter,',
+            ')',
+            '',
+            '# ① 서비스 이름 — Jaeger UI 의 Service 드롭다운에 뜬다',
+            'resource = Resource.create({"service.name": "checkout-service"})',
+            'provider = TracerProvider(resource=resource)',
+            '',
+            '# ② Exporter: Jaeger 의 OTLP 수신 포트(4317)로 전송',
+            'exporter = OTLPSpanExporter(endpoint="http://jaeger:4317", insecure=True)',
+            '',
+            '# ③ BatchProcessor: span 을 모아 배치로 비동기 전송',
+            '#    → 요청 응답 지연에 거의 영향 없음 (성능 안전장치)',
+            'provider.add_span_processor(BatchSpanProcessor(exporter))',
+            '',
+            '# ④ 전역 등록 — 이후 모든 tracer 가 이 파이프라인 사용',
+            'trace.set_tracer_provider(provider)',
+            '',
+            '# → 운영 전환은 endpoint 주소만 바꾸면 끝 (코드 동일)',
+            '# → 개발 중엔 ConsoleSpanExporter 로 터미널 확인 가능',
+          ],
+          highlight: [10, 11, 14, 15, 18, 19, 22],
+        },
+      },
+      {
+        title: 'Step 4. 문맥 전파 — "서비스 경계를 넘어 trace 를 잇는다"',
+        desc: '한 서비스 안의 span 은 문맥(context)으로 부모-자식이 연결되지만, 다른 서비스로 HTTP 호출을 하면 그 문맥이 자동으로 따라가지 않는다. propagator 가 trace_id 를 W3C traceparent 헤더에 실어 보내고(inject), 받는 쪽이 헤더에서 복원(extract)해야 두 서비스의 span 이 하나의 trace 로 이어진다. 이 전파가 한 hop 이라도 빠지면 trace 가 끊겨(broken trace) 하위 서비스 span 이 고아가 되므로, 자동 계측이 헤더를 자동 주입하는지 반드시 확인해야 한다.',
+        focus: 'propagate',
+        legend: '문맥 전파 — traceparent 헤더로 trace_id 를 서비스 간 전달 · 누락 시 trace 끊김',
+        spans: [
+          { id: 'a', name: 'checkout (inject 헤더)',  kind: 'ctx',  note: 'traceparent 주입' },
+          { id: 'b', name: 'pricing (extract 헤더)',  kind: 'ctx',  note: '같은 trace_id 복원' },
+          { id: 'c', name: '전파 누락 시',              kind: 'broken', note: 'span 고아 = trace 끊김' },
+        ],
+        code: {
+          lang: 'python',
+          filename: 'propagation.py — traceparent 헤더로 문맥 전파',
+          lines: [
+            '# 문맥 전파: HTTP 헤더로 trace_id 를 다음 서비스에 넘긴다.',
+            '# (requests/httpx 자동 계측 시 아래는 자동 처리되지만,',
+            '#  직접 클라이언트를 쓸 땐 수동으로 inject 해야 한다.)',
+            'from opentelemetry import trace',
+            'from opentelemetry.propagate import inject, extract',
+            'import requests',
+            '',
+            '# ── 보내는 쪽 (checkout) ──────────────────────',
+            'def call_pricing(user_id: int):',
+            '    headers = {}',
+            '    # ① 현재 문맥의 trace_id 를 헤더에 주입',
+            '    inject(headers)   # {"traceparent": "00-<trace_id>-<span_id>-01"}',
+            '    return requests.get(',
+            '        f"http://pricing/quote?u={user_id}",',
+            '        headers=headers,   # ← 헤더를 반드시 실어 보낸다',
+            '    )',
+            '',
+            '# ── 받는 쪽 (pricing) ────────────────────────',
+            'def handle_quote(request):',
+            '    # ② 헤더에서 부모 문맥을 복원 (extract)',
+            '    ctx = extract(request.headers)',
+            '    tracer = trace.get_tracer("pricing")',
+            '    # ③ 복원한 ctx 를 부모로 삼아 span 시작 → 한 trace 로 연결',
+            '    with tracer.start_as_current_span("quote", context=ctx):',
+            '        return compute_quote(request)',
+            '',
+            '# → 헤더 전파를 빠뜨리면 pricing span 이 고아(orphan)가 됨',
+          ],
+          highlight: [11, 12, 14, 15, 21, 24],
+        },
+      },
+      {
+        title: 'Step 5. 계측 함정 — "공백·과다·카디널리티를 피한다"',
+        desc: '계측은 많이 할수록 좋은 게 아니라 옳게 해야 좋다. 계측 공백은 핵심 로직에 span 이 없어 병목이 안 보이는 맹점을 만들고, 반대로 루프 안 모든 반복마다 span 을 만드는 과다 계측은 오버헤드와 span 폭증을 부른다. 특히 order_id 같은 고유값을 태그로 넣으면 카디널리티가 폭발해 저장·검색 비용이 치솟으므로, 고유 식별자는 태그가 아니라 로그/이벤트로 남긴다. 원칙은 "요청 경로의 서비스 경계·외부 호출·핵심 비즈니스 결정 지점만 span, 나머지는 태그로 요약" 이다.',
+        focus: 'pitfall',
+        legend: '함정 4종 — 계측 공백 · 과다 계측 · 문맥 전파 누락 · 태그 카디널리티',
+        spans: [
+          { id: 'gap',  name: '계측 공백',        kind: 'bad',  note: '핵심 로직 span 없음 = 맹점' },
+          { id: 'over', name: '과다 계측',        kind: 'bad',  note: '루프마다 span = 오버헤드' },
+          { id: 'card', name: '태그 카디널리티',  kind: 'bad',  note: 'order_id 태그 = 비용 폭발' },
+          { id: 'good', name: '균형 잡힌 계측',   kind: 'good', note: '경계·핵심만 span, 요약 태그' },
+        ],
+        code: {
+          lang: 'python',
+          filename: 'pitfalls.py — 계측 안티패턴 vs 올바른 계측',
+          lines: [
+            '# 계측 함정과 올바른 대안',
+            'from opentelemetry import trace',
+            'tracer = trace.get_tracer("orders")',
+            '',
+            '# ❌ 과다 계측: 루프 매 반복마다 span → 수천 개 폭증',
+            'def process_bad(items):',
+            '    for it in items:',
+            '        with tracer.start_as_current_span("item"):   # 안티패턴',
+            '            handle(it)',
+            '',
+            '# ✅ 대안: 루프는 하나의 span 으로 묶고, 개수는 태그로 요약',
+            'def process_good(items):',
+            '    with tracer.start_as_current_span("process_items") as span:',
+            '        span.set_attribute("items.count", len(items))',
+            '        for it in items:',
+            '            handle(it)',
+            '',
+            '# ❌ 카디널리티 폭발: 고유값을 태그로 (검색 인덱스 폭증)',
+            'def tag_bad(span, order):',
+            '    span.set_attribute("order.id", order.id)      # 매번 유일값',
+            '',
+            '# ✅ 대안: 고유 식별자는 event/log 로, 태그는 저카디널리티',
+            'def tag_good(span, order):',
+            '    span.set_attribute("order.tier", order.tier)  # gold/silver 등',
+            '    span.add_event("order_received", {"order.id": order.id})',
+            '',
+            '# 원칙: 서비스 경계 · 외부 호출 · 핵심 결정 지점만 span',
+            '#       나머지 세부는 태그/이벤트로 요약한다',
+          ],
+          highlight: [7, 8, 13, 14, 19, 23, 24],
+        },
+      },
+    ];
+
+    // ── 좌측: LiveDataPane — 자동/수동 계측 + OTLP + 문맥 전파 시각화
+    function LiveDataPane({ step, stepIdx }) {
+      const animKey = `step-${stepIdx}`;
+      const isAuto     = step.focus === 'auto';
+      const isManual   = step.focus === 'manual';
+      const isExport   = step.focus === 'export';
+      const isProp     = step.focus === 'propagate';
+      const isPitfall  = step.focus === 'pitfall';
+
+      const spanStyle = (kind) => {
+        switch (kind) {
+          case 'auto':   return { cls: 'bg-cyan-50 border-cyan-300 text-cyan-900', badge: 'bg-cyan-100 text-cyan-800 border-cyan-300', icon: '⚙️' };
+          case 'manual': return { cls: 'bg-emerald-50 border-emerald-300 text-emerald-900', badge: 'bg-emerald-100 text-emerald-800 border-emerald-300', icon: '✍️' };
+          case 'gap':    return { cls: 'bg-slate-50 border-dashed border-slate-400 text-slate-500', badge: 'bg-slate-100 text-slate-500 border-slate-300', icon: '⬚' };
+          case 'pipe':   return { cls: 'bg-sky-50 border-sky-300 text-sky-900', badge: 'bg-sky-100 text-sky-800 border-sky-300', icon: '🔧' };
+          case 'sink':   return { cls: 'bg-cyan-50 border-cyan-400 text-cyan-900 ring-2 ring-cyan-200', badge: 'bg-cyan-100 text-cyan-800 border-cyan-300', icon: '🗄️' };
+          case 'ctx':    return { cls: 'bg-cyan-50 border-cyan-300 text-cyan-900', badge: 'bg-cyan-100 text-cyan-800 border-cyan-300', icon: '🔗' };
+          case 'broken': return { cls: 'bg-rose-50 border-rose-400 text-rose-900', badge: 'bg-rose-100 text-rose-800 border-rose-300', icon: '⛓️‍💥' };
+          case 'bad':    return { cls: 'bg-rose-50 border-rose-300 text-rose-900', badge: 'bg-rose-100 text-rose-800 border-rose-300', icon: '⚠️' };
+          case 'good':   return { cls: 'bg-emerald-50 border-emerald-400 text-emerald-900 ring-2 ring-emerald-200', badge: 'bg-emerald-100 text-emerald-800 border-emerald-300', icon: '✅' };
+          default:       return { cls: 'bg-slate-50 border-slate-300 text-slate-700', badge: 'bg-slate-100 text-slate-600 border-slate-300', icon: '📦' };
+        }
+      };
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm" key={animKey}>
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🩺</span>
+              <span className="text-xs font-bold text-slate-700">계측(Instrumentation) — Live View</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">step {stepIdx + 1}/5</span>
+          </div>
+
+          <div className="p-4 space-y-4 min-h-[420px]">
+
+            {/* 계측 단계 5 카드 */}
+            <div className="grid grid-cols-5 gap-1.5">
+              {[
+                { key: 'auto',      emoji: '⚙️', name: '자동',   note: '라이브러리' },
+                { key: 'manual',    emoji: '✍️', name: '수동',   note: '비즈니스' },
+                { key: 'export',    emoji: '📤', name: 'OTLP',   note: 'Jaeger 전송' },
+                { key: 'propagate', emoji: '🔗', name: '전파',   note: '서비스 간' },
+                { key: 'pitfall',   emoji: '⚠️', name: '함정',   note: '안티패턴' },
+              ].map((p) => {
+                const active = step.focus === p.key;
+                return (
+                  <div
+                    key={p.key}
+                    className={`rounded-lg p-1.5 text-center transition-all duration-300 ${active ? 'bg-cyan-100 border-2 border-cyan-400 scale-105 shadow-sm' : 'bg-slate-50 border border-slate-200'}`}
+                  >
+                    <div className="text-lg">{p.emoji}</div>
+                    <div className="text-[10px] font-bold text-slate-800 mt-0.5">{p.name}</div>
+                    <div className="text-[8px] text-slate-500 mt-0.5 leading-tight">{p.note}</div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 요청 흐름 다이어그램 (자동/수동/함정) */}
+            {(isAuto || isManual || isPitfall) && (
+              <div className="space-y-2 fade-in">
+                <div className="text-[10px] text-slate-500 font-mono px-1">
+                  {isPitfall ? '계측 함정 4종 — 무엇을 span 으로 만들지가 관건' : '요청 경로의 span 트리 — ⚙️자동 · ✍️수동 · ⬚공백'}
+                </div>
+                {step.spans.map((s, idx) => {
+                  const st = spanStyle(s.kind);
+                  return (
+                    <div
+                      key={`${stepIdx}-${s.id}`}
+                      className={`rounded-lg border-2 px-3 py-2 flex items-center justify-between transition-all duration-500 fade-in ${st.cls}`}
+                      style={{ animationDelay: `${idx * 120}ms` }}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm">{st.icon}</span>
+                        <span className="text-[11px] font-mono font-bold">{s.name}</span>
+                      </div>
+                      <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${st.badge}`}>{s.note}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* OTLP export 파이프라인 */}
+            {isExport && (
+              <div className="space-y-2 fade-in">
+                <div className="text-[10px] text-slate-500 font-mono px-1">SDK 파이프라인 — span 수집 → OTLP 전송 → Jaeger 수신</div>
+                {step.spans.map((s, idx) => {
+                  const st = spanStyle(s.kind);
+                  return (
+                    <div key={`${stepIdx}-${s.id}`} className="fade-in" style={{ animationDelay: `${idx * 150}ms` }}>
+                      <div className={`rounded-lg border-2 px-3 py-2 flex items-center justify-between ${st.cls}`}>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm">{st.icon}</span>
+                          <span className="text-[11px] font-mono font-bold">{s.name}</span>
+                        </div>
+                        <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${st.badge}`}>{s.note}</span>
+                      </div>
+                      {idx < step.spans.length - 1 && (
+                        <div className="text-center text-cyan-500 text-sm leading-none my-0.5">▼</div>
+                      )}
+                    </div>
+                  );
+                })}
+                <div className="mt-2 p-2 rounded-lg" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9' }}>
+                  <div className="text-[10px] text-cyan-700">endpoint 주소만 바꾸면 개발(console) ↔ 운영(Jaeger) 전환</div>
+                </div>
+              </div>
+            )}
+
+            {/* 문맥 전파 — inject/extract 흐름 */}
+            {isProp && (
+              <div className="space-y-3 fade-in">
+                <div className="text-[10px] text-slate-500 font-mono px-1">문맥 전파 — traceparent 헤더로 trace_id 를 넘긴다</div>
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 rounded-lg border-2 border-cyan-300 bg-cyan-50 px-3 py-2 text-center">
+                    <div className="text-[11px] font-mono font-bold text-cyan-900">checkout</div>
+                    <div className="text-[9px] text-cyan-700 mt-0.5">inject(headers)</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-cyan-500 text-lg leading-none">→</div>
+                    <div className="text-[8px] text-slate-500 font-mono">traceparent</div>
+                  </div>
+                  <div className="flex-1 rounded-lg border-2 border-cyan-300 bg-cyan-50 px-3 py-2 text-center">
+                    <div className="text-[11px] font-mono font-bold text-cyan-900">pricing</div>
+                    <div className="text-[9px] text-cyan-700 mt-0.5">extract(headers)</div>
+                  </div>
+                </div>
+                <div className="p-2 rounded-lg" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9' }}>
+                  <div className="text-[10px] font-mono text-cyan-900">traceparent: 00-<span className="font-bold">4bf92f…a3ce</span>-00f067aa0ba9-01</div>
+                  <div className="text-[10px] text-cyan-700 mt-0.5">→ 같은 trace_id 로 두 서비스 span 이 하나로 연결</div>
+                </div>
+                <div className="rounded-lg border-2 border-rose-300 bg-rose-50 px-3 py-2 flex items-center justify-between">
+                  <span className="text-[11px] font-mono font-bold text-rose-900">헤더 전파 누락 시</span>
+                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded border bg-rose-100 text-rose-800 border-rose-300">span 고아 = trace 끊김</span>
+                </div>
+              </div>
+            )}
+
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[10px] text-slate-600 leading-snug font-medium">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: '#0E7B91' }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum I-2-2</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm" style={{ backgroundColor: '#67CFE9' }}>I</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part I. 분산 추적 기초 &gt; Chapter 2. 계측</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Instrumentation (계측)</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                코드에 트레이싱을 넣는 자동·수동 계측 —
+                <code className="bg-slate-100 px-1 rounded text-xs">자동 계측</code>은 프레임워크·HTTP·DB 라이브러리가 span 을 자동 생성하고,
+                <code className="bg-slate-100 px-1 rounded text-xs">수동 계측</code>은 비즈니스 로직에 span·태그를 더한다.
+                OpenTelemetry SDK 로 계측해 <code className="bg-slate-100 px-1 rounded text-xs">OTLP</code> 로 Jaeger 에 보낸다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ backgroundColor: '#0E7B91' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#B7EAF5' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#B7EAF5' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl text-sm" style={{ backgroundColor: '#E6F8FC', border: '2px solid #67CFE9', color: '#0E5567' }}>
+                💡 다음(Part II)에서는 <strong>Jaeger 아키텍처</strong> — Collector · Query · Storage 로 span 이 수집·저장·조회되는 흐름
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]" style={{ backgroundColor: '#0E7B91' }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="../part2/II-1-1.html" className="font-medium" style={{ color: '#0E7B91' }}>II-1-1 Jaeger 아키텍처 &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

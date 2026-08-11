@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — I-2-1. Jaeger 아키텍처 개요</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🏗️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    I-2-1. Jaeger 아키텍처 개요
+    학습 목표: client SDK → agent → collector → storage → query → UI 파이프라인의 각 역할과 데이터 흐름을 이해
+    핵심 비유: "택배 물류망" — 집하(agent) → 분류·검수(collector) → 창고(storage) → 조회(query)
+    패턴: jaeger 표준 — 좌(LiveDataPane: 6-컴포넌트 파이프라인 span 흐름) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 파이프라인 6 컴포넌트 (좌측 공통 렌더용)
+    const PIPELINE = [
+      { key: 'client',    emoji: '📱', name: 'client SDK', role: '계측·span 생성' },
+      { key: 'agent',     emoji: '📡', name: 'agent',      role: '수집·배치' },
+      { key: 'collector', emoji: '🛡️', name: 'collector',  role: '검증·저장' },
+      { key: 'storage',   emoji: '🗄️', name: 'storage',    role: 'Cassandra/ES' },
+      { key: 'query',     emoji: '🔍', name: 'query',      role: '조회 API' },
+      { key: 'ui',        emoji: '🖥️', name: 'UI',         role: '폭포수 화면' },
+    ];
+
+    // 6 STEPS — 전체 구조 → client → agent → collector·storage → query·UI → 배포 형태
+    const STEPS = [
+      {
+        title: 'Step 1. 전체 구조 — "span 이 6개 컴포넌트를 순서대로 통과한다"',
+        desc: 'Jaeger 는 하나의 프로그램이 아니라 역할이 다른 컴포넌트의 파이프라인이다. 애플리케이션이 만든 span 은 client SDK 에서 출발해 agent 가 모으고, collector 가 검증해 storage 에 저장하고, query 가 읽어 UI 에 폭포수로 그린다. 이 흐름을 통째로 외워두면 장애가 났을 때 "어느 구간이 막혔나" 를 바로 짚을 수 있다. 각 화살표가 곧 네트워크 홉이자 잠재적 병목 지점이다.',
+        focus: 'all',
+        legend: '6 컴포넌트 파이프라인 — client → agent → collector → storage → query → UI',
+        active: ['client', 'agent', 'collector', 'storage', 'query', 'ui'],
+        packetAt: 'flow',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-architecture.yaml — 컴포넌트 역할 한눈에',
+          lines: [
+            '# Jaeger 파이프라인 — 각 컴포넌트는 독립 프로세스로 배포된다',
+            'components:',
+            '  client_sdk:      # 앱에 심는 라이브러리 (OpenTelemetry SDK)',
+            '    role: "span 생성 · trace_id 전파 · 배치 전송"',
+            '    runs_in: "애플리케이션 프로세스 안"',
+            '',
+            '  agent:           # 앱과 같은 호스트에 붙는 사이드카/데몬',
+            '    role: "UDP 로 span 수신 · 배치 · collector 로 전달"',
+            '    runs_in: "각 노드(호스트/파드) 마다 1개"',
+            '',
+            '  collector:       # 중앙에서 검증하고 저장하는 서버',
+            '    role: "포맷 검증 · 샘플링 · storage 쓰기"',
+            '    runs_in: "중앙 · 수평 확장(replicas)"',
+            '',
+            '  storage:         # 실제 trace 가 쌓이는 DB',
+            '    role: "span 영구 저장 · 인덱싱"',
+            '    options: [cassandra, elasticsearch, opensearch]',
+            '',
+            '  query:           # storage 를 읽어 API 로 노출',
+            '    role: "trace 검색 · 단건 조회 gRPC/HTTP"',
+            '',
+            '  ui:              # 브라우저 화면',
+            '    role: "폭포수 · 서비스 의존 그래프 렌더"',
+            '',
+            '# 흐름: client -> agent -> collector -> storage <- query <- ui',
+          ],
+          highlight: [3, 7, 11, 15, 20, 23],
+        },
+      },
+      {
+        title: 'Step 2. client SDK — "앱 안에서 span 을 만들고 배치로 내보낸다"',
+        desc: 'client SDK 는 애플리케이션 프로세스 안에서 도는 라이브러리다. 함수 진입/종료마다 span 을 만들고 trace_id 를 HTTP 헤더로 전파하며, 매 span 마다 네트워크를 쓰면 앱이 느려지므로 메모리에 모아 배치로 내보낸다. 요즘은 Jaeger 전용 SDK 대신 OpenTelemetry SDK 를 쓰는 것이 표준이다. 함정: 샘플링을 0% 로 두거나 exporter 엔드포인트를 오타 내면 span 이 조용히 사라진다 — 앱은 정상 동작하니 알아채기 어렵다.',
+        focus: 'client',
+        legend: 'OpenTelemetry SDK — span 생성 · trace_id 전파 · 배치 전송',
+        active: ['client'],
+        packetAt: 'client',
+        code: {
+          lang: 'yaml',
+          filename: 'otel-sdk-config.yaml — 앱에 심는 계측 설정',
+          lines: [
+            '# OpenTelemetry SDK 설정 (앱 프로세스 안)',
+            'service:',
+            '  name: "checkout-api"        # UI 폭포수에 뜰 서비스 이름',
+            '',
+            'sampler:',
+            '  type: "parentbased_traceidratio"',
+            '  ratio: 0.1                  # 요청의 10%만 추적 (비용 절감)',
+            '  # 함정: ratio 0 이면 span 이 전혀 안 나감 (앱은 정상)',
+            '',
+            'exporter:',
+            '  protocol: "otlp"            # 요즘 표준 (grpc 4317 / http 4318)',
+            '  endpoint: "http://otel-agent:4317"',
+            '  # 오타/방화벽이면 조용히 유실 → 반드시 배포 후 UI 확인',
+            '',
+            'batch:',
+            '  max_queue_size: 2048        # 메모리에 모을 최대 span 수',
+            '  schedule_delay_ms: 5000     # 5초마다 or 큐 차면 flush',
+            '  # 배치가 크면 지연 커지고, 작으면 네트워크 부하 증가',
+          ],
+          highlight: [5, 6, 7, 11, 12, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 3. agent — "노드마다 붙어 span 을 모아 collector 로 넘긴다"',
+        desc: 'agent 는 앱과 같은 호스트(또는 같은 파드의 사이드카)에서 돌며, 앱이 UDP 로 던진 span 을 받아 배치로 묶어 collector 에 전달한다. 앱은 "바로 옆" 으로만 쏘면 되니 collector 주소를 몰라도 되고, 서비스 디스커버리 부담이 agent 로 내려간다. 함정: agent 는 UDP 기반이라 버퍼가 넘치면 span 을 말없이 버린다. 최신 아키텍처에서는 앱이 OTLP 로 collector 에 직접 쏘면서 agent 를 생략하는 흐름이 늘고 있다 — 홉이 하나 줄어 단순해진다.',
+        focus: 'agent',
+        legend: 'agent — 노드 로컬 수집 · UDP 수신 · collector 로 배치 전달',
+        active: ['agent'],
+        packetAt: 'agent',
+        code: {
+          lang: 'bash',
+          filename: 'run-jaeger-agent.sh — 노드마다 1개 실행',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# jaeger-agent — 각 호스트/노드에 데몬으로 배포',
+            'set -euo pipefail',
+            '',
+            '# 앱은 localhost 로만 span 을 던진다 (UDP 6831)',
+            '# agent 가 대신 collector 주소를 알고 전달한다',
+            'docker run -d --name jaeger-agent \\',
+            '  -p 6831:6831/udp \\',
+            '  -p 5778:5778 \\',
+            '  jaegertracing/jaeger-agent:1.57 \\',
+            '  --reporter.grpc.host-port=jaeger-collector:14250',
+            '',
+            '# 확인: agent 가 collector 와 연결됐는지 로그 체크',
+            'docker logs jaeger-agent | grep -i "connected"',
+            '',
+            '# 함정: UDP 라 버퍼 넘치면 span 을 조용히 drop',
+            '#  -> --processor.jaeger-binary.server-max-packet-size 조정',
+            '#  -> 트래픽 크면 agent 생략하고 OTLP 직접 수집을 고려',
+          ],
+          highlight: [7, 8, 11, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 4. collector → storage — "검증하고 샘플링해서 DB 에 쓴다"',
+        desc: 'collector 는 파이프라인의 중심이다. agent 가 보낸 span 을 포맷 검증하고, tail 샘플링을 적용하고, storage 에 쓴다. 트래픽에 따라 replicas 로 수평 확장하는 유일한 스케일 지점이라 병목이 여기서 가장 자주 생긴다. storage 는 Cassandra / Elasticsearch / OpenSearch 중 하나를 고르는데, 이 선택을 미루면 배포가 막힌다 — 검색 위주면 ES, 쓰기 처리량 위주면 Cassandra 가 유리하다. 함정: collector 가 storage 쓰기를 못 따라가면 큐가 차서 span 을 버린다.',
+        focus: 'collector',
+        legend: 'collector — 검증·샘플링·쓰기 (수평 확장 지점) · storage 선택 필수',
+        active: ['collector', 'storage'],
+        packetAt: 'collector',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-collector.yaml — 중앙 검증·저장 서버',
+          lines: [
+            '# jaeger-collector — 중앙 배포, 수평 확장 지점',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata: { name: jaeger-collector }',
+            'spec:',
+            '  replicas: 3                 # 병목 지점 → 트래픽 따라 확장',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: collector',
+            '          image: jaegertracing/jaeger-collector:1.57',
+            '          env:',
+            '            - name: SPAN_STORAGE_TYPE',
+            '              value: "elasticsearch"   # 저장소 선택 필수',
+            '            - name: ES_SERVER_URLS',
+            '              value: "http://elasticsearch:9200"',
+            '          # 함정: storage 쓰기 지연 → 큐 만재 → span drop',
+            '          # 지표: jaeger_collector_spans_dropped_total 감시',
+          ],
+          highlight: [6, 13, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 5. query → UI — "storage 를 읽어 폭포수로 그린다"',
+        desc: 'query 는 storage 를 읽어 trace 검색과 단건 조회를 gRPC/HTTP API 로 노출하고, UI 는 그 API 를 호출해 브라우저에 폭포수와 서비스 의존 그래프를 그린다. 쓰기 경로(collector→storage)와 읽기 경로(query→storage)가 분리돼 있어 조회 부하가 수집을 방해하지 않는다. 함정: 저장은 되는데 UI 에 안 뜨면 대개 query 가 다른 storage 를 보고 있거나(설정 불일치), 조회 기간이 데이터 보존 기간(TTL)을 벗어난 경우다.',
+        focus: 'query',
+        legend: 'query → UI — 읽기 경로 분리 · 폭포수/의존 그래프 렌더',
+        active: ['query', 'ui', 'storage'],
+        packetAt: 'query',
+        code: {
+          lang: 'bash',
+          filename: 'run-query-ui.sh — 조회 서버 + 화면',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# jaeger-query — storage 를 읽어 UI 에 데이터를 공급',
+            'set -euo pipefail',
+            '',
+            'docker run -d --name jaeger-query \\',
+            '  -p 16686:16686 \\               # UI 포트 (브라우저)',
+            '  -e SPAN_STORAGE_TYPE=elasticsearch \\',
+            '  -e ES_SERVER_URLS=http://elasticsearch:9200 \\',
+            '  jaegertracing/jaeger-query:1.57',
+            '',
+            '# UI 접속: http://localhost:16686',
+            '# 서비스 선택 -> Find Traces -> 폭포수 확인',
+            '',
+            '# 함정 1: collector 와 query 의 STORAGE_TYPE 이 다르면',
+            '#   저장은 되는데 조회가 빈 화면 (서로 다른 DB 를 봄)',
+            '# 함정 2: 조회 기간이 TTL(보존기간) 밖이면 안 나옴',
+            'curl -s http://localhost:16686/api/services | head',
+          ],
+          highlight: [5, 6, 7, 8, 14, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 6. 배포 형태 — "all-in-one(개발) vs 분산(프로덕션) vs OTLP 직접 수집"',
+        desc: 'all-in-one 은 6 컴포넌트를 한 컨테이너에 담고 메모리에 저장하는 개발용이다 — 재시작하면 trace 가 다 날아가므로 프로덕션에 쓰면 유실 사고가 난다. 프로덕션은 collector 와 storage 를 분리·확장하는 분산 배포가 정석이다. 최신 아키텍처는 앱이 OTLP 로 collector 에 직접 쏴서 agent 를 생략한다 — 홉이 하나 줄고 W3C 표준을 그대로 쓴다. 함정: 컴포넌트별 버전을 뒤섞으면(예: collector 1.57 + agent 1.30) 포맷 비호환으로 span 이 깨진다 — 버전을 맞춰라.',
+        focus: 'deploy',
+        legend: 'all-in-one(개발·휘발) vs 분산(프로덕션) vs OTLP 직접(agent 생략)',
+        active: ['client', 'collector', 'storage', 'query', 'ui'],
+        packetAt: 'direct',
+        code: {
+          lang: 'bash',
+          filename: 'deploy-modes.sh — 개발 vs 프로덕션 vs OTLP 직접',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# (A) 개발용 all-in-one — 6 컴포넌트 한 컨테이너 · 메모리 저장',
+            'docker run -d --name jaeger \\',
+            '  -p 16686:16686 -p 4317:4317 \\',
+            '  jaegertracing/all-in-one:1.57',
+            '# 함정: 재시작하면 trace 전부 소멸 → 프로덕션 금지',
+            '',
+            '# (B) 프로덕션 분산 — collector/storage/query 각각 배포·확장',
+            '#   client -> agent -> collector -> ES -> query -> UI',
+            '#   collector replicas 로 수평 확장, storage 는 관리형 ES/Cassandra',
+            '',
+            '# (C) 최신: OTLP 직접 수집 — agent 를 생략 (홉 1개 감소)',
+            '#   앱이 collector 의 OTLP 포트(4317)로 바로 전송',
+            'export OTEL_EXPORTER_OTLP_ENDPOINT="http://jaeger-collector:4317"',
+            '',
+            '# 함정: 컴포넌트 버전 뒤섞으면 포맷 비호환 → span 깨짐',
+            '#   collector / query / agent 는 같은 버전으로 맞출 것',
+            'docker images | grep jaegertracing   # 버전 일치 확인',
+          ],
+          highlight: [2, 3, 4, 5, 6, 12, 13, 14, 16, 17],
+        },
+      },
+    ];
+
+    // ── 좌측: LiveDataPane — 6 컴포넌트 파이프라인 span 흐름 시각화
+    function LiveDataPane({ step, stepIdx }) {
+      const animKey = `step-${stepIdx}`;
+      const activeSet = new Set(step.active || []);
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm" key={animKey}>
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🏗️</span>
+              <span className="text-xs font-bold text-slate-700">Jaeger 파이프라인 — Live View</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">step {stepIdx + 1}/{STEPS.length}</span>
+          </div>
+
+          <div className="p-4 space-y-4 min-h-[420px]">
+
+            {/* 6 컴포넌트 파이프라인 (세로 스택 + 화살표) */}
+            <div className="space-y-1.5">
+              {PIPELINE.map((c, idx) => {
+                const active = activeSet.has(c.key);
+                return (
+                  <div key={c.key}>
+                    <div
+                      className={`rounded-lg border-2 px-3 py-2 flex items-center justify-between transition-all duration-500 fade-in ${active ? 'shadow-sm' : 'bg-slate-50 border-slate-200 opacity-60'}`}
+                      style={{
+                        animationDelay: `${idx * 90}ms`,
+                        backgroundColor: active ? '#E6F8FC' : undefined,
+                        borderColor: active ? '#67CFE9' : undefined,
+                      }}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg">{c.emoji}</span>
+                        <div>
+                          <div className="text-[12px] font-mono font-bold text-slate-800">{c.name}</div>
+                          <div className="text-[9px] text-slate-500 leading-tight">{c.role}</div>
+                        </div>
+                      </div>
+                      {active && (
+                        <span className="text-[9px] font-mono px-1.5 py-0.5 rounded border" style={{ backgroundColor: '#B7EAF5', color: '#0E5567', borderColor: '#67CFE9' }}>
+                          active
+                        </span>
+                      )}
+                    </div>
+                    {idx < PIPELINE.length - 1 && (
+                      <div className="flex justify-center">
+                        <span className="text-[11px]" style={{ color: activeSet.has(PIPELINE[idx + 1].key) && active ? '#0E7B91' : '#cbd5e1' }}>▼</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* span 패킷 흐름 요약 */}
+            <div className="p-2 rounded-lg" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9' }}>
+              <div className="text-[10px] font-mono text-cyan-900 flex items-center gap-1 flex-wrap">
+                <span className="font-bold">span</span>
+                <span>흐름:</span>
+                {(step.active || []).map((k, i) => (
+                  <span key={k} className="flex items-center gap-1">
+                    {i > 0 && <span className="text-cyan-400">→</span>}
+                    <span className="px-1 rounded bg-white border border-cyan-200">{k}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[10px] text-slate-600 leading-snug font-medium">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: '#0E7B91' }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum I-2-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm" style={{ backgroundColor: '#67CFE9' }}>I</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part I. 분산 추적 기초 &gt; Chapter 2. Jaeger 구조</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Jaeger 아키텍처 개요</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                agent · collector · query · storage 로 이루어진 구조 —
+                span 은 <code className="bg-slate-100 px-1 rounded text-xs">client SDK</code> 에서 출발해
+                <code className="bg-slate-100 px-1 rounded text-xs">collector</code> 검증을 거쳐
+                <code className="bg-slate-100 px-1 rounded text-xs">storage</code> 에 쌓이고
+                <code className="bg-slate-100 px-1 rounded text-xs">query</code> 로 UI 에 그려진다.
+              </p>
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all duration-500" style={{ width: `${progress}%`, backgroundColor: '#67CFE9' }}></div>
+              </div>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ backgroundColor: '#0E7B91' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#B7EAF5' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#B7EAF5' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl text-sm" style={{ backgroundColor: '#E6F8FC', border: '2px solid #67CFE9', color: '#0E5567' }}>
+                💡 다음(I-2-2)에서는 <strong>collector 심화</strong> — 샘플링 전략과 storage 선택 기준을 자세히 파고든다
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]" style={{ backgroundColor: '#0E7B91' }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./I-2-2.html" className="font-medium" style={{ color: '#0E7B91' }}>I-2-2 collector 심화 &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

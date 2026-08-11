@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — III-1-1. Probabilistic / Rate-Limiting 샘플링</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🎲</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/yaml.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/go.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-1-1. Probabilistic / Rate-Limiting 샘플링
+    학습 목표: 모든 trace를 저장할 수 없을 때 두 가장 기본적인 head-based 샘플링 전략의 차이를 이해한다.
+    핵심 비유: "동전 던지기 vs 표 끊기"
+    구조: 4단계 — AlwaysOn 폭주 → Probabilistic(동전) → RateLimiting(표 한 장) → 조합/비교
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+
+    const STEPS = [
+      {
+        key: 'always',
+        title: 'Step 1. AlwaysOn — 다 저장하면 스토리지가 폭주한다',
+        desc: 'sampler=always_on은 모든 span을 백엔드로 보낸다. 트래픽 10k RPS · 1 trace 평균 20 span · span 1KB라면 하루 17TB. ES 인덱스는 그 두 배. 며칠이면 디스크가 가득 차고 collector가 OOM된다. "다 보겠다"는 환상은 비용이 막아준다.',
+        legend: '드롭 0 — 그러나 collector 큐가 부풀고 storage가 폭주한다',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-always-on.yaml — 위험한 기본값',
+          lines: [
+            '# 가장 위험한 설정: 모든 trace를 그대로 보낸다',
+            'apiVersion: jaegertracing.io/v1',
+            'kind: Jaeger',
+            'metadata:',
+            '  name: jaeger-danger',
+            'spec:',
+            '  strategy: production',
+            '  sampling:',
+            '    options:',
+            '      default_strategy:',
+            '        type: probabilistic',
+            '        param: 1.0              # 100% — 절대 금지',
+            '  storage:',
+            '    type: elasticsearch',
+            '    options:',
+            '      es:',
+            '        server-urls: http://es:9200',
+            '        index-prefix: jaeger',
+            '',
+            '# 예상치 ─────────────────────────────────────',
+            '#  트래픽   : 10,000 RPS × 86,400s = 8.64억 req/day',
+            '#  trace당  : 평균 20 span × 1 KB = 20 KB',
+            '#  하루치   : 8.64억 × 20 KB ≈ 17 TB / day',
+            '#  ES 인덱스: 추가 17 TB (전수 인덱싱)',
+            '#  결과     : 며칠이면 disk full → collector OOM',
+            '#',
+            '# 실패 시나리오',
+            '#  1) collector 큐(queue.size) overflow',
+            '#  2) span drop 폭증 → metric jaeger_collector_spans_dropped_total',
+            '#  3) ES bulk reject → 429 폭주 → trace 손실 불규칙',
+          ],
+          highlight: [10, 11, 12, 22, 23],
+        },
+      },
+      {
+        key: 'probabilistic',
+        title: 'Step 2. Probabilistic — trace_id 해시로 동전 던지기 (1%)',
+        desc: 'param=0.01이면 trace_id의 64비트 해시값이 상위 1%에 속할 때만 샘플링한다. 통계적으로 균일하고 서비스 간 일관성(head-based — 첫 서비스의 결정이 모든 하위 span에 전파)이 보장된다. 트래픽이 100배 늘어도 비율은 그대로 1%. 다만 트래픽이 폭증하면 절대량도 비례해서 늘어난다.',
+        legend: 'trace_id 해시 < 0.01 → 샘플. 한 trace 내 모든 span은 같은 결정을 따른다',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-prob.yaml — 1% 확률 샘플링',
+          lines: [
+            '# probabilistic: 같은 비율로 균일 샘플 — 가장 흔한 시작점',
+            'apiVersion: jaegertracing.io/v1',
+            'kind: Jaeger',
+            'metadata:',
+            '  name: jaeger-prob',
+            'spec:',
+            '  sampling:',
+            '    options:',
+            '      default_strategy:',
+            '        type: probabilistic',
+            '        param: 0.01           # 1% — 100분의 1만 저장',
+            '      per_service_strategies: # 핫 서비스만 더 낮춤',
+            '        - service: checkout-api',
+            '          type: probabilistic',
+            '          param: 0.005         # 0.5%',
+            '        - service: payment-api  # 결제는 더 많이 보고 싶다',
+            '          type: probabilistic',
+            '          param: 0.05          # 5%',
+            '',
+            '# 동작 원리 ─────────────────────────────',
+            '#  1) trace_id (128bit) 상위 64bit 해시',
+            '#  2) hash / MAX_INT64 < param 이면 sampled=true',
+            '#  3) traceparent 헤더로 모든 downstream에 전파',
+            '#     → 같은 trace는 모든 hop에서 같은 결정 (consistent)',
+            '#',
+            '# 장점',
+            '#  ✓ 균일·일관·낮은 오버헤드',
+            '#  ✓ 서비스마다 다른 비율 가능',
+            '# 단점',
+            '#  ✗ 트래픽 폭주 시 절대량도 폭주 (10k → 100k RPS)',
+            '#  ✗ 희소 에러는 통계적으로 놓칠 수 있음',
+          ],
+          highlight: [10, 11, 14, 15, 17, 18],
+        },
+      },
+      {
+        key: 'ratelimit',
+        title: 'Step 3. Rate-Limiting — 초당 N개 표 끊기 (leaky bucket)',
+        desc: 'param=10이면 서비스마다 초당 최대 10개 trace만 통과한다. 트래픽이 1k든 100k든 절대 상한선은 고정. 비용과 처리량을 정확히 묶을 수 있다. 단, 초기 폭주 구간 외 trace는 그냥 버려진다 — 균일성 보장 없음.',
+        legend: '초당 10개 표 — 트래픽이 부풀어도 상한선은 고정. 그 외는 drop',
+        code: {
+          lang: 'go',
+          filename: 'rate_limiter.go — token bucket 구현 (개념)',
+          lines: [
+            '// Jaeger client의 RateLimitingSampler 핵심 구조',
+            'package sampler',
+            '',
+            'import (',
+            '\t"sync"',
+            '\t"time"',
+            ')',
+            '',
+            '// RateLimitingSampler — token bucket: 초당 maxTracesPerSecond개만 통과',
+            'type RateLimitingSampler struct {',
+            '\tmu                 sync.Mutex',
+            '\tmaxTracesPerSecond float64 // 예: 10.0',
+            '\tcreditsPerSecond   float64',
+            '\tmaxBalance         float64 // 버스트 허용량 (=maxTracesPerSecond)',
+            '\tbalance            float64',
+            '\tlastTick           time.Time',
+            '}',
+            '',
+            'func NewRateLimitingSampler(maxTracesPerSecond float64) *RateLimitingSampler {',
+            '\treturn &RateLimitingSampler{',
+            '\t\tmaxTracesPerSecond: maxTracesPerSecond,',
+            '\t\tcreditsPerSecond:   maxTracesPerSecond,',
+            '\t\tmaxBalance:         maxTracesPerSecond, // 1초치 버스트',
+            '\t\tbalance:            maxTracesPerSecond,',
+            '\t\tlastTick:           time.Now(),',
+            '\t}',
+            '}',
+            '',
+            '// IsSampled — span 시작 시점에 호출. true면 sampled=1',
+            'func (s *RateLimitingSampler) IsSampled(_ string) bool {',
+            '\ts.mu.Lock()',
+            '\tdefer s.mu.Unlock()',
+            '',
+            '\tnow := time.Now()',
+            '\telapsed := now.Sub(s.lastTick).Seconds()',
+            '\ts.lastTick = now',
+            '',
+            '\t// elapsed초 동안 credit 충전',
+            '\ts.balance += elapsed * s.creditsPerSecond',
+            '\tif s.balance > s.maxBalance {',
+            '\t\ts.balance = s.maxBalance',
+            '\t}',
+            '\tif s.balance >= 1.0 {',
+            '\t\ts.balance -= 1.0',
+            '\t\treturn true // 표 한 장 발급',
+            '\t}',
+            '\treturn false // 매진',
+            '}',
+            '',
+            '// 운영 ─────────────────────────────────',
+            '//  ✓ 비용/처리량 절대 상한 — 예측 가능',
+            '//  ✓ 단순 (서비스마다 N tps)',
+            '//  ✗ 초기 N개 외엔 그냥 drop — 균일성 X',
+            '//  ✗ 인기 endpoint가 항상 먼저 표 차지',
+          ],
+          highlight: [9, 19, 29, 38, 42, 43],
+        },
+      },
+      {
+        key: 'compare',
+        title: 'Step 4. 조합 — 서비스별 prob + 전체 rate cap (이중 안전망)',
+        desc: '실무는 둘을 섞는다. 평소엔 probabilistic 1%로 균일 샘플링, 그러나 collector가 폭주할 위험에 대비해 전체 rate cap을 두어 절대량의 상한선까지 잡는다. operator의 per_service_strategies + 클라이언트의 RateLimitingSampler 조합이 흔하다.',
+        legend: '평소 prob 1%, 폭주 시 rate cap이 안전벨트. 결정 트리로 양쪽 장점',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-hybrid.yaml — 두 전략 조합',
+          lines: [
+            '# 권장 조합: probabilistic + per_operation_strategies',
+            'apiVersion: jaegertracing.io/v1',
+            'kind: Jaeger',
+            'metadata:',
+            '  name: jaeger-hybrid',
+            'spec:',
+            '  sampling:',
+            '    options:',
+            '      default_strategy:',
+            '        type: probabilistic',
+            '        param: 0.01                # 기본 1%',
+            '      per_service_strategies:',
+            '        - service: checkout-api',
+            '          type: probabilistic',
+            '          param: 0.02              # 결제 흐름은 2%',
+            '          operation_strategies:',
+            '            - operation: GET /healthz',
+            '              type: probabilistic',
+            '              param: 0.0001        # 헬스체크는 거의 버림',
+            '            - operation: POST /checkout',
+            '              type: probabilistic',
+            '              param: 0.1           # 핵심은 10%',
+            '        - service: log-shipper',
+            '          type: ratelimiting',
+            '          param: 5                 # 초당 최대 5 trace (절대 상한)',
+            '',
+            '# 결정 트리 ─────────────────────────────',
+            '#  요청 도착',
+            '#  ├─ 첫 서비스 (entry): 위 정책으로 sampled? 결정',
+            '#  ├─ traceparent 헤더에 결정 비트 실어 전파',
+            '#  └─ 모든 hop은 같은 결정을 따른다 (head-based)',
+            '#',
+            '# 비교표 ─────────────────────────────',
+            '#                Probabilistic  RateLimiting',
+            '#  균일성        ◎              ✕',
+            '#  비용 상한     ✕              ◎',
+            '#  서비스간 일관 ◎              △ (각 서비스 독립)',
+            '#  희소 에러     △              ✕',
+            '#  구현 단순     ◎              ◎',
+            '#',
+            '# 한 줄 요약',
+            '#  "기본은 probabilistic, 헬스/로그처럼 양 많은 건 ratelimiting,',
+            '#   희소한 에러는 다음 장(tail-based)에서 보강한다."',
+          ],
+          highlight: [9, 10, 11, 14, 15, 22, 23, 24, 25],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화 — 단계별 컴포넌트
+    // ─────────────────────────────────────────────────────────
+
+    // Step 1: AlwaysOn — span 스트림이 storage로 폭주
+    function AlwaysOnFlood() {
+      const spans = Array.from({ length: 24 }, (_, i) => i);
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🌊</span>
+            <span className="text-xs font-bold">AlwaysOn — span 폭주</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">10k RPS · 17TB/day</span>
+          </div>
+          <div className="p-3">
+            <div className="grid grid-cols-12 gap-1 mb-3">
+              {spans.map((i) => (
+                <div key={i}
+                  className="fade-in h-5 rounded-sm"
+                  style={{
+                    background: BRAND,
+                    animationDelay: `${i * 40}ms`,
+                    opacity: 0.4 + (i % 3) * 0.2,
+                  }} />
+              ))}
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-mono text-slate-600 mb-2">
+              <span>→</span>
+              <div className="flex-1 h-3 bg-slate-100 rounded overflow-hidden">
+                <div className="h-full grow-bar" style={{ '--target-width': '100%', background: '#dc2626' }} />
+              </div>
+              <span className="text-red-600 font-bold">100%</span>
+            </div>
+            <div className="text-[10px] text-slate-500 mb-1">collector queue</div>
+            <div className="flex items-center gap-2 text-[10px] font-mono text-slate-600">
+              <span>↓</span>
+              <div className="flex-1 h-3 bg-slate-100 rounded overflow-hidden">
+                <div className="h-full grow-bar" style={{ '--target-width': '92%', background: '#dc2626', animationDelay: '300ms' }} />
+              </div>
+              <span className="text-red-600 font-bold">disk</span>
+            </div>
+            <div className="mt-3 p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">
+              <span className="font-bold">⚠ OOM / disk full</span> — 며칠 후 collector 죽음. 운영 불가.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2: Probabilistic — trace_id 해시로 1% 통과
+    function ProbCoinFlip() {
+      const traces = Array.from({ length: 30 }, (_, i) => ({
+        id: (Math.sin(i * 7.7) * 1e6).toString(16).slice(2, 8),
+        sampled: i % 33 === 0, // 약 3%
+      }));
+      const passed = traces.filter((t) => t.sampled).length;
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🎲</span>
+            <span className="text-xs font-bold">Probabilistic — trace_id 해시 동전 던지기</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">param=0.01</span>
+          </div>
+          <div className="p-3 space-y-1">
+            {traces.map((t, i) => (
+              <div key={i} className="fade-in flex items-center gap-2 text-[10px] font-mono"
+                   style={{ animationDelay: `${i * 30}ms` }}>
+                <span className="text-slate-500 w-12">trace</span>
+                <span className="text-slate-700 w-16">{t.id}</span>
+                <div className="flex-1 h-2 bg-slate-100 rounded overflow-hidden">
+                  <div className="h-full" style={{
+                    width: `${((i * 31) % 100)}%`,
+                    background: t.sampled ? BRAND : '#cbd5e1',
+                  }} />
+                </div>
+                <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${t.sampled ? 'bg-cyan-100 text-cyan-700' : 'bg-slate-100 text-slate-400'}`}>
+                  {t.sampled ? 'sampled' : 'drop'}
+                </span>
+              </div>
+            ))}
+            <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px]">
+              <span className="text-slate-600">총 30 trace 중</span>
+              <span className="font-bold" style={{ color: BRAND }}>{passed} sampled (≈{Math.round(passed/30*100)}%)</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3: Rate-Limiting — leaky bucket
+    function RateBucket() {
+      const ticks = Array.from({ length: 20 }, (_, i) => ({
+        t: i,
+        accepted: i < 10, // 처음 10개만 통과
+      }));
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🎫</span>
+            <span className="text-xs font-bold">Rate-Limiting — 초당 10개 표</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">leaky bucket</span>
+          </div>
+          <div className="p-3">
+            {/* 버킷 시각화 */}
+            <div className="flex items-center gap-3 mb-3">
+              <div className="text-center">
+                <div className="text-[10px] text-slate-500 mb-1">버킷</div>
+                <div className="w-16 h-20 border-2 border-cyan-500 rounded-b-lg relative overflow-hidden">
+                  <div className="absolute bottom-0 left-0 right-0 grow-bar"
+                       style={{ '--target-width': '100%', height: '60%', background: BRAND }} />
+                </div>
+                <div className="text-[9px] text-slate-500 font-mono mt-1">10 / 10 tokens</div>
+              </div>
+              <div className="flex-1">
+                <div className="text-[10px] text-slate-500 mb-1">drip rate: 10 tokens/sec</div>
+                <div className="flex gap-0.5 flex-wrap">
+                  {ticks.map((t) => (
+                    <div key={t.t}
+                      className={`fade-in w-3 h-3 rounded-sm ${t.accepted ? '' : 'opacity-30'}`}
+                      style={{
+                        background: t.accepted ? BRAND : '#94a3b8',
+                        animationDelay: `${t.t * 50}ms`,
+                      }} />
+                  ))}
+                </div>
+                <div className="flex items-center justify-between text-[10px] font-mono mt-2">
+                  <span className="text-cyan-700">✓ 10 accepted</span>
+                  <span className="text-slate-400">✕ 10 dropped</span>
+                </div>
+              </div>
+            </div>
+            <div className="p-2 rounded bg-cyan-50 border border-cyan-200 text-[11px] text-cyan-800">
+              <span className="font-bold">초당 절대 상한 10.</span> 트래픽이 1k든 100k든 통과량은 그대로 10/s. 비용 예측 가능.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: 조합 — 결정 트리
+    function HybridTree() {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🌲</span>
+            <span className="text-xs font-bold">샘플링 결정 트리 — 서비스/오퍼레이션별</span>
+          </div>
+          <div className="p-3 text-[11px] font-mono">
+            <div className="space-y-1">
+              <div className="px-2 py-1.5 rounded bg-slate-100 text-slate-700 fade-in" style={{ animationDelay: '0ms' }}>
+                요청 도착 (entry service)
+              </div>
+              <div className="pl-4 space-y-1">
+                <div className="px-2 py-1.5 rounded bg-cyan-50 border-l-4 text-cyan-800 fade-in"
+                     style={{ borderColor: BRAND, animationDelay: '150ms' }}>
+                  ├─ service == checkout-api?
+                </div>
+                <div className="pl-6 space-y-1">
+                  <div className="px-2 py-1 rounded bg-cyan-50 text-cyan-700 fade-in" style={{ animationDelay: '300ms' }}>
+                    ├─ op == GET /healthz → <span className="font-bold">prob 0.01%</span>
+                  </div>
+                  <div className="px-2 py-1 rounded bg-cyan-50 text-cyan-700 fade-in" style={{ animationDelay: '400ms' }}>
+                    ├─ op == POST /checkout → <span className="font-bold">prob 10%</span>
+                  </div>
+                  <div className="px-2 py-1 rounded bg-cyan-50 text-cyan-700 fade-in" style={{ animationDelay: '500ms' }}>
+                    └─ 기타 → <span className="font-bold">prob 2%</span>
+                  </div>
+                </div>
+                <div className="px-2 py-1.5 rounded bg-slate-50 border-l-4 border-slate-300 text-slate-700 fade-in"
+                     style={{ animationDelay: '600ms' }}>
+                  ├─ service == log-shipper? → <span className="font-bold">rate 5/s</span>
+                </div>
+                <div className="px-2 py-1.5 rounded bg-slate-50 border-l-4 border-slate-300 text-slate-700 fade-in"
+                     style={{ animationDelay: '700ms' }}>
+                  └─ 그 외 → <span className="font-bold">default prob 1%</span>
+                </div>
+              </div>
+              <div className="px-2 py-1.5 rounded bg-amber-50 border border-amber-300 text-amber-800 mt-2 fade-in"
+                   style={{ animationDelay: '900ms' }}>
+                결과 → traceparent 헤더로 모든 hop에 전파 (head-based, consistent)
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      let inner = null;
+      if (step.key === 'always') inner = <AlwaysOnFlood />;
+      else if (step.key === 'probabilistic') inner = <ProbCoinFlip />;
+      else if (step.key === 'ratelimit') inner = <RateBucket />;
+      else if (step.key === 'compare') inner = <HybridTree />;
+      return (
+        <div className="space-y-2">
+          {inner}
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar { width: 0; animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: BRAND }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-1-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: BRAND }}>III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. 샘플링 · 스토리지 &gt; Chapter 1. Head-based 샘플링</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Probabilistic / Rate-Limiting 샘플링</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                동전 던지기 vs 표 끊기 — <strong>모든 trace를 저장할 수 없을 때</strong> 가장 기본이 되는 두 head-based 샘플링 전략의
+                동작 원리와 비용 트레이드오프를 익힌다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: '#0e7490' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-cyan-50 border-2 border-cyan-300 text-cyan-900 text-sm">
+                💡 다음(III-1-2)에서는 <strong>Adaptive / Tail-based 샘플링</strong> — 트래픽 변화에 따라 자동 조정 + 사후 결정
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: BRAND }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./III-1-2.html" className="font-medium" style={{ color: BRAND }}>III-1-2 Adaptive / Tail-based &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

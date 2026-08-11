@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — V-2-1. OpenTelemetry 마이그레이션</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔭</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/yaml.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/python.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-2-1. OpenTelemetry 마이그레이션
+    학습 목표: deprecated된 Jaeger 클라이언트 SDK에서 OpenTelemetry SDK로 무중단 전환하는 방법과 혼용 기간의 함정을 이해한다.
+    핵심 비유: "계측은 OTel 표준 콘센트로, Jaeger는 그대로 벽 뒤 배선(백엔드)"
+    구조: 5단계 — deprecated 현실 → SDK 교체 → OTLP 전송/agent 제거 → 혼용 기간 함정 → 전환 완료/벤더 중립
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+    const DEEP = '#0E7B91';
+
+    const STEPS = [
+      {
+        key: 'deprecated',
+        title: 'Step 1. 왜 옮기나 — Jaeger 클라이언트 SDK는 deprecated',
+        desc: 'jaeger-client-python/go 등 언어별 SDK는 2022년부터 유지보수가 종료됐고 신규 기능·보안 패치가 멈췄다. 계측 표준은 OpenTelemetry로 수렴했고, Jaeger 프로젝트 자신도 OTel SDK 사용을 공식 권장한다. 핵심은 역할 분리다 — "계측(instrumentation)"은 벤더 중립 OTel SDK가 맡고, Jaeger는 그 뒤에서 저장·조회하는 백엔드로만 남는다. 지금 새 코드에 jaeger-client를 넣으면 곧 재작업이 확정된다.',
+        legend: 'jaeger-client = 유지보수 종료. 계측은 OTel로, Jaeger는 백엔드로 역할이 갈린다.',
+        code: {
+          lang: 'python',
+          filename: 'legacy_setup.py — 지금은 넣으면 안 되는 코드',
+          lines: [
+            '# [DEPRECATED] jaeger-client 기반 계측 — 신규 채택 금지',
+            'import logging',
+            'from jaeger_client import Config  # 유지보수 종료 (2022~)',
+            '',
+            'def init_tracer(service_name: str):',
+            '    # jaeger.thrift 포맷으로 UDP agent(6831)에 직접 전송',
+            '    config = Config(',
+            '        config={',
+            '            \'sampler\': {\'type\': \'const\', \'param\': 1},',
+            '            \'local_agent\': {',
+            '                \'reporting_host\': \'jaeger-agent\',',
+            '                \'reporting_port\': 6831,  # UDP thrift',
+            '            },',
+            '            \'logging\': True,',
+            '        },',
+            '        service_name=service_name,',
+            '    )',
+            '    return config.initialize_tracer()',
+            '',
+            '# 문제점 ─────────────────────────────────',
+            '#  1) 신규 기능/보안 패치 없음 (EOL)',
+            '#  2) jaeger.thrift 독자 포맷 → 벤더 종속',
+            '#  3) agent(UDP 6831) 사이드카 운영 부담',
+            '#  4) OTel 생태계(자동 계측/미터)와 단절',
+          ],
+          highlight: [3, 11, 12, 21, 22, 23],
+        },
+      },
+      {
+        key: 'sdk',
+        title: 'Step 2. SDK 교체 — OpenTelemetry SDK + OTLP exporter',
+        desc: 'jaeger_client.Config를 걷어내고 opentelemetry-sdk의 TracerProvider로 교체한다. exporter는 OTLPSpanExporter 하나면 된다 — endpoint만 Jaeger collector의 OTLP 포트(gRPC 4317)로 향하게 한다. Resource에 service.name을 표준 속성으로 박아두면 Jaeger UI의 서비스 목록에 그대로 뜬다. BatchSpanProcessor로 묶어 보내면 네트워크 왕복이 줄어 프로덕션 기본값으로 안전하다.',
+        legend: 'TracerProvider + OTLPSpanExporter(4317) + BatchSpanProcessor. 계측 코드는 표준 API로.',
+        code: {
+          lang: 'python',
+          filename: 'otel_setup.py — OTel SDK로 교체',
+          lines: [
+            '# OpenTelemetry SDK — 벤더 중립 계측, OTLP로 전송',
+            'from opentelemetry import trace',
+            'from opentelemetry.sdk.resources import Resource',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.export import BatchSpanProcessor',
+            'from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter',
+            '',
+            'def init_tracer(service_name: str):',
+            '    # service.name은 OTel 표준 리소스 속성 → Jaeger UI 서비스명',
+            '    resource = Resource.create({\'service.name\': service_name})',
+            '    provider = TracerProvider(resource=resource)',
+            '',
+            '    # Jaeger collector의 OTLP gRPC 수신 포트로 직접 전송',
+            '    exporter = OTLPSpanExporter(endpoint=\'jaeger-collector:4317\', insecure=True)',
+            '    provider.add_span_processor(BatchSpanProcessor(exporter))',
+            '',
+            '    trace.set_tracer_provider(provider)',
+            '    return trace.get_tracer(service_name)',
+            '',
+            '# 애플리케이션 코드는 표준 API만 사용 (벤더 무관)',
+            'tracer = init_tracer(\'checkout-api\')',
+            'with tracer.start_as_current_span(\'POST /checkout\') as span:',
+            '    span.set_attribute(\'http.method\', \'POST\')',
+            '    span.set_attribute(\'order.id\', \'ord-1024\')',
+          ],
+          highlight: [6, 10, 14, 15, 22, 23],
+        },
+      },
+      {
+        key: 'otlp',
+        title: 'Step 3. OTLP 전송 — Jaeger가 네이티브로 받는다, agent 제거',
+        desc: 'Jaeger v1.35+ collector는 OTLP를 네이티브로 수신한다 — gRPC 4317, HTTP 4318. 즉 예전처럼 jaeger-agent(UDP 6831) 사이드카를 둘 필요가 없다. SDK가 OTLP로 collector에 직접 쏘거나, 표준 OpenTelemetry Collector를 앞단에 두고 파이프라인(배치·필터·라우팅)을 태운 뒤 Jaeger로 내보낸다. jaeger.thrift 독자 포맷은 사라지고 CNCF 표준 OTLP 하나로 통일된다.',
+        legend: 'collector가 OTLP 4317/4318 네이티브 수신 → jaeger-agent 사이드카 제거. thrift → OTLP.',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-collector.yaml — OTLP 수신 활성화',
+          lines: [
+            '# Jaeger collector: OTLP 네이티브 수신 (v1.35+)',
+            'apiVersion: jaegertracing.io/v1',
+            'kind: Jaeger',
+            'metadata:',
+            '  name: jaeger-prod',
+            'spec:',
+            '  strategy: production',
+            '  collector:',
+            '    options:',
+            '      collector:',
+            '        otlp:',
+            '          enabled: true',
+            '          grpc:',
+            '            host-port: \'0.0.0.0:4317\'   # SDK OTLP gRPC',
+            '          http:',
+            '            host-port: \'0.0.0.0:4318\'   # SDK OTLP HTTP',
+            '  storage:',
+            '    type: elasticsearch',
+            '',
+            '# 마이그레이션 체크리스트 ─────────────────',
+            '#  [x] collector OTLP 포트(4317/4318) 오픈',
+            '#  [x] SDK endpoint를 4317로 지정',
+            '#  [ ] jaeger-agent(UDP 6831) 사이드카 제거',
+            '#      → 모든 서비스가 OTLP로 옮겨간 뒤에 제거',
+            '#  [ ] jaeger.thrift 경로 폐기',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 22, 23],
+        },
+      },
+      {
+        key: 'coexist',
+        title: 'Step 4. 혼용 기간 함정 — 문맥 전파와 태그 매핑',
+        desc: '전 서비스를 한 번에 바꿀 수 없으니 jaeger-client와 OTel SDK가 한동안 공존한다. 최대 함정은 propagator 불일치다 — 구 서비스는 uber-trace-id(Jaeger 포맷) 헤더를, 신 서비스는 W3C traceparent를 기본으로 쓴다. 서로 못 읽으면 trace가 끊겨 두 조각으로 갈린다. 해법은 OTel쪽에 CompositePropagator로 두 포맷을 동시에 주입/추출하게 하는 것. 또 Jaeger의 tag는 OTel의 attribute로 이름·타입이 매핑되니(예: 스네이크 케이스 유지) 대시보드 쿼리가 깨지지 않게 키를 맞춘다.',
+        legend: 'propagator 불일치 = trace 단절. CompositePropagator로 uber-trace-id + traceparent 둘 다 처리.',
+        code: {
+          lang: 'python',
+          filename: 'propagator.py — 혼용 기간 문맥 전파 호환',
+          lines: [
+            '# 혼용 기간: 두 포맷을 동시에 읽고 쓴다 → trace 단절 방지',
+            'from opentelemetry.propagate import set_global_textmap',
+            'from opentelemetry.propagators.composite import CompositePropagator',
+            'from opentelemetry.trace.propagation.tracecontext import (',
+            '    TraceContextTextMapPropagator,  # W3C traceparent (신)',
+            ')',
+            'from opentelemetry.propagators.jaeger import JaegerPropagator  # uber-trace-id (구)',
+            '',
+            '# 두 propagator를 합쳐 주입/추출 → 구/신 서비스가 서로 문맥 인식',
+            'set_global_textmap(CompositePropagator([',
+            '    TraceContextTextMapPropagator(),',
+            '    JaegerPropagator(),',
+            ']))',
+            '',
+            '# 태그 → attribute 매핑 (대시보드 쿼리 호환)',
+            'def to_otel_attrs(jaeger_tags: dict) -> dict:',
+            '    # Jaeger tag 키를 그대로 유지해 기존 쿼리가 깨지지 않게',
+            '    return {k: v for k, v in jaeger_tags.items()}',
+            '',
+            '# 함정 정리 ─────────────────────────────',
+            '#  1) propagator 불일치 → trace 두 조각으로 분리',
+            '#  2) agent를 너무 일찍 제거 → 구 서비스 span 유실',
+            '#  3) tag/attribute 키 불일치 → 저장된 쿼리 깨짐',
+            '#  4) 버전 호환: collector가 SDK OTLP 버전 지원하는지 확인',
+          ],
+          highlight: [10, 11, 12, 13, 21, 22, 23],
+        },
+      },
+      {
+        key: 'done',
+        title: 'Step 5. 전환 완료 — 벤더 중립이 남긴 것',
+        desc: '모든 서비스가 OTel SDK로 옮겨가면 마지막으로 jaeger-agent 사이드카와 jaeger.thrift 경로를 걷어낸다. 이제 계측은 표준 OTLP 하나로 통일되고, 백엔드는 Jaeger든 Tempo든 상용 APM이든 exporter endpoint만 바꾸면 갈아탈 수 있다 — 이것이 벤더 중립의 실질 이득이다. 자동 계측(HTTP/DB 라이브러리)과 메트릭·로그까지 같은 파이프라인으로 확장되는 것도 덤이다.',
+        legend: '표준 OTLP로 통일 → 백엔드 교체는 endpoint 한 줄. 자동 계측·메트릭까지 확장.',
+        code: {
+          lang: 'yaml',
+          filename: 'migration-summary.yaml — before / after',
+          lines: [
+            '# 마이그레이션 전후 비교 요약',
+            'before:',
+            '  instrumentation: jaeger-client (EOL)',
+            '  wire_format: jaeger.thrift (독자 포맷)',
+            '  transport: UDP 6831 via jaeger-agent 사이드카',
+            '  propagation: uber-trace-id',
+            '  vendor_lock: high        # 백엔드 교체 어려움',
+            '',
+            'after:',
+            '  instrumentation: opentelemetry-sdk (표준)',
+            '  wire_format: OTLP (CNCF 표준)',
+            '  transport: gRPC 4317 / HTTP 4318 → collector 직결',
+            '  propagation: W3C traceparent (+ 혼용기 composite)',
+            '  vendor_lock: low         # endpoint만 바꾸면 백엔드 교체',
+            '  bonus:',
+            '    - 자동 계측(HTTP/DB) 즉시 활용',
+            '    - metrics/logs 동일 파이프라인으로 확장',
+            '',
+            '# 전환 순서(안전) ───────────────────────',
+            '#  1) collector OTLP 오픈  2) 서비스별 OTel 교체(혼용)',
+            '#  3) composite propagator로 단절 방지',
+            '#  4) 전 서비스 완료 후 agent/thrift 제거',
+          ],
+          highlight: [2, 3, 4, 5, 9, 10, 11, 12, 14],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화 — 단계별 컴포넌트
+    // ─────────────────────────────────────────────────────────
+
+    function PaneShell({ icon, title, badge, children }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+            <span className="text-base">{icon}</span>
+            <span className="text-xs font-bold">{title}</span>
+            {badge && <span className="ml-auto text-[10px] font-mono opacity-80">{badge}</span>}
+          </div>
+          <div className="p-3">{children}</div>
+        </div>
+      );
+    }
+
+    // Step 1: deprecated 표시
+    function DeprecatedPane() {
+      return (
+        <PaneShell icon="⚰️" title="jaeger-client SDK — 유지보수 종료" badge="EOL 2022~">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="flex-1 p-3 rounded-lg border-2 border-red-200 bg-red-50 fade-in">
+              <div className="text-[11px] font-bold text-red-700 mb-1">계측 (구)</div>
+              <div className="text-[10px] font-mono text-red-500 line-through">jaeger-client</div>
+              <div className="text-[10px] text-red-500 mt-1">패치 없음 · thrift · agent</div>
+            </div>
+            <div className="text-slate-300 text-xl">→</div>
+            <div className="flex-1 p-3 rounded-lg border-2 fade-in" style={{ borderColor: BRAND, background: '#E6F8FC', animationDelay: '200ms' }}>
+              <div className="text-[11px] font-bold mb-1" style={{ color: DEEP }}>계측 (표준)</div>
+              <div className="text-[10px] font-mono" style={{ color: DEEP }}>opentelemetry-sdk</div>
+              <div className="text-[10px] text-slate-500 mt-1">OTLP · 벤더 중립</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] fade-in" style={{ animationDelay: '400ms' }}>
+            <div className="flex-1 p-2 rounded bg-slate-100 text-slate-500 text-center">
+              역할 분리 · 계측=OTel / 저장=<span className="font-bold" style={{ color: DEEP }}>Jaeger 백엔드</span>
+            </div>
+          </div>
+          <div className="mt-3 p-2 rounded bg-amber-50 border border-amber-300 text-[11px] text-amber-800">
+            <span className="font-bold">⚠ 지금 jaeger-client를 넣으면</span> 곧 재작업 확정. 새 코드는 OTel부터.
+          </div>
+        </PaneShell>
+      );
+    }
+
+    // Step 2: SDK 파이프라인
+    function SdkPane() {
+      const nodes = [
+        { label: 'App 코드', sub: 'start_span', c: '#f1f5f9', t: '#475569' },
+        { label: 'TracerProvider', sub: 'Resource: service.name', c: '#E6F8FC', t: DEEP },
+        { label: 'BatchSpanProcessor', sub: '묶어서 전송', c: '#E6F8FC', t: DEEP },
+        { label: 'OTLPSpanExporter', sub: 'gRPC :4317', c: '#B7EAF5', t: DEEP },
+      ];
+      return (
+        <PaneShell icon="🔭" title="OTel SDK 파이프라인" badge="OTLP gRPC 4317">
+          <div className="space-y-1.5">
+            {nodes.map((n, i) => (
+              <div key={i}>
+                <div className="fade-in flex items-center justify-between px-3 py-2 rounded-lg border border-slate-200"
+                     style={{ background: n.c, animationDelay: `${i * 150}ms` }}>
+                  <span className="text-[12px] font-bold" style={{ color: n.t }}>{n.label}</span>
+                  <span className="text-[10px] font-mono text-slate-500">{n.sub}</span>
+                </div>
+                {i < nodes.length - 1 && (
+                  <div className="text-center text-slate-300 text-xs leading-none">↓</div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <div className="flex-1 text-center px-3 py-2 rounded-lg text-white text-[12px] font-bold fade-in"
+                 style={{ background: DEEP, animationDelay: '650ms' }}>
+              → Jaeger collector (저장 · 조회)
+            </div>
+          </div>
+        </PaneShell>
+      );
+    }
+
+    // Step 3: agent 제거, OTLP 네이티브
+    function OtlpPane() {
+      return (
+        <PaneShell icon="🔌" title="collector OTLP 네이티브 수신" badge="agent 제거">
+          <div className="mb-3">
+            <div className="text-[10px] text-slate-400 mb-1">BEFORE — agent 사이드카 경유</div>
+            <div className="flex items-center gap-1.5 text-[10px] font-mono">
+              <span className="px-2 py-1 rounded bg-slate-100 text-slate-500">SDK</span>
+              <span className="text-slate-300">→ thrift/UDP →</span>
+              <span className="px-2 py-1 rounded bg-red-50 text-red-500 border border-red-200 line-through">jaeger-agent :6831</span>
+              <span className="text-slate-300">→</span>
+              <span className="px-2 py-1 rounded bg-slate-100 text-slate-500">collector</span>
+            </div>
+          </div>
+          <div className="border-t border-dashed border-slate-200 my-2"></div>
+          <div>
+            <div className="text-[10px] mb-1 font-bold" style={{ color: DEEP }}>AFTER — OTLP 직결</div>
+            <div className="flex items-center gap-1.5 text-[10px] font-mono fade-in">
+              <span className="px-2 py-1 rounded text-white" style={{ background: BRAND }}>OTel SDK</span>
+              <span className="text-slate-400">→ OTLP →</span>
+              <span className="px-2 py-1 rounded font-bold" style={{ background: '#E6F8FC', color: DEEP }}>collector :4317 / :4318</span>
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-1.5 text-[10px]">
+              <div className="px-2 py-1.5 rounded text-center" style={{ background: '#B7EAF5', color: DEEP }}>gRPC 4317</div>
+              <div className="px-2 py-1.5 rounded text-center" style={{ background: '#B7EAF5', color: DEEP }}>HTTP 4318</div>
+            </div>
+          </div>
+          <div className="mt-3 p-2 rounded text-[11px]" style={{ background: '#E6F8FC', color: DEEP }}>
+            <span className="font-bold">사이드카 0개.</span> jaeger.thrift 독자 포맷 폐기 → CNCF 표준 OTLP로 통일.
+          </div>
+        </PaneShell>
+      );
+    }
+
+    // Step 4: 혼용 기간 문맥 전파
+    function CoexistPane() {
+      return (
+        <PaneShell icon="🔗" title="혼용 기간 — 문맥 전파 호환" badge="composite">
+          <div className="space-y-2 text-[11px]">
+            <div className="flex items-center gap-2 fade-in">
+              <span className="px-2 py-1 rounded bg-slate-100 text-slate-600 font-mono w-24 text-center">구 서비스</span>
+              <span className="text-slate-400">헤더:</span>
+              <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">uber-trace-id</span>
+            </div>
+            <div className="flex items-center gap-2 fade-in" style={{ animationDelay: '150ms' }}>
+              <span className="px-2 py-1 rounded font-mono w-24 text-center text-white" style={{ background: BRAND }}>신 서비스</span>
+              <span className="text-slate-400">헤더:</span>
+              <span className="font-mono text-[10px] px-2 py-0.5 rounded" style={{ background: '#E6F8FC', color: DEEP }}>traceparent (W3C)</span>
+            </div>
+            <div className="p-2 rounded bg-red-50 border border-red-200 text-red-600 fade-in" style={{ animationDelay: '300ms' }}>
+              <span className="font-bold">✕ 서로 못 읽으면</span> — trace가 두 조각으로 끊긴다
+            </div>
+            <div className="text-center text-slate-300">↓ CompositePropagator</div>
+            <div className="p-2 rounded fade-in" style={{ background: '#E6F8FC', animationDelay: '450ms' }}>
+              <div className="font-bold mb-1" style={{ color: DEEP }}>✓ 두 포맷 동시 주입/추출</div>
+              <div className="flex gap-1.5">
+                <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-white" style={{ color: DEEP }}>traceparent</span>
+                <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-white text-amber-700">uber-trace-id</span>
+              </div>
+            </div>
+          </div>
+          <div className="mt-3 p-2 rounded bg-slate-50 border border-slate-200 text-[10px] text-slate-500">
+            tag → attribute 키 유지 · agent는 전 서비스 전환 후 제거 · 버전 호환 확인
+          </div>
+        </PaneShell>
+      );
+    }
+
+    // Step 5: before/after 비교표
+    function DonePane() {
+      const rows = [
+        ['계측', 'jaeger-client (EOL)', 'opentelemetry-sdk'],
+        ['포맷', 'jaeger.thrift', 'OTLP (표준)'],
+        ['전송', 'UDP 6831 · agent', 'gRPC 4317 직결'],
+        ['전파', 'uber-trace-id', 'W3C traceparent'],
+        ['벤더 종속', '높음', '낮음 (endpoint 교체)'],
+      ];
+      return (
+        <PaneShell icon="✅" title="마이그레이션 완료 — before / after" badge="vendor-neutral">
+          <div className="space-y-1">
+            <div className="grid grid-cols-[64px_1fr_1fr] gap-1 text-[10px] font-bold text-slate-400 px-1">
+              <span></span><span>BEFORE</span><span>AFTER</span>
+            </div>
+            {rows.map((r, i) => (
+              <div key={i} className="grid grid-cols-[64px_1fr_1fr] gap-1 items-center fade-in"
+                   style={{ animationDelay: `${i * 120}ms` }}>
+                <span className="text-[10px] text-slate-500 font-bold">{r[0]}</span>
+                <span className="text-[10px] font-mono px-2 py-1 rounded bg-slate-100 text-slate-400 line-through truncate">{r[1]}</span>
+                <span className="text-[10px] font-mono px-2 py-1 rounded truncate" style={{ background: '#E6F8FC', color: DEEP }}>{r[2]}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 p-2 rounded text-white text-[11px]" style={{ background: DEEP }}>
+            <span className="font-bold">백엔드 교체 = endpoint 한 줄.</span> Jaeger · Tempo · APM 자유. 자동 계측 · metrics 확장은 덤.
+          </div>
+        </PaneShell>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      let inner = null;
+      if (step.key === 'deprecated') inner = <DeprecatedPane />;
+      else if (step.key === 'sdk') inner = <SdkPane />;
+      else if (step.key === 'otlp') inner = <OtlpPane />;
+      else if (step.key === 'coexist') inner = <CoexistPane />;
+      else if (step.key === 'done') inner = <DonePane />;
+      return (
+        <div className="space-y-2">
+          {inner}
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: DEEP }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-2-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: DEEP }}>V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 실전 운영 &gt; Chapter 2. 표준 전환</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">OpenTelemetry 마이그레이션</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                Jaeger 클라이언트 SDK에서 OpenTelemetry로 전환 — <strong>계측은 OTel 표준, Jaeger는 백엔드</strong>로
+                역할을 나누고 OTLP로 무중단 마이그레이션하는 실전 절차를 익힌다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: DEEP }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl border-2 text-sm" style={{ background: '#E6F8FC', borderColor: BRAND, color: DEEP }}>
+                💡 다음(V-2-2)에서는 <strong>OpenTelemetry Collector 파이프라인</strong> — 배치 · 필터 · 라우팅으로 관측 데이터 흐름 제어
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: DEEP }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./V-2-2.html" className="font-medium" style={{ color: DEEP }}>V-2-2 OpenTelemetry Collector 파이프라인 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — IV-1-2. Dependencies 그래프</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🕸️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/json.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/bash.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-1-2. Dependencies 그래프
+    학습 목표: 여러 trace에서 추출한 서비스 간 호출 관계를 의존성 그래프로 읽고,
+               핫스팟/순환 의존/장애 전파 경로를 찾아 아키텍처를 파악한다.
+    핵심 비유: "수만 통의 통화 기록을 겹쳐 그린 관계도"
+    구조: 5단계 — 집계 → 그래프 읽기 → 생성(job) → 순환/전파 분석 → 실무 함정
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+    const DEEP = '#0E7B91';
+    const TINT = '#E6F8FC';
+    const MID = '#B7EAF5';
+
+    const STEPS = [
+      {
+        key: 'aggregate',
+        title: 'Step 1. 집계 — 수많은 trace를 겹쳐 호출 관계를 뽑는다',
+        desc: 'Dependencies 그래프는 새로 수집하는 데이터가 아니라, 이미 저장된 trace들에서 파생되는 뷰다. 각 span의 (부모 서비스 → 자식 서비스) 쌍을 전체 trace에서 긁어모아 같은 쌍끼리 callCount로 합산한다. trace 하나만 보면 한 요청의 경로지만, 수만 개를 겹치면 시스템 전체의 호출 지도가 된다. 그래서 트래픽이 적거나 아직 흐르지 않은 서비스는 그래프에 아예 나타나지 않는다.',
+        legend: '한 trace = 한 통화 기록. 수만 통을 겹쳐 그리면 서비스 관계도가 된다.',
+        code: {
+          lang: 'json',
+          filename: 'aggregated-links.json — 집계 결과(부분)',
+          lines: [
+            '// span의 (parent→child) 쌍을 전체 trace에서 합산한 결과',
+            '// Jaeger 내부의 model.DependencyLink 배열과 동일한 형태',
+            '{',
+            '  "dependencies": [',
+            '    { "parent": "frontend",    "child": "checkout-api", "callCount": 84210 },',
+            '    { "parent": "checkout-api", "child": "payment-api",  "callCount": 41880 },',
+            '    { "parent": "checkout-api", "child": "cart-api",     "callCount": 79950 },',
+            '    { "parent": "payment-api",  "child": "ledger-db",    "callCount": 41210 },',
+            '    { "parent": "cart-api",     "child": "redis-cache",  "callCount": 158400 },',
+            '    { "parent": "checkout-api", "child": "notify-api",   "callCount": 3120 }',
+            '  ]',
+            '}',
+            '',
+            '// 읽는 법',
+            '//  parent    : 호출을 시작한 서비스 (span의 상위)',
+            '//  child     : 호출을 받은 서비스 (하위 span의 서비스)',
+            '//  callCount : 이 방향 호출이 관찰된 총 횟수 = 엣지 굵기',
+            '//',
+            '// 주의: 여기 없는 서비스 = 이 기간에 trace가 없었을 뿐,',
+            '//       실제로 존재하지 않는다는 뜻이 아니다.',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10],
+        },
+      },
+      {
+        key: 'graph',
+        title: 'Step 2. 그래프 읽기 — 노드=서비스, 엣지=호출, 굵기=호출량',
+        desc: '집계된 링크를 노드와 엣지로 그리면 서비스맵이 된다. 노드는 서비스, 화살표는 호출 방향, 선의 굵기는 callCount에 비례한다. 굵은 엣지로 들어오는 노드는 트래픽이 몰리는 핫스팟이며, 장애가 나면 영향 반경이 가장 크다. 이 그림 한 장으로 아키텍처 문서보다 빠르게 실제 런타임 구조를 파악할 수 있다 — 문서는 낡지만 그래프는 어제의 트래픽을 반영한다.',
+        legend: 'redis-cache로 굵은 엣지가 몰린다 = 최대 핫스팟. 여기가 죽으면 cart 전체가 흔들린다.',
+        code: {
+          lang: 'json',
+          filename: 'GET /api/dependencies — Query API 응답',
+          lines: [
+            '// UI의 System Architecture 탭이 호출하는 실제 엔드포인트',
+            '// GET /api/dependencies?endTs=1699999999000&lookback=3600000',
+            '{',
+            '  "data": [',
+            '    { "parent": "frontend",     "child": "checkout-api", "callCount": 84210 },',
+            '    { "parent": "checkout-api",  "child": "cart-api",     "callCount": 79950 },',
+            '    { "parent": "cart-api",      "child": "redis-cache",  "callCount": 158400 },',
+            '    { "parent": "checkout-api",  "child": "payment-api",  "callCount": 41880 }',
+            '  ],',
+            '  "total": 4, "limit": 0, "offset": 0, "errors": null',
+            '}',
+            '',
+            '// 파라미터',
+            '//  endTs    : 조회 종료 시각(ms) — 이 시점 기준 과거를 본다',
+            '//  lookback : 되돌아볼 시간 창(ms). 3600000 = 최근 1시간',
+            '//',
+            '// 시간 범위가 왜 중요한가',
+            '//  - 배포 전후로 창을 나눠 보면 새 엣지/사라진 엣지가 보인다',
+            '//  - 야간 배치 시간대만 나타나는 엣지도 있다',
+            '//  - 창이 너무 짧으면 저빈도 호출이 통째로 빠진다',
+          ],
+          highlight: [5, 6, 7, 8],
+        },
+      },
+      {
+        key: 'generate',
+        title: 'Step 3. 생성 방식 — all-in-one 자동 vs spark job 배치',
+        desc: '그래프가 저절로 생기는 건 all-in-one(개발용)뿐이다. 프로덕션의 Elasticsearch/Cassandra 백엔드는 trace가 흩어져 저장되므로, 별도의 spark-dependencies 배치 잡을 주기적으로 돌려 링크를 계산하고 별도 인덱스에 써 넣어야 한다. 이 잡을 안 돌리면 UI의 의존성 탭은 영원히 빈 화면이다 — 신규 운영자가 가장 많이 겪는 함정이다. 보통 cron으로 1시간~1일 주기로 실행한다.',
+        legend: 'ES/Cassandra는 spark job이 링크를 미리 계산해 둬야 한다. 안 돌리면 빈 그래프.',
+        code: {
+          lang: 'bash',
+          filename: 'run-deps-job.sh — spark-dependencies 배치',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# 프로덕션(ES/Cassandra)에서 의존성 링크를 계산하는 배치 잡',
+            '# all-in-one 개발 환경에서는 필요 없다(메모리에서 즉시 계산됨)',
+            'set -euo pipefail',
+            '',
+            '# 대상 스토리지와 접속 정보를 환경변수로 넘긴다',
+            'export STORAGE=elasticsearch',
+            'export ES_NODES=http://es:9200',
+            'export ES_INDEX_PREFIX=jaeger',
+            '',
+            '# 오늘 날짜의 trace를 스캔해 dependency 인덱스에 기록',
+            'docker run --rm \\',
+            '  --network jaeger-net \\',
+            '  -e STORAGE=\'elasticsearch\' \\',
+            '  -e ES_NODES=\'http://es:9200\' \\',
+            '  jaegertracing/spark-dependencies:latest',
+            '',
+            '# cron 등록 예: 매시 정각 실행',
+            '#   0 * * * * /opt/jaeger/run-deps-job.sh >> /var/log/deps.log 2>&1',
+            '#',
+            '# 확인: 잡이 성공하면 jaeger-dependencies-YYYY-MM-DD 인덱스가 생긴다',
+            '#   curl -s "$ES_NODES/_cat/indices/jaeger-dependencies-*?v"',
+            '#',
+            '# 흔한 실패',
+            '#   - 잡 미등록: UI 의존성 탭이 계속 빈 화면',
+            '#   - 시간대(UTC/KST) 어긋남: 오늘 데이터를 못 찾음',
+            '#   - trace가 아직 없음: 링크 0건이 정상 출력',
+          ],
+          highlight: [12, 13, 14, 15, 16, 19],
+        },
+      },
+      {
+        key: 'analysis',
+        title: 'Step 4. 분석 — 순환 의존과 장애 전파 경로를 읽는다',
+        desc: '그래프는 눈으로 보는 것 이상이다. A→B→C→A처럼 화살표가 되돌아오는 순환 의존은 배포 순서를 꼬이게 하고 장애를 무한 증폭시키는 설계 냄새다. 또 특정 노드에서 굵은 엣지를 거꾸로 따라가면, 그 서비스가 죽었을 때 어디까지 영향이 번지는지(장애 전파 경로)를 미리 그릴 수 있다. 인시던트 대응 때 "이 DB가 느려지면 누가 아픈가"를 그래프로 즉답할 수 있다.',
+        legend: 'checkout ↔ inventory 순환 발견. redis-cache 장애 시 cart→checkout→frontend로 전파.',
+        code: {
+          lang: 'json',
+          filename: 'analysis.json — 순환·전파 판정',
+          lines: [
+            '// 링크 배열을 그래프로 보고 두 가지를 자동 점검한다',
+            '{',
+            '  "cycles": [',
+            '    {',
+            '      "path": ["checkout-api", "inventory-api", "checkout-api"],',
+            '      "note": "재고 확인이 결제를 다시 호출 — 순환 의존(설계 냄새)"',
+            '    }',
+            '  ],',
+            '  "blastRadius": {',
+            '    "if_down": "redis-cache",',
+            '    "affected": ["cart-api", "checkout-api", "frontend"],',
+            '    "note": "역방향으로 엣지를 따라가면 영향 반경이 나온다"',
+            '  },',
+            '  "hotspots": [',
+            '    { "service": "redis-cache", "inbound": 158400 },',
+            '    { "service": "checkout-api", "inbound": 84210 }',
+            '  ]',
+            '}',
+            '',
+            '// 활용',
+            '//  - cycles  : 배포 순서/롤백을 꼬는 순환은 우선 제거 대상',
+            '//  - blast   : 인시던트 때 영향 범위를 즉시 답한다',
+            '//  - hotspot : 캐시/큐를 넣어 부하를 분산할 1순위',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        },
+      },
+      {
+        key: 'pitfalls',
+        title: 'Step 5. 실무 함정 — 빈 그래프·노드 폭발·누락 엣지',
+        desc: '의존성 그래프는 오해하기 쉽다. 첫째, 잡 미실행이나 짧은 lookback으로 빈 그래프가 나오면 아키텍처가 없는 게 아니라 데이터가 없는 것이다. 둘째, 서비스 이름에 인스턴스 ID나 URL 파라미터가 섞이면(고카디널리티) 노드가 수백 개로 폭발해 그림을 못 읽는다 — service.name을 안정된 논리명으로 고정해야 한다. 셋째, 샘플링으로 저빈도 호출은 통째로 누락돼 실제로 있는 엣지가 안 보일 수 있다. 그래프는 "관찰된 것"이지 "존재하는 전부"가 아니다.',
+        legend: '빈 그래프 ≠ 관계 없음. 노드 폭발은 이름 문제. 얇은 엣지는 샘플링에 잘 잘린다.',
+        code: {
+          lang: 'bash',
+          filename: 'troubleshoot-deps.sh — 함정별 점검',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# 의존성 그래프가 이상할 때의 점검 순서',
+            '',
+            '# 1) 빈 그래프? — 먼저 링크 자체가 계산됐는지 본다',
+            'curl -s "http://es:9200/_cat/indices/jaeger-dependencies-*?v"',
+            'curl -s "http://query:16686/api/dependencies?endTs=$(date +%s000)&lookback=86400000" \\',
+            '  | head -c 400',
+            '#  data가 []면: spark job 미실행 또는 lookback 과소',
+            '',
+            '# 2) 노드 폭발? — service.name 카디널리티 확인',
+            'curl -s "http://query:16686/api/services" | tr \',\' \'\\n\' | wc -l',
+            '#  수백 개면: 이름에 pod-id/uuid가 섞였다는 신호',
+            '#  → 계측에서 service.name을 안정된 논리명으로 고정',
+            '#     예) checkout-api  (O)   checkout-api-7f9c-xk2   (X)',
+            '',
+            '# 3) 누락 엣지? — 샘플링률과 트래픽을 함께 본다',
+            '#  얇은 엣지(저빈도 호출)는 1% 샘플링에서 통째로 빠질 수 있다',
+            '#  → 중요한 경로는 lookback을 늘리거나 tail-based 샘플링 병행',
+            '',
+            '# 4) 방향 오해 금지',
+            '#  화살표는 "호출 방향"이지 "데이터 흐름"이 아니다',
+            '#  응답 데이터는 반대로 흐른다 — 반경 분석 때 헷갈리지 말 것',
+          ],
+          highlight: [4, 5, 6, 7, 8, 10, 11],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화 — 단계별 컴포넌트
+    // ─────────────────────────────────────────────────────────
+
+    // 공통 카드 헤더
+    function PaneHead({ icon, title, tag }) {
+      return (
+        <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+          <span className="text-base">{icon}</span>
+          <span className="text-xs font-bold">{title}</span>
+          {tag && <span className="ml-auto text-[10px] font-mono opacity-80">{tag}</span>}
+        </div>
+      );
+    }
+
+    // Step 1: 여러 trace가 겹쳐 (parent→child) 카운트로 집계
+    function AggregatePane() {
+      const traces = Array.from({ length: 6 }, (_, i) => i);
+      const links = [
+        { pair: 'frontend → checkout-api', n: 84210 },
+        { pair: 'checkout-api → cart-api', n: 79950 },
+        { pair: 'cart-api → redis-cache', n: 158400 },
+        { pair: 'checkout-api → payment-api', n: 41880 },
+      ];
+      const max = 158400;
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <PaneHead icon="🧮" title="집계 — trace 겹쳐 링크 합산" tag="callCount" />
+          <div className="p-3">
+            <div className="text-[10px] text-slate-500 mb-1">수집된 trace (한 줄 = 한 요청 경로)</div>
+            <div className="space-y-1 mb-3">
+              {traces.map((i) => (
+                <div key={i} className="fade-in flex gap-1" style={{ animationDelay: `${i * 60}ms` }}>
+                  {Array.from({ length: 5 }, (_, j) => (
+                    <div key={j} className="h-2 rounded-sm flex-1"
+                      style={{ background: j <= (i % 4) + 1 ? MID : '#eef2f5' }} />
+                  ))}
+                </div>
+              ))}
+            </div>
+            <div className="text-[10px] text-slate-500 mb-1">↓ (parent → child) 쌍으로 합산</div>
+            <div className="space-y-1.5">
+              {links.map((l, i) => (
+                <div key={i} className="fade-in flex items-center gap-2 text-[10px] font-mono"
+                     style={{ animationDelay: `${300 + i * 90}ms` }}>
+                  <span className="text-slate-700 w-40 truncate">{l.pair}</span>
+                  <div className="flex-1 h-2.5 bg-slate-100 rounded overflow-hidden">
+                    <div className="h-full grow-bar" style={{ '--target-width': `${(l.n / max) * 100}%`, background: BRAND }} />
+                  </div>
+                  <span className="w-14 text-right font-bold" style={{ color: DEEP }}>{l.n.toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // 서비스맵 그래프 (SVG) — 공용
+    function ServiceMap({ highlightCycle, highlightBlast }) {
+      // 노드 좌표
+      const nodes = {
+        frontend: { x: 60, y: 120, label: 'frontend' },
+        checkout: { x: 190, y: 60, label: 'checkout-api' },
+        cart: { x: 190, y: 180, label: 'cart-api' },
+        payment: { x: 330, y: 45, label: 'payment-api' },
+        inventory: { x: 330, y: 120, label: 'inventory-api' },
+        redis: { x: 330, y: 195, label: 'redis-cache' },
+        ledger: { x: 450, y: 60, label: 'ledger-db' },
+      };
+      // 엣지: from,to,weight(1~4)
+      const edges = [
+        { a: 'frontend', b: 'checkout', w: 3 },
+        { a: 'checkout', b: 'cart', w: 3 },
+        { a: 'checkout', b: 'payment', w: 2 },
+        { a: 'checkout', b: 'inventory', w: 1, cyc: true },
+        { a: 'inventory', b: 'checkout', w: 1, cyc: true },
+        { a: 'cart', b: 'redis', w: 4, blast: true },
+        { a: 'payment', b: 'ledger', w: 2 },
+      ];
+      const blastNodes = ['redis', 'cart', 'checkout', 'frontend'];
+      return (
+        <svg viewBox="0 0 510 240" className="w-full">
+          <defs>
+            <marker id="arw" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8" />
+            </marker>
+            <marker id="arwC" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L7,3 L0,6 Z" fill="#dc2626" />
+            </marker>
+            <marker id="arwB" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L7,3 L0,6 Z" fill={DEEP} />
+            </marker>
+          </defs>
+          {edges.map((e, i) => {
+            const na = nodes[e.a], nb = nodes[e.b];
+            const isCyc = highlightCycle && e.cyc;
+            const isBlast = highlightBlast && e.blast;
+            const color = isCyc ? '#dc2626' : isBlast ? DEEP : '#cbd5e1';
+            const mk = isCyc ? 'url(#arwC)' : isBlast ? 'url(#arwB)' : 'url(#arw)';
+            return (
+              <line key={i} x1={na.x} y1={na.y} x2={nb.x} y2={nb.y}
+                stroke={color} strokeWidth={e.w} markerEnd={mk} opacity={0.9} />
+            );
+          })}
+          {Object.entries(nodes).map(([k, n], i) => {
+            const isHot = k === 'redis';
+            const inBlast = highlightBlast && blastNodes.includes(k);
+            const fill = inBlast ? TINT : '#ffffff';
+            const stroke = isHot ? DEEP : inBlast ? BRAND : '#94a3b8';
+            return (
+              <g key={k} className="fade-in" style={{ animationDelay: `${i * 70}ms` }}>
+                <circle cx={n.x} cy={n.y} r={isHot ? 15 : 11} fill={fill} stroke={stroke} strokeWidth={isHot ? 3 : 1.5} />
+                <text x={n.x} y={n.y + (isHot ? 30 : 25)} textAnchor="middle"
+                  fontSize="9" fontFamily="monospace" fill="#475569">{n.label}</text>
+              </g>
+            );
+          })}
+        </svg>
+      );
+    }
+
+    // Step 2: 서비스맵 그래프
+    function GraphPane() {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <PaneHead icon="🕸️" title="서비스맵 — 노드·엣지·굵기" tag="lookback 1h" />
+          <div className="p-3">
+            <ServiceMap />
+            <div className="mt-2 flex items-center gap-3 text-[10px] text-slate-500">
+              <span className="flex items-center gap-1"><span className="inline-block w-4 h-1 rounded" style={{ background: BRAND }} /> 굵을수록 호출량↑</span>
+              <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full border-2" style={{ borderColor: DEEP }} /> 핫스팟</span>
+            </div>
+            <div className="mt-2 p-2 rounded text-[11px]" style={{ background: TINT, color: DEEP }}>
+              <span className="font-bold">redis-cache</span>로 가장 굵은 엣지가 들어온다 = 최대 핫스팟. 여기가 느려지면 cart→checkout이 함께 느려진다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3: 생성 방식 비교
+    function GeneratePane() {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <PaneHead icon="⚙️" title="그래프는 어떻게 만들어지나" />
+          <div className="p-3 grid grid-cols-2 gap-2 text-[11px]">
+            <div className="rounded-lg border border-slate-200 p-2">
+              <div className="font-bold text-slate-700 mb-1">all-in-one (개발)</div>
+              <div className="text-slate-500 leading-snug">메모리에 있는 trace로 <b>즉시</b> 계산. 배치 잡 불필요. 재시작하면 사라짐.</div>
+              <div className="mt-2 h-1.5 rounded" style={{ background: MID }} />
+              <div className="text-[9px] text-slate-400 mt-1 font-mono">자동 · 실시간</div>
+            </div>
+            <div className="rounded-lg border-2 p-2" style={{ borderColor: BRAND, background: TINT }}>
+              <div className="font-bold mb-1" style={{ color: DEEP }}>ES / Cassandra (운영)</div>
+              <div className="text-slate-600 leading-snug"><b>spark-dependencies</b> 배치 잡을 cron으로 주기 실행 → dependency 인덱스 생성.</div>
+              <div className="mt-2 flex items-center gap-1">
+                {['scan', 'reduce', 'write'].map((s, i) => (
+                  <React.Fragment key={s}>
+                    <span className="fade-in px-1.5 py-0.5 rounded text-[9px] font-mono text-white"
+                      style={{ background: DEEP, animationDelay: `${i * 200}ms` }}>{s}</span>
+                    {i < 2 && <span className="text-slate-400">→</span>}
+                  </React.Fragment>
+                ))}
+              </div>
+              <div className="text-[9px] mt-1 font-mono" style={{ color: DEEP }}>배치 · 1h~1d 주기</div>
+            </div>
+            <div className="col-span-2 mt-1 p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">
+              <span className="font-bold">⚠ 잡 미실행 = 영원히 빈 그래프.</span> 신규 운영자 최다 실수. 인덱스 생성 여부부터 확인한다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: 순환·전파 분석
+    function AnalysisPane() {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <PaneHead icon="🔎" title="순환 의존 · 장애 전파" tag="cycle + blast" />
+          <div className="p-3">
+            <ServiceMap highlightCycle highlightBlast />
+            <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+              <div className="p-2 rounded bg-red-50 border border-red-200 text-red-700">
+                <div className="font-bold mb-0.5">🔴 순환 의존</div>
+                checkout ↔ inventory 되돌이 호출. 배포·롤백을 꼬는 설계 냄새.
+              </div>
+              <div className="p-2 rounded" style={{ background: TINT, color: DEEP }}>
+                <div className="font-bold mb-0.5">🟦 전파 경로</div>
+                redis 장애 → cart → checkout → frontend까지 반경 확산.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5: 함정 체크리스트
+    function PitfallsPane() {
+      const items = [
+        { t: '빈 그래프', d: '잡 미실행 / lookback 과소 → 데이터 없음이지 관계 없음 아님', bad: true },
+        { t: '노드 폭발', d: 'service.name에 pod-id·uuid 섞임(고카디널리티) → 논리명 고정', bad: true },
+        { t: '누락 엣지', d: '저빈도 호출이 샘플링에 잘림 → lookback↑ / tail-based 병행', bad: true },
+        { t: '방향 오해', d: '화살표 = 호출 방향, 데이터는 반대로 흐름', bad: true },
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <PaneHead icon="🚧" title="의존성 그래프 4대 함정" />
+          <div className="p-3 space-y-2">
+            {items.map((it, i) => (
+              <div key={i} className="fade-in flex gap-2 items-start p-2 rounded border border-red-200 bg-red-50"
+                   style={{ animationDelay: `${i * 120}ms` }}>
+                <span className="text-red-500 font-bold text-xs mt-0.5">✕</span>
+                <div>
+                  <div className="text-[11px] font-bold text-red-700">{it.t}</div>
+                  <div className="text-[10px] text-slate-600 leading-snug">{it.d}</div>
+                </div>
+              </div>
+            ))}
+            <div className="p-2 rounded text-[11px]" style={{ background: TINT, color: DEEP }}>
+              <span className="font-bold">핵심:</span> 그래프는 &lsquo;관찰된 것&rsquo;이지 &lsquo;존재하는 전부&rsquo;가 아니다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      let inner = null;
+      if (step.key === 'aggregate') inner = <AggregatePane />;
+      else if (step.key === 'graph') inner = <GraphPane />;
+      else if (step.key === 'generate') inner = <GeneratePane />;
+      else if (step.key === 'analysis') inner = <AnalysisPane />;
+      else if (step.key === 'pitfalls') inner = <PitfallsPane />;
+      return (
+        <div className="space-y-2">
+          {inner}
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar { width: 0; animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: DEEP }}>&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-2</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: BRAND }}>IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. UI · 분석 &gt; Chapter 1. 트레이스 탐색</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Dependencies 그래프</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                서비스 간 호출 관계를 시각화한 의존성 그래프 — <strong>수만 개 trace를 겹쳐</strong> 노드·엣지로 그린
+                런타임 아키텍처 지도에서 핫스팟·순환 의존·장애 전파 경로를 읽는다.
+              </p>
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full transition-all duration-500" style={{ width: `${progress}%`, background: BRAND }} />
+              </div>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: DEEP }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl border-2 text-sm" style={{ background: TINT, borderColor: MID, color: DEEP }}>
+                💡 다음(IV-2-1)에서는 <strong>트레이스 비교 · 지연 분포 분석</strong> — 두 trace를 나란히 놓고 병목을 짚는다.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: BRAND }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./IV-2-1.html" className="font-medium" style={{ color: DEEP }}>IV-2-1 트레이스 비교 · 지연 분석 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

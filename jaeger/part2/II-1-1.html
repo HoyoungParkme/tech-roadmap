@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — II-1-1. jaeger-agent (sidecar)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📡</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    II-1-1. jaeger-agent (sidecar)
+    학습 목표: 앱이 로컬 agent 에게만 UDP 로 span 을 보내고, agent 가 배치해 collector 로 전달하는 구조 이해
+    핵심: 앱-collector 직결의 부담을 로컬 agent 가 흡수 (버퍼링·배치·디스커버리)
+    패턴: jaeger 표준 — 좌(LiveDataPane: app→UDP→agent→collector 흐름) / 우(VSCode yaml·bash)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5 STEPS — 직결의 문제 → agent 등장 → 배포(DaemonSet/사이드카) → UDP 포트/유실 → OTLP 직결 추세
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — "모든 앱이 collector 에 직접 매달리면"',
+        desc: '앱 코드가 원격 collector 로 span 을 직접 보내면, 요청마다 네트워크 왕복이 앱 스레드에 얹힌다. collector 가 잠깐 느려지거나 재시작하면 그 지연이 앱 응답 시간으로 새어 나온다. 앱은 "collector 주소·재시도·배치" 까지 떠안아야 해서, 추적이 서비스 로직을 오염시킨다. 그래서 이 부담을 앱 곁의 무언가에게 떠넘기고 싶어진다.',
+        focus: 'direct',
+        legend: '앱이 원격 collector 직결 — 네트워크 지연·재시도가 앱 부하로 전가',
+        nodes: [
+          { id: 'app',       name: 'app (여러 파드)', role: 'span 생성', state: 'busy' },
+          { id: 'collector', name: 'collector (원격)', role: '수신·저장', state: 'far' },
+        ],
+        code: {
+          lang: 'yaml',
+          filename: 'direct-to-collector.yaml — 앱이 원격 collector 를 직접 앎 (안티패턴)',
+          lines: [
+            '# 안티패턴: 애플리케이션이 원격 collector 주소를 직접 물고 있다',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: checkout',
+            'spec:',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: checkout',
+            '          image: shop/checkout:1.4.0',
+            '          env:',
+            '            # 앱이 원격 collector 를 직접 가리킨다 (강결합)',
+            '            - name: JAEGER_ENDPOINT',
+            '              value: "http://jaeger-collector.obs.svc:14268/api/traces"',
+            '            # 문제 1) collector 지연이 앱 응답 시간에 그대로 반영',
+            '            # 문제 2) 앱이 배치·재시도·백프레셔를 직접 구현해야 함',
+            '            # 문제 3) collector 주소가 바뀌면 모든 앱을 재배포',
+          ],
+          highlight: [13, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 2. jaeger-agent 등장 — "앱은 localhost 만 알면 된다"',
+        desc: 'jaeger-agent 는 앱과 같은 호스트(또는 사이드카)에서 돌며, 앱이 보낸 span 을 로컬 UDP 로 받는다. UDP 전송은 fire-and-forget 이라 앱 스레드를 붙잡지 않는다. agent 는 받은 span 을 메모리에 모아 배치로 만들고, collector 를 디스커버리해서 대신 전송한다. 이제 앱은 오직 localhost:6831 하나만 알면 되고, collector 위치·재시도·배치는 전부 agent 몫이다.',
+        focus: 'agent',
+        legend: 'app → (로컬 UDP) → agent → (배치·재시도) → collector',
+        nodes: [
+          { id: 'app',       name: 'app', role: 'span 생성', state: 'ok' },
+          { id: 'agent',     name: 'jaeger-agent', role: 'UDP 수신·배치', state: 'agent' },
+          { id: 'collector', name: 'collector', role: '수신·저장', state: 'ok' },
+        ],
+        code: {
+          lang: 'yaml',
+          filename: 'with-agent.yaml — 앱은 로컬 agent 만, agent 가 collector 를 앎',
+          lines: [
+            '# 권장: 앱은 localhost 의 agent 로만 span 을 보낸다',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: checkout',
+            'spec:',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: checkout',
+            '          image: shop/checkout:1.4.0',
+            '          env:',
+            '            # 앱은 오직 로컬 agent 만 안다 (약결합)',
+            '            - name: JAEGER_AGENT_HOST',
+            '              value: "localhost"',
+            '            - name: JAEGER_AGENT_PORT',
+            '              value: "6831"   # compact thrift over UDP',
+            '            # collector 주소·배치·재시도는 전부 agent 책임',
+          ],
+          highlight: [13, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 3. 배포 — "노드당 하나(DaemonSet) vs 파드당 하나(사이드카)"',
+        desc: 'agent 는 두 방식으로 배포한다. DaemonSet 은 노드마다 agent 하나를 띄우고 그 노드의 모든 앱이 공유해서, 리소스가 적고 관리가 단순하다. 사이드카는 앱 파드마다 agent 컨테이너를 붙여, 파드 단위 격리·수명 일치가 필요할 때 쓴다. 대개 DaemonSet 이 기본이고, 멀티테넌시나 강한 격리가 필요할 때 사이드카를 고른다.',
+        focus: 'deploy',
+        legend: 'DaemonSet(노드 1개 공유) — 리소스 절약 / 사이드카(파드 1개) — 격리',
+        nodes: [
+          { id: 'ds',  name: 'DaemonSet', role: '노드당 agent 1', state: 'ds' },
+          { id: 'sc',  name: 'Sidecar', role: '파드당 agent 1', state: 'sc' },
+        ],
+        code: {
+          lang: 'yaml',
+          filename: 'sidecar.yaml — 앱 파드에 agent 를 사이드카로 주입',
+          lines: [
+            '# 사이드카 방식: 앱 컨테이너 옆에 agent 컨테이너를 함께 띄운다',
+            'spec:',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: checkout',
+            '          image: shop/checkout:1.4.0',
+            '        # ── 같은 파드 안의 agent — localhost 로 통신 ──',
+            '        - name: jaeger-agent',
+            '          image: jaegertracing/jaeger-agent:1.57',
+            '          args:',
+            '            # agent 가 전달할 collector 를 여기서만 지정',
+            '            - "--reporter.grpc.host-port=jaeger-collector.obs:14250"',
+            '          ports:',
+            '            - containerPort: 6831',
+            '              protocol: UDP    # ← UDP 임을 반드시 명시',
+            '            - containerPort: 6832',
+            '              protocol: UDP',
+            '            - containerPort: 5778   # 샘플링 설정 제공(HTTP)',
+            '          resources:',
+            '            limits:',
+            '              memory: 128Mi   # 배치 버퍼용 소량',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 4. UDP 포트 & 유실 — "빠르지만 흘릴 수 있다"',
+        desc: 'agent 는 6831(compact thrift), 6832(binary thrift) 두 UDP 포트로 span 을 받는다. UDP 는 빠르고 앱을 막지 않지만, 손실을 보장하지 않는다. 트래픽이 폭증해 agent 큐가 넘치거나 UDP 소켓 버퍼가 가득 차면 span 이 조용히 버려진다. 그래서 trace 가 "가끔 비어 보이는" 사고가 잦다. 큐 크기·소켓 버퍼(rmem)·배치 주기를 트래픽에 맞춰 튜닝해야 한다.',
+        focus: 'ports',
+        legend: '6831/6832 UDP 수신 · 버퍼 초과 시 span 조용히 유실 → 튜닝 필요',
+        nodes: [
+          { id: 'p6831', name: 'UDP 6831', role: 'compact thrift', state: 'port' },
+          { id: 'p6832', name: 'UDP 6832', role: 'binary thrift', state: 'port' },
+          { id: 'drop',  name: 'queue overflow', role: 'span 유실', state: 'drop' },
+        ],
+        code: {
+          lang: 'bash',
+          filename: 'diagnose-udp-drops.sh — UDP span 유실 진단·튜닝',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# agent 가 span 을 흘리는지(유실) 확인하고 버퍼를 키운다',
+            'set -euo pipefail',
+            '',
+            '# 1) agent 메트릭에서 드롭 카운터 확인 (0 이 아니면 유실 중)',
+            'curl -s localhost:14271/metrics | grep -E "reporter_spans|processor.*dropped"',
+            '',
+            '# 2) 커널 UDP 수신 버퍼 초과(RcvbufErrors) 관찰',
+            'netstat -su | grep -i "receive buffer errors"',
+            '',
+            '# 3) UDP 소켓 수신 버퍼를 키워 순간 폭주를 흡수 (기본이 작다)',
+            'sudo sysctl -w net.core.rmem_max=8388608',
+            'sudo sysctl -w net.core.rmem_default=8388608',
+            '',
+            '# 4) agent 큐·배치 파라미터 상향 (재시작 시 반영)',
+            '#    processor.jaeger-compact.server-queue-size : 수신 큐 깊이',
+            '#    processor.jaeger-compact.workers           : 처리 워커 수',
+            'jaeger-agent \\',
+            '  --processor.jaeger-compact.server-queue-size=2000 \\',
+            '  --processor.jaeger-compact.workers=10 \\',
+            '  --reporter.grpc.host-port=jaeger-collector.obs:14250',
+            '',
+            '# → 드롭 카운터가 0 으로 수렴하면 유실 해소',
+          ],
+          highlight: [5, 6, 8, 9, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 5. 최신 흐름 — "agent 없이 OTLP 로 collector 직결"',
+        desc: 'OpenTelemetry 가 표준이 되면서 흐름이 바뀌었다. 앱의 OTel SDK 가 span 을 OTLP(gRPC/HTTP) 로 배치·재시도까지 직접 처리하므로, 중간 agent 의 존재 이유가 줄었다. 그래서 jaeger-agent 는 deprecated 추세이고, 신규 구축은 앱 → collector(OTLP) 또는 앱 → OpenTelemetry Collector → jaeger 로 간다. 다만 부하 분리·노드 로컬 수집이 필요하면 그 역할을 OTel Collector 가 대신 맡는다.',
+        focus: 'otlp',
+        legend: 'agent deprecated → 앱 OTLP 직결 · 또는 OTel Collector 가 로컬 수집 대행',
+        nodes: [
+          { id: 'app',  name: 'app + OTel SDK', role: 'OTLP 배치', state: 'ok' },
+          { id: 'otel', name: 'OTel Collector', role: '(옵션) 로컬 수집', state: 'agent' },
+          { id: 'jc',   name: 'jaeger collector', role: 'OTLP 수신', state: 'ok' },
+        ],
+        code: {
+          lang: 'yaml',
+          filename: 'otlp-direct.yaml — agent 제거, OTLP 로 collector 직결',
+          lines: [
+            '# 최신: agent 를 빼고 OTel SDK 가 OTLP 로 직접 collector 로 전송',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: checkout',
+            'spec:',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: checkout',
+            '          image: shop/checkout:2.0.0   # OTel SDK 내장',
+            '          env:',
+            '            # 표준 OTLP 엔드포인트 하나로 끝 (배치·재시도는 SDK 가)',
+            '            - name: OTEL_EXPORTER_OTLP_ENDPOINT',
+            '              value: "http://jaeger-collector.obs:4317"  # OTLP gRPC',
+            '            - name: OTEL_TRACES_EXPORTER',
+            '              value: "otlp"',
+            '            # 부하 분리가 필요하면 4317 을 노드-로컬',
+            '            # OTel Collector 로 향하게 바꾸면 agent 역할을 대체',
+          ],
+          highlight: [12, 13, 14, 15, 16, 17],
+        },
+      },
+    ];
+
+    // ── 좌측: LiveDataPane — app → UDP → agent → collector 흐름 시각화
+    function LiveDataPane({ step, stepIdx }) {
+      const animKey = `step-${stepIdx}`;
+
+      const stageMeta = [
+        { key: 'direct', emoji: '🔌', name: 'Direct',   note: '앱→collector 직결' },
+        { key: 'agent',  emoji: '📡', name: 'Agent',    note: '로컬 UDP 수신' },
+        { key: 'deploy', emoji: '🧩', name: 'Deploy',   note: 'DaemonSet·사이드카' },
+        { key: 'ports',  emoji: '🕳️', name: 'UDP Port', note: '6831·유실' },
+        { key: 'otlp',   emoji: '🚀', name: 'OTLP',     note: 'agent 없이 직결' },
+      ];
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm" key={animKey}>
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📡</span>
+              <span className="text-xs font-bold text-slate-700">jaeger-agent 수집 경로 — Live View</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">step {stepIdx + 1}/5</span>
+          </div>
+
+          <div className="p-4 space-y-4 min-h-[420px]">
+
+            {/* 진화 단계 5 카드 */}
+            <div className="grid grid-cols-5 gap-2">
+              {stageMeta.map((p) => {
+                const active = step.focus === p.key;
+                return (
+                  <div
+                    key={p.key}
+                    className={`rounded-lg p-2 text-center transition-all duration-300 ${active ? 'bg-cyan-100 border-2 border-cyan-400 scale-105 shadow-sm' : 'bg-slate-50 border border-slate-200'}`}
+                  >
+                    <div className="text-lg">{p.emoji}</div>
+                    <div className="text-[10px] font-bold text-slate-800 mt-1">{p.name}</div>
+                    <div className="text-[8px] text-slate-500 mt-0.5 leading-tight">{p.note}</div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 흐름 다이어그램 (노드 체인) */}
+            <div className="bg-slate-900 rounded-lg p-4 fade-in">
+              <div className="text-[10px] text-slate-400 font-mono mb-3">{step.focus === 'ports' ? 'UDP 수신 & 버퍼' : 'span 전송 경로'}</div>
+              <div className="flex items-stretch justify-center gap-2 flex-wrap">
+                {step.nodes.map((n, idx) => {
+                  let box = 'bg-slate-700 border-slate-500 text-slate-100';
+                  if (n.state === 'busy')  box = 'bg-rose-500/20 border-rose-400 text-rose-100';
+                  if (n.state === 'far')   box = 'bg-slate-600 border-slate-400 text-slate-200 opacity-70';
+                  if (n.state === 'ok')    box = 'bg-slate-700 border-slate-500 text-slate-100';
+                  if (n.state === 'drop')  box = 'bg-rose-500/25 border-rose-400 text-rose-100';
+                  const isAgentNode = n.state === 'agent' || n.state === 'ds' || n.state === 'sc' || n.state === 'port';
+                  return (
+                    <React.Fragment key={`${stepIdx}-${n.id}`}>
+                      <div
+                        className={`rounded-lg border-2 px-3 py-3 text-center min-w-[110px] fade-in ${box}`}
+                        style={Object.assign({ animationDelay: `${idx * 140}ms` }, isAgentNode ? { backgroundColor: '#0E5567', borderColor: '#67CFE9', color: '#E6F8FC' } : {})}
+                      >
+                        <div className="text-[11px] font-bold font-mono">{n.name}</div>
+                        <div className="text-[9px] opacity-80 mt-1">{n.role}</div>
+                      </div>
+                      {idx < step.nodes.length - 1 && (
+                        <div className="flex items-center text-cyan-300 text-lg font-bold self-center" style={{ color: '#67CFE9' }}>
+                          {step.focus === 'agent' && idx === 0 ? 'UDP →' : '→'}
+                        </div>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+
+              {/* 포트 단계: 유실 경고 */}
+              {step.focus === 'ports' && (
+                <div className="mt-4 bg-slate-800 rounded p-2 text-[10px] font-mono leading-relaxed">
+                  <div className="text-cyan-200">recv 6831/6832 (UDP) → queue → batch → collector</div>
+                  <div className="text-rose-300 mt-1">queue 초과 · rmem 부족 → span drop (조용히 유실)</div>
+                  <div className="text-emerald-300 mt-1">→ server-queue-size / net.core.rmem_max 상향</div>
+                </div>
+              )}
+
+              {/* agent 단계: 로컬 통신 강조 */}
+              {step.focus === 'agent' && (
+                <div className="mt-4 p-2 rounded-lg" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9' }}>
+                  <div className="text-[10px] font-mono text-cyan-900">JAEGER_AGENT_HOST=localhost  ·  PORT=6831</div>
+                  <div className="text-[10px] text-cyan-700 mt-0.5">→ 앱은 collector 위치를 몰라도 된다 (약결합)</div>
+                </div>
+              )}
+
+              {/* otlp 단계: deprecated 안내 */}
+              {step.focus === 'otlp' && (
+                <div className="mt-4 p-2 rounded-lg" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9' }}>
+                  <div className="text-[10px] font-mono text-cyan-900">OTEL_EXPORTER_OTLP_ENDPOINT=...:4317</div>
+                  <div className="text-[10px] text-cyan-700 mt-0.5">→ jaeger-agent deprecated · SDK 가 배치·재시도 직접 수행</div>
+                </div>
+              )}
+            </div>
+
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[10px] text-slate-600 leading-snug font-medium">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: '#0E7B91' }}>&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-1-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm" style={{ backgroundColor: '#67CFE9' }}>II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. Agent · Collector · Query &gt; Chapter 1. jaeger-agent</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">jaeger-agent (sidecar)</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                애플리케이션 곁에서 span 을 수집하는 에이전트 — 앱은 <code className="bg-slate-100 px-1 rounded text-xs">localhost:6831</code> 로 UDP span 만 던지면,
+                agent 가 배치해 <code className="bg-slate-100 px-1 rounded text-xs">collector</code> 로 대신 전달한다. (단, 최신 스택은 OTLP 직결로 이동 중)
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ backgroundColor: '#0E7B91' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#B7EAF5' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#B7EAF5' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl text-sm" style={{ backgroundColor: '#E6F8FC', border: '2px solid #67CFE9', color: '#0E5567' }}>
+                💡 다음(II-1-2)에서는 <strong>jaeger-collector</strong> — agent·OTLP 로 받은 span 을 검증·샘플링·저장하는 수집 계층
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]" style={{ backgroundColor: '#0E7B91' }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./II-1-2.html" className="font-medium" style={{ color: '#0E7B91' }}>II-1-2 jaeger-collector &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

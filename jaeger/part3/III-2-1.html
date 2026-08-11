@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — III-2-1. Cassandra 스토리지</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🗄️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/sql.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/yaml.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    III-2-1. Cassandra 스토리지
+    학습 목표: 대규모 trace를 저장하는 Cassandra 백엔드의 스키마·쓰기/읽기 경로·TTL·운영 함정을 이해한다.
+    핵심 비유: "trace_id로 사물함 번호를 정하고, 여러 사물함에 복제해서 나눠 넣는다"
+    구조: 5단계 — 클러스터/파티션 → 스키마 → 쓰기 → 읽기 → TTL/함정
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+    const DEEP = '#0E7B91';
+
+    const STEPS = [
+      {
+        key: 'cluster',
+        title: 'Step 1. Cassandra — trace_id로 파티션을 나누는 분산 NoSQL',
+        desc: 'Cassandra는 마스터가 없는 P2P 링 구조라 노드를 더 붙이면 쓰기 처리량이 선형으로 늘어난다. Jaeger는 저장할 데이터가 append-only(한 번 쓰고 거의 수정 안 함)라 쓰기 최적화된 LSM 트리 엔진과 궁합이 좋다. 어떤 span이 어느 노드에 저장될지는 파티션 키인 trace_id의 해시(토큰)로 결정된다. 그래서 같은 trace의 span은 항상 같은 파티션에 모여, 한 번의 조회로 전체 trace를 긁어올 수 있다.',
+        legend: 'trace_id 해시 → 토큰 → 담당 노드. 같은 trace의 span은 한 파티션에 모인다',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-cassandra.yaml — 스토리지 백엔드 지정',
+          lines: [
+            '# collector / query 가 바라보는 Cassandra 백엔드 설정',
+            'apiVersion: jaegertracing.io/v1',
+            'kind: Jaeger',
+            'metadata:',
+            '  name: jaeger-prod',
+            'spec:',
+            '  strategy: production',
+            '  storage:',
+            '    type: cassandra              # es 대신 cassandra 선택',
+            '    options:',
+            '      cassandra:',
+            '        servers: cass-0,cass-1,cass-2   # 접속 시드 노드',
+            '        keyspace: jaeger_v1_dc1',
+            '        local-dc: dc1',
+            '        connections-per-host: 4',
+            '        # 쓰기 일관성: 빠르되 다수 복제본에 확인',
+            '        consistency: LOCAL_QUORUM',
+            '',
+            '# 왜 Cassandra 인가 ─────────────────────────',
+            '#  1) 마스터리스 링: 노드 추가 = 쓰기 TPS 선형 증가',
+            '#  2) LSM 트리: append 위주 트레이스에 쓰기 최적화',
+            '#  3) trace_id 파티셔닝: 한 trace = 한 파티션 조회',
+            '#  4) rack/dc 인지 복제로 장애·지역 분산 대응',
+          ],
+          highlight: [8, 9, 12, 13, 17],
+        },
+      },
+      {
+        key: 'schema',
+        title: 'Step 2. 스키마 — traces + 조회용 인덱스 테이블들',
+        desc: 'Cassandra는 조인이 없어서 "조회하는 방식대로" 테이블을 미리 나눠 설계한다. 실제 span 본문은 traces 테이블에 trace_id 파티션으로 저장한다. UI의 검색 드롭다운을 채우려고 service_names, operation_names를 따로 둔다. 태그로 trace를 찾으려면 tag_index 같은 역인덱스가 필요한데, 여기가 카디널리티 폭탄이 터지는 지점이다. 즉 저장 스키마가 곧 가능한 쿼리의 한계를 규정한다.',
+        legend: 'traces(본문) + service_names·operation_names·tag_index(조회용). 쿼리 패턴대로 테이블 분리',
+        code: {
+          lang: 'sql',
+          filename: 'jaeger_v1_dc1.cql — Jaeger 코어 스키마 (요약)',
+          lines: [
+            '-- 1) span 본문: trace_id 로 파티셔닝, span_id 로 정렬',
+            'CREATE TABLE traces (',
+            '  trace_id     blob,',
+            '  span_id      bigint,',
+            '  span         blob,       -- 직렬화된 span (Thrift/Proto)',
+            '  PRIMARY KEY (trace_id, span_id)',
+            ') WITH default_time_to_live = 172800;   -- 2일 TTL',
+            '',
+            '-- 2) 검색 드롭다운 채우기용',
+            'CREATE TABLE service_names (service_name text PRIMARY KEY);',
+            '',
+            'CREATE TABLE operation_names (',
+            '  service_name   text,',
+            '  operation_name text,',
+            '  PRIMARY KEY (service_name, operation_name)',
+            ');',
+            '',
+            '-- 3) 태그로 trace 찾기용 역인덱스 (카디널리티 주의)',
+            'CREATE TABLE tag_index (',
+            '  service_name text,',
+            '  tag_key      text,',
+            '  tag_value    text,',
+            '  start_time   bigint,',
+            '  trace_id     blob,',
+            '  PRIMARY KEY ((service_name, tag_key, tag_value), start_time)',
+            ') WITH CLUSTERING ORDER BY (start_time DESC);',
+          ],
+          highlight: [2, 6, 7, 19, 25],
+        },
+      },
+      {
+        key: 'write',
+        title: 'Step 3. 쓰기 경로 — collector가 파티션에 복제하며 넣는다',
+        desc: 'collector는 span을 받으면 trace_id로 토큰을 계산해 담당 노드(코디네이터)에게 넘긴다. 코디네이터는 복제 계수(RF=3)만큼 여러 노드에 동시에 쓰고, LOCAL_QUORUM이면 과반(3 중 2)의 ack만 받으면 성공으로 응답한다. 쓰기는 커밋로그 + 메모리(memtable)에 먼저 떨어져서 매우 빠르고, 나중에 디스크(SSTable)로 flush된다. 덕분에 초당 수십만 span도 흡수하지만, 한 노드가 죽어도 남은 복제본이 데이터를 지킨다.',
+        legend: 'coordinator → RF=3 복제 → LOCAL_QUORUM(2 ack)면 성공. commitlog+memtable로 빠른 쓰기',
+        code: {
+          lang: 'sql',
+          filename: 'write-path.cql — collector 가 실행하는 삽입',
+          lines: [
+            '-- collector 는 span 하나당 여러 테이블에 나눠 쓴다',
+            '-- (1) 본문',
+            'INSERT INTO traces (trace_id, span_id, span)',
+            'VALUES (0x9f2a..e1, 4823019283, 0x0a12..)',
+            'USING TTL 172800;',
+            '',
+            '-- (2) 검색 인덱스 갱신 (idempotent upsert)',
+            'INSERT INTO service_names (service_name)',
+            'VALUES (\'checkout-api\');',
+            '',
+            'INSERT INTO operation_names (service_name, operation_name)',
+            'VALUES (\'checkout-api\', \'POST /checkout\');',
+            '',
+            '-- (3) 태그 역인덱스 (조회 조건마다 한 row)',
+            'INSERT INTO tag_index',
+            '  (service_name, tag_key, tag_value, start_time, trace_id)',
+            'VALUES (\'checkout-api\', \'http.status_code\', \'500\',',
+            '        1691740800000000, 0x9f2a..e1);',
+            '',
+            '-- 쓰기 일관성 ──────────────────────────────',
+            '--  CONSISTENCY LOCAL_QUORUM;   -- RF=3 이면 2 ack',
+            '--  coordinator 가 3개 복제본에 병렬 전송',
+            '--  2개가 commitlog 기록하면 클라이언트에 성공 응답',
+          ],
+          highlight: [3, 4, 5, 21, 22],
+        },
+      },
+      {
+        key: 'read',
+        title: 'Step 4. 읽기 경로 — query가 인덱스로 좁힌 뒤 본문을 긁는다',
+        desc: 'Jaeger UI에서 "checkout-api의 status=500 trace"를 검색하면 query 서비스는 먼저 tag_index를 읽어 조건에 맞는 trace_id 목록을 얻는다. 그 다음 각 trace_id로 traces 파티션을 직접 조회해 span 전체를 모은다. trace_id는 파티션 키라서 이 조회는 단일 파티션 lookup — 매우 빠르다. 반대로 인덱스가 없는 조건으로 검색하면 Cassandra는 전체 스캔을 거부하므로, 스키마에 없는 쿼리는 아예 불가능하다.',
+        legend: '1) tag_index로 trace_id 후보 → 2) trace_id로 traces 단일 파티션 조회. 인덱스 없는 검색은 불가',
+        code: {
+          lang: 'sql',
+          filename: 'read-path.cql — query 서비스의 2단계 조회',
+          lines: [
+            '-- 1단계: 조건에 맞는 trace_id 후보를 인덱스에서 뽑는다',
+            'SELECT trace_id, start_time',
+            'FROM tag_index',
+            'WHERE service_name = \'checkout-api\'',
+            '  AND tag_key   = \'http.status_code\'',
+            '  AND tag_value = \'500\'',
+            '  AND start_time > 1691740000000000',
+            'LIMIT 20;',
+            '',
+            '-- 2단계: 각 trace_id 로 본문 파티션을 직접 조회',
+            '--        (파티션 키 조회라 매우 빠름)',
+            'SELECT span_id, span',
+            'FROM traces',
+            'WHERE trace_id = 0x9f2a..e1;',
+            '',
+            '-- 조회 규칙 ────────────────────────────────',
+            '--  ✓ 파티션 키(trace_id) 로는 즉시 조회',
+            '--  ✓ 인덱스 테이블에 있는 조건만 검색 가능',
+            '--  ✗ 임의 컬럼 WHERE = ALLOW FILTERING 필요 → 위험',
+            '--  ✗ 넓은 시간 범위 = 여러 파티션 fan-out → 느림',
+          ],
+          highlight: [2, 3, 4, 12, 13, 14],
+        },
+      },
+      {
+        key: 'ttl',
+        title: 'Step 5. TTL과 함정 — 안 지우면 무한히 커지고, 핫스팟이 터진다',
+        desc: 'Cassandra는 UPDATE로 오래된 데이터를 지우지 않는다. 각 row에 TTL을 걸어 자동 만료시키는 것이 유일한 정상 보존 전략이다. TTL을 안 걸면 디스크가 무한히 차오르고, tombstone이 쌓여 읽기까지 느려진다. 또 태그 값의 카디널리티가 높으면(예: user_id를 태그로) tag_index 파티션이 폭증하고, 특정 서비스에 트래픽이 몰리면 그 파티션만 뜨거워지는 핫스팟이 생긴다. 넓은 시간 쿼리는 수많은 파티션을 fan-out해 클러스터를 압박한다.',
+        legend: 'TTL로 만료 안 하면 무한 증가·tombstone·핫스팟. 고카디널리티 태그 인덱스는 금물',
+        code: {
+          lang: 'yaml',
+          filename: 'ttl-and-pitfalls.yaml — 보존·운영 체크리스트',
+          lines: [
+            '# TTL 설정 (없으면 디스크 무한 증가)',
+            'storage:',
+            '  cassandra:',
+            '    # span 본문 보존 기간 (초). 2일 = 172800',
+            '    span-store-write-cache-ttl: 12h',
+            '  # 스키마 CREATE 시 default_time_to_live 로 자동 만료',
+            '',
+            '# 함정 체크리스트 ───────────────────────────',
+            '#  1) TTL 미설정',
+            '#     - 증상: disk 사용량이 우상향, 줄지 않음',
+            '#     - 처방: 모든 테이블 default_time_to_live 지정',
+            '#',
+            '#  2) 태그 인덱스 카디널리티 폭탄',
+            '#     - user_id / request_id 같은 유니크 값을 태그로',
+            '#     - tag_index row 수 폭증 → 인덱스가 본문보다 큼',
+            '#     - 처방: 인덱싱할 태그를 allowlist 로 제한',
+            '#',
+            '#  3) 파티션 핫스팟',
+            '#     - 한 서비스에 트래픽 집중 → 한 파티션만 과열',
+            '#     - 처방: bucket 컬럼 추가로 파티션 분산',
+            '#',
+            '#  4) 넓은 시간 범위 쿼리',
+            '#     - 며칠치 조회 = 수백 파티션 fan-out → 타임아웃',
+            '#     - 처방: 조회 창을 좁히고 LIMIT 강제',
+          ],
+          highlight: [4, 5, 9, 13, 18, 22],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화 — 단계별 컴포넌트
+    // ─────────────────────────────────────────────────────────
+
+    // Step 1: 링 클러스터 — trace_id 해시가 담당 노드로
+    function ClusterRing() {
+      const nodes = Array.from({ length: 6 }, (_, i) => {
+        const angle = (i / 6) * Math.PI * 2 - Math.PI / 2;
+        return {
+          i,
+          x: 50 + 38 * Math.cos(angle),
+          y: 50 + 38 * Math.sin(angle),
+          hot: i === 2,
+        };
+      });
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+            <span className="text-base">💍</span>
+            <span className="text-xs font-bold">Cassandra 링 — trace_id 해시로 파티션 배치</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">RF=3</span>
+          </div>
+          <div className="p-3">
+            <div className="relative w-full" style={{ paddingTop: '72%' }}>
+              <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full">
+                <circle cx="50" cy="50" r="38" fill="none" stroke="#e2e8f0" strokeWidth="1.5" />
+                {nodes.map((n) => (
+                  <g key={n.i} className="fade-in" style={{ animationDelay: `${n.i * 90}ms` }}>
+                    <circle cx={n.x} cy={n.y} r="7"
+                      fill={n.hot ? BRAND : '#fff'}
+                      stroke={DEEP} strokeWidth="1.5" />
+                    <text x={n.x} y={n.y + 2.4} textAnchor="middle" fontSize="5" fontFamily="monospace" fill={DEEP}>
+                      n{n.i}
+                    </text>
+                  </g>
+                ))}
+                <text x="50" y="49" textAnchor="middle" fontSize="5.5" fontFamily="monospace" fill="#334155">trace_id</text>
+                <text x="50" y="56" textAnchor="middle" fontSize="4.5" fontFamily="monospace" fill="#94a3b8">0x9f2a..e1</text>
+              </svg>
+            </div>
+            <div className="mt-2 p-2 rounded text-[11px]" style={{ background: '#E6F8FC', color: DEEP, border: '1px solid #B7EAF5' }}>
+              <span className="font-bold">hash(trace_id) → token → n2.</span> 복제본은 n3, n4 에도 저장. 같은 trace 의 모든 span 은 한 파티션에.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2: 스키마 테이블 카드들
+    function SchemaTables() {
+      const tables = [
+        { name: 'traces', pk: '(trace_id, span_id)', role: 'span 본문 저장', cols: ['trace_id', 'span_id', 'span'] },
+        { name: 'service_names', pk: '(service_name)', role: '검색 드롭다운', cols: ['service_name'] },
+        { name: 'operation_names', pk: '(service_name, op)', role: '오퍼레이션 목록', cols: ['service_name', 'operation_name'] },
+        { name: 'tag_index', pk: '((svc,key,val), time)', role: '태그 역인덱스', cols: ['tag_key', 'tag_value', 'trace_id'] },
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+            <span className="text-base">🗂️</span>
+            <span className="text-xs font-bold">Jaeger 스키마 — 쿼리 패턴대로 나눈 테이블</span>
+          </div>
+          <div className="p-3 grid grid-cols-2 gap-2">
+            {tables.map((t, i) => (
+              <div key={t.name} className="fade-in rounded-lg border p-2"
+                   style={{ animationDelay: `${i * 110}ms`, borderColor: '#B7EAF5', background: '#E6F8FC' }}>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-bold font-mono" style={{ color: DEEP }}>{t.name}</span>
+                  <span className="text-[9px] text-slate-500">{t.role}</span>
+                </div>
+                <div className="text-[9px] font-mono text-slate-500 mt-0.5">PK {t.pk}</div>
+                <div className="flex flex-wrap gap-0.5 mt-1">
+                  {t.cols.map((c) => (
+                    <span key={c} className="px-1 py-0.5 rounded bg-white text-[8px] font-mono text-slate-600 border border-slate-200">{c}</span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="px-3 pb-3 text-[10px] text-slate-500">조인 없음 — 검색하려는 방식대로 미리 테이블을 나눠 둔다.</div>
+        </div>
+      );
+    }
+
+    // Step 3: 쓰기 경로 — collector → coordinator → 복제본
+    function WritePath() {
+      const replicas = [
+        { n: 'n2', ack: true },
+        { n: 'n3', ack: true },
+        { n: 'n4', ack: false },
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+            <span className="text-base">✍️</span>
+            <span className="text-xs font-bold">쓰기 경로 — collector → 복제 → LOCAL_QUORUM</span>
+          </div>
+          <div className="p-3">
+            <div className="flex items-center gap-2 mb-3">
+              <div className="px-2 py-1.5 rounded text-[10px] font-mono text-white fade-in" style={{ background: DEEP }}>collector</div>
+              <span className="text-slate-400">→</span>
+              <div className="px-2 py-1.5 rounded text-[10px] font-mono fade-in" style={{ background: BRAND, color: '#083344', animationDelay: '120ms' }}>coordinator (n2)</div>
+            </div>
+            <div className="text-[10px] text-slate-500 mb-1">복제 계수 RF=3 병렬 쓰기</div>
+            <div className="space-y-1.5">
+              {replicas.map((r, i) => (
+                <div key={r.n} className="fade-in flex items-center gap-2" style={{ animationDelay: `${200 + i * 130}ms` }}>
+                  <span className="text-[10px] font-mono text-slate-600 w-8">{r.n}</span>
+                  <div className="flex-1 h-3 bg-slate-100 rounded overflow-hidden">
+                    <div className="h-full grow-bar" style={{ '--target-width': r.ack ? '100%' : '55%', background: r.ack ? BRAND : '#cbd5e1', animationDelay: `${200 + i * 130}ms` }} />
+                  </div>
+                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${r.ack ? '' : 'text-slate-400 bg-slate-100'}`}
+                        style={r.ack ? { background: '#E6F8FC', color: DEEP } : {}}>
+                    {r.ack ? 'ack' : '…'}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 p-2 rounded text-[11px]" style={{ background: '#E6F8FC', color: DEEP, border: '1px solid #B7EAF5' }}>
+              <span className="font-bold">2 / 3 ack → 성공 응답.</span> commitlog + memtable 에 먼저 기록해 초당 수십만 span 을 흡수한다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: 읽기 경로 — 인덱스로 좁힌 뒤 본문 조회
+    function ReadPath() {
+      const candidates = ['0x9f2a..e1', '0x71c4..a0', '0x33be..5d'];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+            <span className="text-base">🔎</span>
+            <span className="text-xs font-bold">읽기 경로 — tag_index → traces 2단계</span>
+          </div>
+          <div className="p-3">
+            <div className="rounded-lg border p-2 fade-in" style={{ borderColor: '#B7EAF5', background: '#E6F8FC' }}>
+              <div className="text-[10px] font-bold" style={{ color: DEEP }}>1단계 · tag_index 조회</div>
+              <div className="text-[9px] font-mono text-slate-500 mt-0.5">svc=checkout-api · status=500</div>
+            </div>
+            <div className="text-center text-slate-400 text-xs my-1">↓ trace_id 후보</div>
+            <div className="grid grid-cols-3 gap-1 mb-2">
+              {candidates.map((c, i) => (
+                <div key={c} className="fade-in text-center px-1 py-1 rounded bg-white border text-[9px] font-mono text-slate-600"
+                     style={{ animationDelay: `${150 + i * 120}ms`, borderColor: '#B7EAF5' }}>{c}</div>
+              ))}
+            </div>
+            <div className="text-center text-slate-400 text-xs my-1">↓ 각 trace_id 로 단일 파티션 조회</div>
+            <div className="rounded-lg border p-2 fade-in" style={{ animationDelay: '520ms', borderColor: '#B7EAF5', background: '#E6F8FC' }}>
+              <div className="text-[10px] font-bold" style={{ color: DEEP }}>2단계 · traces 파티션</div>
+              <div className="flex gap-0.5 mt-1">
+                {Array.from({ length: 12 }, (_, i) => (
+                  <div key={i} className="h-4 flex-1 rounded-sm fade-in" style={{ background: BRAND, opacity: 0.5 + (i % 3) * 0.2, animationDelay: `${560 + i * 25}ms` }} />
+                ))}
+              </div>
+              <div className="text-[9px] text-slate-500 mt-1">span 12개 = 완성된 trace</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5: TTL 만료 + 함정
+    function TtlPitfalls() {
+      const rows = Array.from({ length: 8 }, (_, i) => ({ i, expired: i >= 5 }));
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="text-white px-4 py-2 flex items-center gap-2" style={{ background: DEEP }}>
+            <span className="text-base">⏳</span>
+            <span className="text-xs font-bold">TTL 만료 · 운영 함정</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">ttl=2d</span>
+          </div>
+          <div className="p-3">
+            <div className="text-[10px] text-slate-500 mb-1">오래된 row 는 TTL 로 자동 만료 (회색)</div>
+            <div className="space-y-1 mb-3">
+              {rows.map((r) => (
+                <div key={r.i} className="fade-in flex items-center gap-2" style={{ animationDelay: `${r.i * 60}ms` }}>
+                  <span className="text-[9px] font-mono text-slate-400 w-14">day-{r.i}</span>
+                  <div className="flex-1 h-2.5 rounded overflow-hidden bg-slate-100">
+                    <div className="h-full" style={{ width: '100%', background: r.expired ? '#e2e8f0' : BRAND }} />
+                  </div>
+                  <span className="text-[9px] font-mono w-14 text-right" style={{ color: r.expired ? '#94a3b8' : DEEP }}>
+                    {r.expired ? 'expired' : 'live'}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="space-y-1 text-[10px]">
+              <div className="p-1.5 rounded bg-red-50 border border-red-200 text-red-700"><span className="font-bold">TTL 미설정</span> → disk 무한 증가</div>
+              <div className="p-1.5 rounded bg-red-50 border border-red-200 text-red-700"><span className="font-bold">고카디널리티 태그</span> → tag_index 폭발</div>
+              <div className="p-1.5 rounded bg-red-50 border border-red-200 text-red-700"><span className="font-bold">핫스팟 / 넓은 시간 쿼리</span> → 타임아웃</div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      let inner = null;
+      if (step.key === 'cluster') inner = <ClusterRing />;
+      else if (step.key === 'schema') inner = <SchemaTables />;
+      else if (step.key === 'write') inner = <WritePath />;
+      else if (step.key === 'read') inner = <ReadPath />;
+      else if (step.key === 'ttl') inner = <TtlPitfalls />;
+      return (
+        <div className="space-y-2">
+          {inner}
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar { width: 0; animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: DEEP }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-2-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: DEEP }}>III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. 샘플링 · 스토리지 &gt; Chapter 2. 스토리지 백엔드</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Cassandra 스토리지</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                대규모 트레이스를 저장하는 <strong>Cassandra 백엔드</strong> — trace_id 파티셔닝·스키마·쓰기/읽기 경로·TTL 보존과
+                실무 함정을 익힌다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: DEEP }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#B7EAF5' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#B7EAF5' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="h-1.5 rounded-full bg-slate-200 overflow-hidden">
+              <div className="h-full transition-all duration-300" style={{ width: `${((stepIdx + 1) / STEPS.length) * 100}%`, background: BRAND }} />
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl border-2 text-sm" style={{ background: '#E6F8FC', borderColor: '#B7EAF5', color: DEEP }}>
+                💡 다음(III-2-2)에서는 <strong>Elasticsearch 스토리지</strong> — 풍부한 태그 검색과 인덱싱 트레이드오프를 비교한다.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: DEEP }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./III-2-2.html" className="font-medium" style={{ color: DEEP }}>III-2-2 Elasticsearch 스토리지 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

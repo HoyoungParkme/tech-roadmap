@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — V-1-1. HA / Sharding — 고가용성·분산</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛡️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/yaml.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    V-1-1. HA / Sharding — 고가용성·분산
+    학습 목표: 프로덕션 Jaeger를 단일 장애점 없이, 트래픽 스파이크에도 견디게 확장한다.
+    핵심 비유: "무상태 창구 늘리기 + 대기줄(Kafka) + 서고 나누기(샤딩)"
+    구조: 5단계 — 단일 병목 → collector 수평확장/LB → Kafka 완충 → storage 샤딩 → 지역 분산/장애 격리
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+
+    const STEPS = [
+      {
+        key: 'bottleneck',
+        title: 'Step 1. 단일 collector — 하나 죽으면 전부 멈춘다',
+        desc: 'collector 1대에 모든 agent가 span을 밀어넣으면, 그 한 대가 곧 병목이자 단일 장애점(SPOF)이 된다. CPU가 포화되면 큐가 넘치고 span이 조용히 drop되며, 배포나 OOM으로 재시작되는 순간 트레이싱 전체가 실명한다. 프로덕션에서 "collector 1대"는 설정이 아니라 사고 예약이다. 확장의 출발점은 이 병목을 인지하는 것이다.',
+        legend: '모든 트래픽이 한 collector로 — 포화되면 drop, 죽으면 전면 실명(SPOF)',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-single.yaml — 위험한 단일 collector',
+          lines: [
+            '# 안티패턴: collector 1 replica — 단일 장애점',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: jaeger-collector',
+            'spec:',
+            '  replicas: 1                 # SPOF — 재시작 = 전면 실명',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: collector',
+            '          image: jaegertracing/jaeger-collector:1.57',
+            '          resources:',
+            '            limits:',
+            '              cpu: "1"          # 곧 포화 → 큐 overflow',
+            '              memory: 512Mi     # 스파이크에 OOM 위험',
+            '          env:',
+            '            - name: SPAN_STORAGE_TYPE',
+            '              value: elasticsearch',
+            '',
+            '# 실패 징후 ─────────────────────────────',
+            '#  jaeger_collector_queue_length      → 상한 근접',
+            '#  jaeger_collector_spans_dropped_total → 증가',
+            '#  배포/OOM 시: 그 순간 모든 trace 유실',
+          ],
+          highlight: [7, 14, 15, 16],
+        },
+      },
+      {
+        key: 'scaleout',
+        title: 'Step 2. Collector 수평 확장 — 무상태라서 그냥 복제한다',
+        desc: 'Jaeger collector는 상태를 들고 있지 않다. 받은 span을 스토리지로 흘려보낼 뿐이라, replica를 늘리고 Service 뒤에 세우면 로드밸런싱만으로 처리량이 선형으로 는다. HPA로 큐 길이나 CPU에 따라 자동 확장하면 스파이크에도 replica가 붙는다. 한 대가 죽어도 나머지가 받아내므로 SPOF가 사라진다. 무상태라는 성질이 HA를 공짜로 만든다.',
+        legend: 'agent → LB(Service) → collector N replica. 무상태라 복제·롤링배포 자유',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-collector-ha.yaml — 수평 확장 + HPA',
+          lines: [
+            '# collector를 무상태로 여러 replica + LB Service',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: jaeger-collector',
+            'spec:',
+            '  replicas: 3                 # 최소 3 — HA 확보',
+            '  strategy:',
+            '    type: RollingUpdate       # 무중단 배포',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: collector',
+            '          image: jaegertracing/jaeger-collector:1.57',
+            '---',
+            'apiVersion: v1',
+            'kind: Service                 # agent가 바라보는 단일 진입점',
+            'metadata:',
+            '  name: jaeger-collector',
+            'spec:',
+            '  selector:',
+            '    app: jaeger-collector',
+            '  ports:',
+            '    - name: grpc',
+            '      port: 14250             # 뒤의 3 replica로 분산',
+            '---',
+            'apiVersion: autoscaling/v2',
+            'kind: HorizontalPodAutoscaler',
+            'metadata:',
+            '  name: jaeger-collector',
+            'spec:',
+            '  minReplicas: 3',
+            '  maxReplicas: 12             # 스파이크 시 자동 확장',
+            '  metrics:',
+            '    - type: Resource',
+            '      resource:',
+            '        name: cpu',
+            '        target:',
+            '          type: Utilization',
+            '          averageUtilization: 70',
+          ],
+          highlight: [7, 8, 9, 17, 25, 32, 33],
+        },
+      },
+      {
+        key: 'kafka',
+        title: 'Step 3. Kafka 완충 — 스파이크를 대기줄이 삼킨다',
+        desc: 'collector가 storage에 직접 쓰면, storage가 느려지는 순간 backpressure가 agent까지 역류해 span이 drop된다. 사이에 Kafka를 두면 collector는 Kafka에 빠르게 적재만 하고, ingester가 자기 속도로 Kafka를 소비해 storage에 넣는다. 트래픽 스파이크는 Kafka 파티션에 잠깐 쌓였다가 흡수되고, storage 장애 중에도 데이터가 큐에 보존된다. collector와 storage의 속도를 분리하는 완충 장치다.',
+        legend: 'collector → Kafka(완충) → ingester → storage. 스파이크는 큐에 쌓였다 흡수',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-kafka-buffer.yaml — collector→Kafka→ingester',
+          lines: [
+            '# collector는 Kafka로만 쓰고, ingester가 소비 (속도 분리)',
+            '# 1) collector: storage 대신 Kafka producer',
+            'env:',
+            '  - name: SPAN_STORAGE_TYPE',
+            '    value: kafka',
+            '  - name: KAFKA_PRODUCER_BROKERS',
+            '    value: kafka-0:9092,kafka-1:9092,kafka-2:9092',
+            '  - name: KAFKA_TOPIC',
+            '    value: jaeger-spans        # 파티션 다수 = 완충 용량',
+            '',
+            '# 2) ingester: Kafka consumer → 실제 storage 기록',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata:',
+            '  name: jaeger-ingester',
+            'spec:',
+            '  replicas: 4                  # 파티션 수에 맞춰 병렬 소비',
+            '  template:',
+            '    spec:',
+            '      containers:',
+            '        - name: ingester',
+            '          image: jaegertracing/jaeger-ingester:1.57',
+            '          env:',
+            '            - name: SPAN_STORAGE_TYPE',
+            '              value: elasticsearch',
+            '            - name: KAFKA_CONSUMER_BROKERS',
+            '              value: kafka-0:9092,kafka-1:9092',
+            '            - name: KAFKA_TOPIC',
+            '              value: jaeger-spans',
+            '',
+            '# 왜 Kafka인가 ─────────────────────────',
+            '#  ✓ 스파이크: collector는 적재만, 큐가 흡수',
+            '#  ✓ backpressure 차단: storage 지연이 agent로 역류 X',
+            '#  ✓ storage 장애 중에도 span은 Kafka에 보존',
+            '#  ✓ consumer lag 지표로 소비 지연 감시',
+          ],
+          highlight: [4, 5, 8, 9, 17, 23, 24],
+        },
+      },
+      {
+        key: 'sharding',
+        title: 'Step 4. Storage 샤딩 — 서고를 나눠 핫스팟을 없앤다',
+        desc: 'storage 한 노드에 쓰기가 몰리면 그 노드가 핫스팟이 되어 전체 지연을 끌어올린다. Cassandra는 trace_id 파티션 키를 토큰 링에 해시로 흩뿌려 노드마다 균등하게 쓰기를 분산하고, replication_factor로 노드 장애를 견딘다. Elasticsearch는 인덱스를 여러 shard로 쪼개 노드에 분산하고 replica shard로 이중화한다. 핵심은 파티션 키를 고르게 퍼뜨려 특정 노드에 부하가 쏠리지 않게 하는 것이다.',
+        legend: 'trace_id 해시 → 링/샤드에 균등 분산. replica로 노드 장애도 견딘다',
+        code: {
+          lang: 'yaml',
+          filename: 'storage-sharding.yaml — Cassandra 링 · ES 샤드',
+          lines: [
+            '# A) Cassandra — trace_id 파티션 키를 토큰 링에 해시 분산',
+            'cassandra:',
+            '  keyspace: jaeger_v1',
+            '  replication:',
+            '    class: NetworkTopologyStrategy',
+            '    replication_factor: 3       # 노드 3곳 복제 = 장애 허용',
+            '  # 스키마 요지: PRIMARY KEY (trace_id) 로 링 전체에 균등 분산',
+            '  # → 특정 노드 핫스팟 방지, 노드 추가 시 자동 리밸런스',
+            '  consistency:',
+            '    write: LOCAL_QUORUM         # 과반 응답 = 일관성+가용성 균형',
+            '    read: LOCAL_QUORUM',
+            '',
+            '# B) Elasticsearch — 인덱스를 shard로 쪼개 노드에 분산',
+            'es:',
+            '  server-urls: http://es-0:9200,http://es-1:9200,http://es-2:9200',
+            '  index-prefix: jaeger',
+            '  num-shards: 6                 # primary shard 6개 → 노드 분산',
+            '  num-replicas: 1               # replica 1 → 노드 1대 죽어도 OK',
+            '  # 일자별 인덱스(jaeger-span-2026-08-11)로 쓰기 분산 + 보관 관리',
+            '',
+            '# 핫스팟 함정 ───────────────────────────',
+            '#  ✗ 파티션 키 편향(예: 특정 서비스명) → 한 노드로 쏠림',
+            '#  ✓ trace_id처럼 고엔트로피 키로 균등 해시',
+            '#  ✗ shard 과다 → 오버헤드 / 과소 → 노드 불균형',
+            '#  ✓ 노드 수의 1~3배 shard로 시작, 지표 보며 조정',
+          ],
+          highlight: [6, 7, 10, 17, 18, 23],
+        },
+      },
+      {
+        key: 'multiregion',
+        title: 'Step 5. 지역 분산 · 장애 격리 — 한 곳이 죽어도 나머지는 산다',
+        desc: '단일 리전은 그 리전이 통째로 죽으면 끝이다. collector·Kafka·storage를 리전별로 세우고 각각 로컬에 쓰면, 한 리전 장애가 다른 리전으로 번지지 않는다(blast radius 격리). PodDisruptionBudget과 anti-affinity로 배포·노드 장애 중에도 최소 replica를 유지하고, query는 여러 리전 storage를 조회해 통합 뷰를 만든다. 여기까지가 프로덕션 Jaeger의 완성형 — 병목·SPOF·스파이크·핫스팟·리전 장애를 모두 막는다.',
+        legend: '리전별 독립 스택 + PDB/anti-affinity. 장애 반경을 리전 안에 가둔다',
+        code: {
+          lang: 'yaml',
+          filename: 'multi-region-ha.yaml — 격리 + 무중단 보장',
+          lines: [
+            '# 리전마다 독립 collector/Kafka/storage — 장애 격리',
+            '# 1) 최소 가용 replica 보장 (배포·노드 drain 중에도)',
+            'apiVersion: policy/v1',
+            'kind: PodDisruptionBudget',
+            'metadata:',
+            '  name: jaeger-collector-pdb',
+            'spec:',
+            '  minAvailable: 2             # 항상 2대는 살아있게',
+            '  selector:',
+            '    matchLabels:',
+            '      app: jaeger-collector',
+            '---',
+            '# 2) replica를 서로 다른 노드/존에 분산 (동시 장애 방지)',
+            'affinity:',
+            '  podAntiAffinity:',
+            '    requiredDuringSchedulingIgnoredDuringExecution:',
+            '      - labelSelector:',
+            '          matchLabels:',
+            '            app: jaeger-collector',
+            '        topologyKey: topology.kubernetes.io/zone',
+            '---',
+            '# 3) query는 리전별 storage를 조회해 통합 뷰 구성',
+            'query:',
+            '  regions:',
+            '    - name: us-east',
+            '      es-urls: http://es-use.internal:9200',
+            '    - name: eu-west',
+            '      es-urls: http://es-euw.internal:9200',
+            '',
+            '# 완성형 체크리스트 ─────────────────────',
+            '#  ✓ collector N replica + HPA   (병목/SPOF 제거)',
+            '#  ✓ Kafka 완충                  (스파이크 흡수)',
+            '#  ✓ storage 샤딩 + replica       (핫스팟/장애)',
+            '#  ✓ 리전 격리 + PDB/anti-affinity(blast radius)',
+          ],
+          highlight: [4, 8, 15, 20, 24, 25, 26, 27],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화 — 단계별 컴포넌트
+    // ─────────────────────────────────────────────────────────
+
+    // Step 1: 단일 collector 병목
+    function SingleBottleneck() {
+      const agents = Array.from({ length: 6 }, (_, i) => i);
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">⚠️</span>
+            <span className="text-xs font-bold">단일 collector — SPOF</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">replicas: 1</span>
+          </div>
+          <div className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="grid grid-cols-2 gap-1">
+                {agents.map((i) => (
+                  <div key={i} className="fade-in px-2 py-1 rounded bg-slate-100 text-[9px] font-mono text-slate-600 text-center"
+                       style={{ animationDelay: `${i * 60}ms` }}>agent</div>
+                ))}
+              </div>
+              <div className="flex flex-col items-center text-red-500 text-lg font-bold">→→→</div>
+              <div className="flex-1">
+                <div className="rounded-lg border-2 border-red-400 bg-red-50 p-3 text-center">
+                  <div className="text-[11px] font-bold text-red-700">collector ×1</div>
+                  <div className="mt-2 h-3 bg-white rounded overflow-hidden border border-red-200">
+                    <div className="h-full grow-bar" style={{ '--target-width': '100%', background: '#dc2626' }} />
+                  </div>
+                  <div className="text-[9px] text-red-600 font-mono mt-1">CPU 100% · queue overflow</div>
+                </div>
+              </div>
+            </div>
+            <div className="mt-3 p-2 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">
+              <span className="font-bold">⚠ SPOF</span> — 재시작·OOM 순간 모든 trace 유실. span drop 조용히 증가.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2: collector 수평 확장 + LB
+    function ScaleOut() {
+      const replicas = Array.from({ length: 3 }, (_, i) => i);
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🧩</span>
+            <span className="text-xs font-bold">수평 확장 — 무상태 replica + LB</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">replicas: 3~12</span>
+          </div>
+          <div className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="px-2 py-3 rounded bg-slate-100 text-[10px] font-mono text-slate-600 text-center">agents</div>
+              <div className="text-cyan-500 font-bold">→</div>
+              <div className="px-2 py-3 rounded border-2 text-[9px] font-mono text-cyan-700 text-center"
+                   style={{ borderColor: BRAND, background: '#E6F8FC' }}>LB<br/>Service</div>
+              <div className="text-cyan-500 font-bold">→</div>
+              <div className="flex-1 space-y-1.5">
+                {replicas.map((i) => (
+                  <div key={i} className="fade-in flex items-center gap-2" style={{ animationDelay: `${i * 150}ms` }}>
+                    <div className="flex-1 rounded border px-2 py-1 text-[10px] font-mono text-cyan-800 flex items-center justify-between"
+                         style={{ borderColor: '#B7EAF5', background: '#E6F8FC' }}>
+                      <span>collector-{i}</span>
+                      <span className="text-cyan-600">✓ ready</span>
+                    </div>
+                    <div className="w-14 h-2 bg-slate-100 rounded overflow-hidden">
+                      <div className="h-full grow-bar" style={{ '--target-width': '55%', background: BRAND, animationDelay: `${i * 150}ms` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="mt-3 p-2 rounded bg-cyan-50 border border-cyan-200 text-[11px] text-cyan-800">
+              <span className="font-bold">부하 55%씩 분산.</span> 한 대 죽어도 나머지가 받아냄 · HPA로 스파이크 시 자동 증설.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3: Kafka 완충
+    function KafkaBuffer() {
+      const partitions = Array.from({ length: 6 }, (_, i) => i);
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🪣</span>
+            <span className="text-xs font-bold">Kafka 완충 — collector와 storage 속도 분리</span>
+          </div>
+          <div className="p-4">
+            <div className="flex items-center gap-2 text-[10px] font-mono">
+              <div className="px-2 py-2 rounded text-cyan-800 text-center" style={{ background: '#E6F8FC' }}>collector<br/>×3</div>
+              <span className="text-cyan-500 font-bold">→</span>
+              <div className="flex-1">
+                <div className="text-[9px] text-slate-500 mb-1 text-center">Kafka topic: jaeger-spans</div>
+                <div className="grid grid-cols-6 gap-0.5 p-1 rounded border-2" style={{ borderColor: BRAND, background: '#F7FDFF' }}>
+                  {partitions.map((i) => (
+                    <div key={i} className="fade-in h-8 rounded-sm flex items-end" style={{ animationDelay: `${i * 80}ms` }}>
+                      <div className="w-full grow-bar rounded-sm" style={{ '--target-width': '100%', height: `${40 + (i % 3) * 20}%`, background: BRAND }} />
+                    </div>
+                  ))}
+                </div>
+                <div className="text-[9px] text-slate-500 mt-1 text-center">스파이크가 파티션에 쌓였다 흡수</div>
+              </div>
+              <span className="text-cyan-500 font-bold">→</span>
+              <div className="px-2 py-2 rounded text-cyan-800 text-center" style={{ background: '#E6F8FC' }}>ingester<br/>×4</div>
+              <span className="text-cyan-500 font-bold">→</span>
+              <div className="px-2 py-2 rounded bg-slate-100 text-slate-600 text-center">storage</div>
+            </div>
+            <div className="mt-3 p-2 rounded bg-cyan-50 border border-cyan-200 text-[11px] text-cyan-800">
+              <span className="font-bold">backpressure 차단.</span> storage 지연·장애가 agent로 역류하지 않음 · consumer lag로 감시.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: storage 샤딩
+    function StorageSharding() {
+      const nodes = Array.from({ length: 3 }, (_, i) => i);
+      const shards = [
+        { node: 0, ids: ['a3f', '9c1'] },
+        { node: 1, ids: ['4e8', 'b72'] },
+        { node: 2, ids: ['1d0', 'f56'] },
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🗄️</span>
+            <span className="text-xs font-bold">Storage 샤딩 — trace_id 해시로 균등 분산</span>
+          </div>
+          <div className="p-4">
+            <div className="text-[9px] font-mono text-slate-500 mb-2 text-center">trace_id → hash(ring) → 노드에 균등 배치</div>
+            <div className="grid grid-cols-3 gap-2">
+              {shards.map((s, i) => (
+                <div key={i} className="fade-in rounded-lg border p-2" style={{ borderColor: '#B7EAF5', background: '#E6F8FC', animationDelay: `${i * 150}ms` }}>
+                  <div className="text-[10px] font-bold text-cyan-800 mb-1">node-{s.node}</div>
+                  {s.ids.map((id) => (
+                    <div key={id} className="text-[9px] font-mono text-cyan-700 px-1.5 py-0.5 mb-0.5 rounded bg-white border border-cyan-100">
+                      {id}…
+                    </div>
+                  ))}
+                  <div className="text-[8px] font-mono text-slate-400 mt-1">RF=3 replica</div>
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center gap-1.5 mt-3 text-[9px] font-mono">
+              {nodes.map((i) => (
+                <div key={i} className="flex-1 h-2 bg-slate-100 rounded overflow-hidden">
+                  <div className="h-full grow-bar" style={{ '--target-width': '66%', background: BRAND, animationDelay: `${i * 120}ms` }} />
+                </div>
+              ))}
+              <span className="text-cyan-700">균등</span>
+            </div>
+            <div className="mt-3 p-2 rounded bg-amber-50 border border-amber-300 text-[11px] text-amber-800">
+              <span className="font-bold">핫스팟 함정.</span> 편향된 키(서비스명)는 한 노드로 쏠림 → trace_id처럼 고엔트로피 키로 해시.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5: 지역 분산 / 장애 격리
+    function MultiRegion() {
+      const regions = [
+        { name: 'us-east', alive: true },
+        { name: 'eu-west', alive: false },
+        { name: 'ap-south', alive: true },
+      ];
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-cyan-700 text-white px-4 py-2 flex items-center gap-2">
+            <span className="text-base">🌐</span>
+            <span className="text-xs font-bold">지역 분산 — 장애 반경(blast radius) 격리</span>
+          </div>
+          <div className="p-4">
+            <div className="grid grid-cols-3 gap-2">
+              {regions.map((r, i) => (
+                <div key={r.name}
+                     className={`fade-in rounded-lg border-2 p-2 ${r.alive ? '' : 'opacity-70'}`}
+                     style={{ borderColor: r.alive ? BRAND : '#f87171', background: r.alive ? '#E6F8FC' : '#fef2f2', animationDelay: `${i * 150}ms` }}>
+                  <div className={`text-[10px] font-bold mb-1 ${r.alive ? 'text-cyan-800' : 'text-red-600'}`}>
+                    {r.name} {r.alive ? '✓' : '✕ down'}
+                  </div>
+                  <div className="space-y-0.5 text-[8px] font-mono text-slate-500">
+                    <div className={`px-1 py-0.5 rounded ${r.alive ? 'bg-white' : 'bg-red-100 line-through'}`}>collector ×3</div>
+                    <div className={`px-1 py-0.5 rounded ${r.alive ? 'bg-white' : 'bg-red-100 line-through'}`}>kafka</div>
+                    <div className={`px-1 py-0.5 rounded ${r.alive ? 'bg-white' : 'bg-red-100 line-through'}`}>storage</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-center text-[9px] font-mono text-slate-400">↑ query가 살아있는 리전만 통합 조회</div>
+            <div className="mt-3 p-2 rounded bg-cyan-50 border border-cyan-200 text-[11px] text-cyan-800">
+              <span className="font-bold">eu-west 전면 장애에도</span> us-east·ap-south는 정상 · PDB/anti-affinity로 최소 replica 유지.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      let inner = null;
+      if (step.key === 'bottleneck') inner = <SingleBottleneck />;
+      else if (step.key === 'scaleout') inner = <ScaleOut />;
+      else if (step.key === 'kafka') inner = <KafkaBuffer />;
+      else if (step.key === 'sharding') inner = <StorageSharding />;
+      else if (step.key === 'multiregion') inner = <MultiRegion />;
+      return (
+        <div className="space-y-2">
+          {inner}
+          <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar { width: 0; animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: BRAND }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-1-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: BRAND }}>V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 실전 운영 &gt; Chapter 1. 확장·고가용성</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">HA / Sharding — 고가용성·분산</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                프로덕션 Jaeger를 안정적으로 확장한다 — <strong>병목·SPOF·스파이크·핫스팟·리전 장애</strong>를
+                collector 수평 확장, Kafka 완충, storage 샤딩, 지역 분산으로 하나씩 막는다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: '#0E7B91' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-cyan-50 border-2 border-cyan-300 text-cyan-900 text-sm">
+                💡 다음(V-1-2)에서는 <strong>모니터링·알림</strong> — collector 큐·consumer lag·drop 지표로 이 확장 구조를 지킨다
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: BRAND }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./V-1-2.html" className="font-medium" style={{ color: BRAND }}>V-1-2 모니터링·알림 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

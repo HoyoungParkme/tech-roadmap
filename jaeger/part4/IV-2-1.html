@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — IV-2-1. Trace Comparison</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔬</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/json.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/bash.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!--
+    IV-2-1. Trace Comparison
+    학습 목표: 정상 트레이스와 느린/에러 트레이스를 나란히 비교해 구조·duration 차이로 원인을 좁힌다.
+    핵심 비유: "before / after 사진 겹쳐 보기"
+    구조: 5단계 — 왜 비교 → 기준 선정 → 구조 diff → duration diff → 실무 함정
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#67CFE9';
+    const INK = '#0E7B91';
+
+    // 비교 대상 두 트레이스 (span duration 단위: ms, 표시용)
+    // tag: same(변화 없음) / slower(느려짐) / added(추가됨)
+    const SCALE = 1200; // 공통 타임라인 스케일 = 느린 트레이스 총길이
+
+    const BASELINE = [
+      { name: 'GET /product', start: 0, dur: 200, depth: 0, tag: 'same' },
+      { name: 'auth.verify', start: 10, dur: 20, depth: 1, tag: 'same' },
+      { name: 'product-api.load', start: 40, dur: 150, depth: 1, tag: 'same' },
+      { name: 'db.query orders', start: 60, dur: 60, depth: 2, tag: 'same' },
+    ];
+
+    const CANDIDATE = [
+      { name: 'GET /product', start: 0, dur: 1200, depth: 0, tag: 'slower' },
+      { name: 'auth.verify', start: 10, dur: 20, depth: 1, tag: 'same' },
+      { name: 'product-api.load', start: 40, dur: 1110, depth: 1, tag: 'slower' },
+      { name: 'db.query orders', start: 60, dur: 440, depth: 2, tag: 'slower' },
+      { name: 'cache.retry (miss)', start: 520, dur: 580, depth: 2, tag: 'added' },
+    ];
+
+    const STEPS = [
+      {
+        key: 'why',
+        title: 'Step 1. 왜 비교하나 — 하나만 보면 "느리다"까지, 둘을 겹치면 "어디가"까지',
+        desc: '트레이스 하나만 열면 850ms가 느린 건 알아도 무엇이 정상 대비 늘었는지는 알 수 없다. 회귀 분석(배포 전후), 성능 저하 원인 추적, A/B 경로 비교는 모두 "기준과 얼마나 다른가"의 문제다. 정상 트레이스와 느린 트레이스를 같은 타임라인 스케일 위에 나란히 놓으면 눈으로 바로 어느 span이 부풀었는지 보인다. 비교는 로그를 뒤지기 전에 범위를 좁혀 주는 가장 빠른 도구다.',
+        legend: '위: 정상 200ms · 아래: 느림 1200ms. 같은 스케일로 겹쳐 보면 차이가 드러난다',
+        mode: 'overview',
+        code: {
+          lang: 'json',
+          filename: 'baseline-trace.json — 정상 트레이스(기준)',
+          lines: [
+            '// Jaeger Query API가 돌려주는 트레이스 한 건 (발췌)',
+            '// duration 단위는 마이크로초(us). 200ms = 200000us',
+            '{',
+            '  "traceID": "a1f3c9e2b7d40001",',
+            '  "spans": [',
+            '    {',
+            '      "spanID": "0001",',
+            '      "operationName": "GET /product",',
+            '      "duration": 200000,',
+            '      "references": []',
+            '    },',
+            '    {',
+            '      "spanID": "0002",',
+            '      "operationName": "auth.verify",',
+            '      "duration": 20000',
+            '    },',
+            '    {',
+            '      "spanID": "0003",',
+            '      "operationName": "product-api.load",',
+            '      "duration": 150000',
+            '    },',
+            '    {',
+            '      "spanID": "0004",',
+            '      "operationName": "db.query orders",',
+            '      "duration": 60000',
+            '    }',
+            '  ]',
+            '}',
+          ],
+          highlight: [4, 8, 9],
+        },
+      },
+      {
+        key: 'baseline',
+        title: 'Step 2. 기준 트레이스 선정 — 무엇과 비교할지가 결과를 좌우한다',
+        desc: '비교의 신뢰도는 기준(baseline) 선택에서 갈린다. p50 근처의 정상 트레이스를 기준으로 잡아야 "보통 대비 얼마나 느린가"가 의미를 갖는다. 캐시가 이미 데워진 트레이스나 우연히 빨랐던 outlier를 기준으로 삼으면 모든 게 느려 보이는 착시가 생긴다. 같은 endpoint·같은 배포 버전·같은 시간대에서 골라 조건을 맞추는 것이 핵심이다.',
+        legend: '기준 = p50 정상 트레이스. outlier를 기준으로 잡으면 비교 전체가 왜곡된다',
+        mode: 'baseline',
+        code: {
+          lang: 'bash',
+          filename: 'fetch-traces.sh — 비교할 두 트레이스 가져오기',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# Jaeger Query API로 같은 operation의 두 트레이스를 받는다',
+            'set -euo pipefail',
+            '',
+            'JAEGER=http://localhost:16686',
+            'SERVICE=product-api',
+            'OP="GET /product"',
+            '',
+            '# 1) 기준: 최근 1시간 중 정상(200ms 근처) 트레이스',
+            'curl -s -G "$JAEGER/api/traces" \\',
+            '  --data-urlencode "service=$SERVICE" \\',
+            '  --data-urlencode "operation=$OP" \\',
+            '  --data-urlencode "maxDuration=250ms" \\',
+            '  --data-urlencode "minDuration=150ms" \\',
+            '  --data-urlencode "limit=1" > baseline.json',
+            '',
+            '# 2) 대상: 느린(800ms 이상) 트레이스',
+            'curl -s -G "$JAEGER/api/traces" \\',
+            '  --data-urlencode "service=$SERVICE" \\',
+            '  --data-urlencode "operation=$OP" \\',
+            '  --data-urlencode "minDuration=800ms" \\',
+            '  --data-urlencode "limit=1" > candidate.json',
+            '',
+            '# 조건을 맞춰라: 같은 service/operation/배포버전/시간대',
+            'echo "baseline vs candidate 준비 완료"',
+          ],
+          highlight: [12, 13, 14, 20],
+        },
+      },
+      {
+        key: 'structure',
+        title: 'Step 3. 구조 diff — 추가·삭제된 span을 색으로 잡는다',
+        desc: '먼저 볼 것은 duration이 아니라 트리 구조다. 느린 트레이스에만 존재하는 span은 그 자체가 원인 후보다. 여기서는 cache.retry span이 새로 등장했다 — 캐시 미스로 재조회가 붙은 것이다. 반대로 정상에는 있는데 사라진 span은 조기 실패나 경로 변경을 뜻한다. 추가는 초록, 삭제는 빨강으로 코딩하면 눈이 먼저 그쪽으로 간다.',
+        legend: '초록 = candidate에만 추가된 span(원인 후보). 구조 차이를 duration보다 먼저 본다',
+        mode: 'structure',
+        code: {
+          lang: 'json',
+          filename: 'structure-diff.json — 구조 차이(추가된 span)',
+          lines: [
+            '// candidate에만 있고 baseline에는 없는 span',
+            '// = 새로 붙은 작업. 가장 강력한 원인 후보.',
+            '{',
+            '  "added": [',
+            '    {',
+            '      "spanID": "0005",',
+            '      "operationName": "cache.retry (miss)",',
+            '      "parent": "product-api.load",',
+            '      "duration": 580000,',
+            '      "tags": { "cache.hit": false, "retry": 1 }',
+            '    }',
+            '  ],',
+            '  "removed": [],',
+            '  "note": "정상 경로엔 cache.hit=true 라 재조회 span이 없었다"',
+            '}',
+          ],
+          highlight: [7, 9, 10],
+        },
+      },
+      {
+        key: 'duration',
+        title: 'Step 4. duration diff — 같은 span이 얼마나 느려졌나',
+        desc: '구조가 같은 span끼리 duration을 빼면 지연의 출처가 숫자로 나온다. product-api.load는 150ms에서 1110ms로, db.query는 60ms에서 440ms로 늘었다. 여기서 함정: product-api가 가장 크게 늘어 보이지만 그 안엔 db.query와 cache.retry가 포함된 부모 span이다. self time(자식 제외 순수 시간)으로 봐야 진짜 병목이 db 조회와 캐시 재시도임이 드러난다. 부모의 총합에 속지 말라.',
+        legend: '주황 = 느려진 span, 옆 숫자는 증가분(Δ). 부모 총합이 아니라 self time으로 병목을 판정',
+        mode: 'duration',
+        code: {
+          lang: 'bash',
+          filename: 'duration-diff.sh — span별 지연 계산',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# 같은 operationName끼리 duration을 빼서 Δ를 뽑는다',
+            'set -euo pipefail',
+            '',
+            '# baseline/candidate에서 operationName -> duration(ms) 맵 추출',
+            'to_map() {',
+            '  jq -r ".data[0].spans[]',
+            '    | .operationName + \\" \\" + (.duration/1000|tostring)" "$1"',
+            '}',
+            '',
+            'join -a2 -e 0 -o 0,1.2,2.2 \\',
+            '  <(to_map baseline.json  | sort) \\',
+            '  <(to_map candidate.json | sort) \\',
+            '  | awk \'{ d=$3-$2; printf "%-22s base=%6s cand=%6s  d=%+7.0f ms\\n", $1,$2,$3,d }\'',
+            '',
+            '# 예상 출력 ───────────────────────────────',
+            '#  GET /product        base=   200 cand=  1200  Δ=  +1000 ms',
+            '#  auth.verify         base=    20 cand=    20  Δ=     +0 ms',
+            '#  product-api.load    base=   150 cand=  1110  Δ=   +960 ms',
+            '#  db.query orders     base=    60 cand=   440  Δ=   +380 ms',
+            '#  cache.retry (miss)  base=     0 cand=   580  Δ=   +580 ms  # 신규',
+            '#',
+            '# 주의: product-api.load Δ에는 자식(db,cache)이 포함된다.',
+            '#       self time = 1110 - 440 - 580 = 90ms → 부모 자체는 거의 안 느려짐',
+          ],
+          highlight: [17, 18, 19, 22, 23],
+        },
+      },
+      {
+        key: 'pitfalls',
+        title: 'Step 5. 실무 함정 — 비교가 거짓말을 하는 순간들',
+        desc: '비교는 강력하지만 전제가 틀리면 엉뚱한 결론을 준다. 첫째, 비교 대상 선정 오류 — 다른 배포 버전·다른 endpoint를 나란히 놓으면 구조가 다른 게 당연하다. 둘째, 샘플링 편향 — 느린 요청만 tail-based로 더 잡혔다면 "느린 게 흔하다"는 착시가 생긴다. 셋째, 구조 다름과 지연 혼동 — span이 추가된 것과 기존 span이 느려진 것은 처방이 다르다. 넷째, 카디널리티 — operationName에 id/타임스탬프가 박히면 같은 작업이 서로 다른 이름이 되어 매칭이 깨진다.',
+        legend: '4대 함정: 대상 선정 · 샘플링 편향 · 구조 vs 지연 혼동 · 카디널리티 폭발',
+        mode: 'pitfalls',
+        code: {
+          lang: 'bash',
+          filename: 'compare-pitfalls.sh — 비교 전 점검',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# 결론 내기 전 4가지를 반드시 확인한다',
+            'set -euo pipefail',
+            '',
+            '# 1) 대상 선정: 같은 배포 버전인가?',
+            'jq -r ".data[0].spans[0].tags[]',
+            '  | select(.key==\\"deploy.version\\").value" baseline.json candidate.json',
+            '',
+            '# 2) 샘플링 편향: tail-based가 느린 것만 잡지 않았나?',
+            'jq -r ".data[0].spans[0].tags[]',
+            '  | select(.key==\\"sampler.type\\").value" candidate.json',
+            '',
+            '# 3) 구조 vs 지연: 추가 span 수 / 느려진 span 수를 분리 집계',
+            'echo "added=$(jq \'.added|length\' structure-diff.json)"',
+            '',
+            '# 4) 카디널리티: operationName에 변수가 박혔는지',
+            '#    나쁜 예: GET /product/8f2a-...  (id가 이름에 포함)',
+            '#    좋은 예: GET /product/:id       (라우트 템플릿)',
+            'jq -r ".data[0].spans[].operationName" candidate.json \\',
+            '  | grep -E \'[0-9a-f]{8}\' && echo "카디널리티 위험: id가 op명에 있음"',
+            '',
+            '# 점검 통과 후에야 "원인은 X" 라고 말할 수 있다',
+          ],
+          highlight: [5, 9, 13, 16, 17],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 시각화
+    // ─────────────────────────────────────────────────────────
+    const TAG_COLOR = {
+      same: '#B7EAF5',
+      slower: '#f59e0b',
+      added: '#10b981',
+    };
+    const TAG_TEXT = {
+      same: 'text-cyan-800',
+      slower: 'text-amber-700',
+      added: 'text-emerald-700',
+    };
+
+    // 한 트레이스의 워터폴 (span = 가로 막대)
+    function Waterfall({ title, spans, badge, dim, emphasize }) {
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="px-4 py-2 flex items-center gap-2 text-white" style={{ background: dim ? '#94a3b8' : INK }}>
+            <span className="text-xs font-bold">{title}</span>
+            <span className="ml-auto text-[10px] font-mono opacity-80">{badge}</span>
+          </div>
+          <div className="p-3 space-y-1.5">
+            {spans.map((s, i) => {
+              const on = !emphasize || emphasize.includes(s.tag);
+              const color = on ? TAG_COLOR[s.tag] : '#e2e8f0';
+              return (
+                <div key={i} className="fade-in flex items-center gap-2 text-[10px]"
+                     style={{ animationDelay: `${i * 80}ms` }}>
+                  <span className="font-mono text-slate-600 w-32 truncate" style={{ paddingLeft: `${s.depth * 10}px` }}>
+                    {s.tag === 'added' ? '+ ' : ''}{s.name}
+                  </span>
+                  <div className="flex-1 h-3.5 bg-slate-100 rounded relative overflow-hidden">
+                    <div className="h-full grow-bar rounded absolute top-0"
+                         style={{
+                           left: `${(s.start / SCALE) * 100}%`,
+                           '--target-width': `${(s.dur / SCALE) * 100}%`,
+                           background: color,
+                         }} />
+                  </div>
+                  <span className={`font-mono w-14 text-right font-bold ${on ? TAG_TEXT[s.tag] : 'text-slate-400'}`}>
+                    {s.dur}ms
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function ComparePane({ step }) {
+      const emphasize = step.mode === 'structure' ? ['added']
+        : step.mode === 'duration' ? ['slower', 'added']
+        : null;
+
+      if (step.mode === 'pitfalls') {
+        const traps = [
+          { icon: '🎯', t: '비교 대상 선정 오류', d: '다른 배포·다른 endpoint를 겹치면 구조 차이는 당연. 조건을 먼저 맞춰라.' },
+          { icon: '⚖️', t: '샘플링 편향', d: 'tail-based가 느린 것만 더 잡으면 "느린 게 흔하다"는 착시.' },
+          { icon: '🔀', t: '구조 vs 지연 혼동', d: 'span 추가와 기존 span 지연은 처방이 다르다. 나눠서 본다.' },
+          { icon: '💥', t: '카디널리티 폭발', d: 'op명에 id가 박히면 같은 작업이 다른 이름 → 매칭 실패.' },
+        ];
+        return (
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+            <div className="px-4 py-2 flex items-center gap-2 text-white" style={{ background: '#b45309' }}>
+              <span className="text-base">🕳️</span>
+              <span className="text-xs font-bold">비교가 거짓말을 하는 4가지 함정</span>
+            </div>
+            <div className="p-3 space-y-2">
+              {traps.map((t, i) => (
+                <div key={i} className="fade-in flex gap-2 p-2 rounded-lg bg-amber-50 border border-amber-200"
+                     style={{ animationDelay: `${i * 120}ms` }}>
+                  <span className="text-base leading-none mt-0.5">{t.icon}</span>
+                  <div>
+                    <div className="text-[11px] font-bold text-amber-900">{t.t}</div>
+                    <div className="text-[10px] text-amber-800 leading-snug">{t.d}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="space-y-2.5">
+          <Waterfall title="baseline — 정상" spans={BASELINE} badge="200ms · p50"
+                     dim={step.mode === 'baseline'} emphasize={emphasize} />
+          <Waterfall title="candidate — 느림" spans={CANDIDATE} badge="1200ms · 6배 느림"
+                     emphasize={emphasize} />
+          {step.mode === 'duration' && (
+            <div className="fade-in flex flex-wrap gap-1.5 text-[10px] font-mono" style={{ animationDelay: '400ms' }}>
+              <span className="px-2 py-1 rounded bg-amber-100 text-amber-800 font-bold">product-api Δ+960ms</span>
+              <span className="px-2 py-1 rounded bg-amber-100 text-amber-800 font-bold">db.query Δ+380ms</span>
+              <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-800 font-bold">cache.retry +580ms(신규)</span>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      return (
+        <div className="space-y-2">
+          <ComparePane step={step} />
+          <div className="flex items-center gap-3 px-3 py-1.5 bg-white rounded-lg border border-slate-200 text-[10px] font-mono">
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{ background: TAG_COLOR.same }}></span>변화 없음</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{ background: TAG_COLOR.slower }}></span>느려짐</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-3 rounded" style={{ background: TAG_COLOR.added }}></span>추가됨</span>
+          </div>
+          <div className="px-3 py-2 rounded-lg border text-[10px] leading-snug" style={{ background: '#E6F8FC', borderColor: BRAND, color: INK }}>
+            {step.legend}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 코드 뷰어
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { opacity: 0; animation: fadeIn 360ms ease-out forwards; }
+            @keyframes growBar {
+              from { width: 0; }
+              to   { width: var(--target-width); }
+            }
+            .grow-bar { width: 0; animation: growBar 700ms cubic-bezier(.2,.7,.3,1) forwards; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: INK }}>&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-2-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm"
+                     style={{ background: BRAND }}>IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. UI &middot; 분석 &gt; Chapter 2. 트레이스 심화 분석</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Trace Comparison</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                두 트레이스를 비교해 차이를 찾는다 — <strong>정상 트레이스 vs 느린/에러 트레이스</strong>를 같은 스케일에 나란히 놓고
+                구조(추가·삭제)와 duration(느려진 span) 차이를 색으로 짚어 원인을 좁힌다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: INK }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl border-2 text-sm" style={{ background: '#E6F8FC', borderColor: BRAND, color: INK }}>
+                💡 다음(IV-2-2)에서는 <strong>여러 트레이스를 한 번에 겹쳐 보는 집계 비교</strong> — 한 건이 아니라 분포로 회귀를 판정한다.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'} aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]"
+                style={{ background: BRAND }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./IV-2-2.html" className="font-medium" style={{ color: INK }}>IV-2-2 집계 비교 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

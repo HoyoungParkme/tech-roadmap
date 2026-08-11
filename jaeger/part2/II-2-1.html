@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jaeger 학습 — II-2-1. jaeger-query + Storage 읽기</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔎</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    II-2-1. jaeger-query + Storage 읽기
+    학습 목표: 저장된 트레이스를 조건으로 조회하는 jaeger-query 의 요청→인덱스→본문→반환 흐름 이해
+    핵심 비유: "도서관 사서" — 검색 조건(서비스/태그/duration/시간)을 받아 색인 카드로 후보를 찾고 책 본문을 꺼내온다
+    패턴: jaeger 표준 — 좌(LiveDataPane: UI→query→storage 조회 파이프라인) / 우(VSCode 코드 bash/json)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5 STEPS — 검색 요청 → 인덱스 조회 → 본문 조회+반환 → 페이지네이션 → 실무 함정
+    const STEPS = [
+      {
+        title: 'Step 1. 검색 요청 진입 — "UI/API 가 조건을 던진다"',
+        desc: 'jaeger-query 는 UI(React)와 외부 도구가 쏘는 조회 요청을 받는 읽기 전용 서비스다. 요청에는 service·operation·tag·시간범위(start/end)·최소/최대 duration·결과 개수(limit) 같은 필터가 담긴다. 쓰기(수집)는 collector 가 하고, query 는 오직 읽기만 담당해 역할이 분리돼 있다. 이 조건이 곧 storage 로 내려갈 쿼리의 재료이므로, 조건을 좁게 줄수록 뒤 단계가 빨라진다.',
+        focus: 'request',
+        legend: 'jaeger-query = 읽기 전용 · service/operation/tag/시간/duration/limit 필터를 수신',
+        pipe: { ui: 'active', query: 'recv', storage: 'idle' },
+        code: {
+          lang: 'bash',
+          filename: 'search_request.sh — 조건으로 트레이스 검색 (REST)',
+          lines: [
+            '# jaeger-query REST API 로 트레이스 검색',
+            '# UI 의 "Find Traces" 버튼이 그대로 이 요청을 만든다',
+            'BASE="http://jaeger-query:16686"',
+            '',
+            'curl -sG "$BASE/api/traces" \\',
+            '  --data-urlencode "service=payment" \\',
+            '  --data-urlencode "operation=payment.charge" \\',
+            '  --data-urlencode "tags={\\"error\\":\\"true\\"}" \\',
+            '  --data-urlencode "minDuration=500ms" \\',
+            '  --data-urlencode "maxDuration=5s" \\',
+            '  --data-urlencode "start=1699000000000000" \\',
+            '  --data-urlencode "end=1699000600000000" \\',
+            '  --data-urlencode "limit=20"',
+            '',
+            '# start/end 는 마이크로초(µs) epoch — 10분 창을 좁게 지정',
+            '# limit 은 반환할 trace 개수 상한 (기본 20)',
+            '# 조건이 구체적일수록 storage 스캔 범위가 줄어든다',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 13],
+        },
+      },
+      {
+        title: 'Step 2. 인덱스 조회 — "색인 카드로 trace_id 후보 추림"',
+        desc: 'query 는 조건 전체로 본문을 뒤지지 않고, 먼저 storage 의 인덱스(Cassandra 의 service/operation/tag/duration 인덱스 테이블, ES 의 역색인)를 읽어 매칭되는 trace_id 목록만 얻는다. 시간범위는 인덱스를 파티션/샤드 단위로 잘라 스캔량을 줄이는 1차 필터다. 여러 조건은 각 인덱스 결과의 교집합으로 좁혀진다. 인덱스가 걸린 태그로 검색해야 빠르고, 인덱스 없는 태그는 이 단계를 건너뛰어 뒤에서 느려진다.',
+        focus: 'index',
+        legend: '인덱스 = trace_id 후보 목록 · 시간범위로 파티션 컷 · 조건 교집합',
+        pipe: { ui: 'sent', query: 'index', storage: 'index' },
+        code: {
+          lang: 'json',
+          filename: 'trace_query_parameters.json — query 가 storage 로 내리는 조건',
+          lines: [
+            '{',
+            '  "serviceName": "payment",',
+            '  "operationName": "payment.charge",',
+            '  "tags": { "error": "true", "card.brand": "visa" },',
+            '  "startTimeMin": "2023-11-03T10:00:00Z",',
+            '  "startTimeMax": "2023-11-03T10:10:00Z",',
+            '  "durationMin": "500ms",',
+            '  "durationMax": "5s",',
+            '  "numTraces": 20,',
+            '',
+            "  \"_index_lookup\": [",
+            '    "service_name_index  -> [t-9af3, t-1c02, t-77be, ...]",',
+            '    "operation_index     -> [t-9af3, t-77be, t-b410, ...]",',
+            '    "tag_index(error)    -> [t-9af3, t-77be, ...]",',
+            '    "duration_index      -> [t-9af3, t-5d1a, ...]"',
+            '  ],',
+            '',
+            '  "_result": "교집합 = [t-9af3, t-77be]  (2 traceIDs)"',
+            '}',
+          ],
+          highlight: [2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 18],
+        },
+      },
+      {
+        title: 'Step 3. 본문 조회 + 반환 — "trace_id 로 span 을 모아 JSON 으로"',
+        desc: '인덱스에서 얻은 trace_id 로 storage 에서 실제 span 본문을 읽어온다(Cassandra 는 traces 테이블 파티션 키 조회, ES 는 _mget). 한 trace 의 흩어진 span 들을 parent_span_id 로 트리로 조립해 UI 폭포수용 구조로 만든다. 결과는 REST 는 JSON, gRPC 는 protobuf 로 반환된다. 인덱스로 후보를 먼저 좁혔기 때문에 이 무거운 본문 읽기는 딱 필요한 trace 개수만큼만 일어난다.',
+        focus: 'fetch',
+        legend: '후보 trace_id → span 본문 조회 → 트리 조립 → REST(JSON)/gRPC 반환',
+        pipe: { ui: 'wait', query: 'assemble', storage: 'fetch' },
+        code: {
+          lang: 'json',
+          filename: 'traces_response.json — /api/traces 응답 (요약)',
+          lines: [
+            '{',
+            '  "data": [',
+            '    {',
+            '      "traceID": "t-9af3",',
+            '      "spans": [',
+            '        {',
+            '          "spanID": "a1", "operationName": "api /checkout",',
+            '          "duration": 1200000, "references": []',
+            '        },',
+            '        {',
+            '          "spanID": "c7", "operationName": "payment.charge",',
+            '          "duration": 820000,',
+            '          "references": [',
+            '            { "refType": "CHILD_OF", "spanID": "a1" }',
+            '          ],',
+            '          "tags": [ { "key": "error", "value": true } ]',
+            '        }',
+            '      ]',
+            '    }',
+            '  ],',
+            '  "total": 2, "limit": 20, "errors": null',
+            '}',
+          ],
+          highlight: [4, 5, 11, 12, 13, 14, 16, 22],
+        },
+      },
+      {
+        title: 'Step 4. 페이지네이션 + 결과 제한 — "다 주지 않고 끊어서 준다"',
+        desc: 'trace 검색은 목록이 길 수 있어 numTraces/limit 로 반환 개수를 자른다(기본 20). 목록 API 는 각 trace 를 요약만 주고, 상세는 사용자가 클릭할 때 /api/traces/{id} 로 단건 조회한다. ES 백엔드는 search_after 로 다음 페이지를 이어받아 깊은 offset 의 비용을 피한다. limit 을 무한정 키우면 storage 도, 브라우저 렌더링도 함께 죽으므로 상한은 성능 보호 장치다.',
+        focus: 'paginate',
+        legend: 'limit=20 상한 · 목록은 요약 · 상세는 단건 조회 · ES search_after',
+        pipe: { ui: 'active', query: 'page', storage: 'idle' },
+        code: {
+          lang: 'bash',
+          filename: 'paginate.sh — 목록 제한 & 단건 상세 조회',
+          lines: [
+            'BASE="http://jaeger-query:16686"',
+            '',
+            '# 1) 목록: limit 으로 개수 상한 — 요약만 받는다',
+            'curl -sG "$BASE/api/traces" \\',
+            '  --data-urlencode "service=payment" \\',
+            '  --data-urlencode "limit=20"',
+            '',
+            '# 2) 상세: 사용자가 특정 trace 를 클릭하면 단건 조회',
+            'curl -s "$BASE/api/traces/t-9af3"',
+            '',
+            '# 3) ES 백엔드는 깊은 페이지네이션에 search_after 사용',
+            '#    (from+size 로 10000 건 넘게 건너뛰면 heap 폭발)',
+            'curl -s "$BASE:9200/jaeger-span-*/_search" -d \'{',
+            '  "size": 20,',
+            '  "sort": [ { "startTime": "desc" } ],',
+            '  "search_after": [ 1699000123456 ]',
+            '}\'',
+          ],
+          highlight: [4, 5, 6, 9, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — "느린 쿼리는 대부분 조건이 넓어서다"',
+        desc: '가장 흔한 사고는 시간범위를 며칠씩 열어두는 것이다. 인덱스 스캔량이 폭증해 query 가 느려지고 storage(Cassandra/ES) 에 부하가 번진다. 인덱스 없는 커스텀 태그로 검색하면 후보 축소가 안 돼 대량 본문을 스캔한다. limit 을 크게 주면 무거운 본문 읽기가 그만큼 늘어난다. 원칙은 시간창을 좁게, 인덱싱된 필드로 필터, limit 은 보수적으로 — 조건을 좁히는 것이 유일하고 확실한 튜닝이다.',
+        focus: 'pitfall',
+        legend: '넓은 시간범위·인덱스 없는 태그·큰 limit = storage 부하 → 좁혀라',
+        pipe: { ui: 'active', query: 'slow', storage: 'overload' },
+        code: {
+          lang: 'bash',
+          filename: 'slow_vs_fast.sh — 느린 검색 vs 빠른 검색',
+          lines: [
+            '# BAD: 7일 전체 범위 + 인덱스 없는 태그 + 큰 limit',
+            'curl -sG "$BASE/api/traces" \\',
+            '  --data-urlencode "service=payment" \\',
+            '  --data-urlencode "start=1698400000000000" \\   # 7일 전',
+            '  --data-urlencode "end=1699000000000000" \\',
+            '  --data-urlencode "tags={\\"req.body.raw\\":\\"...\\"}" \\  # 미인덱스',
+            '  --data-urlencode "limit=1500"                 # 과도',
+            '# → 인덱스 스캔 폭증 · 대량 본문 읽기 · storage 부하',
+            '',
+            '# GOOD: 좁은 시간창 + 인덱싱된 태그 + 보수적 limit',
+            'curl -sG "$BASE/api/traces" \\',
+            '  --data-urlencode "service=payment" \\',
+            '  --data-urlencode "operation=payment.charge" \\',
+            '  --data-urlencode "start=1699000000000000" \\   # 최근 10분',
+            '  --data-urlencode "end=1699000600000000" \\',
+            '  --data-urlencode "tags={\\"error\\":\\"true\\"}" \\    # 인덱싱됨',
+            '  --data-urlencode "limit=20"',
+            '# → 파티션 컷 · 후보 최소화 · 빠르고 부하 낮음',
+          ],
+          highlight: [1, 4, 6, 7, 8, 10, 14, 16, 17, 18],
+        },
+      },
+    ];
+
+    // ── 좌측: LiveDataPane — UI → jaeger-query → storage 조회 파이프라인 시각화
+    function LiveDataPane({ step, stepIdx }) {
+      const animKey = `step-${stepIdx}`;
+      const pipe = step.pipe;
+
+      // 파이프 노드 상태별 색
+      const nodeCls = (s) => {
+        if (s === 'idle')     return 'bg-slate-50 border-slate-200 text-slate-400';
+        if (s === 'overload') return 'bg-rose-50 border-rose-400 text-rose-800 ring-2 ring-rose-300';
+        if (s === 'slow')     return 'bg-amber-50 border-amber-400 text-amber-900';
+        return 'bg-cyan-50 border-cyan-300 text-cyan-900';
+      };
+
+      const stageLabel = {
+        active: '요청 작성', recv: '조건 수신', sent: '전송됨', wait: '대기', page: '페이지 컷', slow: '느림 ⚠',
+        index: '인덱스 조회', assemble: '트리 조립',
+        fetch: '본문 조회', overload: '부하 ⚠',
+      };
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm" key={animKey}>
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🔎</span>
+              <span className="text-xs font-bold text-slate-700">jaeger-query 조회 파이프라인 — Live View</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">step {stepIdx + 1}/5</span>
+          </div>
+
+          <div className="p-4 space-y-4 min-h-[420px]">
+
+            {/* 3-노드 파이프라인: UI → query → storage */}
+            <div className="grid grid-cols-3 gap-2 items-stretch">
+              {[
+                { key: 'ui',      emoji: '🖥️', name: 'Jaeger UI / API', sub: '검색 조건 입력' },
+                { key: 'query',   emoji: '🔎', name: 'jaeger-query',    sub: '읽기 전용 서비스' },
+                { key: 'storage', emoji: '🗄️', name: 'Storage',         sub: 'Cassandra / ES' },
+              ].map((n) => (
+                <div key={n.key} className={`rounded-lg border-2 p-2 text-center transition-all duration-300 fade-in ${nodeCls(pipe[n.key])}`}>
+                  <div className="text-xl">{n.emoji}</div>
+                  <div className="text-[11px] font-bold mt-1 leading-tight">{n.name}</div>
+                  <div className="text-[9px] opacity-70 mt-0.5">{n.sub}</div>
+                  <div className="text-[9px] font-mono mt-1 px-1 py-0.5 rounded bg-white/60 border border-white">{stageLabel[pipe[n.key]] || pipe[n.key]}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* 흐름 화살표 */}
+            <div className="flex items-center justify-around text-[10px] text-slate-400 font-mono -mt-2">
+              <span>조건 →</span>
+              <span>← 인덱스/본문</span>
+            </div>
+
+            {/* Step 1: 검색 조건 폼 */}
+            {step.focus === 'request' && (
+              <div className="bg-slate-900 rounded-lg p-3 fade-in space-y-1.5">
+                <div className="text-[10px] text-slate-400 font-mono mb-1">Find Traces — 검색 조건</div>
+                {[
+                  ['service', 'payment'], ['operation', 'payment.charge'], ['tags', 'error=true'],
+                  ['minDuration', '500ms'], ['maxDuration', '5s'], ['limit', '20'],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex items-center justify-between text-[11px] font-mono">
+                    <span className="text-slate-400">{k}</span>
+                    <span className="px-2 py-0.5 rounded text-white" style={{ backgroundColor: '#0E7B91' }}>{v}</span>
+                  </div>
+                ))}
+                <div className="text-[10px] mt-1" style={{ color: '#67CFE9' }}>→ 좁은 조건일수록 뒤 단계가 빨라진다</div>
+              </div>
+            )}
+
+            {/* Step 2: 인덱스 교집합 */}
+            {step.focus === 'index' && (
+              <div className="fade-in space-y-2">
+                {[
+                  { idx: 'service_name_index', ids: 't-9af3, t-1c02, t-77be' },
+                  { idx: 'operation_index',    ids: 't-9af3, t-77be, t-b410' },
+                  { idx: 'tag_index(error)',   ids: 't-9af3, t-77be' },
+                  { idx: 'duration_index',     ids: 't-9af3, t-5d1a' },
+                ].map((r) => (
+                  <div key={r.idx} className="flex items-center gap-2 text-[10px] font-mono">
+                    <span className="w-[150px] text-slate-600 truncate">{r.idx}</span>
+                    <span className="flex-1 px-2 py-1 rounded bg-cyan-50 border border-cyan-200 text-cyan-900">{r.ids}</span>
+                  </div>
+                ))}
+                <div className="mt-1 p-2 rounded-lg text-[11px] font-mono" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9', color: '#0E5567' }}>
+                  교집합 = <span className="font-bold">t-9af3, t-77be</span> — 본문 조회는 이 2건만
+                </div>
+              </div>
+            )}
+
+            {/* Step 3: 본문 조회 + 트리 조립 */}
+            {step.focus === 'fetch' && (
+              <div className="fade-in space-y-2">
+                <div className="text-[10px] text-slate-500 font-mono">trace t-9af3 — span 트리 조립</div>
+                {[
+                  { n: 'api /checkout', d: 1200, w: 100, err: false },
+                  { n: '└─ payment.charge', d: 820, w: 68, err: true },
+                ].map((s) => (
+                  <div key={s.n} className="flex items-center gap-2">
+                    <div className="w-[140px] text-[11px] font-mono text-slate-700 truncate">{s.n}</div>
+                    <div className="flex-1 relative h-5 bg-slate-100 rounded">
+                      <div className={`absolute h-full rounded ${s.err ? 'bg-rose-400 border border-rose-500' : 'border'}`}
+                        style={{ width: `${s.w}%`, backgroundColor: s.err ? undefined : '#67CFE9', borderColor: s.err ? undefined : '#3FB7D6' }}>
+                        <span className="absolute inset-0 px-1 flex items-center text-[9px] font-bold text-white">{s.d}ms{s.err ? ' ⚠' : ''}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                <div className="text-[10px] text-slate-500 font-mono mt-1">parent_span_id 로 CHILD_OF 연결 → REST(JSON) / gRPC 반환</div>
+              </div>
+            )}
+
+            {/* Step 4: 페이지네이션 */}
+            {step.focus === 'paginate' && (
+              <div className="fade-in space-y-2">
+                <div className="text-[10px] text-slate-500 font-mono">결과 목록 (limit=20 · 요약만)</div>
+                {['t-9af3 · payment.charge · 820ms ⚠', 't-77be · payment.charge · 640ms', 't-5d1a · payment.charge · 512ms'].map((r, i) => (
+                  <div key={i} className="text-[11px] font-mono px-2 py-1 rounded bg-cyan-50 border border-cyan-200 text-cyan-900 fade-in" style={{ animationDelay: `${i * 100}ms` }}>{r}</div>
+                ))}
+                <div className="text-[10px] text-slate-400 font-mono px-2">… 최대 20건에서 절단 · 다음 페이지는 search_after</div>
+                <div className="p-2 rounded-lg text-[11px]" style={{ backgroundColor: '#E6F8FC', borderLeft: '4px solid #67CFE9', color: '#0E5567' }}>
+                  상세는 클릭 시 <span className="font-mono font-bold">/api/traces/t-9af3</span> 단건 조회
+                </div>
+              </div>
+            )}
+
+            {/* Step 5: 함정 비교 */}
+            {step.focus === 'pitfall' && (
+              <div className="fade-in grid grid-cols-1 gap-2">
+                <div className="rounded-lg border-2 border-rose-300 bg-rose-50 p-2">
+                  <div className="text-[11px] font-bold text-rose-800">❌ 넓은 조건</div>
+                  <div className="text-[10px] text-rose-700 mt-1 leading-snug">7일 범위 · 인덱스 없는 태그 · limit=1500 → 인덱스 스캔 폭증 · 대량 본문 읽기 · storage 부하</div>
+                </div>
+                <div className="rounded-lg border-2 p-2" style={{ borderColor: '#67CFE9', backgroundColor: '#E6F8FC' }}>
+                  <div className="text-[11px] font-bold" style={{ color: '#0E5567' }}>✅ 좁은 조건</div>
+                  <div className="text-[10px] mt-1 leading-snug" style={{ color: '#0E5567' }}>10분 창 · 인덱싱된 error 태그 · limit=20 → 파티션 컷 · 후보 최소화 · 빠름</div>
+                </div>
+              </div>
+            )}
+
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[10px] text-slate-600 leading-snug font-medium">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in {
+              opacity: 0;
+              animation: fadeIn 360ms ease-out forwards;
+            }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium" style={{ color: '#0E7B91' }}>&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-2-1</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm" style={{ backgroundColor: '#67CFE9' }}>II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. Agent · Collector · Query</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">jaeger-query + Storage 읽기</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                저장된 트레이스를 조회하는 쿼리 서비스. UI/API 요청을 받아 <code className="bg-slate-100 px-1 rounded text-xs">storage</code> 인덱스로 후보를 좁히고,
+                <code className="bg-slate-100 px-1 rounded text-xs">trace_id</code> 로 span 본문을 모아 REST/gRPC 로 반환한다.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ backgroundColor: '#0E7B91' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#B7EAF5' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#B7EAF5' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl text-sm" style={{ backgroundColor: '#E6F8FC', border: '2px solid #67CFE9', color: '#0E5567' }}>
+                💡 다음(II-2-2)에서는 <strong>storage 백엔드 선택</strong> — Cassandra vs Elasticsearch 인덱싱/보존/비용 트레이드오프
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white transition min-w-[96px]" style={{ backgroundColor: '#0E7B91' }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./II-2-2.html" className="font-medium" style={{ color: '#0E7B91' }}>II-2-2 storage 백엔드 선택 &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
