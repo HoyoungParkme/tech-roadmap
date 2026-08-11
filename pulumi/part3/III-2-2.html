@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pulumi 인터랙티브 학습 — III-2-2. cross-provider 의존성 — 서로 다른 클라우드 리소스 연결</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔗</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Pulumi III-2-2 — cross-provider 의존성
+    학습 목표: 서로 다른 provider 리소스의 출력을 다른 provider 입력으로 연결하는 5단계
+    핵심 비유: 릴레이 경주 — 앞 주자(리소스)가 넘긴 바통(출력)을 뒷 주자(다른 cloud 리소스)가 받는다
+    패턴: fastapi v1 — 좌(LiveDataPane: cross-provider 의존성 DAG + 배포 순서) / 우(VSCode CodeViewer TypeScript)
+    색상: purple #8A3391 (Pulumi 브랜드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — cross-provider 의존성
+    //   providers : provider 카드 [{ name, region, status, icon }]
+    //   resources : 리소스 노드 [{ id, provider, kind, label, phase }]
+    //     phase : 'wait' | 'building' | 'done'  (배포 진행 표시)
+    //   edges     : 출력→입력 화살표 [{ from, to, note, kind }]
+    //     kind : 'implicit'(출력참조) | 'explicit'(dependsOn)
+    //   keyPoint  : 한 줄 정리
+    //   code      : 우측 CodeViewer 탭
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 왜 cross-provider 의존성인가',
+        desc: '현실의 스택은 한 cloud 로 끝나지 않는다. DB 는 AWS RDS 에 있는데 앱은 GCP Cloud Run 에 돌고, 앞단 DNS 는 Cloudflare 가, 모니터링은 Datadog 이 맡는다. 이때 GCP 앱은 RDS 의 **엔드포인트 주소를 알아야** 접속한다. 문제는 이 주소가 `pulumi up` 을 돌리기 전엔 존재하지 않는다는 것 — 미래 값이다. Pulumi 는 이 미래 값을 `Output<T>` 로 표현하고, 그걸 다른 provider 리소스의 입력에 그대로 넣으면 의존성이 자동으로 만들어진다.',
+        providers: [
+          { name: 'AWS',        region: 'ap-northeast-2', status: 'planning', icon: '🟠' },
+          { name: 'GCP',        region: 'asia-northeast3', status: 'planning', icon: '🔵' },
+          { name: 'Cloudflare', region: 'global',          status: 'planning', icon: '🟧' },
+        ],
+        resources: [],
+        edges: [],
+        keyPoint: 'cross-provider 연결의 핵심은 "아직 없는 값(Output)"을 다른 cloud 입력에 넘기는 것.',
+        code: {
+          lang: 'typescript',
+          filename: 'index.ts',
+          lines: [
+            '// 서로 다른 provider 를 한 파일에 import',
+            'import * as pulumi from "@pulumi/pulumi";',
+            'import * as aws from "@pulumi/aws";',
+            'import * as gcp from "@pulumi/gcp";',
+            'import * as cloudflare from "@pulumi/cloudflare";',
+            '',
+            '// 목표 아키텍처',
+            '//   1) AWS RDS       — Postgres 데이터베이스',
+            '//   2) GCP Cloud Run — API 서버 (RDS 에 접속해야 함)',
+            '//   3) Cloudflare    — api.example.com DNS 를 Cloud Run 으로',
+            '',
+            '// 문제 — RDS 의 endpoint 주소는 배포 전엔 모른다.',
+            '//   const url = rds.endpoint  // ← string 이 아니라 Output<string>',
+            '//   콘솔에 찍어도 "실제 주소" 가 아니라 Promise-like 객체가 나온다.',
+            '',
+            '// Pulumi 의 답 — Output<T> 는 "배포가 끝나야 채워질 미래 값".',
+            '//   이 미래 값을 다른 리소스 입력에 넣으면,',
+            '//   Pulumi 가 "A 가 끝나야 B 를 만들 수 있다" 를 스스로 안다.',
+            '//   → 이게 cross-provider 의존성이다.',
+            '',
+            '// 다음 step 부터 실제로 RDS → Cloud Run → Cloudflare 를 잇는다.',
+          ],
+          highlight: [1, 2, 3, 4, 5, 16, 17, 18, 19],
+        },
+      },
+      {
+        title: 'Step 2. 암묵적 의존성 — 출력을 참조하면 끝',
+        desc: '먼저 AWS RDS 를 만든다. 그리고 GCP Cloud Run 을 만들 때 환경변수 `DATABASE_HOST` 에 `db.endpoint` 를 그대로 넣는다. 이것만으로 Pulumi 는 "Cloud Run 은 RDS 에 의존한다" 를 자동 인식한다 — 이게 **암묵적 의존성(implicit dependency)**이다. 별도 선언 없이, 출력을 입력에 참조하는 것만으로 배포 순서(RDS 먼저 → Cloud Run 나중)가 결정된다.',
+        providers: [
+          { name: 'AWS',        region: 'ap-northeast-2', status: 'ready', icon: '🟠' },
+          { name: 'GCP',        region: 'asia-northeast3', status: 'planning', icon: '🔵' },
+          { name: 'Cloudflare', region: 'global',          status: 'planning', icon: '🟧' },
+        ],
+        resources: [
+          { id: 'rds', provider: 'AWS', kind: 'RDS Postgres', label: 'app-db', phase: 'done' },
+          { id: 'run', provider: 'GCP', kind: 'Cloud Run',    label: 'api-server', phase: 'wait' },
+        ],
+        edges: [
+          { from: 'rds', to: 'run', note: 'db.endpoint → DATABASE_HOST', kind: 'implicit' },
+        ],
+        keyPoint: '출력(db.endpoint)을 다른 리소스 입력에 참조 = 암묵적 의존성 자동 생성.',
+        code: {
+          lang: 'typescript',
+          filename: 'index.ts',
+          lines: [
+            '// 1) AWS RDS — Postgres 데이터베이스',
+            'const db = new aws.rds.Instance("app-db", {',
+            '  engine:            "postgres",',
+            '  instanceClass:     "db.t3.micro",',
+            '  allocatedStorage:  20,',
+            '  dbName:            "appdb",',
+            '  username:          "app",',
+            '  password:          dbPassword,   // pulumi config secret',
+            '  skipFinalSnapshot: true,',
+            '});',
+            '',
+            '// db.endpoint 는 Output<string> — 배포 후에야 실제 주소가 채워짐',
+            '//   예) "app-db.abc123.ap-northeast-2.rds.amazonaws.com:5432"',
+            '',
+            '// 2) GCP Cloud Run — 그 Output 을 환경변수로 그대로 참조',
+            'const api = new gcp.cloudrun.Service("api-server", {',
+            '  location: "asia-northeast3",',
+            '  template: {',
+            '    spec: {',
+            '      containers: [{',
+            '        image: "gcr.io/my-proj/api:latest",',
+            '        envs: [',
+            '          // ↓ 여기! AWS 의 출력을 GCP 입력에 그냥 넣는다',
+            '          { name: "DATABASE_HOST", value: db.endpoint },',
+            '          { name: "DATABASE_NAME", value: db.dbName },',
+            '        ],',
+            '      }],',
+            '    },',
+            '  },',
+            '});',
+            '',
+            '// 이 한 줄(value: db.endpoint)로 Pulumi 는 자동으로 안다:',
+            '//   "api-server(GCP) 는 app-db(AWS) 가 끝나야 만들 수 있다"',
+            '//   → 명시적 선언 없이 순서가 잡힌다. 이게 암묵적 의존성.',
+          ],
+          highlight: [1, 2, 12, 13, 15, 16, 21, 22, 23, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 3. apply / interpolate — 출력을 가공해서 넘기기',
+        desc: '출력을 그냥 넘기지 못하고 **가공**해야 할 때가 많다. 엔드포인트에서 포트를 떼거나, 여러 출력을 합쳐 접속 문자열을 만들거나. Output 은 일반 string 이 아니라서 `+` 로 못 붙인다. 두 도구를 쓴다 — `.apply(fn)` 는 값 하나를 변환하고, `pulumi.interpolate` 는 템플릿 문자열처럼 여러 Output 을 한 줄에 조립한다. 결과 역시 Output 이라 의존성은 그대로 유지된다.',
+        providers: [
+          { name: 'AWS',        region: 'ap-northeast-2', status: 'ready', icon: '🟠' },
+          { name: 'GCP',        region: 'asia-northeast3', status: 'ready', icon: '🔵' },
+          { name: 'Cloudflare', region: 'global',          status: 'planning', icon: '🟧' },
+        ],
+        resources: [
+          { id: 'rds', provider: 'AWS', kind: 'RDS Postgres', label: 'app-db', phase: 'done' },
+          { id: 'run', provider: 'GCP', kind: 'Cloud Run',    label: 'api-server', phase: 'done' },
+        ],
+        edges: [
+          { from: 'rds', to: 'run', note: 'interpolate 로 접속 URL 조립', kind: 'implicit' },
+        ],
+        keyPoint: 'Output 은 .apply() 로 변환, interpolate 로 조립. 결과도 Output → 의존성 유지.',
+        code: {
+          lang: 'typescript',
+          filename: 'outputs.ts',
+          lines: [
+            '// ❌ 이렇게는 못 한다 — Output 은 그냥 string 이 아니다',
+            '// const url = "postgres://" + db.endpoint;  // [object Output]',
+            '',
+            '// ✅ 방법 A) .apply() — 값 하나를 변환',
+            'const hostOnly = db.endpoint.apply((ep) => ep.split(":")[0]);',
+            '//   "app-db.xxx.rds.amazonaws.com:5432" → 포트를 뗀 host 만',
+            '',
+            '// ✅ 방법 B) pulumi.interpolate — 여러 Output 을 한 줄에 조립',
+            '//   백틱 템플릿처럼 쓰되, Output 을 안전하게 풀어 준다',
+            'const dbUrl = pulumi.interpolate`postgres://app:${dbPassword}@${db.endpoint}/appdb`;',
+            '',
+            '// ✅ 방법 C) pulumi.all([...]) — 여러 Output 을 모아 한 번에',
+            'const conn = pulumi',
+            '  .all([db.endpoint, db.dbName])',
+            '  .apply(([ep, name]) => `${ep}/${name}`);',
+            '',
+            '// 가공한 값을 다시 다른 provider 입력으로',
+            'const api = new gcp.cloudrun.Service("api-server", {',
+            '  location: "asia-northeast3",',
+            '  template: { spec: { containers: [{',
+            '    image: "gcr.io/my-proj/api:latest",',
+            '    envs: [',
+            '      { name: "DATABASE_URL",  value: dbUrl },     // interpolate 결과',
+            '      { name: "DATABASE_HOST", value: hostOnly },  // apply 결과',
+            '    ],',
+            '  }] } },',
+            '});',
+            '',
+            '// 포인트 — apply/interpolate 의 결과도 Output<T> 다.',
+            '//   그래서 db → api 의존성은 그대로 살아 있다.',
+            '//   가공을 거쳐도 배포 순서는 자동으로 지켜진다.',
+          ],
+          highlight: [4, 5, 8, 9, 10, 12, 13, 14, 15, 23, 24, 29, 30, 31],
+        },
+      },
+      {
+        title: 'Step 4. 명시적 dependsOn — 데이터 참조가 없을 때',
+        desc: '가끔은 A 의 출력을 B 가 안 쓰는데도 "A 가 먼저여야" 하는 경우가 있다. 예: DB 스키마 마이그레이션 Job 이 끝난 뒤에 Cloud Run 을 띄우고 싶다 — 둘 사이에 참조할 값은 없다. 이럴 땐 `{ dependsOn: [migration] }` 로 **명시적 의존성**을 건다. Cloudflare DNS 레코드도 Cloud Run URL 을 참조하니 암묵적이지만, "앱이 진짜 뜬 뒤에만 트래픽을 보내고 싶다" 면 dependsOn 을 더 건다.',
+        providers: [
+          { name: 'AWS',        region: 'ap-northeast-2', status: 'ready', icon: '🟠' },
+          { name: 'GCP',        region: 'asia-northeast3', status: 'ready', icon: '🔵' },
+          { name: 'Cloudflare', region: 'global',          status: 'ready', icon: '🟧' },
+        ],
+        resources: [
+          { id: 'rds', provider: 'AWS', kind: 'RDS Postgres', label: 'app-db', phase: 'done' },
+          { id: 'mig', provider: 'GCP', kind: 'Migration Job', label: 'db-migrate', phase: 'done' },
+          { id: 'run', provider: 'GCP', kind: 'Cloud Run',    label: 'api-server', phase: 'done' },
+          { id: 'dns', provider: 'Cloudflare', kind: 'DNS Record', label: 'api.example.com', phase: 'wait' },
+        ],
+        edges: [
+          { from: 'rds', to: 'mig', note: 'db.endpoint 참조', kind: 'implicit' },
+          { from: 'mig', to: 'run', note: 'dependsOn: [migration]', kind: 'explicit' },
+          { from: 'run', to: 'dns', note: 'api.statuses[0].url 참조', kind: 'implicit' },
+        ],
+        keyPoint: '참조할 값이 없지만 순서는 필요할 때 → dependsOn 으로 명시적 의존성.',
+        code: {
+          lang: 'typescript',
+          filename: 'dependencies.ts',
+          lines: [
+            '// 1) 스키마 마이그레이션 Job — RDS 를 참조(암묵적)',
+            'const migration = new gcp.cloudrunv2.Job("db-migrate", {',
+            '  location: "asia-northeast3",',
+            '  template: { template: { containers: [{',
+            '    image: "gcr.io/my-proj/migrate:latest",',
+            '    envs: [{ name: "DB_HOST", value: db.endpoint }],  // 암묵적 의존',
+            '  }] } },',
+            '});',
+            '',
+            '// 2) Cloud Run — 마이그레이션이 "끝난 뒤" 떠야 한다',
+            '//    둘 사이에 참조할 출력값은 없다 → 명시적으로 순서 지정',
+            'const api = new gcp.cloudrun.Service("api-server", {',
+            '  location: "asia-northeast3",',
+            '  template: { spec: { containers: [{',
+            '    image: "gcr.io/my-proj/api:latest",',
+            '    envs: [{ name: "DATABASE_URL", value: dbUrl }],',
+            '  }] } },',
+            '}, {',
+            '  dependsOn: [migration],   // ← 명시적 의존성. 값 참조 없이 순서만',
+            '});',
+            '',
+            '// 3) Cloudflare DNS — Cloud Run URL 을 참조(암묵적)',
+            '//    + "앱이 실제로 뜬 뒤에만" DNS 를 켜고 싶어 dependsOn 추가',
+            'const record = new cloudflare.Record("api-dns", {',
+            '  zoneId:  cfZoneId,',
+            '  name:    "api",',
+            '  type:    "CNAME",',
+            '  content: api.statuses[0].url.apply((u) => u.replace("https://", "")),',
+            '  proxied: true,',
+            '}, {',
+            '  dependsOn: [api],   // URL 참조로도 이미 의존이지만 의도를 명시',
+            '});',
+            '',
+            '// 정리 — 암묵적(출력 참조) 이 기본, dependsOn 은 참조 없이',
+            '//   순서만 필요하거나 의도를 못박고 싶을 때 쓰는 보강 수단.',
+          ],
+          highlight: [1, 6, 10, 11, 18, 19, 22, 23, 28, 31, 32],
+        },
+      },
+      {
+        title: 'Step 5. DAG 가 배포 순서를 결정 — preview / up',
+        desc: '이제 `pulumi up` 하나면 4개 provider 리소스가 한 plan 으로 배포된다. Pulumi 엔진은 모든 의존성(암묵적+명시적)을 모아 **DAG(방향 비순환 그래프)**를 만들고, 위상 정렬로 순서를 정한다 — RDS 가 먼저, 그 뒤 migration, 이어서 Cloud Run, 마지막에 Cloudflare DNS. 서로 의존 없는 리소스는 **병렬로** 동시에 만든다. 이 순서화는 우리가 짠 게 아니라 그래프에서 자동으로 나온 것이다.',
+        providers: [
+          { name: 'AWS',        region: 'ap-northeast-2', status: 'deployed', icon: '🟠' },
+          { name: 'GCP',        region: 'asia-northeast3', status: 'deployed', icon: '🔵' },
+          { name: 'Cloudflare', region: 'global',          status: 'deployed', icon: '🟧' },
+        ],
+        resources: [
+          { id: 'rds', provider: 'AWS', kind: 'RDS Postgres', label: 'app-db', phase: 'done' },
+          { id: 'mig', provider: 'GCP', kind: 'Migration Job', label: 'db-migrate', phase: 'done' },
+          { id: 'run', provider: 'GCP', kind: 'Cloud Run',    label: 'api-server', phase: 'done' },
+          { id: 'dns', provider: 'Cloudflare', kind: 'DNS Record', label: 'api.example.com', phase: 'done' },
+        ],
+        edges: [
+          { from: 'rds', to: 'mig', note: '① RDS → migration', kind: 'implicit' },
+          { from: 'mig', to: 'run', note: '② migration → Cloud Run', kind: 'explicit' },
+          { from: 'run', to: 'dns', note: '③ Cloud Run → DNS', kind: 'implicit' },
+        ],
+        keyPoint: 'Pulumi 가 의존성을 DAG 로 위상 정렬. 독립 리소스는 병렬, 의존 리소스는 순차.',
+        code: {
+          lang: 'bash',
+          filename: 'pulumi-up.sh',
+          lines: [
+            '# 4 provider 리소스를 한 번에 배포',
+            '$ pulumi up',
+            '',
+            'Previewing update (prod):',
+            '     Type                          Name           Plan',
+            ' +   pulumi:pulumi:Stack           cross-prod     create',
+            ' +   ├─ aws:rds:Instance           app-db         create',
+            ' +   ├─ gcp:cloudrunv2:Job         db-migrate     create',
+            ' +   ├─ gcp:cloudrun:Service       api-server     create',
+            ' +   └─ cloudflare:Record          api-dns        create',
+            '',
+            'Resources: + 5 to create',
+            'Do you want to perform this update? yes',
+            '',
+            'Updating (prod):',
+            ' +   aws:rds:Instance      app-db      created (182s)   # 1번, 최상위',
+            ' +   gcp:cloudrunv2:Job    db-migrate  created (24s)    # app-db 후',
+            ' +   gcp:cloudrun:Service  api-server  created (18s)    # migrate 후',
+            ' +   cloudflare:Record     api-dns     created (3s)     # api-server 후',
+            '',
+            '# 만약 서로 의존 없는 리소스가 여럿이면 이렇게 병렬로:',
+            '#   aws:rds:Instance    other-db   created (170s)  ┐ 동시에',
+            '#   gcp:storage:Bucket  assets     created (4s)    ┘ (병렬)',
+            '',
+            'Outputs:',
+            '    apiUrl:  "https://api.example.com"',
+            '    dbHost:  "app-db.abc123.ap-northeast-2.rds.amazonaws.com"',
+            '',
+            'Resources: + 5 created',
+            'Duration: 3m52s',
+            '',
+            '# 핵심 정리 ─────────────────────────────────',
+            '# 1) 우리는 "순서" 를 직접 안 짰다.',
+            '#    출력 참조(암묵적) + dependsOn(명시적) 을 선언했을 뿐.',
+            '# 2) Pulumi 가 그걸 DAG 로 모아 위상 정렬 → 순서 결정.',
+            '# 3) 의존 없는 노드는 병렬, 의존 체인은 순차로 자동 최적화.',
+            '# 4) destroy 는 역순 — DNS → Run → migration → RDS.',
+          ],
+          highlight: [6, 7, 8, 9, 10, 16, 17, 18, 19, 21, 22, 23, 33, 34, 35, 36, 37, 38],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — purple #8A3391 톤
+    // ─────────────────────────────────────────────────────
+    const PROVIDER_STYLE = {
+      AWS:        { bg: 'bg-orange-50', border: 'border-orange-300', text: 'text-orange-800', badge: 'bg-orange-200 text-orange-800' },
+      GCP:        { bg: 'bg-blue-50',   border: 'border-blue-300',   text: 'text-blue-800',   badge: 'bg-blue-200 text-blue-800' },
+      Cloudflare: { bg: 'bg-amber-50',  border: 'border-amber-300',  text: 'text-amber-800',  badge: 'bg-amber-200 text-amber-800' },
+      Datadog:    { bg: 'bg-purple-50', border: 'border-purple-300', text: 'text-purple-800', badge: 'bg-purple-200 text-purple-800' },
+    };
+
+    const STATUS_LABEL = {
+      planning: { text: '준비 중', cls: 'bg-slate-200 text-slate-700' },
+      ready:    { text: '배포 직전', cls: 'bg-amber-200 text-amber-800' },
+      deployed: { text: '배포 완료', cls: 'bg-emerald-200 text-emerald-800' },
+    };
+
+    const PHASE_LABEL = {
+      wait:     { text: '대기', cls: 'bg-slate-200 text-slate-600' },
+      building: { text: '생성 중', cls: 'bg-amber-200 text-amber-800' },
+      done:     { text: '완료', cls: 'bg-emerald-200 text-emerald-700' },
+    };
+
+    function ProviderCards({ providers }) {
+      return (
+        <div className="grid grid-cols-3 gap-2">
+          {providers.map((p) => {
+            const s = PROVIDER_STYLE[p.name] || PROVIDER_STYLE.AWS;
+            const st = STATUS_LABEL[p.status] || STATUS_LABEL.planning;
+            return (
+              <div key={p.name} className={`rounded-lg border-2 ${s.bg} ${s.border} p-2`}>
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="text-base">{p.icon}</span>
+                  <span className={`text-xs font-bold ${s.text}`}>{p.name}</span>
+                </div>
+                <div className="text-[10px] text-slate-600 font-mono">{p.region}</div>
+                <div className="mt-1.5">
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${st.cls}`}>{st.text}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // 의존성 DAG — 리소스 노드를 세로로 쌓고, 노드 사이에 출력→입력 화살표
+    function DependencyDag({ resources, edges }) {
+      if (!resources || resources.length === 0) {
+        return (
+          <div className="mt-3 rounded-lg border border-dashed border-purple-300 bg-purple-50/40 p-4 text-center text-xs text-purple-700">
+            아직 리소스 없음 — 다음 step 부터 의존성 그래프가 그려짐
+          </div>
+        );
+      }
+      // from → to 를 빠르게 찾기 위한 맵 (노드 아래에 나가는 화살표 표시)
+      const outEdge = {};
+      (edges || []).forEach((e) => { outEdge[e.from] = e; });
+
+      return (
+        <div className="mt-3 rounded-lg border border-purple-200 bg-white p-2">
+          <div className="text-[11px] font-bold text-purple-800 mb-2">cross-provider 의존성 DAG ({resources.length})</div>
+          <div className="flex flex-col items-stretch">
+            {resources.map((r, idx) => {
+              const s = PROVIDER_STYLE[r.provider] || PROVIDER_STYLE.AWS;
+              const ph = PHASE_LABEL[r.phase] || PHASE_LABEL.wait;
+              const edge = outEdge[r.id];
+              return (
+                <div key={r.id}>
+                  <div className={`flex items-center gap-2 rounded px-2 py-1.5 border ${s.bg} ${s.border}`}>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${s.badge}`}>{r.provider}</span>
+                    <span className="text-[11px] font-mono text-slate-700">{r.kind}</span>
+                    <span className="text-[11px] text-slate-500 truncate">{r.label}</span>
+                    <span className={`text-[9px] px-1.5 py-0.5 rounded ml-auto ${ph.cls}`}>{ph.text}</span>
+                  </div>
+                  {edge && (
+                    <div className="flex items-center gap-1.5 pl-3 py-0.5">
+                      <span className="text-purple-500 text-sm leading-none">&darr;</span>
+                      <span className={`text-[9px] px-1 py-0.5 rounded font-bold ${edge.kind === 'explicit' ? 'bg-fuchsia-200 text-fuchsia-800' : 'bg-purple-200 text-purple-800'}`}>
+                        {edge.kind === 'explicit' ? 'dependsOn' : '출력참조'}
+                      </span>
+                      <span className="text-[10px] text-purple-900">{edge.note}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-2 pt-2 border-t border-purple-100 flex items-center gap-3 text-[9px]">
+            <span className="flex items-center gap-1">
+              <span className="px-1 py-0.5 rounded bg-purple-200 text-purple-800 font-bold">출력참조</span>
+              <span className="text-slate-500">암묵적 의존성</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="px-1 py-0.5 rounded bg-fuchsia-200 text-fuchsia-800 font-bold">dependsOn</span>
+              <span className="text-slate-500">명시적 의존성</span>
+            </span>
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-purple-200 bg-white p-4 h-full flex flex-col overflow-auto">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-purple-800">cross-provider 라이브 뷰</h3>
+            <span className="text-[10px] text-slate-500">왼쪽 = 도메인 상태</span>
+          </div>
+          <ProviderCards providers={state.providers} />
+          <DependencyDag resources={state.resources} edges={state.edges} />
+          <div className="mt-3 text-xs text-purple-900 bg-purple-50 border border-purple-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-purple-500/15 border-l-2 border-purple-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-purple-50 to-fuchsia-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-purple-700 text-white font-bold">III</span>
+              <div>
+                <h1 className="text-2xl font-bold text-purple-900">III-2-2. cross-provider 의존성 — 서로 다른 클라우드 리소스 연결</h1>
+                <p className="text-sm text-purple-800/80">Output→Input 참조 · apply/interpolate 가공 · 암묵적 vs dependsOn · DAG 가 배포 순서를 결정</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-purple-700 underline hover:no-underline" aria-label="챕터 목록으로">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-purple-700' : 'bg-purple-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-purple-800 text-purple-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-purple-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-purple-300 bg-white text-purple-700 hover:bg-purple-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-purple-300 bg-white text-purple-700 hover:bg-purple-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-purple-800 text-white' : 'bg-purple-700 text-white hover:bg-purple-800'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-purple-300 bg-white text-purple-700 hover:bg-purple-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-purple-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-purple-400 bg-white px-4 py-3 text-sm text-purple-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                cross-provider 연결의 핵심은 한 provider 리소스의 Output&lt;T&gt; 를 다른 provider 입력에 넣는 것이다. 그냥 참조하면 암묵적 의존성이 자동 생성되고, 값을 가공해야 하면 `.apply()` / `pulumi.interpolate` / `pulumi.all()` 을 쓰되 결과도 Output 이라 의존성은 유지된다. 참조할 값이 없지만 순서만 필요하면 `dependsOn` 으로 명시한다. Pulumi 엔진은 이 의존성들을 DAG 로 모아 위상 정렬해서 배포 순서를 자동 결정하고, 독립 리소스는 병렬로 최적화한다. 다음 (IV-1-1) 부터는 배포 자동화(CI/CD) 로 넘어간다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['cross-provider', 'Output<T>', 'Input', 'apply', 'interpolate', 'pulumi.all', 'implicit dependency', 'dependsOn', 'DAG', 'topological sort'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-purple-100 text-purple-800 border border-purple-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-purple-700">
+              <a href="./III-2-1.html" className="underline hover:no-underline" aria-label="이전 챕터로">← 이전: III-2-1</a>
+              <a href="../index.html" className="underline hover:no-underline" aria-label="챕터 목록">목차</a>
+              <a href="../part4/IV-1-1.html" className="underline hover:no-underline" aria-label="다음 챕터로">다음: IV-1-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pulumi 인터랙티브 학습 — IV-2-1. CrossGuard — Policy as Code</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛡️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    Pulumi IV-2-1 — CrossGuard: Policy as Code
+    학습 목표: 배포 전에 리소스가 조직 정책을 지키는지 검증하고 위반이면 배포를 차단하는 가드레일 5단계
+    핵심 비유: 공항 보안검색대 — advisory 는 "주의" 경고, mandatory 는 통과 금지(게이트 차단)
+    패턴: fastapi v1 — 좌(LiveDataPane: 리소스가 정책 게이트를 통과/위반하는 흐름) / 우(VSCode CodeViewer TypeScript)
+    색상: purple #8A3391 (Pulumi 브랜드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — CrossGuard Policy as Code
+    //   policies  : 활성 정책 [{ name, level, rule }]
+    //   resources : 검사 대상 [{ id, type, name, checks:[{policy, result}] }]
+    //   gate      : 배포 게이트 상태 'pending' | 'open' | 'blocked'
+    //   keyPoint  : 한 줄 정리
+    //   code      : 우측 CodeViewer 탭
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 왜 Policy as Code 인가 — 배포 전 가드레일',
+        desc: '리소스를 만들 수 있다는 것과 만들어도 된다는 것은 다르다. 누군가 S3 버킷을 암호화 없이, 태그 없이, 혹은 초대형 인스턴스로 올리면 컴플라이언스·비용·보안 사고가 된다. 사람이 PR 리뷰로 잡기엔 놓치기 쉽다. CrossGuard 는 이 규칙을 코드로 적어 두고 pulumi preview/up 이 돌 때마다 자동으로 검사한다. 통과하면 배포, 위반이면 경고하거나 아예 차단한다. 즉 배포 파이프라인 앞단의 보안검색대다.',
+        policies: [],
+        resources: [
+          { id: 'r1', type: 'aws:s3:BucketV2', name: 'user-uploads', checks: [] },
+          { id: 'r2', type: 'aws:ec2:Instance', name: 'batch-worker', checks: [] },
+        ],
+        gate: 'pending',
+        keyPoint: 'Policy as Code = 조직 규칙을 코드로 적고 배포 전에 자동 검증. CrossGuard 가 그 엔진.',
+        code: {
+          lang: 'bash',
+          filename: 'setup.sh',
+          lines: [
+            '# CrossGuard 는 "Policy Pack" 단위로 관리한다',
+            '# 정책 팩 하나 = 여러 개의 규칙(정책) 묶음',
+            '',
+            '$ mkdir compliance-policies && cd compliance-policies',
+            '$ pulumi policy new aws-typescript   # 템플릿 생성',
+            '',
+            '# 생성되는 구조',
+            '#   index.ts        ← 정책들을 정의하는 곳',
+            '#   PulumiPolicy.yaml',
+            '#   package.json',
+            '',
+            '# 스택에 정책 팩을 붙여서 preview 실행',
+            '$ pulumi preview --policy-pack ../compliance-policies',
+            '',
+            '# 앞으로 이 스택의 모든 배포는 정책 검사를 통과해야 한다.',
+            '# 규칙 예시:',
+            '#   1) S3 는 반드시 서버사이드 암호화',
+            '#   2) 모든 리소스에 team 태그 필수',
+            '#   3) EC2 인스턴스 타입은 승인된 목록만',
+          ],
+          highlight: [0, 1, 4, 12, 13],
+        },
+      },
+      {
+        title: 'Step 2. Policy Pack 작성 — validateResource',
+        desc: '정책은 언어(TypeScript/Python)로 짠다. 가장 흔한 형태가 validateResource — 리소스 하나하나를 받아 속성을 검사하고, 규칙을 어기면 reportViolation 을 호출한다. YAML DSL 이 아니라 진짜 코드라서 조건 분기, 정규식, 외부 데이터 조회까지 마음껏 쓴다. 여기서는 S3 암호화 필수와 team 태그 필수 두 규칙을 만든다. 아직 위반해도 배포는 막지 않는 상태(다음 step 에서 강도를 정한다).',
+        policies: [
+          { name: 's3-encryption-required', level: 'advisory', rule: 'S3 버킷 서버사이드 암호화 필수' },
+          { name: 'require-team-tag', level: 'advisory', rule: '모든 리소스에 team 태그 필수' },
+        ],
+        resources: [
+          { id: 'r1', type: 'aws:s3:BucketV2', name: 'user-uploads', checks: [
+            { policy: 's3-encryption-required', result: 'violate' },
+            { policy: 'require-team-tag', result: 'pass' },
+          ] },
+          { id: 'r2', type: 'aws:ec2:Instance', name: 'batch-worker', checks: [
+            { policy: 'require-team-tag', result: 'violate' },
+          ] },
+        ],
+        gate: 'pending',
+        keyPoint: 'validateResource(리소스 → 검사 → reportViolation). YAML 이 아니라 진짜 코드로 규칙 작성.',
+        code: {
+          lang: 'typescript',
+          filename: 'index.ts',
+          lines: [
+            'import { PolicyPack, validateResourceOfType } from "@pulumi/policy";',
+            'import * as aws from "@pulumi/aws";',
+            '',
+            'new PolicyPack("compliance-policies", {',
+            '  policies: [',
+            '    {',
+            '      name: "s3-encryption-required",',
+            '      description: "S3 버킷은 서버사이드 암호화가 켜져 있어야 한다",',
+            '      enforcementLevel: "advisory",',
+            '      // 특정 타입만 골라서 검사',
+            '      validateResource: validateResourceOfType(',
+            '        aws.s3.BucketServerSideEncryptionConfigurationV2,',
+            '        (cfg, args, reportViolation) => {',
+            '          if (!cfg.rules || cfg.rules.length === 0) {',
+            '            reportViolation("암호화 규칙이 설정되지 않았습니다.");',
+            '          }',
+            '        },',
+            '      ),',
+            '    },',
+            '    {',
+            '      name: "require-team-tag",',
+            '      description: "모든 리소스에 team 태그가 있어야 한다",',
+            '      enforcementLevel: "advisory",',
+            '      // 모든 리소스를 받아서 tags 를 검사',
+            '      validateResource: (args, reportViolation) => {',
+            '        const tags = args.props.tags;',
+            '        if (!tags || !tags["team"]) {',
+            '          reportViolation("team 태그가 없습니다. 소유 팀을 명시하세요.");',
+            '        }',
+            '      },',
+            '    },',
+            '  ],',
+            '});',
+          ],
+          highlight: [0, 3, 6, 8, 10, 11, 12, 13, 14, 15, 20, 25, 26, 27, 28, 29, 30],
+        },
+      },
+      {
+        title: 'Step 3. enforcement level — advisory 경고 vs mandatory 차단',
+        desc: '규칙마다 강도를 정한다. advisory 는 위반해도 경고만 찍고 배포는 진행된다 — 새 규칙을 도입할 때 팀에 예고편으로 돌리기 좋다. mandatory 는 위반이 하나라도 있으면 preview/up 을 실패시켜 배포를 막는다. 보통 보안·컴플라이언스처럼 타협 불가한 규칙에 mandatory 를 건다. 여기서 s3-encryption 을 mandatory 로 승격하면, 암호화 없는 버킷은 이제 배포 자체가 불가능해진다.',
+        policies: [
+          { name: 's3-encryption-required', level: 'mandatory', rule: 'S3 암호화 필수 (차단)' },
+          { name: 'require-team-tag', level: 'advisory', rule: 'team 태그 필수 (경고)' },
+          { name: 'allowed-instance-types', level: 'mandatory', rule: '승인된 인스턴스 타입만 (차단)' },
+        ],
+        resources: [
+          { id: 'r1', type: 'aws:s3:BucketV2', name: 'user-uploads', checks: [
+            { policy: 's3-encryption-required', result: 'violate' },
+            { policy: 'require-team-tag', result: 'pass' },
+          ] },
+          { id: 'r2', type: 'aws:ec2:Instance', name: 'batch-worker', checks: [
+            { policy: 'require-team-tag', result: 'violate' },
+            { policy: 'allowed-instance-types', result: 'pass' },
+          ] },
+        ],
+        gate: 'pending',
+        keyPoint: 'advisory = 경고 후 진행, mandatory = 위반 시 배포 차단. 보안 규칙은 mandatory.',
+        code: {
+          lang: 'typescript',
+          filename: 'index.ts',
+          lines: [
+            '// enforcementLevel 로 강도를 조절한다',
+            '//   "advisory"  → 위반해도 경고만, 배포 진행',
+            '//   "mandatory" → 위반 시 preview/up 실패, 배포 차단',
+            '//   "disabled"  → 이 규칙 잠시 끄기',
+            '',
+            'const policies = [',
+            '  {',
+            '    name: "s3-encryption-required",',
+            '    enforcementLevel: "mandatory",   // ← 경고에서 차단으로 승격',
+            '    validateResource: validateResourceOfType(',
+            '      aws.s3.BucketServerSideEncryptionConfigurationV2,',
+            '      (cfg, args, reportViolation) => {',
+            '        if (!cfg.rules || cfg.rules.length === 0) {',
+            '          reportViolation("암호화 필수 — 배포를 막습니다.");',
+            '        }',
+            '      },',
+            '    ),',
+            '  },',
+            '  {',
+            '    name: "allowed-instance-types",',
+            '    enforcementLevel: "mandatory",',
+            '    validateResource: validateResourceOfType(',
+            '      aws.ec2.Instance,',
+            '      (instance, args, reportViolation) => {',
+            '        const allowed = ["t3.micro", "t3.small", "t3.medium"];',
+            '        if (!allowed.includes(instance.instanceType ?? "")) {',
+            '          reportViolation(',
+            '            `허용되지 않은 타입: ${instance.instanceType}. ` +',
+            '            `승인 목록: ${allowed.join(", ")}`,',
+            '          );',
+            '        }',
+            '      },',
+            '    ),',
+            '  },',
+            '];',
+          ],
+          highlight: [0, 1, 2, 8, 20, 24, 25, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 4. pulumi preview/up 이 정책 위반이면 차단한다',
+        desc: 'preview 를 돌리면 CrossGuard 가 모든 리소스를 정책 팩에 통과시킨다. advisory 위반은 노란 경고로 남기고 계속 진행하지만, mandatory 위반이 하나라도 있으면 preview 가 실패로 끝나고 up 이 거부된다. CI 파이프라인에서 이 exit code 를 받으면 머지/배포가 자동으로 멈춘다. 개발자는 로컬에서 바로 같은 검사를 돌려 미리 고칠 수 있어, 사고가 프로덕션이 아니라 IDE 에서 잡힌다.',
+        policies: [
+          { name: 's3-encryption-required', level: 'mandatory', rule: 'S3 암호화 필수 (차단)' },
+          { name: 'require-team-tag', level: 'advisory', rule: 'team 태그 필수 (경고)' },
+          { name: 'allowed-instance-types', level: 'mandatory', rule: '승인된 인스턴스 타입만 (차단)' },
+        ],
+        resources: [
+          { id: 'r1', type: 'aws:s3:BucketV2', name: 'user-uploads', checks: [
+            { policy: 's3-encryption-required', result: 'violate' },
+            { policy: 'require-team-tag', result: 'pass' },
+          ] },
+          { id: 'r2', type: 'aws:ec2:Instance', name: 'batch-worker', checks: [
+            { policy: 'require-team-tag', result: 'violate' },
+            { policy: 'allowed-instance-types', result: 'pass' },
+          ] },
+        ],
+        gate: 'blocked',
+        keyPoint: 'mandatory 위반 1건이라도 있으면 preview/up 실패 → CI 가 배포를 멈춘다.',
+        code: {
+          lang: 'bash',
+          filename: 'preview-blocked.sh',
+          lines: [
+            '$ pulumi preview --policy-pack ../compliance-policies',
+            '',
+            'Previewing update (prod):',
+            '',
+            '     Type                     Name           Plan',
+            ' +   aws:s3:BucketV2          user-uploads   create',
+            ' +   aws:ec2:Instance         batch-worker   create',
+            '',
+            'Policy Violations:',
+            '',
+            '    [mandatory]  s3-encryption-required  (aws:s3:BucketV2: user-uploads)',
+            '      암호화 필수 — 배포를 막습니다.',
+            '',
+            '    [advisory]   require-team-tag  (aws:ec2:Instance: batch-worker)',
+            '      team 태그가 없습니다. 소유 팀을 명시하세요.',
+            '',
+            'error: preview failed: 1 mandatory policy violation',
+            '',
+            '# advisory 위반(태그)은 경고로 남고 넘어가지만,',
+            '# mandatory 위반(암호화)이 있어서 preview 가 실패한다.',
+            '# → pulumi up 도 거부된다. CI 는 이 exit code 로 배포 중단.',
+            '',
+            '$ echo $?',
+            '1                # 0 이 아니므로 파이프라인이 멈춘다',
+          ],
+          highlight: [8, 10, 11, 13, 14, 16, 22, 23],
+        },
+      },
+      {
+        title: 'Step 5. 정책 팩 배포·재사용, 그리고 Transformation·OPA 와의 차이',
+        desc: '규칙을 고쳐 암호화를 켜면 preview 가 통과하고 게이트가 열린다. 잘 만든 정책 팩은 `pulumi policy publish` 로 조직 전체에 배포해, 모든 스택이 같은 가드레일을 공유하게 한다. 여기서 개념을 정리하자 — Transformation 은 리소스를 조용히 바꾸는 도구(예: 태그 자동 주입)이고, CrossGuard 는 검증·차단만 한다(값을 바꾸지 않음). OPA/Rego 는 범용 정책 엔진이지만, CrossGuard 는 Pulumi 리소스 그래프를 그대로 언어로 검사한다는 게 강점이다. 보안·컴플라이언스 가드레일 자동화의 표준 자리다.',
+        policies: [
+          { name: 's3-encryption-required', level: 'mandatory', rule: 'S3 암호화 필수 (통과)' },
+          { name: 'require-team-tag', level: 'mandatory', rule: 'team 태그 필수 (통과)' },
+          { name: 'allowed-instance-types', level: 'mandatory', rule: '승인된 인스턴스 타입만 (통과)' },
+        ],
+        resources: [
+          { id: 'r1', type: 'aws:s3:BucketV2', name: 'user-uploads', checks: [
+            { policy: 's3-encryption-required', result: 'pass' },
+            { policy: 'require-team-tag', result: 'pass' },
+          ] },
+          { id: 'r2', type: 'aws:ec2:Instance', name: 'batch-worker', checks: [
+            { policy: 'require-team-tag', result: 'pass' },
+            { policy: 'allowed-instance-types', result: 'pass' },
+          ] },
+        ],
+        gate: 'open',
+        keyPoint: '정책은 검증·차단(값 안 바꿈), Transformation 은 변경. publish 로 조직 전체 재사용.',
+        code: {
+          lang: 'bash',
+          filename: 'publish.sh',
+          lines: [
+            '# 1) 리소스를 규칙에 맞게 고친 뒤 다시 preview',
+            '$ pulumi preview --policy-pack ../compliance-policies',
+            '',
+            '     Type                     Name           Plan',
+            ' +   aws:s3:BucketV2          user-uploads   create',
+            ' +   aws:ec2:Instance         batch-worker   create',
+            '',
+            'Policy Packs run: compliance-policies (all passed)',
+            '# 위반 0건 → 게이트 open, 배포 진행 가능',
+            '',
+            '# 2) 조직 전체에 정책 팩 배포 (Pulumi Cloud)',
+            '$ pulumi policy publish my-org',
+            '$ pulumi policy enable  my-org/compliance-policies latest',
+            '# 이제 조직의 모든 스택이 같은 가드레일을 강제로 통과',
+            '',
+            '# ─ 개념 정리 ────────────────────────────────',
+            '#  CrossGuard      : 검증·차단만 (값을 바꾸지 않음)',
+            '#  Transformation  : 리소스를 조용히 변경 (예: 태그 주입)',
+            '#  OPA / Rego      : 범용 정책 엔진 (별도 DSL)',
+            '#  → CrossGuard 는 Pulumi 그래프를 TS/Python 으로 직접 검사',
+            '#  실무: 컴플라이언스·보안 가드레일 자동화의 표준',
+          ],
+          highlight: [7, 8, 11, 12, 13, 16, 17, 18, 19, 20],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — purple #8A3391 톤
+    //   리소스가 정책 게이트를 통과/위반하는 흐름
+    // ─────────────────────────────────────────────────────
+    const LEVEL_STYLE = {
+      advisory:  { badge: 'bg-amber-200 text-amber-800', label: 'advisory · 경고' },
+      mandatory: { badge: 'bg-red-200 text-red-800',     label: 'mandatory · 차단' },
+    };
+
+    const GATE_STYLE = {
+      pending: { text: '검사 대기', cls: 'bg-slate-100 border-slate-300 text-slate-600', icon: '⏳' },
+      open:    { text: '게이트 OPEN — 배포 허용', cls: 'bg-emerald-50 border-emerald-400 text-emerald-800', icon: '✅' },
+      blocked: { text: '게이트 BLOCKED — 배포 차단', cls: 'bg-red-50 border-red-400 text-red-800', icon: '⛔' },
+    };
+
+    function PolicyList({ policies }) {
+      if (!policies || policies.length === 0) {
+        return (
+          <div className="rounded-lg border border-dashed border-purple-300 bg-purple-50/40 p-3 text-center text-xs text-purple-700">
+            아직 정책 팩 없음 — 다음 step 에서 규칙 작성
+          </div>
+        );
+      }
+      return (
+        <div className="space-y-1.5">
+          {policies.map((p) => {
+            const lv = LEVEL_STYLE[p.level] || LEVEL_STYLE.advisory;
+            return (
+              <div key={p.name} className="rounded-lg border border-purple-200 bg-white px-2.5 py-1.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-mono font-bold text-purple-800">{p.name}</span>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ml-auto ${lv.badge}`}>{lv.label}</span>
+                </div>
+                <div className="text-[10px] text-slate-500 mt-0.5">{p.rule}</div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function ResourceChecks({ resources, policies }) {
+      const levelOf = (name) => {
+        const p = (policies || []).find((x) => x.name === name);
+        return p ? p.level : 'advisory';
+      };
+      return (
+        <div className="space-y-2">
+          {resources.map((r) => {
+            const hasViolation = r.checks.some((c) => c.result === 'violate');
+            const hasMandViolation = r.checks.some(
+              (c) => c.result === 'violate' && levelOf(c.policy) === 'mandatory'
+            );
+            const borderCls = hasMandViolation
+              ? 'border-red-400 bg-red-50'
+              : hasViolation
+              ? 'border-amber-400 bg-amber-50'
+              : r.checks.length > 0
+              ? 'border-emerald-300 bg-emerald-50'
+              : 'border-slate-200 bg-white';
+            return (
+              <div key={r.id} className={`rounded-lg border-2 ${borderCls} p-2.5`}>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-200 text-purple-800 font-mono">{r.type}</span>
+                  <span className="text-[11px] font-bold text-slate-700">{r.name}</span>
+                  {hasMandViolation && <span className="ml-auto text-[10px] font-bold text-red-700">⛔ 차단</span>}
+                  {!hasMandViolation && hasViolation && <span className="ml-auto text-[10px] font-bold text-amber-700">⚠ 경고</span>}
+                  {r.checks.length > 0 && !hasViolation && <span className="ml-auto text-[10px] font-bold text-emerald-700">✓ 통과</span>}
+                </div>
+                {r.checks.length === 0 ? (
+                  <div className="text-[10px] text-slate-400">검사 전</div>
+                ) : (
+                  <div className="space-y-0.5">
+                    {r.checks.map((c, i) => {
+                      const ok = c.result === 'pass';
+                      const mand = levelOf(c.policy) === 'mandatory';
+                      return (
+                        <div key={i} className="text-[10px] flex items-center gap-1.5">
+                          <span className={ok ? 'text-emerald-600' : mand ? 'text-red-600' : 'text-amber-600'}>
+                            {ok ? '✓' : mand ? '✕' : '!'}
+                          </span>
+                          <span className="font-mono text-slate-600">{c.policy}</span>
+                          <span className={`ml-auto text-[9px] px-1 rounded ${ok ? 'bg-emerald-100 text-emerald-700' : mand ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>
+                            {ok ? 'pass' : mand ? 'BLOCK' : 'warn'}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function DeployGate({ gate }) {
+      const g = GATE_STYLE[gate] || GATE_STYLE.pending;
+      return (
+        <div className={`mt-3 rounded-lg border-2 ${g.cls} px-3 py-2 flex items-center gap-2`}>
+          <span className="text-lg">{g.icon}</span>
+          <span className="text-xs font-bold">{g.text}</span>
+          <span className="ml-auto text-[10px] opacity-70">pulumi up</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-purple-200 bg-white p-4 h-full flex flex-col overflow-auto">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-purple-800">정책 게이트 라이브 뷰</h3>
+            <span className="text-[10px] text-slate-500">리소스 → 정책 검사 → 게이트</span>
+          </div>
+
+          <div className="text-[11px] font-bold text-purple-700 mb-1.5">활성 Policy Pack</div>
+          <PolicyList policies={state.policies} />
+
+          <div className="text-[11px] font-bold text-purple-700 mt-3 mb-1.5">검사 대상 리소스</div>
+          <ResourceChecks resources={state.resources} policies={state.policies} />
+
+          <DeployGate gate={state.gate} />
+
+          <div className="mt-3 text-xs text-purple-900 bg-purple-50 border border-purple-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(i);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-purple-500/15 border-l-2 border-purple-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-purple-50 to-fuchsia-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-purple-700 text-white font-bold">IV</span>
+              <div>
+                <h1 className="text-2xl font-bold text-purple-900">IV-2-1. CrossGuard — Policy as Code</h1>
+                <p className="text-sm text-purple-800/80">조직 규칙을 코드로 · validateResource · advisory 경고 vs mandatory 차단 · 배포 전 가드레일</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-purple-700 underline hover:no-underline" aria-label="챕터 목록으로">← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-purple-700' : 'bg-purple-200'}`}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl bg-purple-800 text-purple-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-purple-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-purple-300 bg-white text-purple-700 hover:bg-purple-50"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-purple-300 bg-white text-purple-700 hover:bg-purple-50 disabled:opacity-40"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-purple-800 text-white' : 'bg-purple-700 text-white hover:bg-purple-800'}`}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-purple-300 bg-white text-purple-700 hover:bg-purple-50 disabled:opacity-40"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-purple-700/60 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-purple-400 bg-white px-4 py-3 text-sm text-purple-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                CrossGuard 는 조직 규칙을 TypeScript/Python 코드로 적어 배포 전에 자동 검증하는 Policy as Code 엔진이다. validateResource 로 리소스를 검사하고, enforcementLevel 로 강도를 정한다 — advisory 는 경고만, mandatory 는 위반 시 preview/up 을 실패시켜 배포를 차단한다. Transformation 은 값을 바꾸는 도구이고 CrossGuard 는 검증·차단만 한다는 점, OPA/Rego 대신 Pulumi 그래프를 언어로 직접 검사한다는 점이 핵심 차이다. pulumi policy publish 로 조직 전체에 같은 가드레일을 배포해 컴플라이언스·보안을 자동화한다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['CrossGuard', 'Policy as Code', 'PolicyPack', 'validateResource', 'validateStack', 'advisory', 'mandatory', 'enforcementLevel', 'policy publish', 'vs Transformation', 'vs OPA'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-purple-100 text-purple-800 border border-purple-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs text-purple-700">
+              <a href="../index.html" className="underline hover:no-underline" aria-label="챕터 목록">← 목차</a>
+              <div className="flex gap-4">
+                <a href="./IV-1-2.html" className="underline hover:no-underline" aria-label="이전 챕터로">← 이전: IV-1-2</a>
+                <a href="./IV-2-2.html" className="underline hover:no-underline" aria-label="다음 챕터로">다음: IV-2-2 →</a>
+              </div>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
