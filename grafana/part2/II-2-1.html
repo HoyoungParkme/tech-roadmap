@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Grafana 학습 — II-2-1. SQL — Postgres / MySQL</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📊</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    .grafana-orange { color: #F46800; }
+    .bg-grafana-orange { background-color: #F46800; }
+    .border-grafana-orange { border-color: #F46800; }
+    .bg-grafana-soft { background-color: #FFF1E6; }
+    .text-grafana-deep { color: #B84F00; }
+    .hover-grafana:hover { background-color: #B84F00; }
+    @keyframes flowPulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+    .flow-pulse { animation: flowPulse 1.4s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    II-2-1. SQL — Postgres / MySQL — fastapi v1 패턴
+    학습 목표: SQL 데이터소스로 관계형 DB(주문/매출)를 대시보드로. time 컬럼→time series,
+              매크로($__timeFilter·$__timeGroup) 치환, GROUP BY 집계, 변수 필터, 읽기전용·인덱스.
+    핵심 비유: "SQL 한 줄 = 패널 하나" — DB 테이블 → Grafana 패널로 흐르는 파이프라인
+    패턴: 좌(LiveDataPane: SQL→DB→패널 렌더 파이프라인 시각화) / 우(VSCode CodeViewer: sql)
+    색상: #F46800 (Grafana brand orange)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. SQL 데이터소스 연결 — "읽기 전용 계정으로"',
+        desc: 'Grafana는 Prometheus·Loki뿐 아니라 Postgres·MySQL 같은 관계형 DB를 그대로 데이터소스로 붙일 수 있다. 이미 서비스 DB에 쌓여 있는 주문·매출·회원 데이터를 별도 파이프라인 없이 대시보드로 만들 수 있어서 실무에서 가장 빠른 시작점이다. 다만 반드시 읽기 전용(SELECT only) 계정을 써야 한다 — 대시보드가 실수로 UPDATE·DELETE를 날릴 위험을 계정 권한 수준에서 원천 차단하기 때문이다. 운영 사고의 상당수가 "분석용인데 쓰기 권한까지 준 계정"에서 나온다.',
+        pane: {
+          ds: 'PostgreSQL',
+          sql: ['SELECT 1  -- 연결 테스트', '-- 계정: grafana_ro (읽기 전용)'],
+          macros: [],
+          columns: ['?column?'],
+          rows: [['1']],
+          panel: { type: 'stat', title: 'Connection', value: 'OK', unit: '' },
+          stage: 'connect',
+        },
+        keyPoint: '관계형 DB를 바로 데이터소스로. 반드시 읽기 전용(SELECT only) 계정 사용.',
+        code: {
+          lang: 'sql',
+          filename: 'setup_readonly.sql — 읽기 전용 계정',
+          lines: [
+            '-- Grafana 전용 읽기 전용 계정 (PostgreSQL)',
+            '-- 대시보드가 절대 쓰기를 못 하도록 권한으로 막는다',
+            'CREATE ROLE grafana_ro WITH LOGIN PASSWORD :env_pw;',
+            '',
+            '-- 스키마 조회 + SELECT 만 허용',
+            'GRANT CONNECT ON DATABASE shop TO grafana_ro;',
+            'GRANT USAGE  ON SCHEMA public TO grafana_ro;',
+            'GRANT SELECT  ON ALL TABLES IN SCHEMA public TO grafana_ro;',
+            '',
+            '-- 앞으로 새로 생기는 테이블도 자동으로 SELECT 허용',
+            'ALTER DEFAULT PRIVILEGES IN SCHEMA public',
+            '  GRANT SELECT ON TABLES TO grafana_ro;',
+            '',
+            '-- (MySQL 이라면)',
+            "-- CREATE USER 'grafana_ro'@'%' IDENTIFIED BY '***';",
+            "-- GRANT SELECT ON shop.* TO 'grafana_ro'@'%';",
+            '',
+            '-- Grafana UI: Connections > Data sources > PostgreSQL',
+            '--   Host      db.internal:5432',
+            '--   Database  shop',
+            '--   User      grafana_ro   (쓰기 권한 없음)',
+            '--   TLS/SSL   require       (사내망이라도 권장)',
+          ],
+          highlight: [2, 5, 6, 7, 9, 10, 11],
+        },
+      },
+      {
+        title: 'Step 2. time 컬럼 → time series — "이름이 time 이면 시계열"',
+        desc: 'Grafana의 SQL 데이터소스는 규칙이 단순하다 — 결과에 time 이라는 이름의 컬럼이 있으면 그 값을 x축(시간)으로 삼아 시계열 그래프를 그린다. 그래서 timestamp 컬럼을 반드시 AS time 으로 별칭을 붙여야 한다. 별칭을 빠뜨리면 Grafana가 시간축을 못 찾아 "no time column" 에러가 나거나 테이블로만 렌더된다. 나머지 숫자 컬럼들은 각각 하나의 선(series)이 된다.',
+        pane: {
+          ds: 'PostgreSQL',
+          sql: ['SELECT', '  created_at AS "time",', '  amount', 'FROM orders', 'ORDER BY 1'],
+          macros: [],
+          columns: ['time', 'amount'],
+          rows: [
+            ['09:00', '120'],
+            ['09:05', '180'],
+            ['09:10', '150'],
+            ['09:15', '240'],
+          ],
+          panel: { type: 'timeseries', title: '주문 금액', series: [120, 180, 150, 240, 210, 300, 260], unit: '원' },
+          stage: 'render',
+        },
+        keyPoint: 'time 이라는 이름의 컬럼 = x축. timestamp 는 반드시 AS time 별칭.',
+        code: {
+          lang: 'sql',
+          filename: 'timeseries_basic.sql — 첫 시계열',
+          lines: [
+            '-- 규칙 1: time 컬럼이 있으면 시계열이 된다',
+            '-- 규칙 2: 나머지 숫자 컬럼은 각각 하나의 선(series)',
+            'SELECT',
+            '  created_at  AS "time",   -- 반드시 time 별칭',
+            '  amount                    -- 값 = 선 하나',
+            'FROM orders',
+            'WHERE created_at >= NOW() - INTERVAL \'1 hour\'',
+            'ORDER BY created_at;',
+            '',
+            '-- time 별칭을 빠뜨리면?',
+            '--   Grafana: "no time column found"',
+            '--   또는 테이블 패널로만 표시됨',
+            '',
+            '-- 여러 선을 그리려면 숫자 컬럼을 더 SELECT',
+            '--   SELECT created_at AS "time",',
+            '--          revenue, refund   -- 선 2개',
+            '--   FROM orders ...',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7],
+        },
+      },
+      {
+        title: 'Step 3. 매크로 — "$__timeFilter 가 대시보드 시간과 이어준다"',
+        desc: 'SQL을 그대로 쓰면 대시보드 우상단의 시간 범위(last 1h 등)와 쿼리가 따로 논다. Grafana 매크로가 이 둘을 연결한다 — $__timeFilter(col) 은 실행 시점에 col BETWEEN 시작 AND 끝 으로 자동 치환되고, $__timeGroup(col, 5m) 은 5분 단위 버킷으로 시간을 묶어준다. 덕분에 사용자가 시간 범위나 새로고침을 바꾸면 SQL이 저절로 따라간다. 매크로를 안 쓰고 시간을 하드코딩하면 대시보드 시간 선택기가 무력화되니 반드시 매크로를 써야 한다.',
+        pane: {
+          ds: 'PostgreSQL',
+          sql: ['SELECT', '  $__timeGroup(created_at, \'5m\') AS "time",', '  count(*) AS orders', 'FROM orders', 'WHERE $__timeFilter(created_at)', 'GROUP BY 1 ORDER BY 1'],
+          macros: [
+            { from: '$__timeFilter(created_at)', to: "created_at BETWEEN '09:00' AND '10:00'" },
+            { from: "$__timeGroup(created_at,'5m')", to: "date_bin('5m', created_at, ...)" },
+          ],
+          columns: ['time', 'orders'],
+          rows: [
+            ['09:00', '8'],
+            ['09:05', '11'],
+            ['09:10', '7'],
+            ['09:15', '14'],
+          ],
+          panel: { type: 'timeseries', title: '5분당 주문 수', series: [8, 11, 7, 14, 12, 18, 15], unit: '건' },
+          stage: 'macro',
+        },
+        keyPoint: '$__timeFilter = 시간 WHERE 자동 치환, $__timeGroup = 시간 버킷. 시간 하드코딩 금지.',
+        code: {
+          lang: 'sql',
+          filename: 'macros.sql — 대시보드 시간과 연결',
+          lines: [
+            '-- 매크로는 실행 직전 Grafana 가 실제 SQL 로 치환한다',
+            'SELECT',
+            "  $__timeGroup(created_at, '5m') AS \"time\",  -- 5분 버킷",
+            '  count(*) AS orders',
+            'FROM orders',
+            'WHERE $__timeFilter(created_at)   -- 대시보드 시간 범위',
+            'GROUP BY 1',
+            'ORDER BY 1;',
+            '',
+            '-- 치환 결과 (last 1h 를 선택했다면)',
+            '--   $__timeFilter(created_at)',
+            "--     => created_at BETWEEN '2026-08-11 09:00'",
+            "--                       AND '2026-08-11 10:00'",
+            '--   $__timeGroup(created_at, 5m)',
+            "--     => date_bin('5 min', created_at, ...)",
+            '',
+            '-- 안티패턴: 시간을 직접 박으면 선택기가 죽는다',
+            "--   WHERE created_at >= '2026-08-11 09:00'  -- 금지",
+          ],
+          highlight: [2, 3, 5, 6, 7, 8],
+        },
+      },
+      {
+        title: 'Step 4. GROUP BY 집계 — "주문 로그를 비즈니스 지표로"',
+        desc: '원본 주문 로그 한 줄씩은 대시보드에 쓸모가 없다 — 의미는 집계에서 나온다. GROUP BY 로 시간·카테고리별로 묶고 sum·count·avg 를 얹으면 그때 매출·주문 수·객단가 같은 비즈니스 지표가 된다. 시계열 패널은 $__timeGroup 으로 시간축 집계를, 테이블/스탯 패널은 카테고리별 집계를 쓰는 게 실무 조합이다. 여기서 핵심은 "무거운 원본을 다 긁지 말고 DB가 집계까지 끝낸 작은 결과만 받아오는 것" — 네트워크와 브라우저 부담이 크게 줄어든다.',
+        pane: {
+          ds: 'PostgreSQL',
+          sql: ['SELECT', '  category,', '  sum(amount) AS revenue,', '  count(*)    AS orders', 'FROM orders', 'WHERE $__timeFilter(created_at)', 'GROUP BY category', 'ORDER BY revenue DESC'],
+          macros: [{ from: '$__timeFilter(created_at)', to: "created_at BETWEEN '09:00' AND '10:00'" }],
+          columns: ['category', 'revenue', 'orders'],
+          rows: [
+            ['식품', '1,240,000', '312'],
+            ['전자', '980,000', '54'],
+            ['패션', '620,000', '188'],
+          ],
+          panel: { type: 'table', title: '카테고리별 매출', unit: '' },
+          stage: 'aggregate',
+        },
+        keyPoint: 'GROUP BY + sum/count 로 비즈니스 지표. 집계는 DB에서 끝내고 작은 결과만 받는다.',
+        code: {
+          lang: 'sql',
+          filename: 'business_metrics.sql — 매출·주문 집계',
+          lines: [
+            '-- 카테고리별 매출/주문 (테이블·바 차트용)',
+            'SELECT',
+            '  category,',
+            '  sum(amount)          AS revenue,   -- 매출',
+            '  count(*)             AS orders,    -- 주문 수',
+            '  round(avg(amount))   AS aov        -- 객단가',
+            'FROM orders',
+            'WHERE $__timeFilter(created_at)',
+            '  AND status = \'paid\'                -- 결제 완료만',
+            'GROUP BY category',
+            'ORDER BY revenue DESC;',
+            '',
+            '-- 시간축 매출 추이 (시계열 패널용)',
+            "-- SELECT $__timeGroup(created_at, '1h') AS \"time\",",
+            '--        sum(amount) AS revenue',
+            '-- FROM orders',
+            '-- WHERE $__timeFilter(created_at) AND status = \'paid\'',
+            '-- GROUP BY 1 ORDER BY 1;',
+          ],
+          highlight: [1, 2, 3, 4, 5, 7, 8, 9, 10, 11],
+        },
+      },
+      {
+        title: 'Step 5. 변수 필터 + 성능 — "인덱스와 함정"',
+        desc: '마지막은 실전 운영 품질이다. 대시보드 변수 $region 을 WHERE region IN ($region) 으로 받으면 사용자가 드롭다운으로 지역을 골라 같은 패널을 재사용한다 — 변수는 반드시 매크로/따옴표 처리(${region:sqlstring})로 SQL 인젝션을 막아야 한다. 성능은 인덱스가 좌우한다 — time 필터가 걸리는 created_at 에 인덱스가 없으면 매 새로고침마다 풀 스캔이 돌아 운영 DB에 부하를 준다. 흔한 사고는 무거운 쿼리를 30초 새로고침으로 프로덕션 DB에 꽂아 버리는 것 — 읽기 전용 리플리카를 붙이고, EXPLAIN 으로 인덱스 사용을 확인하는 습관이 필요하다.',
+        pane: {
+          ds: 'PostgreSQL',
+          sql: ['SELECT $__timeGroup(created_at,\'1h\') AS "time",', '  sum(amount) AS revenue', 'FROM orders', 'WHERE $__timeFilter(created_at)', '  AND region IN (${region:sqlstring})', 'GROUP BY 1 ORDER BY 1'],
+          macros: [{ from: '${region}', to: "'seoul','busan'" }],
+          columns: ['time', 'revenue'],
+          rows: [
+            ['09:00', '820,000'],
+            ['10:00', '910,000'],
+            ['11:00', '1,050,000'],
+          ],
+          panel: { type: 'timeseries', title: '지역별 매출 추이', series: [820, 910, 1050, 990, 1120, 1230], unit: '천원' },
+          stage: 'variable',
+        },
+        summary: {
+          title: 'SQL 데이터소스 5가지 핵심',
+          points: [
+            '읽기 전용(SELECT only) 계정 — 쓰기 사고를 권한으로 차단',
+            'time 별칭 컬럼 = 시계열 x축, 숫자 컬럼 = 선',
+            '$__timeFilter·$__timeGroup 로 대시보드 시간과 연결',
+            'GROUP BY 집계는 DB에서 끝내 작은 결과만 받기',
+            '변수는 sqlstring 처리, created_at 인덱스로 풀스캔 방지',
+          ],
+        },
+        keyPoint: '변수 IN (${region:sqlstring}) 로 필터·인젝션 방지, created_at 인덱스로 성능 확보.',
+        code: {
+          lang: 'sql',
+          filename: 'variable_and_index.sql — 변수·성능',
+          lines: [
+            '-- 대시보드 변수로 필터 (드롭다운 재사용)',
+            'SELECT',
+            "  $__timeGroup(created_at, '1h') AS \"time\",",
+            '  sum(amount) AS revenue',
+            'FROM orders',
+            'WHERE $__timeFilter(created_at)',
+            '  AND region IN (${region:sqlstring})  -- 인젝션 방지',
+            'GROUP BY 1 ORDER BY 1;',
+            '',
+            '-- 성능: 시간 필터 컬럼에 인덱스는 필수',
+            'CREATE INDEX IF NOT EXISTS idx_orders_created',
+            '  ON orders (created_at);',
+            '',
+            '-- 인덱스 사용 확인',
+            'EXPLAIN ANALYZE',
+            'SELECT count(*) FROM orders',
+            'WHERE created_at >= NOW() - INTERVAL \'1 hour\';',
+            '--   Index Scan 이면 OK, Seq Scan 이면 위험',
+            '',
+            '-- 함정 정리',
+            '--   1) 무거운 쿼리 + 30s refresh = 프로덕션 DB 부하',
+            '--      => 읽기 전용 리플리카에 연결',
+            '--   2) 변수 원문 삽입 = SQL 인젝션 => sqlstring 처리',
+            '--   3) time 별칭 누락 = no time column',
+          ],
+          highlight: [6, 7, 10, 11, 12, 14, 15, 16, 17],
+        },
+      },
+    ];
+
+    // ── 우측 패널에 렌더될 미니 시계열
+    function MiniSparkline({ series }) {
+      const data = series && series.length ? series : [1, 1];
+      const W = 220, H = 60;
+      const max = Math.max(...data) * 1.1 || 1;
+      const min = Math.min(...data) * 0.9;
+      const span = max - min || 1;
+      const pts = data
+        .map((v, i) => `${(i / (data.length - 1)) * W},${H - ((v - min) / span) * H}`)
+        .join(' ');
+      const area = `0,${H} ${pts} ${W},${H}`;
+      return (
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full" preserveAspectRatio="none">
+          <polygon points={area} fill="#F46800" opacity="0.12" />
+          <polyline points={pts} fill="none" stroke="#F46800" strokeWidth="2" />
+        </svg>
+      );
+    }
+
+    function RenderedPanel({ panel }) {
+      return (
+        <div className="rounded border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div className="px-2 py-1 border-b border-slate-200 bg-slate-50 flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-grafana-orange"></span>
+            <span className="text-[10px] font-bold text-slate-700">{panel.title}</span>
+            <span className="ml-auto text-[8px] text-slate-400 font-mono">{panel.type}</span>
+          </div>
+          <div className="p-2">
+            {panel.type === 'timeseries' && (
+              <div className="h-16">
+                <MiniSparkline series={panel.series} />
+              </div>
+            )}
+            {panel.type === 'stat' && (
+              <div className="h-16 flex items-center justify-center">
+                <span className="text-2xl font-bold font-mono grafana-orange">{panel.value}</span>
+              </div>
+            )}
+            {panel.type === 'table' && (
+              <div className="text-[9px] text-slate-500 font-mono text-center py-4">
+                표 패널 · 아래 결과 그대로 표시
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── 좌측: SQL → DB → 패널 파이프라인 시각화
+    function LiveDataPane({ step }) {
+      const p = step.pane;
+      return (
+        <div className="rounded-xl border border-slate-200 bg-white overflow-hidden shadow-sm h-full flex flex-col">
+          {/* Grafana 상단 헤더바 */}
+          <div className="bg-slate-900 px-3 py-2 flex items-center gap-2 border-b border-slate-700">
+            <span className="text-base">📊</span>
+            <span className="text-xs font-bold" style={{ color: '#F46800' }}>Grafana</span>
+            <span className="text-slate-500">/</span>
+            <span className="text-xs text-slate-300 font-mono">Explore · {p.ds}</span>
+            <span className="ml-auto text-[10px] text-slate-400 font-mono">🐘 {p.ds}</span>
+          </div>
+
+          <div className="flex-1 p-3 bg-slate-100 space-y-2 overflow-auto">
+            {/* 1) SQL 편집기 */}
+            <div className="rounded-lg border border-slate-700 bg-slate-900 overflow-hidden">
+              <div className="px-2 py-1 bg-slate-800 text-[10px] text-slate-400 font-mono flex items-center gap-2">
+                <span className="grafana-orange">SQL</span>
+                <span>Query editor</span>
+                <span className="ml-auto text-slate-500">refId A</span>
+              </div>
+              <div className="p-2 font-mono text-[10.5px] leading-5 text-slate-200 whitespace-pre-wrap break-words">
+                {p.sql.map((line, i) => (
+                  <div key={i}>
+                    {line.split(/(\$__\w+|\$\{[^}]+\}|\$\w+)/).map((seg, j) =>
+                      /^\$/.test(seg) ? (
+                        <span key={j} className="px-1 rounded bg-grafana-soft text-grafana-deep font-bold">{seg}</span>
+                      ) : (
+                        <span key={j}>{seg}</span>
+                      )
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* 2) 매크로 치환 */}
+            {p.macros.length > 0 && (
+              <div className="rounded-lg border border-orange-200 bg-grafana-soft p-2 space-y-1">
+                <div className="text-[10px] font-bold text-grafana-deep">🔁 실행 직전 매크로 치환</div>
+                {p.macros.map((m, i) => (
+                  <div key={i} className="flex items-center gap-1.5 text-[10px] font-mono flex-wrap">
+                    <span className="px-1 rounded bg-white text-grafana-deep border border-orange-200">{m.from}</span>
+                    <span className="grafana-orange font-bold">→</span>
+                    <span className="px-1 rounded bg-white text-slate-600 border border-slate-200">{m.to}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* 실행 화살표 */}
+            <div className="flex items-center justify-center gap-2 text-[10px] text-slate-500">
+              <span className="flow-pulse grafana-orange text-sm">↓</span>
+              <span className="font-mono">쿼리 실행 → {p.ds}</span>
+            </div>
+
+            {/* 3) DB 결과 테이블 */}
+            <div className="rounded-lg border border-slate-300 bg-white overflow-hidden">
+              <div className="px-2 py-1 bg-slate-50 text-[10px] font-bold text-slate-600 border-b border-slate-200">
+                🗄️ {p.ds} 결과셋 (result set)
+              </div>
+              <table className="w-full text-[10px] font-mono">
+                <thead>
+                  <tr className="bg-slate-100 text-slate-500">
+                    {p.columns.map((c) => (
+                      <th key={c} className="px-2 py-1 text-left font-bold border-b border-slate-200">{c}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {p.rows.map((row, i) => (
+                    <tr key={i} className="border-b border-slate-100">
+                      {row.map((cell, j) => (
+                        <td key={j} className={`px-2 py-1 ${j === 0 ? 'text-slate-500' : 'text-slate-800 font-bold'}`}>{cell}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* 렌더 화살표 */}
+            <div className="flex items-center justify-center gap-2 text-[10px] text-slate-500">
+              <span className="flow-pulse grafana-orange text-sm">↓</span>
+              <span className="font-mono">Grafana 렌더</span>
+            </div>
+
+            {/* 4) 렌더된 패널 */}
+            <RenderedPanel panel={p.panel} />
+          </div>
+
+          {/* keyPoint */}
+          <div className="px-3 py-2 bg-grafana-soft border-t border-grafana-orange text-[11px] text-grafana-deep">
+            💡 {step.keyPoint}
+          </div>
+
+          {/* summary (Step 5) */}
+          {step.summary && (
+            <div className="px-3 pb-3 pt-2 bg-white border-t border-slate-200">
+              <div className="text-[11px] font-bold text-slate-700 mb-1.5">📋 {step.summary.title}</div>
+              <ul className="space-y-1">
+                {step.summary.points.map((pt, i) => (
+                  <li key={i} className="text-[11px] text-slate-700 flex gap-1.5">
+                    <span className="grafana-orange">▸</span><span>{pt}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode CodeViewer
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 -ml-3 pl-2' : ''}`} style={isHi ? { borderColor: '#F46800' } : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1 whitespace-pre" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3500);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-slate-50 px-4 py-5">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-4 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-grafana-orange text-white font-bold">G</span>
+              <div>
+                <div className="flex items-center gap-2 mb-0.5">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-grafana-soft text-grafana-deep border border-grafana-orange">Part II. 데이터 소스</span>
+                  <span className="text-[10px] font-mono text-slate-500">II-2-1</span>
+                </div>
+                <h1 className="text-xl font-bold text-slate-900">SQL — Postgres / MySQL</h1>
+                <p className="text-xs text-slate-600">관계형 DB 데이터를 대시보드로 — SQL 한 줄이 패널 하나가 된다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← Grafana 학습 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-3 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ backgroundColor: i <= stepIdx ? '#F46800' : '#fed7aa' }} />
+              ))}
+            </div>
+
+            {/* 단계 제목+설명 */}
+            <div className="mb-4 rounded-xl bg-grafana-orange text-white px-5 py-3 shadow">
+              <h2 className="text-base font-bold mb-1">{step.title}</h2>
+              <p className="text-xs leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((pp) => !pp); }} aria-label="자동 재생 시작/정지" aria-pressed={playing} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: playing ? '#B84F00' : '#F46800' }}>
+                {playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}
+              </button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-500 mt-2">키보드 ←/→ · 자동재생 3.5초/단계</div>
+
+            {isLast && (
+              <div className="mt-4 rounded-lg border-2 bg-white px-4 py-3 text-sm text-slate-900" style={{ borderColor: '#F46800' }}>
+                <div className="font-bold mb-1 grafana-orange">✅ 핵심 정리</div>
+                SQL 데이터소스는 이미 쌓인 관계형 데이터를 가장 빠르게 대시보드로 만드는 길이다. time 별칭 컬럼이 시계열 x축이 되고, $__timeFilter·$__timeGroup 매크로가 대시보드 시간과 SQL을 이어준다. GROUP BY 집계로 매출·주문 같은 비즈니스 지표를 만들되 집계는 DB에서 끝내 작은 결과만 받는다. 운영 품질은 읽기 전용 계정, 변수 sqlstring 처리, created_at 인덱스 이 세 가지가 좌우한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['PostgreSQL', 'MySQL', 'time column', '$__timeFilter', '$__timeGroup', 'GROUP BY', 'read-only', 'index', 'variable'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-grafana-soft text-grafana-deep border border-grafana-orange">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← Grafana 학습 목록</a>
+              <a href="./II-2-2.html" className="underline hover:no-underline" style={{ color: '#F46800' }}>II-2-2 Variable & Template →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

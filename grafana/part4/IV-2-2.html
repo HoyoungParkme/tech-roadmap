@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Grafana 학습 — IV-2-2. Dashboard provisioning — 대시보드 자동 배포</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📊</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    .grafana-orange { color: #F46800; }
+    .bg-grafana-orange { background-color: #F46800; }
+    .border-grafana-orange { border-color: #F46800; }
+    .bg-grafana-soft { background-color: #FFF1E6; }
+    .text-grafana-deep { color: #B84F00; }
+    .hover-grafana:hover { background-color: #B84F00; }
+    @keyframes scanPulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+    .scan-pulse { animation: scanPulse 1.2s ease-in-out infinite; }
+    @keyframes flowDash { to { stroke-dashoffset: -16; } }
+    .flow-dash { stroke-dasharray: 6 4; animation: flowDash 0.8s linear infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    IV-2-2. Dashboard provisioning — 대시보드 자동 배포 (fastapi v1 패턴)
+    학습 목표: provisioning provider가 지정 경로의 dashboard JSON을 주기적으로 스캔해
+               Grafana에 자동 등록/갱신하는 GitOps 흐름. providers(folder·path·updateIntervalSeconds),
+               foldersFromFilesStructure, allowUiUpdates, dashboard as code 종합.
+    패턴: 좌(LiveDataPane: Git → provider 스캔 → Grafana 폴더 GitOps 흐름 애니메이션)
+          우(VSCode CodeViewer: yaml provider 정의 + json dashboard)
+    색상: #F46800 (Grafana brand orange)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. providers 정의 — "어느 폴더를 감시할지 선언"',
+        desc: 'Provisioning은 대시보드를 UI에서 손으로 만드는 대신 파일로 선언해 자동 등록하는 방식이다. 시작점은 provisioning/dashboards/ 밑의 yaml 한 장 — 여기서 provider를 정의한다. name(식별), folder(Grafana에 만들 폴더명), options.path(스캔할 디렉터리), updateIntervalSeconds(몇 초마다 파일을 다시 읽을지)가 핵심 4종이다. 이 파일은 Grafana 부팅 시 읽히므로, 컨테이너/파드에 볼륨으로 마운트해 두면 배포와 동시에 감시가 켜진다.',
+        stage: 'config',
+        files: [],
+        scanning: false,
+        folders: [],
+        keyPoint: 'provider = { folder, path, updateIntervalSeconds } — 어느 경로를 몇 초마다 볼지 선언.',
+        code: {
+          lang: 'yaml',
+          filename: 'provisioning/dashboards/default.yaml',
+          lines: [
+            '# Grafana 부팅 시 자동으로 읽는 provisioning 설정',
+            '# 위치: /etc/grafana/provisioning/dashboards/*.yaml',
+            'apiVersion: 1',
+            '',
+            'providers:',
+            '  - name: platform-dashboards   # provider 식별 이름',
+            '    orgId: 1                     # 대상 조직(기본 1)',
+            '    type: file                   # 파일 기반 provider',
+            '',
+            '    # Grafana 안에 만들어질 폴더 이름',
+            '    folder: Platform',
+            '    folderUid: platform          # 폴더의 영구 식별자',
+            '',
+            '    options:',
+            '      # 이 디렉터리의 *.json 을 대시보드로 로드',
+            '      path: /etc/grafana/dashboards/platform',
+            '',
+            '    # 몇 초마다 path 를 다시 스캔할지 (0 = 재시작 때만)',
+            '    updateIntervalSeconds: 30',
+            '',
+            '# 운영 배치',
+            '# - 이 yaml 은 provisioning/dashboards/ 아래',
+            '# - 실제 대시보드 json 은 options.path 아래',
+            '# - 둘 다 컨테이너에 volume 으로 마운트',
+          ],
+          highlight: [5, 6, 10, 11, 15, 16, 19],
+        },
+      },
+      {
+        title: 'Step 2. 파일 자동 로드 — "path 를 스캔해 Grafana 에 등록"',
+        desc: 'provider가 켜지면 options.path 디렉터리를 updateIntervalSeconds 주기로 스캔한다. 발견한 *.json 은 각각 하나의 대시보드로 folder 아래에 등록된다 — UI에서 클릭 한 번 안 해도 보드가 생긴다. 파일을 고치면 다음 스캔 주기에 자동 반영되고, 파일을 지우면 대시보드도 사라진다(disableDeletion=false 기준). 즉 "파일이 곧 진실(source of truth)"이 된다. 대시보드 json의 uid는 파일 안에 박아 둬야 재스캔 때 같은 보드로 갱신된다 — uid가 없으면 매번 새 보드가 생겨 중복된다.',
+        stage: 'scan',
+        files: [
+          { name: 'service-health.json', uid: 'service-health', status: 'loaded' },
+          { name: 'latency-slo.json', uid: 'latency-slo', status: 'loaded' },
+        ],
+        scanning: true,
+        folders: [
+          { name: 'Platform', boards: ['Service Health', 'Latency SLO'] },
+        ],
+        keyPoint: 'path 의 *.json → folder 아래 자동 등록. 파일이 source of truth, uid 로 갱신 매칭.',
+        code: {
+          lang: 'json',
+          filename: '/etc/grafana/dashboards/platform/service-health.json',
+          lines: [
+            '{',
+            '  "uid": "service-health",   // 재스캔 갱신의 매칭 키(필수)',
+            '  "title": "Service Health",',
+            '  "tags": ["platform", "prod"],',
+            '  "schemaVersion": 39,',
+            '  "time": { "from": "now-1h", "to": "now" },',
+            '  "refresh": "30s",',
+            '',
+            '  "panels": [',
+            '    {',
+            '      "id": 1,',
+            '      "title": "p99 Latency",',
+            '      "type": "timeseries",',
+            '      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 },',
+            '      "datasource": { "type": "prometheus", "uid": "prom" },',
+            '      "targets": [{ "refId": "A",',
+            '        "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))"',
+            '      }]',
+            '    }',
+            '  ]',
+            '}',
+            '',
+            '// provider 가 이 파일을 발견하면',
+            '// 1) uid 로 기존 보드 조회',
+            '// 2) 있으면 갱신 / 없으면 신규 생성',
+            '// 3) folder(Platform) 아래 배치',
+            '// uid 를 빼먹으면 스캔마다 새 보드가 쌓인다(중복 사고 1위)',
+          ],
+          highlight: [2, 3, 22, 23, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 3. GitOps — "Git 이 배포, foldersFromFilesStructure 로 폴더 자동"',
+        desc: 'provisioning의 진짜 힘은 Git과 붙일 때 나온다. 대시보드 json을 Git 저장소에 두고, CI/CD가 그 파일을 options.path로 배치(volume·initContainer·git-sync)하면 "merge가 곧 배포"가 된다. 리뷰·롤백·이력이 전부 Git에 남는다. foldersFromFilesStructure: true 를 켜면 path 아래 하위 디렉터리 구조가 Grafana 폴더로 그대로 매핑된다 — payment/ 폴더의 json 은 Payment 폴더로, infra/ 는 Infra 폴더로. 팀별 디렉터리를 그대로 폴더 권한 경계로 쓸 수 있어 대규모 조직에서 특히 편하다.',
+        stage: 'gitops',
+        files: [
+          { name: 'payment/checkout.json', uid: 'pay-checkout', status: 'loaded' },
+          { name: 'payment/refund.json', uid: 'pay-refund', status: 'loaded' },
+          { name: 'infra/nodes.json', uid: 'infra-nodes', status: 'new' },
+        ],
+        scanning: true,
+        gitCommit: 'a1b9f2e  feat: add refund board',
+        folders: [
+          { name: 'Payment', boards: ['Checkout', 'Refund'] },
+          { name: 'Infra', boards: ['Nodes'] },
+        ],
+        keyPoint: 'Git merge = 배포. foldersFromFilesStructure → 디렉터리 구조가 곧 Grafana 폴더.',
+        code: {
+          lang: 'yaml',
+          filename: 'provisioning/dashboards/gitops.yaml',
+          lines: [
+            'apiVersion: 1',
+            '',
+            'providers:',
+            '  - name: gitops-dashboards',
+            '    orgId: 1',
+            '    type: file',
+            '    disableDeletion: false       # 파일 삭제 시 보드도 삭제',
+            '    updateIntervalSeconds: 20',
+            '',
+            '    options:',
+            '      # git-sync 가 저장소를 이 경로로 clone/pull',
+            '      path: /etc/grafana/dashboards/git',
+            '',
+            '      # 하위 디렉터리 구조 → Grafana 폴더로 자동 매핑',
+            '      #   git/payment/*.json  → "Payment" 폴더',
+            '      #   git/infra/*.json    → "Infra"   폴더',
+            '      foldersFromFilesStructure: true',
+            '',
+            '# GitOps 파이프라인',
+            '# 1) 개발자가 dashboard json 을 PR 로 올림',
+            '# 2) 리뷰 → main 머지 (변경 이력이 Git 에 남음)',
+            '# 3) git-sync sidecar 가 path 로 pull',
+            '# 4) provider 가 20초 내 재스캔 → 반영',
+            '# 5) 문제가 생기면 git revert 로 즉시 롤백',
+          ],
+          highlight: [7, 14, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 4. allowUiUpdates — "파일 vs UI 편집 충돌"',
+        desc: 'Provisioning의 최대 함정은 UI 편집과 파일의 충돌이다. allowUiUpdates: false(기본)면 provisioned 보드는 UI에서 Save가 막힌다 — "This dashboard is provisioned" 경고가 뜨고, 저장을 눌러도 다음 스캔 때 파일 내용으로 덮여 편집이 날아간다. 운영자가 급히 UI에서 고쳤다가 20초 뒤 원복돼 당황하는 사고가 흔하다. allowUiUpdates: true 로 열면 UI 편집이 파일보다 우선해 유지되지만, 이번엔 파일(Git)과 실제 보드가 어긋나 "진실이 둘"이 된다. 원칙은 하나만 진실로 두는 것 — GitOps라면 false로 잠그고 모든 변경을 PR로 몰아라.',
+        stage: 'conflict',
+        files: [
+          { name: 'service-health.json', uid: 'service-health', status: 'locked' },
+        ],
+        scanning: true,
+        uiBlocked: true,
+        folders: [
+          { name: 'Platform', boards: ['Service Health 🔒'] },
+        ],
+        keyPoint: 'allowUiUpdates=false → UI Save 차단·파일이 이김. true → UI 우선이나 Git 과 불일치.',
+        code: {
+          lang: 'yaml',
+          filename: 'provisioning/dashboards/locked.yaml',
+          lines: [
+            'apiVersion: 1',
+            '',
+            'providers:',
+            '  - name: platform-dashboards',
+            '    orgId: 1',
+            '    type: file',
+            '',
+            '    # 핵심 3종 — 충돌을 어떻게 다룰지 결정',
+            '    disableDeletion: true        # 보드 삭제 버튼 잠금',
+            '    allowUiUpdates: false        # UI 저장 차단(파일이 진실)',
+            '    updateIntervalSeconds: 30',
+            '',
+            '    options:',
+            '      path: /etc/grafana/dashboards/platform',
+            '',
+            '# 선택 기준',
+            '# allowUiUpdates: false  (권장, GitOps)',
+            '#   - UI 편집 불가 → 모든 변경은 PR 로',
+            '#   - 파일이 유일한 진실, 재스캔이 항상 이김',
+            '#   - 함정: 급한 hotfix 도 파일 고쳐 배포해야 함',
+            '#',
+            '# allowUiUpdates: true   (예외적)',
+            '#   - UI 편집 유지 → 실험/임시 보드에만',
+            '#   - 함정: Git 과 실제 보드가 갈라짐(진실 2개)',
+            '#',
+            '# 원칙: source of truth 는 반드시 하나만',
+          ],
+          highlight: [9, 10, 16, 17, 18, 22, 23],
+        },
+      },
+      {
+        title: 'Step 5. Dashboard as Code — "IV-1-1 JSON + 프로비저닝 종합"',
+        desc: '앞의 조각을 하나로 합치면 "dashboard as code" 파이프라인이 완성된다. IV-1-1에서 다룬 dashboard JSON 구조(uid·panels·targets·templating)를 Git으로 관리하고, provisioning provider가 이를 자동 등록·갱신한다. 결과적으로 보드는 코드 리뷰를 거치고, 버전이 찍히고, 클릭 없이 여러 환경(dev/stg/prod)에 동일하게 배포된다. 손으로 만든 보드는 어느 순간 아무도 재현 못 하지만, 파일로 선언한 보드는 저장소만 있으면 언제든 똑같이 되살아난다 — 이것이 provisioning을 쓰는 진짜 이유다.',
+        stage: 'summary',
+        files: [
+          { name: 'payment/checkout.json', uid: 'pay-checkout', status: 'locked' },
+          { name: 'platform/service-health.json', uid: 'service-health', status: 'locked' },
+          { name: 'infra/nodes.json', uid: 'infra-nodes', status: 'locked' },
+        ],
+        scanning: true,
+        gitCommit: 'main @ 9c3d0aa',
+        folders: [
+          { name: 'Payment', boards: ['Checkout'] },
+          { name: 'Platform', boards: ['Service Health'] },
+          { name: 'Infra', boards: ['Nodes'] },
+        ],
+        summary: {
+          title: 'Provisioning 5가지 핵심',
+          points: [
+            'provider = folder + path + updateIntervalSeconds 선언',
+            'path 의 *.json 자동 등록·갱신 — uid 로 매칭(중복 방지)',
+            'Git merge = 배포, foldersFromFilesStructure 로 폴더 자동',
+            'allowUiUpdates=false 로 잠가 파일을 유일한 진실로',
+            'dashboard as code = 리뷰·버전·재현 가능한 배포',
+          ],
+        },
+        keyPoint: '파일이 진실 → 리뷰·버전·재현. 손으로 만든 보드는 재현 불가, 코드형 보드는 항상 되살아남.',
+        code: {
+          lang: 'yaml',
+          filename: 'docker-compose.yml — 종합 배치',
+          lines: [
+            '# dashboard as code 를 실제로 돌리는 최소 구성',
+            'services:',
+            '  grafana:',
+            '    image: grafana/grafana:11.2.0',
+            '    ports:',
+            '      - "3000:3000"',
+            '    volumes:',
+            '      # 1) provider 정의(yaml)',
+            '      - ./provisioning:/etc/grafana/provisioning',
+            '      # 2) Git 에서 받은 dashboard json 들',
+            '      - ./dashboards:/etc/grafana/dashboards',
+            '',
+            '# 디렉터리 레이아웃',
+            '# ./provisioning/dashboards/default.yaml   ← provider',
+            '# ./provisioning/datasources/prom.yaml     ← data source',
+            '# ./dashboards/platform/service-health.json',
+            '# ./dashboards/payment/checkout.json',
+            '# ./dashboards/infra/nodes.json',
+            '',
+            '# CI 파이프라인(요약)',
+            '# git push → PR review → merge',
+            '#   → 이미지/볼륨에 json 반영 → provider 재스캔 → 배포 완료',
+            '#',
+            '# 이제 보드는 "코드" — 리뷰되고, 버전이 찍히고, 어디서든 재현된다',
+          ],
+          highlight: [7, 8, 9, 10, 11, 13, 14, 15],
+        },
+      },
+    ];
+
+    // ── 좌측: GitOps 흐름 시각화 (Git → provider 스캔 → Grafana 폴더)
+    const STATUS_STYLE = {
+      loaded: { label: '등록', cls: 'text-emerald-700 bg-emerald-50 border-emerald-300' },
+      new:    { label: '신규', cls: 'text-sky-700 bg-sky-50 border-sky-300' },
+      locked: { label: '잠김', cls: 'text-slate-600 bg-slate-100 border-slate-300' },
+    };
+
+    function FlowArrow({ active, label }) {
+      return (
+        <div className="flex flex-col items-center justify-center px-1">
+          <svg viewBox="0 0 40 20" className="w-10 h-5">
+            <line x1="2" y1="10" x2="34" y2="10" stroke="#F46800" strokeWidth="2"
+              className={active ? 'flow-dash' : ''} />
+            <polygon points="34,4 40,10 34,16" fill="#F46800" />
+          </svg>
+          {label && <span className="text-[8px] text-slate-400 mt-0.5">{label}</span>}
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const scanning = step.scanning;
+      return (
+        <div className="rounded-xl border border-slate-200 bg-white overflow-hidden shadow-sm h-full flex flex-col">
+          {/* Grafana 상단 헤더바 */}
+          <div className="bg-slate-900 px-3 py-2 flex items-center gap-2 border-b border-slate-700">
+            <span className="text-base">📊</span>
+            <span className="text-xs font-bold" style={{ color: '#F46800' }}>Grafana</span>
+            <span className="text-slate-500">/</span>
+            <span className="text-xs text-slate-300 font-mono">Provisioning</span>
+            <span className="ml-auto text-[10px] font-mono flex items-center gap-1">
+              {scanning ? (
+                <span className="scan-pulse text-emerald-400">● scanning · {step.stage === 'config' ? 'idle' : 'every 20~30s'}</span>
+              ) : (
+                <span className="text-slate-500">○ boot 대기</span>
+              )}
+            </span>
+          </div>
+
+          {/* GitOps 3단 흐름: Git → Provider → Grafana */}
+          <div className="flex-1 p-3 bg-slate-100 flex flex-col gap-3">
+            <div className="flex items-stretch gap-1">
+              {/* 1) Git / 파일 소스 */}
+              <div className="flex-1 rounded-lg border border-slate-300 bg-white overflow-hidden">
+                <div className="px-2 py-1 bg-slate-800 text-[10px] font-bold text-slate-100 flex items-center gap-1">
+                  <span>🗂️</span> options.path
+                </div>
+                <div className="p-1.5 space-y-1 min-h-[92px]">
+                  {step.gitCommit && (
+                    <div className="text-[9px] font-mono text-grafana-deep bg-grafana-soft rounded px-1 py-0.5 truncate">
+                      ⎇ {step.gitCommit}
+                    </div>
+                  )}
+                  {step.files.length === 0 ? (
+                    <div className="text-[10px] text-slate-400 italic py-4 text-center">
+                      아직 json 없음 — provider 만 정의됨
+                    </div>
+                  ) : (
+                    step.files.map((f) => {
+                      const s = STATUS_STYLE[f.status] || STATUS_STYLE.loaded;
+                      return (
+                        <div key={f.name} className="flex items-center gap-1">
+                          <span className="text-[10px]">📄</span>
+                          <span className="text-[9px] font-mono text-slate-700 truncate flex-1">{f.name}</span>
+                          <span className={`text-[8px] px-1 rounded border ${s.cls}`}>{s.label}</span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              <FlowArrow active={scanning} label="scan" />
+
+              {/* 2) Provider */}
+              <div className="w-28 rounded-lg border-2 overflow-hidden bg-white" style={{ borderColor: '#F46800' }}>
+                <div className="px-2 py-1 bg-grafana-orange text-[10px] font-bold text-white text-center">
+                  provider
+                </div>
+                <div className="p-1.5 flex flex-col items-center justify-center gap-1 min-h-[92px]">
+                  <span className={`text-2xl ${scanning ? 'scan-pulse' : ''}`}>🔄</span>
+                  <span className="text-[9px] text-slate-500 text-center leading-tight">
+                    path 스캔<br/>uid 매칭
+                  </span>
+                </div>
+              </div>
+
+              <FlowArrow active={scanning} label="register" />
+
+              {/* 3) Grafana 폴더 */}
+              <div className="flex-1 rounded-lg border border-slate-300 bg-white overflow-hidden">
+                <div className="px-2 py-1 bg-slate-800 text-[10px] font-bold text-slate-100 flex items-center gap-1">
+                  <span>📁</span> Grafana 폴더
+                </div>
+                <div className="p-1.5 space-y-1 min-h-[92px]">
+                  {step.folders.length === 0 ? (
+                    <div className="text-[10px] text-slate-400 italic py-4 text-center">
+                      로드된 보드 없음
+                    </div>
+                  ) : (
+                    step.folders.map((fd) => (
+                      <div key={fd.name} className="rounded border border-slate-200 bg-slate-50 px-1.5 py-1">
+                        <div className="text-[9px] font-bold text-grafana-deep flex items-center gap-1">
+                          <span>📁</span>{fd.name}
+                        </div>
+                        {fd.boards.map((b) => (
+                          <div key={b} className="text-[9px] text-slate-600 font-mono pl-3 truncate">└ {b}</div>
+                        ))}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* UI 편집 충돌 배너 (Step 4) */}
+            {step.uiBlocked && (
+              <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-[11px] text-red-700 flex items-start gap-2">
+                <span className="text-sm">⛔</span>
+                <span>
+                  <b>This dashboard is provisioned.</b> UI 에서 Save 를 눌러도
+                  다음 스캔(30s) 때 파일 내용으로 덮인다. <b>allowUiUpdates=false</b> → 파일이 이긴다.
+                </span>
+              </div>
+            )}
+
+            {/* stage 라벨 */}
+            <div className="flex items-center gap-1 flex-wrap text-[9px]">
+              {['config','scan','gitops','conflict','summary'].map((s) => (
+                <span key={s}
+                  className={`px-1.5 py-0.5 rounded-full border font-mono ${step.stage === s ? 'bg-grafana-orange text-white border-grafana-orange' : 'bg-white text-slate-400 border-slate-200'}`}>
+                  {s}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {/* keyPoint */}
+          <div className="px-3 py-2 bg-grafana-soft border-t border-grafana-orange text-[11px] text-grafana-deep">
+            💡 {step.keyPoint}
+          </div>
+
+          {/* summary (Step 5) */}
+          {step.summary && (
+            <div className="px-3 pb-3 pt-2 bg-white border-t border-slate-200">
+              <div className="text-[11px] font-bold text-slate-700 mb-1.5">📋 {step.summary.title}</div>
+              <ul className="space-y-1">
+                {step.summary.points.map((p, i) => (
+                  <li key={i} className="text-[11px] text-slate-700 flex gap-1.5">
+                    <span className="grafana-orange">▸</span><span>{p}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode CodeViewer
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono truncate">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 -ml-3 pl-2' : ''}`} style={isHi ? { borderColor: '#F46800' } : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1 whitespace-pre" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3500);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-slate-50 px-4 py-5">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-4 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-grafana-orange text-white font-bold">G</span>
+              <div>
+                <div className="flex items-center gap-2 mb-0.5">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-grafana-soft text-grafana-deep border border-grafana-orange">Part IV. 프로비저닝</span>
+                  <span className="text-[10px] font-mono text-slate-500">IV-2-2</span>
+                </div>
+                <h1 className="text-xl font-bold text-slate-900">Dashboard provisioning — 대시보드 자동 배포</h1>
+                <p className="text-xs text-slate-600">대시보드 JSON을 파일로 자동 로드 — Git → provider 스캔 → Grafana 폴더 GitOps 흐름</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← Grafana 학습 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-3 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ backgroundColor: i <= stepIdx ? '#F46800' : '#fed7aa' }} />
+              ))}
+            </div>
+
+            {/* 단계 제목+설명 */}
+            <div className="mb-4 rounded-xl bg-grafana-orange text-white px-5 py-3 shadow">
+              <h2 className="text-base font-bold mb-1">{step.title}</h2>
+              <p className="text-xs leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-label="자동 재생 시작/정지" aria-pressed={playing} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: playing ? '#B84F00' : '#F46800' }}>
+                {playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}
+              </button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-500 mt-2">키보드 ←/→ · 자동재생 3.5초/단계</div>
+
+            {isLast && (
+              <div className="mt-4 rounded-lg border-2 bg-white px-4 py-3 text-sm text-slate-900" style={{ borderColor: '#F46800' }}>
+                <div className="font-bold mb-1 grafana-orange">✅ 핵심 정리</div>
+                Provisioning은 대시보드를 파일로 선언해 provider가 자동 등록·갱신하게 한다. provider는 folder·path·updateIntervalSeconds로 어느 경로를 몇 초마다 볼지 정하고, path의 *.json은 uid로 매칭돼 중복 없이 반영된다. Git과 붙이면 merge가 곧 배포이고 foldersFromFilesStructure로 디렉터리가 폴더가 된다. allowUiUpdates=false로 잠가 파일을 유일한 진실로 두면 — 대시보드는 리뷰·버전·재현이 가능한 "코드"가 된다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['provisioning', 'providers', 'path', 'updateIntervalSeconds', 'foldersFromFilesStructure', 'allowUiUpdates', 'GitOps', 'dashboard as code'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-grafana-soft text-grafana-deep border border-grafana-orange">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← Grafana 학습 목록</a>
+              <a href="../part5/V-1-1.html" className="underline hover:no-underline" style={{ color: '#F46800' }}>V-1-1 다음 파트 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

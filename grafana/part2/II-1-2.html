@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Grafana 학습 — II-1-2. Loki — 로그 시각화</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📊</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    .grafana-orange { color: #F46800; }
+    .bg-grafana-orange { background-color: #F46800; }
+    .border-grafana-orange { border-color: #F46800; }
+    .bg-grafana-soft { background-color: #FFF1E6; }
+    .text-grafana-deep { color: #B84F00; }
+    .hover-grafana:hover { background-color: #B84F00; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    II-1-2. Loki — 로그 시각화 (fastapi v1 패턴)
+    학습 목표: LogQL 스트림 셀렉터 → 라인 필터 → 파싱 → 로그를 메트릭으로(rate/count_over_time)
+    핵심 비유: "라벨로 서랍을 열고, 필터로 종이를 고른 뒤, 세어서 그래프로"
+    패턴: 좌(LiveDataPane: Loki 로그 스트림 파이프라인) / 우(VSCode LogQL sql + json)
+    색상: #F46800 (Grafana brand orange)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ── 공용 로그 라인 (라벨 + 원문). 각 STEP이 통과 여부를 지정
+    const LOG_LINES = [
+      { id: 1, app: 'api', env: 'prod', level: 'info',  text: 'GET /users 200 in 12ms  traceID=a1b2c3' },
+      { id: 2, app: 'api', env: 'prod', level: 'error', text: 'POST /pay 500 upstream timeout  traceID=d4e5f6' },
+      { id: 3, app: 'api', env: 'prod', level: 'error', text: 'DB connection refused  traceID=99aa88' },
+      { id: 4, app: 'web', env: 'prod', level: 'info',  text: 'render /home 200 in 40ms' },
+      { id: 5, app: 'api', env: 'prod', level: 'warn',  text: 'slow query 900ms /orders' },
+      { id: 6, app: 'api', env: 'prod', level: 'info',  text: 'GET /health 200 healthcheck' },
+    ];
+
+    // 파이프라인 단계 라벨 (0=스트림, 1=셀렉터, 2=라인필터, 3=파싱, 4=메트릭)
+    const STAGES = ['원본 스트림', '스트림 셀렉터', '라인 필터', '파싱 · 라벨필터', '메트릭 변환'];
+
+    const STEPS = [
+      {
+        title: 'Step 1. Loki 개념 — "라벨만 인덱싱, 본문은 통째로 압축 저장"',
+        desc: 'Loki는 로그 본문(full-text)을 인덱싱하지 않는다. 오직 라벨(app, env, level 같은 소량의 키-값)만 인덱싱하고 로그 본문은 압축 청크로 그대로 쌓는다. 그래서 Elasticsearch보다 인덱스가 가볍고 저장 비용이 싸다 — 대신 본문 검색은 "인덱스로 스트림을 좁힌 뒤 grep" 방식이라 라벨 설계가 성능을 좌우한다. 구조가 Prometheus와 쌍둥이라 같은 라벨 규칙을 공유하는 게 핵심이다.',
+        stage: 0,
+        query: '',
+        keptIds: [1, 2, 3, 4, 5, 6],
+        keyPoint: 'Loki = 라벨만 인덱싱 + 본문은 압축 저장. 라벨 설계가 곧 성능.',
+        code: {
+          lang: 'json',
+          filename: 'loki-datasource.json — Grafana 데이터 소스 등록',
+          lines: [
+            '{',
+            '  "name": "Loki",',
+            '  "type": "loki",',
+            '  "access": "proxy",',
+            '  "url": "http://loki:3100",',
+            '',
+            '  "jsonData": {',
+            '    "maxLines": 1000,',
+            '',
+            '    // 로그 라인에서 TraceID를 뽑아 Tempo로 점프',
+            '    "derivedFields": [',
+            '      {',
+            '        "name": "TraceID",',
+            '        "matcherRegex": "traceID=(\\\\w+)",',
+            '        "url": "${__value.raw}",',
+            '        "datasourceUid": "tempo"',
+            '      }',
+            '    ]',
+            '  }',
+            '}',
+            '',
+            '// Loki의 인덱싱 원칙',
+            '//  - 인덱싱 대상: 라벨( app / env / level ) 뿐',
+            '//  - 저장 방식:   로그 본문은 압축 청크(chunk)',
+            '//  - 검색 절차:   라벨로 스트림 선택 → 본문은 순차 grep',
+            '//',
+            '// 그래서 라벨은 "적고 안정적인" 값만 써야 한다.',
+            '// user_id / request_id 같은 값은 라벨 금지 → 본문에.',
+          ],
+          highlight: [2, 3, 5, 7, 8, 21, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 2. 스트림 셀렉터 — "라벨로 서랍을 연다"',
+        desc: '모든 LogQL 쿼리는 중괄호 스트림 셀렉터로 시작한다. 라벨 매처(=, !=, =~, !~)로 어떤 로그 스트림을 읽을지 먼저 좁히는 단계다. 이 단계에서 인덱스가 실제로 쓰이므로 여기서 스트림을 잘 좁힐수록 이후 grep 대상이 줄어 쿼리가 빨라진다. 반대로 셀렉터를 느슨하게 두면 수천 개 스트림을 열어 본문을 훑게 되어 큰 시간 범위에서 폭발한다.',
+        stage: 1,
+        query: '{app="api", env="prod"}',
+        keptIds: [1, 2, 3, 5, 6],
+        keyPoint: '쿼리는 항상 셀렉터로 시작 — 라벨 매처(= != =~ !~)로 스트림을 먼저 좁힌다.',
+        code: {
+          lang: 'sql',
+          filename: 'selector.logql — 스트림 셀렉터',
+          lines: [
+            '-- 1) 정확히 일치',
+            '{app="api", env="prod"}',
+            '',
+            '-- 2) 제외 매처 (!=)',
+            '{app="api", env!="dev"}',
+            '',
+            '-- 3) 정규식 매처 (=~) — 여러 앱 한 번에',
+            '{app=~"api|worker", env="prod"}',
+            '',
+            '-- 4) 정규식 제외 (!~)',
+            '{app=~"api|worker", instance!~"canary-.*"}',
+            '',
+            '-- 매처 종류',
+            '--   =    같음',
+            '--   !=   다름',
+            '--   =~   정규식 일치',
+            '--   !~   정규식 불일치',
+            '',
+            '-- 성능 규칙',
+            '--   셀렉터에서 스트림을 최대한 좁혀라.',
+            '--   여기서 좁힌 만큼 이후 grep 대상이 줄어든다.',
+            '--   최소 1개의 = 매처가 반드시 있어야 한다.',
+          ],
+          highlight: [1, 2, 4, 5, 7, 8, 10, 11],
+        },
+      },
+      {
+        title: 'Step 3. 라인 필터 — "열린 서랍에서 종이를 고른다"',
+        desc: '셀렉터로 연 스트림에서 본문을 문자열로 거르는 단계다. 파이프 연산자 뒤에 필터를 붙인다 — 포함(|=), 미포함(!=), 정규식 포함(|~), 정규식 미포함(!~). 이 필터는 인덱스가 아니라 본문을 훑기 때문에, 앞에서 셀렉터로 스트림을 좁혀 두는 것이 전제다. 실무 함정은 정규식(|~) 남용이다 — 단순 문자열이면 |=가 훨씬 빠르니 |~는 꼭 필요할 때만 쓴다.',
+        stage: 2,
+        query: '{app="api"} |= "error"',
+        keptIds: [2, 3],
+        keyPoint: '라인 필터는 본문 grep — |= 포함, != 미포함, |~ 정규식. |~ 남용은 느리다.',
+        code: {
+          lang: 'sql',
+          filename: 'linefilter.logql — 라인 필터 체인',
+          lines: [
+            '-- 셀렉터 뒤에 필터를 파이프로 연결',
+            '{app="api"} |= "error" != "healthcheck"',
+            '',
+            '-- 필터 연산자',
+            '--   |=   문자열 포함   (가장 빠름)',
+            '--   !=   문자열 미포함',
+            '--   |~   정규식 포함   (필요할 때만)',
+            '--   !~   정규식 미포함',
+            '',
+            '-- 여러 필터는 왼쪽부터 순차 적용 → 빨리 거를 조건을 앞에',
+            '{app="api"}',
+            '  |= "error"',
+            '  != "timeout"',
+            '  |~ "5[0-9][0-9]"',
+            '',
+            '-- 함정: 단순 문자열인데 정규식을 쓰지 말 것',
+            '--   느림:  |~ "error"',
+            '--   빠름:  |= "error"',
+            '--',
+            '-- 함정: 넓은 시간 범위 + 느슨한 셀렉터 = 본문 폭발',
+            '--   → 항상 셀렉터를 먼저 좁히고, 시간 범위를 제한하라.',
+          ],
+          highlight: [1, 2, 5, 6, 7, 8, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 4. 파싱 · 라벨 필터 — "본문을 구조화해서 다시 거른다"',
+        desc: '라인 필터로 좁힌 뒤에는 파서(logfmt, json, pattern)로 본문을 키-값으로 쪼갠다. 파싱하면 status, method 같은 필드가 생기고, 이 추출 필드로 숫자 비교 필터(예: status 500 이상)를 걸 수 있다. 여기서 만든 필드는 "쿼리 시점 라벨"이라 인덱스를 늘리지 않는다 — 고카디널리티 값을 저장 라벨로 두는 대신 파싱으로 다루는 게 정석이다. line_format으로 출력 라인을 사람이 읽기 좋게 재구성할 수도 있다.',
+        stage: 3,
+        query: '{app="api"} |= "error" | logfmt',
+        keptIds: [2, 3],
+        keyPoint: '파서(logfmt · json)로 본문을 필드화 → 추출 필드로 재필터. 저장 라벨은 안 늘어난다.',
+        code: {
+          lang: 'sql',
+          filename: 'parse.logql — 파싱과 라벨 필터',
+          lines: [
+            '-- logfmt: key=value 형태 로그를 필드로 추출',
+            '{app="api"} |= "error"',
+            '  | logfmt',
+            '  | status >= 500',
+            '  | line_format "{{.method}} {{.path}} status={{.status}}"',
+            '',
+            '-- json: JSON 로그를 필드로 추출',
+            '{app="api"} | json | level="error" | latency_ms > 300',
+            '',
+            '-- pattern: 위치 기반 추출 (비정형 로그)',
+            '{app="nginx"} | pattern "<ip> - - <_> \\"<method> <path>\\""',
+            '',
+            '-- 추출 필드 = 쿼리 시점 라벨',
+            '--   인덱스(저장 라벨)를 늘리지 않는다.',
+            '--   그래서 status / request_id 같은 고카디널리티 값은',
+            '--   저장 라벨이 아니라 파싱으로 다뤄야 한다.',
+            '--',
+            '-- line_format 으로 출력 라인을 재구성 → 대시보드 가독성 상승',
+          ],
+          highlight: [1, 2, 3, 4, 5, 8, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 5. 로그 → 메트릭 — "센 다음 그래프로, 그리고 알림"',
+        desc: '로그를 시계열 숫자로 바꾸는 단계다. rate는 초당 매칭 로그 수, count_over_time은 구간 내 누적 개수를 낸다. 여기에 sum by (level) 같은 집계를 씌우면 Prometheus 메트릭처럼 패널에 그리고 알림 규칙까지 걸 수 있다 — 즉 "5분간 error 로그가 급증" 조건을 로그만으로 감시한다. 별도 메트릭 파이프라인 없이 로그 하나로 시각화와 알림을 겸하는 것이 Loki의 강점이다.',
+        stage: 4,
+        query: 'sum by (level) (rate({app="api"} |= "error" [5m]))',
+        keptIds: [2, 3],
+        metric: [
+          { level: 'error', value: 9, color: 'red' },
+          { level: 'warn',  value: 3, color: 'amber' },
+          { level: 'info',  value: 1, color: 'sky' },
+        ],
+        keyPoint: 'rate · count_over_time 으로 로그를 메트릭화 → 패널 + 알림을 로그 하나로.',
+        code: {
+          lang: 'sql',
+          filename: 'metric.logql — 로그 기반 메트릭 · 알림',
+          lines: [
+            '-- rate: 초당 매칭 로그 수 (구간 [5m])',
+            'sum by (level) (',
+            '  rate({app="api"} |= "error" [5m])',
+            ')',
+            '',
+            '-- count_over_time: 구간 내 누적 개수',
+            'sum(count_over_time({app="api"} |= "error" [5m]))',
+            '',
+            '-- 파싱 필드로 집계 (unwrap: 숫자 필드를 값으로)',
+            'sum by (path) (',
+            '  rate({app="api"} | logfmt | unwrap latency_ms [5m])',
+            ')',
+            '',
+            '-- 이 쿼리를 그대로 알림 규칙 expr 로 사용',
+            '--   조건: 5분간 error rate 가 임계 초과 시 발화',
+            '--   for:  2m  (플래핑 방지)',
+            '--   → 메트릭 파이프라인 없이 로그만으로 감시',
+          ],
+          highlight: [1, 2, 3, 4, 6, 7, 14, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 6. Grafana 연동 — "로그 패널 · 라이브 테일 · 트레이스 점프"',
+        desc: 'Grafana Explore에서 같은 LogQL로 로그 패널과 메트릭 패널을 함께 본다. 라이브 테일을 켜면 새 로그가 실시간으로 흐르고, derivedFields로 뽑은 TraceID 링크를 누르면 그 요청의 Tempo 트레이스로 바로 점프한다 — 로그·메트릭·트레이스를 한 화면에서 오간다. 마지막으로 라벨 설계 원칙만 지키면 된다: 라벨은 적고 안정적으로, 나머지는 필터와 파싱으로.',
+        stage: 4,
+        query: '{app="api"} |= "error"  →  TraceID 링크 → Tempo',
+        keptIds: [2, 3],
+        summary: {
+          title: 'Loki · LogQL 5가지 핵심',
+          points: [
+            'Loki는 라벨만 인덱싱 — 본문은 압축 저장, 라벨 설계가 성능',
+            '쿼리 순서: 셀렉터 → 라인 필터 → 파싱 → 메트릭',
+            '고카디널리티(user_id 등)는 라벨 금지 → 필터·파싱으로',
+            'rate · count_over_time 으로 로그를 메트릭·알림으로 전환',
+            'derivedFields TraceID 로 로그에서 트레이스로 바로 점프',
+          ],
+        },
+        keyPoint: '로그 · 메트릭 · 트레이스를 한 화면에 — 라벨은 적게, 나머지는 필터·파싱.',
+        code: {
+          lang: 'json',
+          filename: 'logs-panel.json — Grafana 로그 패널',
+          lines: [
+            '{',
+            '  "type": "logs",',
+            '  "title": "API 에러 로그",',
+            '  "datasource": { "type": "loki", "uid": "loki-default" },',
+            '',
+            '  "targets": [',
+            '    {',
+            '      "refId": "A",',
+            '      "expr": "{app=\\"api\\"} |= \\"error\\"",',
+            '      "queryType": "range"',
+            '    }',
+            '  ],',
+            '',
+            '  "options": {',
+            '    "showTime": true,',
+            '    "wrapLogMessage": true,',
+            '    "enableLogDetails": true,',
+            '    "sortOrder": "Descending"',
+            '  }',
+            '}',
+            '',
+            '// 실무 연동 포인트',
+            '//  - 라이브 테일: Explore 상단 Live 버튼 → 실시간 흐름',
+            '//  - 트레이스 점프: derivedFields TraceID 링크 → Tempo',
+            '//  - 같은 LogQL 을 메트릭 패널에도 재사용(rate)',
+            '//  - 알림: 로그 rate 쿼리를 alert rule 로 승격',
+          ],
+          highlight: [1, 2, 3, 8, 9, 14, 15, 16, 17, 18],
+        },
+      },
+    ];
+
+    // ── 색상 팔레트
+    const LEVEL_COLOR = {
+      info:  { bg: 'bg-sky-50',     border: 'border-sky-200',     text: 'text-sky-700',     dot: 'bg-sky-500'     },
+      warn:  { bg: 'bg-amber-50',   border: 'border-amber-200',   text: 'text-amber-700',   dot: 'bg-amber-500'   },
+      error: { bg: 'bg-red-50',     border: 'border-red-200',     text: 'text-red-700',      dot: 'bg-red-500'     },
+    };
+    const BAR_COLOR = { red: '#ef4444', amber: '#f59e0b', sky: '#0ea5e9' };
+
+    // ── 파이프라인 단계 칩
+    function PipelineChips({ active }) {
+      return (
+        <div className="flex items-center gap-1 flex-wrap">
+          {STAGES.map((s, i) => {
+            const on = i <= active;
+            const now = i === active;
+            return (
+              <React.Fragment key={s}>
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-full border font-mono ${now ? 'text-white' : on ? 'text-grafana-deep bg-grafana-soft border-grafana-orange' : 'text-slate-400 bg-slate-50 border-slate-200'}`}
+                  style={now ? { backgroundColor: '#F46800', borderColor: '#F46800' } : {}}
+                >
+                  {s}
+                </span>
+                {i < STAGES.length - 1 && <span className="text-slate-300 text-[10px]">→</span>}
+              </React.Fragment>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ── 로그 라인 한 줄
+    function LogRow({ line, kept }) {
+      const c = LEVEL_COLOR[line.level] || LEVEL_COLOR.info;
+      return (
+        <div className={`rounded border px-2 py-1 flex items-center gap-2 transition ${kept ? `${c.bg} ${c.border} shadow-sm` : 'bg-slate-50 border-slate-100 opacity-40'}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${kept ? c.dot : 'bg-slate-300'}`}></span>
+          <span className="text-[9px] font-mono px-1 rounded bg-white/70 text-slate-500 border border-slate-200 whitespace-nowrap">
+            app={line.app} · {line.level}
+          </span>
+          <span className={`text-[10px] font-mono truncate ${kept ? 'text-slate-700' : 'text-slate-400 line-through'}`}>
+            {line.text}
+          </span>
+        </div>
+      );
+    }
+
+    // ── 메트릭 막대 그래프
+    function MetricBars({ metric }) {
+      const max = Math.max(...metric.map((m) => m.value), 1);
+      return (
+        <div className="w-full">
+          <div className="text-[10px] font-bold text-slate-500 mb-2">rate() 결과 — 초당 매칭 로그 수</div>
+          <div className="flex items-end gap-3 h-28 px-2 border-b border-l border-slate-300">
+            {metric.map((m) => (
+              <div key={m.level} className="flex-1 flex flex-col items-center justify-end h-full">
+                <span className="text-[10px] font-mono font-bold" style={{ color: BAR_COLOR[m.color] }}>{m.value}</span>
+                <div className="w-full rounded-t" style={{ height: `${(m.value / max) * 100}%`, backgroundColor: BAR_COLOR[m.color], minHeight: '4px' }}></div>
+                <span className="text-[9px] font-mono text-slate-500 mt-1">{m.level}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const keptSet = new Set(step.keptIds);
+      return (
+        <div className="rounded-xl border border-slate-200 bg-white overflow-hidden shadow-sm h-full flex flex-col">
+          {/* Grafana 상단 헤더바 */}
+          <div className="bg-slate-900 px-3 py-2 flex items-center gap-2 border-b border-slate-700">
+            <span className="text-base">📊</span>
+            <span className="text-xs font-bold" style={{ color: '#F46800' }}>Grafana</span>
+            <span className="text-slate-500">/</span>
+            <span className="text-xs text-slate-300 font-mono">Explore · Loki</span>
+            <span className="ml-auto text-[10px] text-slate-400 font-mono">⏱ last 15m · Live</span>
+          </div>
+
+          {/* LogQL 쿼리 바 */}
+          <div className="bg-slate-50 px-3 py-2 border-b border-slate-200">
+            <div className="text-[9px] text-slate-400 font-bold mb-1">LogQL</div>
+            <div className="rounded bg-white border border-slate-300 px-2 py-1 font-mono text-[11px] text-grafana-deep min-h-[24px] flex items-center">
+              {step.query ? step.query : <span className="text-slate-300">라벨 인덱스 — 아직 쿼리 없음</span>}
+            </div>
+          </div>
+
+          {/* 파이프라인 단계 */}
+          <div className="px-3 py-2 border-b border-slate-100 bg-white">
+            <PipelineChips active={step.stage} />
+          </div>
+
+          {/* 본체 — 로그 스트림 또는 메트릭 */}
+          <div className="flex-1 p-3 bg-slate-100 overflow-auto">
+            {step.metric ? (
+              <MetricBars metric={step.metric} />
+            ) : (
+              <div className="space-y-1.5">
+                <div className="text-[10px] text-slate-500 font-bold mb-1">
+                  로그 스트림 — 통과 {step.keptIds.length} / 전체 {LOG_LINES.length}
+                </div>
+                {LOG_LINES.map((line) => (
+                  <LogRow key={line.id} line={line} kept={keptSet.has(line.id)} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* keyPoint */}
+          <div className="px-3 py-2 bg-grafana-soft border-t border-grafana-orange text-[11px] text-grafana-deep">
+            💡 {step.keyPoint}
+          </div>
+
+          {/* summary (Step 6) */}
+          {step.summary && (
+            <div className="px-3 pb-3 pt-2 bg-white border-t border-slate-200">
+              <div className="text-[11px] font-bold text-slate-700 mb-1.5">📋 {step.summary.title}</div>
+              <ul className="space-y-1">
+                {step.summary.points.map((p, i) => (
+                  <li key={i} className="text-[11px] text-slate-700 flex gap-1.5">
+                    <span className="grafana-orange">▸</span><span>{p}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode CodeViewer
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 -ml-3 pl-2' : ''}`} style={isHi ? { borderColor: '#F46800' } : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1 whitespace-pre" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3500);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-slate-50 px-4 py-5">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-4 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-grafana-orange text-white font-bold">G</span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-grafana-soft text-grafana-deep border border-grafana-orange">Part II. 데이터 소스</span>
+                  <span className="text-[10px] font-mono text-slate-500">II-1-2</span>
+                </div>
+                <h1 className="text-xl font-bold text-slate-900 mt-1">II-1-2. Loki — 로그 시각화</h1>
+                <p className="text-xs text-slate-600">LogQL로 로그를 탐색하고 메트릭으로 — 셀렉터 → 필터 → 파싱 → rate</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← Grafana 학습 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-3 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ backgroundColor: i <= stepIdx ? '#F46800' : '#fed7aa' }} />
+              ))}
+            </div>
+
+            {/* 단계 제목+설명 */}
+            <div className="mb-4 rounded-xl bg-grafana-orange text-white px-5 py-3 shadow">
+              <h2 className="text-base font-bold mb-1">{step.title}</h2>
+              <p className="text-xs leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-label="자동 재생 시작/정지" aria-pressed={playing} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: playing ? '#B84F00' : '#F46800' }}>
+                {playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}
+              </button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-500 mt-2">키보드 ←/→ · 자동재생 3.5초/단계</div>
+
+            {isLast && (
+              <div className="mt-4 rounded-lg border-2 bg-white px-4 py-3 text-sm text-slate-900" style={{ borderColor: '#F46800' }}>
+                <div className="font-bold mb-1 grafana-orange">✅ 핵심 정리</div>
+                Loki는 라벨만 인덱싱하고 본문은 압축 저장하므로 라벨 설계가 성능을 좌우한다. LogQL은 셀렉터로 스트림을 좁히고, 라인 필터로 본문을 grep한 뒤, 파서로 필드화해 재필터하는 순서로 흐른다. rate와 count_over_time으로 로그를 메트릭으로 바꾸면 같은 쿼리로 패널과 알림을 겸할 수 있다. 고카디널리티 값은 라벨이 아니라 필터·파싱으로 다루고, derivedFields의 TraceID로 로그에서 트레이스까지 한 화면에서 오간다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Loki', 'LogQL', 'stream selector', 'line filter', 'logfmt', 'json', 'rate', 'count_over_time', 'derivedFields', 'TraceID'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-grafana-soft text-grafana-deep border border-grafana-orange">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← Grafana 학습 목록</a>
+              <a href="./II-2-1.html" className="underline hover:no-underline" style={{ color: '#F46800' }}>II-2-1 SQL 데이터 소스 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
