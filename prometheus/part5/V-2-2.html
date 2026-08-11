@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Prometheus 학습 — V-2-2. Thanos vs Cortex vs Mimir</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🌍</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    V-2-2. Thanos vs Cortex vs Mimir (Prometheus 완주 장)
+    학습 목표: 단일 Prometheus의 한계(장기저장·글로벌뷰·수평확장)를 이해하고
+              세 가지 대표 장기저장/글로벌뷰 솔루션의 접근 방식을 비교한다.
+    핵심 비유: "지점 한 곳(단일 Prometheus)" vs "본사에서 전국을 보는 두 가지 방법"
+              Thanos(각 지점에 사이드카를 붙여 창고로 올려 훑기) / Cortex·Mimir(중앙 물류센터로 밀어넣기)
+    패턴: 좌(LiveDataPane — 아키텍처 대비 + 비교표) / 우(VSCode CodeViewer — yaml 설정)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 단일 Prometheus의 벽 — 장기저장·글로벌뷰·수평확장',
+        desc: '단일 Prometheus는 로컬 디스크 TSDB에 저장하고 보관기간이 보통 15일 수준이라 장기 추세를 잃는다. 서버·리전이 여러 개면 각자 자기 데이터만 알아서 "전체를 한 번에 보는" 글로벌 뷰가 없다. 한 대의 스크랩·메모리·디스크 한계를 넘으면 그 프로세스는 더 이상 수직으로 키우기 어렵다. HA를 위해 같은 타깃을 두 대가 긁으면 데이터가 중복되고 조회 시 누가 진실인지 정해야 한다. 이 세 가지 벽을 넘으려고 Thanos·Cortex·Mimir가 등장했다.',
+        focus: 'limits',
+        legend: '한 대의 Prometheus로는 장기저장·글로벌뷰·수평확장을 동시에 풀 수 없다',
+        code: {
+          lang: 'yaml',
+          filename: 'prometheus.yml — 단일 인스턴스의 한계',
+          lines: [
+            '# 단일 Prometheus — 로컬 디스크 TSDB 에 저장',
+            '# 문제 1) 보관기간이 짧다 (기본 15d), 장기 추세 소실',
+            '# 문제 2) 리전/클러스터마다 따로 떠서 글로벌 뷰가 없다',
+            '# 문제 3) 한 대의 메모리/디스크/스크랩 한계 → 수평확장 불가',
+            '',
+            'global:',
+            '  scrape_interval: 15s',
+            '  external_labels:',
+            '    region: ap-northeast-2      # 이 라벨이 나중에 핵심',
+            '    replica: A                  # HA 쌍 구분용',
+            '',
+            'storage:',
+            '  tsdb:',
+            '    path: /prometheus',
+            '    retention.time: 15d         # ← 여기서 끝, 그 이후는 삭제',
+            '',
+            'scrape_configs:',
+            '  - job_name: api',
+            '    static_configs:',
+            '      - targets: ["10.0.1.10:8080", "10.0.1.11:8080"]',
+            '',
+            '# HA 로 같은 타깃을 replica A, B 두 대가 긁으면',
+            '# 동일 시계열이 중복 저장된다 → 조회 시 dedup 필요',
+            '# 장기보관/글로벌뷰/수평확장은 별도 계층이 있어야 한다',
+          ],
+          highlight: [1, 2, 3, 4, 15, 16],
+        },
+      },
+      {
+        title: 'Step 2. Thanos — 사이드카 + 오브젝트 스토리지 + Querier',
+        desc: 'Thanos는 기존 Prometheus를 거의 그대로 두고 각 인스턴스 옆에 sidecar를 붙인다. sidecar는 완성된 2시간 TSDB 블록을 S3 같은 오브젝트 스토리지로 올리고, Store Gateway가 그 블록을 다시 쿼리 가능하게 노출한다. Querier는 여러 sidecar와 Store Gateway에 팬아웃해 결과를 합치고 HA 복제본을 dedup 해서 하나의 글로벌 뷰를 만든다. Compactor가 오래된 블록을 다운샘플링(5m·1h)해 장기 조회를 가볍게 한다. 기존 Prometheus를 유지하며 얹는 pull 친화적 접근이라 도입 저항이 작다.',
+        focus: 'thanos',
+        legend: 'Thanos = Prometheus는 그대로, 사이드카가 블록을 스토리지로 올리고 Querier가 팬아웃·dedup',
+        code: {
+          lang: 'yaml',
+          filename: 'thanos — sidecar + querier (docker-compose 발췌)',
+          lines: [
+            '# Thanos: 기존 Prometheus 옆에 sidecar 를 붙이는 방식',
+            '# Prometheus 는 그대로 로컬에 긁고, 블록을 오브젝트 스토리지로 업로드',
+            '',
+            'services:',
+            '  prometheus:',
+            '    command:',
+            '      - "--storage.tsdb.path=/prometheus"',
+            '      - "--storage.tsdb.min-block-duration=2h"   # 사이드카 업로드 단위',
+            '      - "--storage.tsdb.max-block-duration=2h"',
+            '',
+            '  thanos-sidecar:',
+            '    image: quay.io/thanos/thanos:v0.36.1',
+            '    command:',
+            '      - "sidecar"',
+            '      - "--tsdb.path=/prometheus"',
+            '      - "--prometheus.url=http://prometheus:9090"',
+            '      - "--objstore.config-file=/etc/thanos/s3.yml"  # S3 로 블록 업로드',
+            '',
+            '  thanos-querier:',
+            '    image: quay.io/thanos/thanos:v0.36.1',
+            '    command:',
+            '      - "query"',
+            '      - "--query.replica-label=replica"    # HA 복제본 dedup 키',
+            '      - "--store=thanos-sidecar:10901"      # 여러 sidecar 를 팬아웃',
+            '      - "--store=thanos-store:10901"        # 과거 블록은 Store Gateway',
+            '',
+            '# Compactor 가 오래된 블록을 5m/1h 로 다운샘플링 → 장기 조회 경량화',
+          ],
+          highlight: [11, 12, 17, 20, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 3. Cortex / Mimir — remote_write 수집 + 멀티테넌트 TSDB',
+        desc: 'Cortex와 Mimir는 접근이 반대다. Prometheus를 스크랩 에이전트로만 쓰고 remote_write로 샘플을 중앙 클러스터로 밀어넣는다. Distributor가 들어온 샘플을 해시 링으로 여러 Ingester에 분산하고, Ingester는 최근 데이터를 메모리에 두다가 블록으로 오브젝트 스토리지에 flush 한다. 조회는 Querier가 Ingester(최근)와 Store Gateway(과거)를 합쳐 처리한다. 모든 요청에 X-Scope-OrgID 테넌트가 붙어 멀티테넌시가 기본이고, 각 컴포넌트를 수평으로 늘려 대규모를 감당한다. Mimir는 Grafana가 Cortex를 포크해 운영성을 다듬은 후속으로, 성능·샤딩·설치 편의가 개선됐다.',
+        focus: 'cortex',
+        legend: 'Cortex/Mimir = Prometheus는 에이전트, remote_write 로 밀어넣고 분산 TSDB가 수평확장·멀티테넌트',
+        code: {
+          lang: 'yaml',
+          filename: 'prometheus.yml(agent) + mimir 수집 설정',
+          lines: [
+            '# Cortex/Mimir: Prometheus 는 스크랩만, remote_write 로 밀어넣기(push)',
+            '',
+            '# 1) 각 Prometheus(agent) 쪽 설정',
+            'remote_write:',
+            '  - url: http://mimir:8080/api/v1/push',
+            '    headers:',
+            '      X-Scope-OrgID: team-payments     # 멀티테넌트 식별자(필수)',
+            '    queue_config:',
+            '      max_shards: 200                  # 백프레셔 대비 병렬 전송',
+            '      capacity: 10000',
+            '',
+            '# 2) Mimir 서버 — 분산 컴포넌트가 수평확장',
+            'multitenancy_enabled: true',
+            '',
+            'distributor:                           # 들어온 샘플을 해시 링으로 분산',
+            '  ring:',
+            '    kvstore: { store: memberlist }',
+            '',
+            'ingesters:                             # 최근 데이터 메모리 보관 후 flush',
+            '  ring:',
+            '    replication_factor: 3              # 샘플을 3벌 복제(내구성)',
+            '',
+            'blocks_storage:',
+            '  backend: s3                          # 블록은 오브젝트 스토리지로',
+            '  s3: { bucket_name: mimir-blocks }',
+            '',
+            '# Querier 가 Ingester(최근) + Store Gateway(과거) 를 합쳐 조회',
+          ],
+          highlight: [4, 5, 7, 13, 15, 19, 21, 24],
+        },
+      },
+      {
+        title: 'Step 4. 공통점 — 오브젝트 스토리지·장기보관·글로벌 쿼리',
+        desc: '접근은 pull(Thanos)과 push(Cortex/Mimir)로 갈리지만 도착지는 같다. 셋 다 값싼 오브젝트 스토리지(S3·GCS)를 장기 저장소로 쓰고, 최근 데이터는 로컬/메모리·과거 데이터는 스토리지 블록으로 이원화한다. 조회 계층은 여러 소스에 팬아웃해 하나의 PromQL 결과로 합치므로 대시보드는 어느 방식이든 글로벌 뷰를 얻는다. HA 복제본은 replica 라벨로 dedup 한다. 차이는 "누가 데이터를 옮기는가"와 "멀티테넌시가 필수인가"이며, 이것이 곧 운영 복잡도와 규모 적합성을 가른다.',
+        focus: 'common',
+        legend: '수집 방향은 달라도 → 오브젝트 스토리지·장기보관·글로벌 쿼리라는 목적지는 같다',
+        code: {
+          lang: 'yaml',
+          filename: '비교 요약 — 같은 목적지, 다른 경로',
+          lines: [
+            '# 세 솔루션의 공통점 (도착지가 같다)',
+            'common:',
+            '  long_term_store: object-storage    # S3 / GCS / MinIO 로 장기보관',
+            '  data_split:',
+            '    recent: local-or-memory          # 최근은 빠른 계층',
+            '    historical: storage-blocks       # 과거는 스토리지 블록',
+            '  global_view: query-fanout          # 여러 소스 팬아웃 후 합산',
+            '  ha_dedup: by-replica-label         # 복제본 중복 제거',
+            '',
+            '# 차이점 (경로가 다르다)',
+            'thanos:',
+            '  collect: pull (sidecar uploads blocks)',
+            '  keep_prometheus: true              # 기존 Prometheus 유지',
+            '  multitenancy: 약함(주로 단일 조직)',
+            '',
+            'cortex_mimir:',
+            '  collect: push (remote_write)',
+            '  keep_prometheus: agent-only        # 스크랩 전용으로 강등',
+            '  multitenancy: 기본 내장(X-Scope-OrgID)',
+            '  scaling: 컴포넌트별 수평확장(distributor/ingester/querier)',
+            '',
+            '# mimir 는 cortex 포크 → 샤딩/성능/설치 편의 개선판',
+          ],
+          highlight: [2, 3, 7, 8, 12, 17, 19, 20],
+        },
+      },
+      {
+        title: 'Step 5. 선택 기준과 함정 — Prometheus 완주',
+        desc: '선택은 규모·조직·운영 여력으로 정한다. 이미 Prometheus가 여럿 있고 기존 구성을 유지한 채 장기보관·글로벌뷰만 원하면 Thanos가 진입장벽이 낮다. 여러 팀에 테넌트를 나눠 대규모를 수평확장하려면 Cortex/Mimir가 맞고, 신규라면 운영성이 다듬어진 Mimir가 무난하다. 함정은 분명하다. 규모가 작은데 도입하면 컴포넌트만 늘어 운영 부담이 폭증하고, 오브젝트 스토리지 요청·전송 비용과 다운샘플링 안 한 원본 축적으로 청구서가 커진다. 대부분은 먼저 retention을 늘리고 remote_write 한 곳만 붙여 보는 것으로 충분하다. 여기까지가 Prometheus 완주다 — 지표 모델부터 HA·Federation·remote_write·장기저장까지 한 흐름으로 이어진다.',
+        focus: 'choose',
+        legend: '규모·멀티테넌시·운영여력으로 고른다 · 과도한 도입은 비용과 운영부담을 부른다',
+        code: {
+          lang: 'yaml',
+          filename: 'decision.yml — 언제 무엇을, 그리고 함정',
+          lines: [
+            '# 선택 기준 (규모 · 조직 · 운영 여력)',
+            'choose:',
+            '  - if: 기존 Prometheus 를 유지하며 장기보관/글로벌뷰만 필요',
+            '    pick: thanos                     # 사이드카만 얹으면 됨(저저항)',
+            '  - if: 여러 팀 멀티테넌트 + 대규모 수평확장',
+            '    pick: cortex-or-mimir',
+            '  - if: 신규 도입이고 운영성 우선',
+            '    pick: mimir                      # cortex 개선 포크',
+            '',
+            '# 실무 함정 (도입 전 반드시 점검)',
+            'pitfalls:',
+            '  over_adoption: 소규모에 도입 → 컴포넌트 폭증, 운영부담↑',
+            '  storage_cost: S3 요청/전송 비용 + 다운샘플링 누락 시 원본 폭증',
+            '  ops_burden: distributor/ingester/compactor 등 상시 운영 필요',
+            '',
+            '# 가장 흔한 정답(먼저 이것부터)',
+            'start_simple:',
+            '  step1: retention.time 를 30~90d 로 늘려본다',
+            '  step2: remote_write 한 곳만 붙여 장기보관 검증',
+            '  step3: 진짜 글로벌뷰/멀티테넌트가 필요할 때 확장',
+            '',
+            '# ✅ Prometheus 완주: metric 모델 → 수집 → PromQL →',
+            '#    HA/Federation/remote_write → 장기저장(Thanos·Cortex·Mimir)',
+          ],
+          highlight: [3, 4, 5, 6, 12, 13, 18, 19],
+        },
+      },
+    ];
+
+    const SOLUTIONS = [
+      { key: 'thanos', emoji: '🛰', name: 'Thanos',       note: 'sidecar · pull',  color: 'orange' },
+      { key: 'cortex', emoji: '📦', name: 'Cortex/Mimir', note: 'remote_write · push', color: 'sky' },
+      { key: 'common', emoji: '🪣', name: '공통',          note: 'object storage',  color: 'purple' },
+      { key: 'choose', emoji: '🧭', name: '선택 기준',      note: '규모 · 비용',      color: 'emerald' },
+    ];
+
+    // 비교표 행 — common/choose 단계에서 tick 으로 하나씩 채워짐
+    const COMPARE = [
+      { label: '수집 방향',   thanos: 'pull (sidecar 업로드)',  cortex: 'push (remote_write)' },
+      { label: 'Prometheus', thanos: '그대로 유지',            cortex: 'agent 로 강등' },
+      { label: '멀티테넌시',  thanos: '약함 (단일 조직)',        cortex: '기본 내장' },
+      { label: '수평확장',    thanos: 'Querier/Store 계층',     cortex: '컴포넌트별 확장' },
+      { label: '장기저장',    thanos: 'S3 블록',                cortex: 'S3 블록' },
+    ];
+
+    // ── 좌측: 아키텍처 대비 + 비교표
+    function LiveDataPane({ step, stepIdx }) {
+      const [tick, setTick] = useState(0);
+      useEffect(() => {
+        setTick(0);
+        const id = setInterval(() => setTick((t) => (t < 8 ? t + 1 : t)), 600);
+        return () => clearInterval(id);
+      }, [stepIdx]);
+
+      const Box = ({ children, tone, dim }) => (
+        <div className={`rounded-lg px-2 py-1.5 text-center text-[10px] font-bold border transition-all duration-500 ${dim ? 'opacity-30' : 'opacity-100'} ${tone}`}>
+          {children}
+        </div>
+      );
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          {/* 헤더 */}
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🌍</span>
+              <span className="text-xs font-bold text-slate-700">장기저장 · 글로벌뷰 솔루션</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">Thanos / Cortex / Mimir</span>
+          </div>
+
+          {/* 4 카드 — 현재 focus 강조 */}
+          <div className="px-4 pt-3">
+            <div className="grid grid-cols-4 gap-2">
+              {SOLUTIONS.map((s) => {
+                const active = step.focus === s.key;
+                return (
+                  <div key={s.key}
+                    className={`rounded-lg p-2 text-center transition-all duration-300 ${active ? 'bg-orange-100 border-2 border-orange-400 scale-105 shadow-sm' : 'bg-slate-50 border border-slate-200'}`}>
+                    <div className="text-xl">{s.emoji}</div>
+                    <div className="text-[11px] font-bold text-slate-800 mt-1">{s.name}</div>
+                    <div className="text-[9px] text-slate-500 mt-0.5 leading-tight">{s.note}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 본문 */}
+          <div className="p-4 min-h-[320px]">
+            {/* Step1: 단일 Prometheus 한계 */}
+            {step.focus === 'limits' && (
+              <div className="space-y-3">
+                <div className="rounded-lg bg-slate-50 border-2 border-slate-300 p-3 text-center">
+                  <div className="inline-block rounded-lg bg-white border-2 border-slate-400 px-4 py-2 text-xs font-bold text-slate-700">
+                    단일 Prometheus
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-1 font-mono">로컬 디스크 TSDB · retention 15d</div>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { t: '장기저장 X', d: '15일 지나면 삭제' },
+                    { t: '글로벌뷰 X', d: '리전별로 따로 존재' },
+                    { t: '수평확장 X', d: '한 대의 한계' },
+                  ].map((x, i) => (
+                    <div key={i}
+                      className={`rounded-lg border-2 p-2 text-center transition-all duration-500 ${tick > i ? 'bg-red-50 border-red-300 opacity-100' : 'bg-slate-50 border-slate-200 opacity-40'}`}>
+                      <div className="text-lg">🚫</div>
+                      <div className="text-[11px] font-bold text-red-700 mt-1">{x.t}</div>
+                      <div className="text-[9px] text-slate-500 leading-tight mt-0.5">{x.d}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="text-[11px] text-slate-600 leading-snug bg-slate-50 rounded p-2 border border-slate-200">
+                  세 개의 벽을 동시에 넘으려면 <strong className="text-orange-700">장기저장 · 글로벌뷰 · 수평확장</strong> 계층이 따로 필요하다.
+                </div>
+              </div>
+            )}
+
+            {/* Step2: Thanos 흐름 */}
+            {step.focus === 'thanos' && (
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-orange-800 mb-1">🛰 Thanos — 사이드카가 블록을 올리고 Querier가 훑어 합친다 (pull)</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded-lg bg-orange-50 border-2 border-orange-200 p-2 space-y-1.5">
+                    <Box tone="bg-white border-orange-300 text-orange-800" dim={tick < 1}>Prometheus + sidecar</Box>
+                    <div className="text-center text-orange-400 text-xs">↓ 2h 블록 업로드</div>
+                    <Box tone="bg-white border-orange-300 text-orange-800" dim={tick < 2}>🪣 오브젝트 스토리지(S3)</Box>
+                  </div>
+                  <div className="rounded-lg bg-orange-50 border-2 border-orange-200 p-2 space-y-1.5">
+                    <Box tone="bg-white border-orange-300 text-orange-800" dim={tick < 3}>Store Gateway (과거 블록)</Box>
+                    <div className="text-center text-orange-400 text-xs">↓ 팬아웃 · dedup</div>
+                    <Box tone="bg-orange-500 border-orange-500 text-white" dim={tick < 4}>Querier → 글로벌 뷰</Box>
+                  </div>
+                </div>
+                <div className={`rounded-lg border-2 p-2 text-center transition-all duration-500 ${tick > 4 ? 'bg-orange-50 border-orange-300 opacity-100' : 'opacity-40 border-slate-200'}`}>
+                  <span className="text-[11px] font-bold text-orange-700">Compactor</span>
+                  <span className="text-[10px] text-slate-600"> — 오래된 블록 다운샘플링(5m · 1h)으로 장기 조회 경량화</span>
+                </div>
+                <div className="text-[11px] text-slate-600 leading-snug bg-slate-50 rounded p-2 border border-slate-200">
+                  기존 Prometheus를 유지한 채 <strong className="text-orange-700">사이드카만 얹는다</strong> → 도입 저항이 작다.
+                </div>
+              </div>
+            )}
+
+            {/* Step3: Cortex/Mimir 흐름 */}
+            {step.focus === 'cortex' && (
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-sky-800 mb-1">📦 Cortex/Mimir — remote_write 로 중앙에 밀어넣는다 (push)</div>
+                <div className="rounded-lg bg-sky-50 border-2 border-sky-200 p-2 space-y-1.5">
+                  <Box tone="bg-white border-sky-300 text-sky-800" dim={tick < 1}>Prometheus(agent) → remote_write</Box>
+                  <div className="text-center text-sky-400 text-xs">↓ X-Scope-OrgID(테넌트)</div>
+                  <Box tone="bg-white border-sky-300 text-sky-800" dim={tick < 2}>Distributor (해시 링 분산)</Box>
+                  <div className="text-center text-sky-400 text-xs">↓ 3벌 복제</div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <Box tone="bg-white border-sky-300 text-sky-800" dim={tick < 3}>Ingester</Box>
+                    <Box tone="bg-white border-sky-300 text-sky-800" dim={tick < 3}>Ingester</Box>
+                    <Box tone="bg-white border-sky-300 text-sky-800" dim={tick < 3}>Ingester</Box>
+                  </div>
+                  <div className="text-center text-sky-400 text-xs">↓ flush</div>
+                  <Box tone="bg-sky-500 border-sky-500 text-white" dim={tick < 4}>🪣 오브젝트 스토리지(S3) 블록</Box>
+                </div>
+                <div className="text-[11px] text-slate-600 leading-snug bg-slate-50 rounded p-2 border border-slate-200">
+                  각 컴포넌트를 <strong className="text-sky-700">수평으로 늘려</strong> 대규모·멀티테넌트를 감당한다. Mimir는 Cortex 개선 포크.
+                </div>
+              </div>
+            )}
+
+            {/* Step4: 공통 + 비교표 */}
+            {step.focus === 'common' && (
+              <div className="space-y-2">
+                <div className="rounded-lg bg-purple-50 border-2 border-purple-200 p-2 text-center text-[11px] font-bold text-purple-800">
+                  🪣 목적지는 같다 — 오브젝트 스토리지 · 장기보관 · 글로벌 쿼리 · replica dedup
+                </div>
+                <div className="rounded-lg border border-slate-200 overflow-hidden">
+                  <div className="grid grid-cols-3 bg-slate-100 text-[10px] font-bold text-slate-600">
+                    <div className="px-2 py-1.5">항목</div>
+                    <div className="px-2 py-1.5 border-l border-slate-200">🛰 Thanos</div>
+                    <div className="px-2 py-1.5 border-l border-slate-200">📦 Cortex/Mimir</div>
+                  </div>
+                  {COMPARE.map((row, i) => (
+                    <div key={i}
+                      className={`grid grid-cols-3 text-[10px] border-t border-slate-100 transition-all duration-500 ${tick > i ? 'opacity-100' : 'opacity-20'}`}>
+                      <div className="px-2 py-1.5 font-bold text-slate-700">{row.label}</div>
+                      <div className="px-2 py-1.5 border-l border-slate-100 text-orange-700">{tick > i ? row.thanos : '…'}</div>
+                      <div className="px-2 py-1.5 border-l border-slate-100 text-sky-700">{tick > i ? row.cortex : '…'}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="text-[11px] text-slate-600 leading-snug bg-slate-50 rounded p-2 border border-slate-200">
+                  차이는 <strong>누가 데이터를 옮기는가</strong>와 <strong>멀티테넌시가 필수인가</strong> — 이게 운영 복잡도를 가른다.
+                </div>
+              </div>
+            )}
+
+            {/* Step5: 선택 기준 + 함정 */}
+            {step.focus === 'choose' && (
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold text-emerald-800 mb-1">🧭 언제 무엇을 고를까</div>
+                {[
+                  { c: '기존 Prometheus 유지 + 장기보관/글로벌뷰만', p: 'Thanos', tone: 'bg-orange-50 border-orange-300 text-orange-800' },
+                  { c: '멀티테넌트 + 대규모 수평확장', p: 'Cortex / Mimir', tone: 'bg-sky-50 border-sky-300 text-sky-800' },
+                  { c: '신규 도입 · 운영성 우선', p: 'Mimir', tone: 'bg-indigo-50 border-indigo-300 text-indigo-800' },
+                ].map((x, i) => (
+                  <div key={i}
+                    className={`rounded-lg border-2 px-3 py-1.5 flex items-center justify-between transition-all duration-500 ${tick > i ? 'opacity-100' : 'opacity-30'} ${x.tone}`}>
+                    <span className="text-[10px]">{x.c}</span>
+                    <span className="text-[11px] font-bold">{x.p}</span>
+                  </div>
+                ))}
+                <div className={`rounded-lg bg-red-50 border-2 border-red-200 p-2 transition-all duration-500 ${tick > 3 ? 'opacity-100' : 'opacity-30'}`}>
+                  <div className="text-[10px] font-bold text-red-700 mb-1">⚠ 실무 함정</div>
+                  <div className="text-[10px] text-slate-600 leading-tight">과도한 도입(컴포넌트 폭증) · S3 스토리지 비용 · 상시 운영부담 → 먼저 retention을 늘리고 remote_write 한 곳만 붙여보라.</div>
+                </div>
+                <div className="rounded-lg bg-emerald-500 text-white text-center py-2 text-xs font-bold">
+                  ✅ Prometheus 완주 — metric 모델부터 장기저장까지
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 범례 */}
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">{step.legend}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 우측: VSCode 스타일 코드 뷰어
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="text-orange-600 hover:text-orange-800 font-medium" aria-label="챕터 목록으로">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-2-2</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 text-white flex items-center justify-center rounded-full font-bold text-sm" style={{ background: '#E6522C' }}>V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 운영 &gt; Chapter 2. 장기저장 &gt; V-2-2</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Thanos vs Cortex vs Mimir</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                장기 저장 · 글로벌 뷰를 위한 대표 솔루션 비교 — 단일 Prometheus의 한계를 넘는 세 가지 접근
+                (<strong>Thanos</strong> 사이드카 pull · <strong>Cortex/Mimir</strong> remote_write push). <strong className="text-orange-700">Prometheus 완주</strong>.
+              </p>
+              <div className="mt-3 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full transition-all duration-500" style={{ width: `${progress}%`, background: '#E6522C' }}></div>
+              </div>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: '#B8421F' }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider opacity-80">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs opacity-80">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-orange-50 border-2 border-orange-300 text-orange-900 text-sm">
+                🎉 <strong>Prometheus 완주!</strong> — Metric 모델 · Scrape · PromQL · Alerting · HA · Federation · remote_write · 장기저장(Thanos·Cortex·Mimir)까지 한 흐름으로 이어졌다. 실무에선 먼저 retention을 늘리고, 필요할 때 이 계층을 얹어라.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'} aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold text-white hover:opacity-90 transition min-w-[96px]" style={{ background: '#E6522C' }}>
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700" aria-label="챕터 목록">&larr; 챕터 목록</a>
+              <a href="../index.html" className="text-orange-600 hover:text-orange-800 font-medium" aria-label="Prometheus 완주 — 챕터 목록으로">🎉 Prometheus 완주 — 챕터 목록 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Prometheus 학습 — III-1-1. Recording Rule</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📼</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const BRAND = '#E6522C';
+    const BRAND_DARK = '#A33B1F';
+    const BRAND_BG = '#fff1ec';
+    const BRAND_BD = '#f8c8b5';
+
+    // ── 5 STEPS — Recording Rule이 무거운 쿼리를 사전 집계로 바꿔주는 흐름
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — 매 대시보드 새로고침마다 1.2초 PromQL',
+        desc: '결제 API의 5분 p99 latency를 Grafana 4개 대시보드가 30초마다 호출한다. histogram_quantile에 1주일 rate가 들어가서 매번 7천만 샘플을 훑는다. 1쿼리 1.2초 × 4대시보드 × 5팀 = Prometheus가 매 30초마다 24초어치 쿼리에 깔린다.',
+        rows: [
+          { name: 'p99 latency', desc: '1.2s / 쿼리', tag: 'slow' },
+          { name: 'error rate',  desc: '0.8s / 쿼리', tag: 'slow' },
+          { name: 'qps',         desc: '0.9s / 쿼리', tag: 'slow' },
+          { name: '동시 호출자', desc: '20 dashboard × 30s', tag: 'load' },
+        ],
+        alert: { tone: 'danger', text: '같은 무거운 쿼리를 모두가 동시에 — 사전 계산이 답.' },
+        code: {
+          lang: 'promql',
+          filename: 'dashboard.promql — 매번 직접 계산',
+          lines: [
+            '# Grafana 패널이 30초마다 던지는 쿼리',
+            '# (지난 1주일 데이터를 7일 동안 슬라이딩 윈도우로 훑음)',
+            'histogram_quantile(',
+            '  0.99,',
+            '  sum by (le, service) (',
+            '    rate(',
+            '      http_request_duration_seconds_bucket{',
+            '        service="checkout-api"',
+            '      }[7d]',
+            '    )',
+            '  )',
+            ')',
+            '',
+            '# 비용 측정',
+            '# - 1쿼리 평균 1.2초',
+            '# - 4 대시보드 × 5 팀 = 20 호출',
+            '# - 30초 주기 → 분당 40 호출 × 1.2s = 48초/분',
+            '# - 1 core 80% 점유 (그 외 ad-hoc 쿼리 못 받음)',
+            '',
+            '# 증상',
+            '# - 대시보드 첫 로드 5~7초 (panel 차례차례 로딩)',
+            '# - PromQL alert 평가도 같이 느려짐',
+            '# - 새벽 traffic 적은데도 CPU 80%',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        },
+      },
+      {
+        title: 'Step 2. Recording Rule — 1분마다 미리 계산',
+        desc: 'recording rule은 PromQL 결과를 새 메트릭 이름으로 저장한다. job:checkout_api_p99:5m처럼 "{레벨}:{메트릭}:{윈도우}" 컨벤션을 따른다. interval 1분이면 1분에 1번만 무거운 쿼리가 돌고, 결과는 가벼운 단일 시계열로 TSDB에 적힌다.',
+        rows: [
+          { name: 'rule 이름',       desc: 'job:checkout_api_p99:5m' },
+          { name: 'evaluation',      desc: '60s 마다 1회' },
+          { name: '계산 시간',       desc: '1.2s (변동 없음)' },
+          { name: '저장 방식',       desc: '새 metric으로 TSDB' },
+        ],
+        alert: { tone: 'info', text: '컨벤션: level:metric:operation (job/instance 등)' },
+        code: {
+          lang: 'yaml',
+          filename: 'recording-rules.yml — 핵심 정의',
+          lines: [
+            '# /etc/prometheus/recording-rules.yml',
+            'groups:',
+            '',
+            '- name: checkout-api-aggregates',
+            '  interval: 60s              # 1분마다 평가 (기본 = global)',
+            '  rules:',
+            '',
+            '  # 1) p99 latency — Grafana 메인 SLI',
+            '  - record: job:checkout_api_p99:5m',
+            '    expr: |',
+            '      histogram_quantile(0.99,',
+            '        sum by (le, service) (',
+            '          rate(',
+            '            http_request_duration_seconds_bucket{',
+            '              service="checkout-api"',
+            '            }[5m]',
+            '          )',
+            '        )',
+            '      )',
+            '    labels:',
+            '      sli_type: latency',
+            '',
+            '  # 2) error rate',
+            '  - record: job:checkout_api_error_rate:5m',
+            '    expr: |',
+            '      sum(rate(http_requests_total{',
+            '        service="checkout-api", code=~"5.."',
+            '      }[5m]))',
+            '      /',
+            '      sum(rate(http_requests_total{',
+            '        service="checkout-api"',
+            '      }[5m]))',
+            '',
+            '  # 컨벤션',
+            '  # record: <집계레벨>:<메트릭>:<연산>',
+            '  # 예) job:http_requests:rate5m',
+            '  # 예) instance:node_cpu:rate1m',
+          ],
+          highlight: [9, 10, 25, 26],
+        },
+      },
+      {
+        title: 'Step 3. Reload — config 검증 → SIGHUP',
+        desc: '룰 파일은 prometheus.yml의 rule_files: 에 등록한다. 적용 전에 promtool check rules 로 expr 문법, label 충돌, 이름 컨벤션을 검증한다. 검증 통과 후 SIGHUP(또는 /-/reload)로 무중단 reload. 컨테이너 환경이면 sidecar로 inotify watch 패턴이 일반적이다.',
+        rows: [
+          { name: 'rule_files',     desc: 'prometheus.yml' },
+          { name: 'check',          desc: 'promtool check rules' },
+          { name: 'reload',         desc: 'SIGHUP / POST /-/reload' },
+          { name: 'rollback',       desc: 'git revert + reload' },
+        ],
+        alert: { tone: 'warn', text: 'reload 실패해도 기존 룰은 그대로 — 로그를 꼭 확인.' },
+        code: {
+          lang: 'yaml',
+          filename: 'prometheus.yml + 반영 절차',
+          lines: [
+            '# /etc/prometheus/prometheus.yml',
+            'global:',
+            '  scrape_interval: 15s',
+            '  evaluation_interval: 60s     # 룰 평가 기본 주기',
+            '',
+            'rule_files:',
+            '  - /etc/prometheus/recording-rules.yml',
+            '  - /etc/prometheus/alert-rules.yml',
+            '',
+            'scrape_configs:',
+            '  - job_name: checkout-api',
+            '    static_configs:',
+            '      - targets: ["checkout-api:8080"]',
+            '',
+            '# ─────────────────────────────────────',
+            '# 반영 절차 — git push 전에 반드시',
+            '# ─────────────────────────────────────',
+            '',
+            '# 1) 문법 + 컨벤션 검사',
+            '$ promtool check rules recording-rules.yml',
+            '#   SUCCESS: 2 rules found',
+            '',
+            '# 2) PR 머지 → 배포',
+            '#    (Kubernetes는 ConfigMap update + reloader sidecar)',
+            '',
+            '# 3) 무중단 reload',
+            '$ curl -X POST http://prometheus:9090/-/reload',
+            '#   또는: kill -HUP $(pidof prometheus)',
+            '',
+            '# 4) 적용 확인',
+            '$ curl -s prometheus:9090/api/v1/rules \\',
+            '    | jq ".data.groups[].name"',
+          ],
+          highlight: [6, 7, 8, 21, 28],
+        },
+      },
+      {
+        title: 'Step 4. 효과 — 대시보드 5초 → 50ms (24배)',
+        desc: '대시보드는 이제 job:checkout_api_p99:5m 라는 단일 시계열만 읽는다. histogram_quantile 계산이 한 번도 안 돈다. p99 로딩 50ms, CPU도 한 자릿수로 떨어진다. 무거운 쿼리는 1분에 1번, 모두가 그 결과를 공유하는 구조.',
+        rows: [
+          { name: 'panel 로딩',     desc: '5s → 50ms (24×)' },
+          { name: 'CPU',            desc: '80% → 6%' },
+          { name: '계산 횟수',      desc: '40/min → 1/min' },
+          { name: 'ad-hoc 쿼리',    desc: '여유 회복' },
+        ],
+        alert: { tone: 'good', text: '대시보드와 알람은 record 메트릭을 — raw 직접 쿼리는 ad-hoc 디버깅용으로만.' },
+        code: {
+          lang: 'promql',
+          filename: 'dashboard.promql — Recording Rule 적용 후',
+          lines: [
+            '# Grafana 패널: 단일 시계열만 읽음',
+            'job:checkout_api_p99:5m{service="checkout-api"}',
+            '',
+            '# instant query, 평균 응답 ~50ms',
+            '# 시계열 1개 (sli_type=latency) 를 그대로 그래프로',
+            '',
+            '# Alertmanager 룰도 같은 record 사용',
+            '- alert: HighLatency',
+            '  expr: job:checkout_api_p99:5m > 0.2',
+            '  for: 5m',
+            '  labels: { severity: critical }',
+            '  annotations:',
+            '    summary: "p99 > 200ms (record 메트릭 기반)"',
+            '',
+            '# 핵심 효과',
+            '# - 모든 panel/alert가 같은 record 시계열을 공유',
+            '# - histogram_quantile 1분 1회 (모두 합쳐서)',
+            '# - 대시보드 첫 로드 5~7초 → 0.5초',
+            '# - rate 윈도우 변경(5m↔30m)은 record 추가만 하면 됨',
+            '',
+            '# 주의',
+            '# - record 이름을 사후에 바꾸면 대시보드 깨짐 → 신규명 + 마이그',
+            '# - 윈도우 줄이면 cardinality 증가 → metric explorer 확인',
+          ],
+          highlight: [2, 9],
+        },
+      },
+      {
+        title: 'Step 5. 운영 베스트 — 컨벤션 + 검증 + 모니터링',
+        desc: '룰은 점점 늘어난다(보통 100~300개). 이름 컨벤션을 강제하지 않으면 _v2, _final, _new 가 산다. 룰 자체 메트릭(rule_evaluation_duration_seconds)을 알람으로 감시해 무거운 룰을 발견. 모든 새 룰은 PR + promtool check + 변경 영향 분석 (대시보드 grep) 필수.',
+        rows: [
+          { name: '이름 컨벤션',     desc: 'level:metric:op' },
+          { name: 'CI 검증',         desc: 'promtool check rules' },
+          { name: '메타 모니터링',   desc: 'rule_evaluation_duration_seconds' },
+          { name: '영향 분석',       desc: 'grafonnet / grep 대시보드' },
+        ],
+        wins: [
+          '컨벤션 강제 (linter) — 100+ 룰이 깨끗하게 살아남는다',
+          'CI에 promtool check rules — 깨진 룰은 머지 자체 차단',
+          '평가 시간 알람 — 1초 넘는 룰은 즉시 reviewer 호출',
+          '대시보드 grep — 룰 이름 바꿀 때 깨지는 panel 사전 발견',
+          'recording vs alert — recording은 메트릭 생산, alert는 소비',
+        ],
+        alert: { tone: 'good', text: 'recording rule은 "메트릭의 인덱스" — 잘 깔면 운영비 절반, 못 깔면 슬프다.' },
+        code: {
+          lang: 'yaml',
+          filename: 'meta-monitoring.yml — 룰을 감시하는 룰',
+          lines: [
+            '# 룰 평가 자체가 느려지면 대시보드도 같이 느려진다',
+            '# → 메타 알람으로 감시',
+            '',
+            'groups:',
+            '- name: prometheus-meta',
+            '  rules:',
+            '',
+            '  # 1) 평가 1초 넘는 룰',
+            '  - alert: SlowRecordingRule',
+            '    expr: |',
+            '      prometheus_rule_evaluation_duration_seconds{',
+            '        quantile="0.99"',
+            '      } > 1',
+            '    for: 10m',
+            '    labels: { severity: warning, team: observability }',
+            '    annotations:',
+            '      summary: "룰 평가 p99 > 1s"',
+            '      runbook: "https://wiki/runbook#SlowRule"',
+            '',
+            '  # 2) 평가 실패 누적',
+            '  - alert: RuleEvaluationFailures',
+            '    expr: |',
+            '      increase(prometheus_rule_evaluation_failures_total[10m])',
+            '      > 0',
+            '    for: 0m            # 즉시 알람 (한 번이라도 실패하면)',
+            '    labels: { severity: critical, team: observability }',
+            '',
+            '  # 3) reload 실패 — config 깨진 채로 운영 중',
+            '  - alert: ConfigReloadFailed',
+            '    expr: prometheus_config_last_reload_successful == 0',
+            '    for: 5m',
+            '    labels: { severity: critical }',
+            '',
+            '# CI에서도 같은 룰 파일을 검사',
+            '# $ promtool check rules recording-rules.yml alert-rules.yml',
+            '# $ promtool test rules unit-tests.yml',
+          ],
+          highlight: [9, 22, 30],
+        },
+      },
+    ];
+
+    function Rows({ rows }) {
+      return (
+        <div className="rounded-lg overflow-hidden bg-white" style={{ border: `2px solid ${BRAND}` }}>
+          <div className="px-3 py-1.5 text-xs font-bold text-white" style={{ background: BRAND }}>📼 사전 녹화한 PromQL</div>
+          <div className="p-3 space-y-2">
+            {rows.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 text-xs">
+                <span className="w-44 font-mono font-bold" style={{ color: BRAND_DARK }}>{r.name}</span>
+                <span className="flex-1 px-2 py-0.5 rounded font-mono" style={{ background: BRAND_BG, color: BRAND_DARK }}>{r.desc}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function WinsBox({ wins }) {
+      if (!wins) return null;
+      return (
+        <div className="mt-3 rounded-xl p-4" style={{ border: `2px solid ${BRAND}`, background: BRAND_BG }}>
+          <div className="text-lg font-bold mb-2" style={{ color: BRAND_DARK }}>🔶 핵심 정리</div>
+          <ul className="space-y-1.5">
+            {wins.map((w, i) => (
+              <li key={i} className="text-sm flex gap-2" style={{ color: BRAND_DARK }}><span style={{ color: BRAND }}>✓</span><span>{w}</span></li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    const ALERT_STYLE = {
+      info:   { bg: '#fff1ec', bd: '#f8c8b5', tx: '#A33B1F', icon: '💡' },
+      warn:   { bg: '#fef3c7', bd: '#fde68a', tx: '#92400e', icon: '⚠️' },
+      danger: { bg: '#fee2e2', bd: '#fecaca', tx: '#991b1b', icon: '🚨' },
+      good:   { bg: '#dbf3e6', bd: '#86efac', tx: '#166534', icon: '✅' },
+    };
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className="mt-3 rounded-lg p-2 text-xs flex gap-2" style={{ background: s.bg, border: `1px solid ${s.bd}`, color: s.tx }}>
+          <span>{s.icon}</span><span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl bg-white p-4 h-full flex flex-col" style={{ border: `1px solid ${BRAND}` }}>
+          <div className="mb-3 text-sm font-bold" style={{ color: BRAND_DARK }}>녹화 → 재생 흐름</div>
+          <Rows rows={state.rows} />
+          <WinsBox wins={state.wins} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? '-ml-3 pl-2' : ''}`} style={isHi ? { background: 'rgba(230,82,44,0.18)', borderLeft: `2px solid ${BRAND}` } : {}}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{ background: 'linear-gradient(135deg,#fff1ec 0%,#ffdcc9 100%)' }}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ background: BRAND }}>PR</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: BRAND_DARK }}>III-1-1. Recording Rule — 사전 집계</h1>
+                <p className="text-sm" style={{ color: BRAND }}>비유: VCR 사전녹화 — 무거운 PromQL을 1분에 1번만 계산, 결과는 가벼운 메트릭으로 저장</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: BRAND }}>← 챕터 목록</a>
+            </header>
+            <div className="mb-4 flex gap-1.5" role="progressbar" aria-valuenow={stepIdx + 1} aria-valuemin={1} aria-valuemax={STEPS.length}>
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ background: i <= stepIdx ? BRAND : BRAND_BD }} />
+              ))}
+            </div>
+            <div className="mb-4 rounded-xl px-5 py-4 shadow text-white" style={{ background: BRAND }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded bg-white" style={{ border: `1px solid ${BRAND}`, color: BRAND }}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{ border: `1px solid ${BRAND}`, color: BRAND }}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ background: BRAND }}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded bg-white disabled:opacity-40" style={{ border: `1px solid ${BRAND}`, color: BRAND }}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: `${BRAND}aa` }}>키보드 ←/→ · 자동재생 3초/단계</div>
+            {isLast && (
+              <div className="mt-5 rounded-lg bg-white px-4 py-3 text-sm" style={{ border: `2px solid ${BRAND}`, color: BRAND_DARK }}>
+                <div className="font-bold mb-1">✅ Recording Rule 핵심</div>
+                무거운 쿼리는 1분 1번 사전 계산 → 가벼운 시계열로 저장 → 모두가 공유. 컨벤션 + promtool check + 메타 모니터링이 운영의 기본.
+              </div>
+            )}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {["recording-rule","promql","aggregation","performance"].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full" style={{ background: BRAND_BG, color: BRAND_DARK, border: `1px solid ${BRAND_BD}` }}>#{k}</span>
+              ))}
+            </div>
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: BRAND }}>
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-1-2.html" className="underline hover:no-underline">다음: III-1-2 Alerting Rule →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
