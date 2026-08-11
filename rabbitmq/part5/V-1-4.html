@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitMQ 인터랙티브 학습 — V-1-4. Sizing + Flow Control</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    RabbitMQ V-1-4 — Sizing + Flow Control (용량 산정과 흐름 제어)
+    학습 목표: 메모리 워터마크 / 디스크 free limit / credit-based flow control /
+              lazy queue / 사이징 계산을 5단계로 학습한다.
+    패턴: fastapi v1 — 좌(리소스 게이지·flow control 시뮬레이션) / 우(VSCode CodeViewer 5탭)
+    색상: orange (RabbitMQ 공식 #FF6600 / 진한색 #a64200)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 브랜드 색상
+    const BRAND = '#FF6600';
+    const BRAND_DARK = '#a64200';
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    //   1: 메모리 워터마크 — 초과 시 publisher 블록 (백프레셔)
+    //   2: 디스크 free limit — 미달 시 발행 차단
+    //   3: credit-based flow control — 느린 소비자 시 publisher 스로틀
+    //   4: lazy queue vs 기본(메모리) — 대량 적재 시 디스크 우선
+    //   5: 사이징 계산 + 종합 정리
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 메모리 워터마크 — 초과하면 publisher를 블록한다',
+        desc: 'RabbitMQ는 노드 전체 메모리 사용량이 vm_memory_high_watermark(기본 0.4 = 물리 RAM의 40%)를 넘으면 모든 발행 연결을 블록한다. 소비자가 밀려 메시지가 큐에 쌓이면 메모리가 차오르고, 워터마크에 닿는 순간 producer의 basic_publish가 멈춘다(연결이 blocked 상태). 이게 백프레셔다 — 브로커가 죽는 대신 발행 속도를 강제로 늦춰 스스로를 보호한다. 애플리케이션은 connection.blocked 콜백으로 이 신호를 받아 발행을 잠시 멈추도록 설계해야 한다.',
+        actor: '🧠 메모리 워터마크 — 40% 도달 시 발행 블록',
+        gauge: { kind: 'mem', used: 41, limit: 40, unit: '%', label: '노드 메모리 사용률', blocked: true },
+        flow: [
+          { node: 'Producer', state: 'error', detail: 'basic_publish → 연결 blocked (전송 멈춤)' },
+          { node: 'orders.queue', state: 'warn', detail: '소비 지연으로 메시지 적재 → 메모리 상승' },
+          { node: 'Consumer', state: 'warn', detail: '처리 지연 (느린 소비자)' },
+          { node: 'RabbitMQ node', state: 'error', detail: 'mem 41% ≥ watermark 40% → block publishers' },
+        ],
+        alert: { tone: 'warn', text: '워터마크는 "메시지를 버리는" 게 아니라 "발행을 멈추는" 안전장치. 절대값(예: 2GB)로도 지정 가능 — 컨테이너 환경에선 절대값 권장.' },
+        code: {
+          lang: 'ini',
+          filename: 'rabbitmq.conf (watermark)',
+          lines: [
+            '# rabbitmq.conf — 메모리 워터마크(백프레셔) 설정',
+            '#',
+            '# 핵심:',
+            '#   - 노드 메모리가 임계값을 넘으면 모든 publisher 연결을 block',
+            '#   - 소비가 따라잡아 메모리가 내려가면 자동으로 unblock',
+            '#   - 메시지를 버리지 않는다 (발행 속도만 늦춘다)',
+            '',
+            '# ── 상대값: 물리 RAM 대비 비율 (기본 0.4 = 40%) ──',
+            'vm_memory_high_watermark.relative = 0.4',
+            '',
+            '# ── 절대값: 컨테이너/K8s 에서는 절대값을 권장 ──',
+            '#   cgroup 제한을 RabbitMQ 가 정확히 못 볼 때가 있어',
+            '#   OOM-Kill 을 피하려면 명시적 상한이 안전하다',
+            '# vm_memory_high_watermark.absolute = 2GB',
+            '',
+            '# ── paging 임계: 워터마크의 몇 %에서 디스크로 내보낼지 ──',
+            '#   기본 0.5 → watermark 의 50% 도달 시 메시지를 디스크로 page-out',
+            'vm_memory_high_watermark_paging_ratio = 0.5',
+            '',
+            '# ── 확인 명령 ──',
+            '#   rabbitmqctl status | grep -A5 memory',
+            '#   rabbitmq-diagnostics memory_breakdown',
+            '#   rabbitmq-diagnostics alarms   # 워터마크 알람 발생 여부',
+            '',
+            '# ── 운영 팁 ──',
+            '#   • blocked 연결은 Management UI Connections 탭에서 state=blocked',
+            '#   • 애플리케이션은 connection.blocked / unblocked 콜백을 구독',
+            '#   • 근본 해결은 "소비자 증설" 또는 "발행 속도 제한"',
+          ],
+          highlight: [1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 13, 14, 15],
+        },
+      },
+      {
+        title: 'Step 2. 디스크 free limit — 여유 공간이 부족하면 발행을 막는다',
+        desc: 'RabbitMQ는 데이터 디렉터리가 위치한 디스크의 남은 여유 공간이 disk_free_limit 미만이 되면 발행을 차단한다. 큐가 durable이거나 메시지가 persistent면 결국 디스크에 써야 하는데, 디스크가 꽉 차면 브로커가 손상되기 때문이다. 기본값은 50MB로 지나치게 낮아 실무에선 절대 안전하지 않다 — 권장은 노드 RAM과 같은 크기(relative 1.0~2.0) 또는 명시적 절대값이다. 디스크 알람이 뜨면 메모리 워터마크와 똑같이 publisher가 blocked 상태가 된다.',
+        actor: '💽 디스크 free limit — 여유 부족 시 발행 차단',
+        gauge: { kind: 'disk', used: 96, limit: 90, unit: '%', label: '디스크 사용률 (free < limit)', blocked: true },
+        flow: [
+          { node: 'Producer', state: 'error', detail: 'persistent 메시지 발행 → blocked' },
+          { node: 'disk (data dir)', state: 'error', detail: 'free 1.8GB < disk_free_limit 2GB' },
+          { node: 'RabbitMQ node', state: 'error', detail: 'disk alarm 발생 → block publishers' },
+          { node: '운영자', state: 'info', detail: '로그 회전 / 디스크 증설 / 소비 재개' },
+        ],
+        alert: { tone: 'err', text: '기본 50MB는 함정. persistent 메시지 폭주 시 순식간에 채워진다. relative 1.0(=RAM 크기) 또는 넉넉한 절대값으로 반드시 올려라.' },
+        code: {
+          lang: 'ini',
+          filename: 'rabbitmq.conf (disk)',
+          lines: [
+            '# rabbitmq.conf — 디스크 free limit(발행 차단) 설정',
+            '#',
+            '# 핵심:',
+            '#   - 데이터 디렉터리 디스크의 "남은 여유 공간"이 임계 미만이면',
+            '#     디스크 알람 → publisher block (메모리 워터마크와 동일 동작)',
+            '#   - durable queue / persistent message 는 결국 디스크에 쓰이므로',
+            '#     디스크가 꽉 차면 브로커 손상 → 이를 예방하는 안전장치',
+            '',
+            '# ── 절대값: 명시적 상한 (권장 시작점) ──',
+            'disk_free_limit.absolute = 2GB',
+            '',
+            '# ── 상대값: 노드 RAM 대비 배수 ──',
+            '#   1.0 = RAM 과 같은 크기의 여유를 항상 확보',
+            '#   2.0 = RAM 의 2배 (여유롭게)',
+            '# disk_free_limit.relative = 1.0',
+            '',
+            '# ── 확인 명령 ──',
+            '#   rabbitmq-diagnostics disk_free',
+            '#   rabbitmq-diagnostics alarms',
+            '#   df -h /var/lib/rabbitmq   # 실제 디스크 여유',
+            '',
+            '# ── 왜 기본 50MB 는 위험한가 ──',
+            '#   • persistent 메시지가 초당 수천 건이면 50MB 는 몇 초 만에 소진',
+            '#   • 알람이 늦게 떠서 이미 디스크가 꽉 찬 뒤 block → 복구 어려움',
+            '#   • 로그/definitions/mnesia 도 같은 디스크를 쓰면 더 빨리 참',
+            '',
+            '# ── 알람 대응 순서 ──',
+            '#   1) df -h 로 무엇이 차지하는지 확인 (로그? 큐 데이터?)',
+            '#   2) 소비자 증설로 큐를 비운다',
+            '#   3) 디스크 증설 (가장 확실)',
+            '#   4) lazy queue 로 메모리 부담을 낮춘다 (Step 4)',
+          ],
+          highlight: [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 24, 25, 26, 27],
+        },
+      },
+      {
+        title: 'Step 3. Flow Control — credit 기반으로 publisher를 자동 스로틀',
+        desc: 'RabbitMQ 내부는 여러 프로세스가 credit(허용량)을 주고받으며 연결된다. 발행자 연결 → 채널 → 큐 프로세스로 메시지가 흐를 때, 뒷단(느린 큐/소비자)이 credit을 다 소진하면 앞단은 새 credit을 못 받아 자연스럽게 멈춘다. 즉 워터마크 같은 전역 알람이 아니라도, 특정 큐가 밀리면 그 경로의 publisher만 초당 처리량에 맞춰 자동으로 느려진다. Management UI에서 연결/채널 state가 flow로 보이면 바로 이 credit-based flow control이 작동 중이라는 신호다.',
+        actor: '🚦 Credit-based Flow Control — 밀리면 자동 스로틀',
+        gauge: { kind: 'rate', publish: 20000, consume: 8000, unit: 'msg/s', label: '발행 vs 소비 처리량', blocked: false },
+        flow: [
+          { node: 'Producer 채널', state: 'warn', detail: 'state=flow — credit 소진, 전송 스로틀' },
+          { node: 'Queue 프로세스', state: 'warn', detail: '메시지 적체 → 하위에 credit 미발급' },
+          { node: 'Consumer', state: 'active', detail: 'prefetch 만큼만 소비 (초당 8k)' },
+          { node: '균형 결과', state: 'success', detail: '발행이 소비 속도(8k)에 자동 수렴' },
+        ],
+        alert: { tone: 'info', text: 'flow control은 "정상적인 백프레셔"다. 나쁜 게 아니라 브로커가 스스로 균형을 잡는 것. 지속되면 소비자 부족·prefetch 과다·큐 병목을 의심하라.' },
+        code: {
+          lang: 'bash',
+          filename: 'flow_control.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# flow_control.sh — credit-based flow control 관찰/진단',
+            '#',
+            '# 핵심:',
+            '#   - RabbitMQ 는 connection -> channel -> queue 사이를 credit 으로 연결',
+            '#   - 하위(느린 큐/소비자)가 credit 을 소진하면 상위가 자동으로 멈춤',
+            '#   - 채널/연결 state 가 "flow" 이면 스로틀 발동 중',
+            '',
+            'set -euo pipefail',
+            '',
+            '# ── 1) flow 상태인 연결 확인 ──',
+            'echo "== connections in flow state =="',
+            'rabbitmqctl list_connections name state | grep flow || echo "none"',
+            '',
+            '# ── 2) flow 상태인 채널 확인 ──',
+            'echo "== channels in flow state =="',
+            'rabbitmqctl list_channels name state messages_unacknowledged | grep flow || echo "none"',
+            '',
+            '# ── 3) 큐별 적체/소비 속도 확인 ──',
+            'echo "== queue depth & rates =="',
+            'rabbitmqctl list_queues name messages messages_ready \\',
+            '  consumers message_bytes',
+            '',
+            '# ── 4) prefetch 진단 ──',
+            '#   prefetch 가 너무 크면 소비자 하나가 메시지를 독점 → 불균형',
+            '#   너무 작으면 왕복 지연으로 처리량 저하',
+            'echo "== consumer prefetch =="',
+            'rabbitmqctl list_consumers queue_name prefetch_count ack_required',
+            '',
+            '# ── 해결 가이드 ──',
+            '#   • flow 가 지속 → 소비자 스케일 아웃 (consumers 늘리기)',
+            '#   • prefetch_count 조정: 처리시간이 짧으면 크게(100+), 길면 작게(1~10)',
+            '#   • 큐 병목이면 sharding / consistent-hash exchange 로 분산',
+            '#   • 발행 폭주가 원인이면 애플리케이션 rate limit 도입',
+          ],
+          highlight: [4, 5, 6, 7, 12, 13, 14, 16, 17, 18, 30, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 4. Lazy Queue vs 기본 — 대량 적재 시 디스크를 우선한다',
+        desc: '기본(classic) 큐는 메시지를 가능한 한 메모리에 들고 있어 빠르지만, 수백만 건이 쌓이면 RAM을 잡아먹어 워터마크를 유발한다. lazy queue는 메시지를 처음부터 디스크에 두고 필요할 때만 메모리로 올려 RAM 사용을 극적으로 낮춘다 — 대량 백로그·느린 소비자·배치 처리에 적합하다. 대신 소비 지연시간이 조금 늘고 디스크 I/O가 커진다. 중요한 변화: RabbitMQ 3.12+에서 classic 큐는 사실상 lazy처럼 동작하고, Quorum 큐는 원래부터 디스크 우선이라 신규 설계는 Quorum이 기본 권장이다.',
+        actor: '📦 Lazy Queue — 디스크 우선으로 RAM 방어',
+        gauge: { kind: 'compare', normalMem: 78, lazyMem: 12, unit: '% RAM', label: '동일 백로그 100만건 — 메모리 점유', blocked: false },
+        flow: [
+          { node: '기본(classic) 큐', state: 'warn', detail: '100만건 → RAM 78% (워터마크 위험)' },
+          { node: 'lazy 큐', state: 'success', detail: '100만건 → RAM 12% (디스크 상주)' },
+          { node: 'Quorum 큐 (권장)', state: 'success', detail: '원래 디스크 우선 + 복제 안정성' },
+          { node: '트레이드오프', state: 'info', detail: 'lazy: 소비 지연 ↑, 디스크 I/O ↑' },
+        ],
+        alert: { tone: 'good', text: '"빠른 소비 + 작은 큐"면 기본, "대량 백로그 + RAM 방어"면 lazy/Quorum. 3.12+ 신규 설계는 Quorum 큐를 우선 검토하라.' },
+        code: {
+          lang: 'python',
+          filename: 'lazy_queue.py',
+          lines: [
+            '"""',
+            'lazy_queue.py — lazy queue / Quorum queue 선언 예시',
+            '',
+            '핵심:',
+            '  - lazy queue: 메시지를 디스크 우선 저장 → RAM 절약 (대량 백로그)',
+            '  - Quorum queue: 디스크 우선 + Raft 복제 → 신규 설계 권장',
+            '  - 선택 기준: 큐 크기, 소비 속도, 내구성 요구',
+            '"""',
+            'import pika',
+            '',
+            'connection = pika.BlockingConnection(',
+            '    pika.ConnectionParameters(host="localhost", port=5672)',
+            ')',
+            'channel = connection.channel()',
+            '',
+            '# ── 1) lazy queue (classic + x-queue-mode=lazy) ──',
+            '#   대량 적재 예상 큐에 지정 → 메모리 대신 디스크에 상주',
+            'channel.queue_declare(',
+            '    queue="orders.backlog",',
+            '    durable=True,',
+            '    arguments={"x-queue-mode": "lazy"},',
+            ')',
+            '',
+            '# ── 2) Quorum queue (신규 설계 권장) ──',
+            '#   디스크 우선 + 복제(HA). x-queue-type 으로 지정',
+            'channel.queue_declare(',
+            '    queue="orders.quorum",',
+            '    durable=True,   # Quorum 은 항상 durable',
+            '    arguments={',
+            '        "x-queue-type": "quorum",',
+            '        "x-max-length": 1000000,          # 큐 상한 (초과분 dead-letter)',
+            '        "x-delivery-limit": 5,            # 재전달 5회 초과 시 dead-letter',
+            '    },',
+            ')',
+            '',
+            '# ── 선택 가이드 ──────────────────────────────',
+            '#   기본(classic):  작은 큐 + 빠른 소비 + 최저 지연',
+            '#   lazy:           대량 백로그 + RAM 방어 (구버전 호환)',
+            '#   Quorum:         내구성/HA 필요 + 신규 설계 (권장 기본값)',
+            '#',
+            '# ── 주의 ──',
+            '#   • 3.12+ 에서 classic 큐는 사실상 lazy 처럼 동작',
+            '#   • x-queue-mode 는 classic 전용 (Quorum 엔 불필요)',
+            '#   • lazy 는 소비 지연이 조금 늘고 디스크 I/O 가 커진다',
+          ],
+          highlight: [4, 5, 6, 7, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34],
+        },
+      },
+      {
+        title: 'Step 5. Sizing — 처리량·크기·소비자로 용량을 계산한다 (종합)',
+        desc: '사이징의 목표는 "피크 발행량을 소비가 따라잡아 큐가 무한정 자라지 않게" 하는 것이다. 필요 소비자 수 = 목표 처리량(msg/s) ÷ (소비자 1개 처리율). 소비자 1개 처리율 ≈ prefetch_count ÷ 평균 처리시간(초). 메모리 여유는 (피크 큐 깊이 × 평균 메시지 크기)가 워터마크 안에 들어오는지로 검증한다. 넘치면 소비자 증설·lazy/Quorum·큐 분산으로 해결한다. 마지막으로 백프레셔(워터마크·디스크·flow control)는 폭주 시 브로커를 지키는 최후 방어선이므로, 애플리케이션이 blocked 신호를 받아 발행을 줄이도록 반드시 설계에 포함한다.',
+        actor: '📐 Sizing 종합 — 용량 계산 + 백프레셔 설계',
+        gauge: { kind: 'sizing', publish: 20000, perConsumer: 2500, needConsumers: 8, unit: 'msg/s', label: '용량 계산 결과', blocked: false },
+        flow: [
+          { node: '목표 처리량', state: 'active', detail: '피크 20,000 msg/s' },
+          { node: '소비자 1개 처리율', state: 'active', detail: 'prefetch 50 ÷ 20ms = 2,500 msg/s' },
+          { node: '필요 소비자 수', state: 'success', detail: '20000 ÷ 2500 = 8개 (+여유 2 → 10)' },
+          { node: '메모리 검증', state: 'info', detail: '피크깊이 50만 × 2KB = 1GB < watermark' },
+        ],
+        alert: { tone: 'good', text: '핵심 공식: 필요 소비자 = 목표 처리량 ÷ (prefetch ÷ 처리시간). 큐가 계속 자라면 소비 부족 신호 — 소비자·prefetch·큐 분산 순으로 조정.' },
+        code: {
+          lang: 'python',
+          filename: 'sizing_calc.py',
+          lines: [
+            '"""',
+            'sizing_calc.py — RabbitMQ 용량 산정 계산기 (실무 견적용)',
+            '',
+            '핵심 공식:',
+            '  소비자 1개 처리율 = prefetch_count / 평균 처리시간(초)',
+            '  필요 소비자 수    = ceil(목표 처리량 / 소비자 1개 처리율)',
+            '  피크 메모리 요구  = 피크 큐 깊이 * 평균 메시지 크기',
+            '"""',
+            'import math',
+            '',
+            '',
+            'def per_consumer_rate(prefetch: int, process_ms: float) -> float:',
+            '    """소비자 1개의 초당 처리량(msg/s)',
+            '',
+            '    Args:',
+            '        prefetch: basic_qos prefetch_count',
+            '        process_ms: 메시지 1건 평균 처리시간 (밀리초)',
+            '',
+            '    Returns:',
+            '        초당 처리 가능 메시지 수',
+            '    """',
+            '    if process_ms <= 0:',
+            '        raise ValueError("process_ms must be > 0")',
+            '    # prefetch 만큼 파이프라이닝된다고 가정 (I/O 왕복 숨김)',
+            '    return prefetch / (process_ms / 1000.0)',
+            '',
+            '',
+            'def required_consumers(target_rate: int, prefetch: int,',
+            '                       process_ms: float, safety: float = 1.25) -> int:',
+            '    """목표 처리량을 감당할 소비자 수 (여유율 포함)',
+            '',
+            '    Args:',
+            '        target_rate: 목표/피크 처리량 (msg/s)',
+            '        prefetch: prefetch_count',
+            '        process_ms: 건당 처리시간 (ms)',
+            '        safety: 여유 계수 (1.25 = 25% 여유)',
+            '    """',
+            '    one = per_consumer_rate(prefetch, process_ms)',
+            '    return math.ceil(target_rate / one * safety)',
+            '',
+            '',
+            'def peak_memory_mb(peak_depth: int, avg_msg_bytes: int) -> float:',
+            '    """피크 큐 깊이가 요구하는 대략적 메모리(MB)"""',
+            '    return peak_depth * avg_msg_bytes / (1024 * 1024)',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    TARGET = 20_000      # 피크 발행 20k msg/s',
+            '    PREFETCH = 50',
+            '    PROCESS_MS = 20      # 건당 20ms',
+            '',
+            '    rate = per_consumer_rate(PREFETCH, PROCESS_MS)',
+            '    need = required_consumers(TARGET, PREFETCH, PROCESS_MS)',
+            '    mem = peak_memory_mb(500_000, 2048)  # 50만건 x 2KB',
+            '',
+            '    print(f"소비자 1개 처리율 : {rate:,.0f} msg/s")',
+            '    print(f"필요 소비자 수    : {need} 개")',
+            '    print(f"피크 메모리 요구  : {mem:,.0f} MB")',
+            '    # 소비자 1개 처리율 : 2,500 msg/s',
+            '    # 필요 소비자 수    : 10 개',
+            '    # 피크 메모리 요구  : 977 MB  (watermark 안이면 OK)',
+          ],
+          highlight: [4, 5, 6, 7, 8, 13, 25, 26, 29, 30, 40, 41, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 리소스 게이지 + flow control 시뮬레이션
+    // ─────────────────────────────────────────────────────
+    const NODE_STATE = {
+      idle:    { ring: 'border-slate-300',  bg: 'bg-slate-50',    text: 'text-slate-600',  dot: 'bg-slate-300'  },
+      active:  { ring: 'border-orange-400', bg: 'bg-orange-50',   text: 'text-orange-800', dot: 'bg-orange-500' },
+      success: { ring: 'border-green-400',  bg: 'bg-green-50',    text: 'text-green-800',  dot: 'bg-green-500'  },
+      warn:    { ring: 'border-amber-400',  bg: 'bg-amber-50',    text: 'text-amber-800',  dot: 'bg-amber-500'  },
+      error:   { ring: 'border-red-400',    bg: 'bg-red-50',      text: 'text-red-800',    dot: 'bg-red-500'    },
+      info:    { ring: 'border-sky-400',    bg: 'bg-sky-50',      text: 'text-sky-800',    dot: 'bg-sky-500'    },
+    };
+
+    const ALERT_TONE = {
+      good: 'bg-green-50  border-green-300  text-green-900',
+      info: 'bg-sky-50    border-sky-300    text-sky-900',
+      warn: 'bg-amber-50  border-amber-300  text-amber-900',
+      err:  'bg-red-50    border-red-300    text-red-900',
+    };
+
+    // 리소스 게이지 (메모리/디스크) — 워터마크 라인 + blocked 애니메이션
+    function ResourceGauge({ gauge }) {
+      const pct = Math.min(100, gauge.used);
+      const overLimit = gauge.used >= gauge.limit;
+      const barColor = overLimit ? '#dc2626' : BRAND;
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-orange-800">{gauge.label}</div>
+            <div className={`text-xs font-mono ${overLimit ? 'text-red-700 font-bold' : 'text-slate-600'}`}>
+              {gauge.used}{gauge.unit} / limit {gauge.limit}{gauge.unit}
+            </div>
+          </div>
+          <div className="relative h-6 rounded-full bg-slate-100 overflow-hidden border border-slate-200">
+            <div
+              className="h-full transition-all duration-500"
+              style={{ width: `${pct}%`, backgroundColor: barColor }}
+            />
+            {/* 워터마크 라인 */}
+            <div
+              className="absolute top-0 bottom-0 border-l-2 border-dashed border-red-500"
+              style={{ left: `${Math.min(100, gauge.limit)}%` }}
+            >
+              <span className="absolute -top-0.5 left-1 text-[9px] text-red-600 font-bold whitespace-nowrap">watermark</span>
+            </div>
+          </div>
+          {gauge.blocked && overLimit && (
+            <div className="mt-2 flex items-center gap-2 text-xs text-red-700 font-bold animate-pulse">
+              <span className="inline-block w-2 h-2 rounded-full bg-red-500"></span>
+              🚫 publisher BLOCKED — 발행 중단 (백프레셔 발동)
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // 처리량 균형 대시보드 (발행 vs 소비)
+    function RateBoard({ gauge }) {
+      const max = Math.max(gauge.publish, gauge.consume);
+      const pubPct = (gauge.publish / max) * 100;
+      const conPct = (gauge.consume / max) * 100;
+      const Bar = ({ label, val, pct, color }) => (
+        <div className="mb-2">
+          <div className="flex justify-between text-[11px] mb-0.5">
+            <span className="font-bold text-slate-700">{label}</span>
+            <span className="font-mono text-slate-600">{val.toLocaleString()} {gauge.unit}</span>
+          </div>
+          <div className="h-4 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: color }} />
+          </div>
+        </div>
+      );
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="text-xs font-bold text-orange-800 mb-2">{gauge.label}</div>
+          <Bar label="발행 (publish)" val={gauge.publish} pct={pubPct} color={BRAND} />
+          <Bar label="소비 (consume)" val={gauge.consume} pct={conPct} color="#16a34a" />
+          <div className="mt-2 text-[11px] text-slate-600 leading-relaxed">
+            발행이 소비보다 빠르면 → credit 소진 → publisher가 소비 속도({gauge.consume.toLocaleString()})로 자동 수렴
+          </div>
+        </div>
+      );
+    }
+
+    // 메모리 비교 (기본 vs lazy)
+    function CompareBoard({ gauge }) {
+      const Bar = ({ label, val, color, note }) => (
+        <div className="mb-2">
+          <div className="flex justify-between text-[11px] mb-0.5">
+            <span className="font-bold text-slate-700">{label}</span>
+            <span className="font-mono text-slate-600">{val}{gauge.unit}</span>
+          </div>
+          <div className="h-5 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full transition-all duration-500 flex items-center justify-end pr-1" style={{ width: `${val}%`, backgroundColor: color }}>
+              <span className="text-[9px] text-white font-bold">{note}</span>
+            </div>
+          </div>
+        </div>
+      );
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="text-xs font-bold text-orange-800 mb-2">{gauge.label}</div>
+          <Bar label="기본(classic) 큐" val={gauge.normalMem} color="#d97706" note="RAM 상주" />
+          <Bar label="lazy 큐" val={gauge.lazyMem} color="#16a34a" note="디스크 상주" />
+          <div className="mt-2 text-[11px] text-slate-600 leading-relaxed">
+            같은 100만건 백로그 — lazy는 메시지를 디스크에 두어 RAM을 {gauge.normalMem - gauge.lazyMem}%p 절약한다
+          </div>
+        </div>
+      );
+    }
+
+    // 사이징 계산 결과
+    function SizingBoard({ gauge }) {
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="text-xs font-bold text-orange-800 mb-2">{gauge.label}</div>
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div className="rounded-lg bg-orange-50 border border-orange-200 py-2">
+              <div className="text-lg font-bold" style={{ color: BRAND_DARK }}>{gauge.publish.toLocaleString()}</div>
+              <div className="text-[10px] text-slate-600">목표 {gauge.unit}</div>
+            </div>
+            <div className="rounded-lg bg-orange-50 border border-orange-200 py-2">
+              <div className="text-lg font-bold" style={{ color: BRAND_DARK }}>{gauge.perConsumer.toLocaleString()}</div>
+              <div className="text-[10px] text-slate-600">소비자 1개 {gauge.unit}</div>
+            </div>
+            <div className="rounded-lg bg-green-50 border border-green-300 py-2">
+              <div className="text-lg font-bold text-green-700">{gauge.needConsumers}개</div>
+              <div className="text-[10px] text-slate-600">필요 소비자</div>
+            </div>
+          </div>
+          <div className="mt-2 text-center text-[11px] font-mono text-slate-600">
+            {gauge.publish.toLocaleString()} &divide; {gauge.perConsumer.toLocaleString()} = {gauge.needConsumers} (+여유)
+          </div>
+        </div>
+      );
+    }
+
+    function GaugeArea({ gauge }) {
+      if (gauge.kind === 'mem' || gauge.kind === 'disk') return <ResourceGauge gauge={gauge} />;
+      if (gauge.kind === 'rate') return <RateBoard gauge={gauge} />;
+      if (gauge.kind === 'compare') return <CompareBoard gauge={gauge} />;
+      if (gauge.kind === 'sizing') return <SizingBoard gauge={gauge} />;
+      return null;
+    }
+
+    function FlowNode({ node, idx, total }) {
+      const s = NODE_STATE[node.state] || NODE_STATE.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.ring} ${s.bg} px-3 py-2.5 shadow-sm`}>
+          <div className="flex items-center gap-2">
+            <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`}></span>
+            <span className={`text-xs font-mono ${s.text}`}>#{idx + 1} / {total}</span>
+            <span className={`ml-auto text-sm font-bold ${s.text}`}>{node.node}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-700 leading-relaxed">{node.detail}</div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const flow = step.flow || [];
+      const alertCls = ALERT_TONE[step.alert.tone] || ALERT_TONE.info;
+      return (
+        <div className="rounded-xl bg-white border-2 border-orange-200 shadow-md p-4 h-full flex flex-col">
+          <div className="text-xs font-bold text-orange-800 mb-2">{step.actor}</div>
+
+          {/* 리소스 게이지 / 대시보드 */}
+          <div className="mb-3">
+            <GaugeArea gauge={step.gauge} />
+          </div>
+
+          {/* 흐름 노드 */}
+          <div className="space-y-2">
+            {flow.map((n, i) => <FlowNode key={i} node={n} idx={i} total={flow.length} />)}
+          </div>
+
+          {/* 핵심 경고 / 안내 */}
+          <div className={`mt-3 rounded-lg border-2 ${alertCls} px-3 py-2 text-xs leading-relaxed`}>
+            💡 {step.alert.text}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ stepIdx, total }) {
+      const codeRef = useRef(null);
+      const code = STEPS[stepIdx].code;
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          {/* 5탭 헤더 */}
+          <div className="flex items-center gap-0 bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {STEPS.map((s, i) => {
+              const isActive = i === stepIdx;
+              return (
+                <div
+                  key={i}
+                  className={`px-3 py-2 text-[10px] font-mono whitespace-nowrap border-r border-slate-700 ${
+                    isActive
+                      ? 'bg-[#282c34] text-orange-300 border-t-2 border-t-orange-400'
+                      : 'bg-slate-900 text-slate-500'
+                  }`}
+                >
+                  {s.code.filename}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 파일명 바 */}
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-amber-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: BRAND }}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: BRAND_DARK }}>V-1-4. Sizing + Flow Control</h1>
+                <p className="text-sm" style={{ color: BRAND_DARK, opacity: 0.8 }}>용량 산정과 흐름 제어 — 백프레셔로 폭주를 막는다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: BRAND_DARK }}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className="h-1.5 flex-1 rounded-full transition"
+                  style={{ backgroundColor: i <= stepIdx ? BRAND : '#fed7aa' }}
+                />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-orange-50 px-5 py-4 shadow" style={{ backgroundColor: BRAND_DARK }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50"
+                style={{ color: BRAND_DARK }}
+                aria-label="처음으로"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: BRAND_DARK }}
+                aria-label="이전 단계"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className="px-4 py-1.5 text-xs rounded font-bold text-white"
+                style={{ backgroundColor: playing ? BRAND_DARK : BRAND }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: BRAND_DARK }}
+                aria-label="다음 단계"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: BRAND_DARK, opacity: 0.6 }}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-400 bg-white px-4 py-3 text-sm" style={{ color: BRAND_DARK }}>
+                <div className="font-bold mb-2">📌 V-1-4 핵심 정리 — Sizing + Flow Control</div>
+                <ul className="space-y-1 text-slate-700 text-[13px] leading-relaxed list-disc pl-5">
+                  <li><b>메모리 워터마크</b>(vm_memory_high_watermark 기본 0.4): 초과 시 publisher를 block. 컨테이너는 절대값 권장.</li>
+                  <li><b>디스크 free limit</b>(disk_free_limit): 여유 부족 시 발행 차단. 기본 50MB는 위험 → relative 1.0 이상으로.</li>
+                  <li><b>Flow Control</b>(credit 기반): 느린 소비자 경로의 publisher를 자동 스로틀. state=flow는 정상 백프레셔 신호.</li>
+                  <li><b>lazy / Quorum 큐</b>: 대량 백로그는 디스크 우선으로 RAM 방어. 신규 설계는 Quorum 큐 우선.</li>
+                  <li><b>Sizing 공식</b>: 필요 소비자 = 목표 처리량 ÷ (prefetch ÷ 처리시간). 큐가 계속 자라면 소비 부족 신호.</li>
+                </ul>
+                <div className="mt-2 text-[13px]">백프레셔는 브로커를 지키는 최후 방어선 — 애플리케이션은 blocked 신호를 받아 발행을 줄이도록 설계하라. Part 5 운영 편의 마지막 주제다.</div>
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RabbitMQ', 'sizing', 'flow-control', 'watermark', 'disk_free_limit', 'backpressure', 'lazy-queue', 'quorum-queue', 'prefetch', 'credit', 'capacity-planning'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border border-orange-200" style={{ backgroundColor: '#fff4eb', color: BRAND_DARK }}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: BRAND_DARK }}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <a href="./V-1-3.html" className="underline hover:no-underline">← 이전: V-1-3</a>
+              <a href="../index.html" className="underline hover:no-underline">전체 목차 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

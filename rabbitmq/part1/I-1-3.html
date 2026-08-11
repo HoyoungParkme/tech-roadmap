@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitMQ 인터랙티브 학습 — I-1-3. Connection / Channel</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    RabbitMQ I-1-3 — Connection / Channel (AMQP 연결 모델)
+    학습 목표: TCP Connection(비쌈)과 그 위의 경량 논리 채널 Channel(멀티플렉싱)을
+              구분하고, 스레드-채널 매핑 / prefetch(QoS) / 자동 복구 / heartbeat /
+              커넥션 풀 실무 패턴을 5단계로 학습한다.
+    패턴: fastapi v1 — 좌(Connection·Channel 시뮬레이션) / 우(VSCode CodeViewer 5탭)
+    색상: orange (RabbitMQ 공식 #FF6600 / dark #a64200)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const PRIMARY = '#FF6600';
+    const PRIMARY_DARK = '#a64200';
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    //   1: TCP Connection — 비싼 자원 (핸드셰이크 비용)
+    //   2: Channel — Connection 위 경량 논리 채널 (멀티플렉싱)
+    //   3: 스레드별 Channel + prefetch(QoS) (Channel은 스레드 안전 X)
+    //   4: 자동 복구(automatic recovery) + Heartbeat
+    //   5: 안티패턴 vs 실무 — 커넥션 풀 / 스레드-로컬 채널
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. TCP Connection — 비싼 자원',
+        desc: 'Connection 하나는 RabbitMQ 브로커로 향하는 TCP 소켓 하나다. 열 때 TCP 3-way handshake, TLS handshake(옵션), 그리고 AMQP 핸드셰이크(Start/Tune/Open: 인증·프레임 크기·heartbeat 협상)까지 여러 왕복이 필요해 수 ms~수십 ms가 든다. 그래서 Connection은 요청마다 열고 닫는 자원이 아니라, 앱 시작 시 한 번 열어 오래 살려두는 자원이다. 웹 서버 워커 100개가 각자 Connection을 열면 소켓·파일 디스크립터·브로커 메모리가 낭비된다.',
+        actor: '🔌 TCP Connection 수립 — 비싼 왕복',
+        flow: [
+          { node: 'App (client)', state: 'active', detail: 'ConnectionFactory.newConnection()' },
+          { node: 'TCP handshake', state: 'active', detail: 'SYN → SYN/ACK → ACK (1 RTT)' },
+          { node: 'AMQP handshake', state: 'active', detail: 'Start/Tune/Open — 인증·프레임·heartbeat 협상' },
+          { node: 'Connection 확립', state: 'success', detail: 'TCP 소켓 1개 = Connection 1개 (계속 재사용)' },
+        ],
+        conn: {
+          heartbeat: '협상 완료 (60s)',
+          recovery: '-',
+          channels: [],
+          note: 'Connection 은 열렸지만 아직 Channel 이 없다. 실제 통신은 Channel 위에서 일어난다.',
+        },
+        alert: { tone: 'info', text: 'Connection 열기는 비싸다(멀티 RTT). 앱당 소수의 Connection 을 오래 유지하고 재사용하는 게 핵심.' },
+        code: {
+          lang: 'java',
+          filename: 'Connection.java',
+          lines: [
+            '/**',
+            ' * Connection.java — RabbitMQ TCP Connection 을 한 번 열어 오래 재사용한다.',
+            ' *',
+            ' * 핵심:',
+            ' *   - Connection = TCP 소켓 1개 (열기 비용이 큼: 멀티 RTT + 인증)',
+            ' *   - 앱 시작 시 1회 생성 → 종료 시 close. 요청마다 열지 않는다.',
+            ' *   - ConnectionFactory 에서 host/포트/인증/heartbeat 를 설정한다.',
+            ' */',
+            'import com.rabbitmq.client.Connection;',
+            'import com.rabbitmq.client.ConnectionFactory;',
+            '',
+            'public class AppConnection {',
+            '',
+            '    // 앱 전체가 공유하는 단일 Connection (싱글턴처럼 관리)',
+            '    private static Connection sharedConnection;',
+            '',
+            '    /** 앱 시작 시 1회 호출 — 비싼 Connection 을 미리 열어둔다. */',
+            '    public static synchronized Connection open() throws Exception {',
+            '        if (sharedConnection != null && sharedConnection.isOpen()) {',
+            '            return sharedConnection;   // 이미 열려 있으면 재사용',
+            '        }',
+            '        ConnectionFactory factory = new ConnectionFactory();',
+            '        factory.setHost("localhost");',
+            '        factory.setPort(5672);',
+            '        factory.setUsername("app");',
+            '        factory.setPassword("secret");',
+            '        factory.setVirtualHost("/");',
+            '',
+            '        // AMQP 핸드셰이크 단계에서 협상되는 값들',
+            '        factory.setRequestedHeartbeat(60);        // heartbeat 60초',
+            '        factory.setConnectionTimeout(10_000);     // 연결 타임아웃 10초',
+            '',
+            '        sharedConnection = factory.newConnection("app-main");  // ← 여기서 TCP+AMQP 핸드셰이크',
+            '        return sharedConnection;',
+            '    }',
+            '',
+            '    /** 앱 종료 시 1회 호출. */',
+            '    public static void close() throws Exception {',
+            '        if (sharedConnection != null) sharedConnection.close();',
+            '    }',
+            '}',
+            '',
+            '// ── 적합한 유스케이스 ────────────────────────────',
+            '//   ✓ 프로세스당 1~수개의 Connection 을 오래 유지',
+            '//   ✓ 스레드/작업 분리는 Channel 로 (다음 스텝)',
+            '//   ✗ 요청마다 newConnection() → 소켓·핸드셰이크 낭비 (안티패턴)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 22, 30, 31, 34],
+        },
+      },
+      {
+        title: 'Step 2. Channel — Connection 위의 경량 논리 채널 (멀티플렉싱)',
+        desc: '실제 publish/consume/queue 선언 같은 모든 AMQP 명령은 Channel 위에서 일어난다. Channel 은 하나의 TCP Connection 안에서 다중화(multiplexing)되는 가상 연결이다. 각 AMQP 프레임에는 channel number 가 붙어, 하나의 소켓으로 여러 Channel 의 트래픽이 뒤섞여 흘러도 브로커가 구분한다. Channel 을 여는 건 TCP 왕복이 아니라 Connection 안에서의 가벼운 명령이라 값싸다. 덕분에 비싼 TCP 는 하나만 두고, 논리적 분리는 Channel 여러 개로 처리한다.',
+        actor: '🧵 Channel 멀티플렉싱 — TCP 1개 위에 논리 채널 N개',
+        flow: [
+          { node: 'Connection (TCP 1개)', state: 'active', detail: '소켓 하나를 여러 Channel 이 공유' },
+          { node: 'Channel 1', state: 'success', detail: 'ch=1 프레임 — publish orders' },
+          { node: 'Channel 2', state: 'success', detail: 'ch=2 프레임 — consume payments' },
+          { node: 'Channel 3', state: 'success', detail: 'ch=3 프레임 — queue 선언/관리' },
+        ],
+        conn: {
+          heartbeat: '정상 (60s)',
+          recovery: '-',
+          channels: [
+            { id: 'ch #1', thread: '—', prefetch: '—', state: 'active', note: 'publish orders' },
+            { id: 'ch #2', thread: '—', prefetch: '—', state: 'active', note: 'consume payments' },
+            { id: 'ch #3', thread: '—', prefetch: '—', state: 'active', note: 'queueDeclare / bind' },
+          ],
+          note: '3개의 Channel 이 단 1개의 TCP Connection 위에서 다중화되어 흐른다.',
+        },
+        alert: { tone: 'good', text: 'Channel 열기는 값싸다(TCP 왕복 없음). "비싼 Connection 은 소수 · 논리 분리는 Channel 다수" 가 표준 모델.' },
+        code: {
+          lang: 'java',
+          filename: 'Channels.java',
+          lines: [
+            '/**',
+            ' * Channels.java — 하나의 Connection 위에서 여러 Channel 을 열어 쓴다.',
+            ' *',
+            ' * 핵심:',
+            ' *   - createChannel() 은 TCP 왕복이 아니라 Connection 내부의 값싼 명령',
+            ' *   - 각 Channel 은 독립적으로 publish / consume / declare 가능',
+            ' *   - 모든 트래픽은 하나의 TCP 소켓으로 다중화(multiplex)되어 흐른다',
+            ' */',
+            'import com.rabbitmq.client.Channel;',
+            'import com.rabbitmq.client.Connection;',
+            '',
+            'public class OrderMessaging {',
+            '',
+            '    private final Connection connection;   // Step 1 에서 만든 공유 Connection',
+            '',
+            '    public OrderMessaging(Connection connection) {',
+            '        this.connection = connection;',
+            '    }',
+            '',
+            '    /** 용도별로 Channel 을 하나씩 연다 (모두 같은 TCP 위). */',
+            '    public void setup() throws Exception {',
+            '        // Channel 1 — 발행 전용',
+            '        Channel publishCh = connection.createChannel();',
+            '        publishCh.confirmSelect();   // publisher confirms',
+            '',
+            '        // Channel 2 — 소비 전용',
+            '        Channel consumeCh = connection.createChannel();',
+            '',
+            '        // Channel 3 — 토폴로지(선언) 전용',
+            '        Channel adminCh = connection.createChannel();',
+            '        adminCh.exchangeDeclare("orders", "direct", true);',
+            '        adminCh.queueDeclare("orders.queue", true, false, false, null);',
+            '        adminCh.queueBind("orders.queue", "orders", "order.created");',
+            '',
+            '        // 같은 Connection 위, 서로 다른 channelNumber 로 다중화',
+            '        System.out.println("publish ch = " + publishCh.getChannelNumber());',
+            '        System.out.println("consume ch = " + consumeCh.getChannelNumber());',
+            '        System.out.println("admin   ch = " + adminCh.getChannelNumber());',
+            '',
+            '        // 실제 발행 — ch=1 프레임으로 나간다',
+            '        publishCh.basicPublish("orders", "order.created", null,',
+            '                "{\\"orderId\\":42}".getBytes());',
+            '    }',
+            '}',
+            '',
+            '// ── 왜 Channel 을 나눌까 ─────────────────────────',
+            '//   ✓ 용도/스레드별 격리 (한 Channel 오류가 다른 Channel 로 안 번짐)',
+            '//   ✓ prefetch(QoS) 를 Channel 단위로 다르게 설정 (다음 스텝)',
+            '//   ✗ Channel 은 스레드 안전하지 않다 → 공유 금지 (다음 스텝)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 21, 22, 23, 25, 26, 28, 29, 30, 33, 34, 35],
+        },
+      },
+      {
+        title: 'Step 3. 스레드별 Channel + prefetch(QoS) — Channel 은 스레드 안전하지 않다',
+        desc: 'Channel 은 스레드 안전(thread-safe)하지 않다. 여러 스레드가 하나의 Channel 을 공유해 basicPublish 하면 프레임이 인터리빙되어 프로토콜이 깨진다. 그래서 규칙은 "스레드당 Channel 하나". 소비 측 흐름 제어인 prefetch(basicQos) 도 Channel 단위로 걸린다. prefetch=1 이면 브로커가 한 번에 미확인 메시지 1개만 그 Channel 로 보낸다(느린 컨슈머 보호), prefetch=250 이면 처리량을 올리는 대신 메모리·불균형 위험이 커진다. 스레드마다 Channel 을 두면 각 워커의 부하를 독립적으로 조절할 수 있다.',
+        actor: '🔀 스레드-채널 매핑 + prefetch 흐름 제어',
+        flow: [
+          { node: 'Worker Thread A', state: 'active', detail: '전용 Channel #1 (공유 금지)' },
+          { node: 'Worker Thread B', state: 'active', detail: '전용 Channel #2 (공유 금지)' },
+          { node: 'basic_qos(prefetch)', state: 'info', detail: 'Channel 단위 미확인 메시지 상한' },
+          { node: 'ack 후 다음 배달', state: 'success', detail: 'prefetch 만큼만 in-flight 유지' },
+        ],
+        conn: {
+          heartbeat: '정상 (60s)',
+          recovery: '-',
+          channels: [
+            { id: 'ch #1', thread: 'thread-A', prefetch: '10', state: 'success', note: '주문 컨슈머 (in-flight ≤ 10)' },
+            { id: 'ch #2', thread: 'thread-B', prefetch: '10', state: 'success', note: '결제 컨슈머 (in-flight ≤ 10)' },
+            { id: 'ch #3', thread: 'thread-C', prefetch: '1',  state: 'warn',    note: '무거운 작업 — 1건씩만' },
+          ],
+          note: '스레드마다 전용 Channel. prefetch 는 Channel 별로 독립. Channel 을 스레드끼리 공유하면 프레임이 깨진다.',
+        },
+        alert: { tone: 'warn', text: 'Channel 은 thread-safe 하지 않다! 스레드가 Channel 을 공유하면 프레임 인터리빙으로 연결이 끊긴다. 스레드당 Channel 1개가 철칙.' },
+        code: {
+          lang: 'python',
+          filename: 'worker_pool.py',
+          lines: [
+            '"""',
+            'worker_pool.py — 스레드마다 전용 Channel + Channel 단위 prefetch(QoS)',
+            '',
+            '핵심:',
+            '  - Channel 은 스레드 안전하지 않다 → 스레드마다 채널을 새로 연다',
+            '  - basic_qos(prefetch_count) 로 in-flight 메시지 상한을 Channel 별로 건다',
+            '  - prefetch 작음 → 공정 분배/느린 컨슈머 보호, 큼 → 처리량↑ 메모리↑',
+            '"""',
+            'import threading',
+            'import pika',
+            '',
+            '',
+            'def start_worker(worker_id: int, prefetch: int) -> None:',
+            '    """스레드 하나가 전용 Connection·Channel 로 소비한다.',
+            '',
+            '    Args:',
+            '        worker_id: 워커 식별자 (로그용)',
+            '        prefetch: 이 Channel 이 한 번에 받을 미확인 메시지 상한',
+            '',
+            '    Side Effects:',
+            '        전용 채널에서 start_consuming() (블로킹)',
+            '    """',
+            '    # pika 의 BlockingConnection 은 스레드 간 공유 불가 →',
+            '    # 스레드마다 Connection·Channel 을 따로 만든다',
+            '    conn = pika.BlockingConnection(pika.ConnectionParameters("localhost"))',
+            '    channel = conn.channel()',
+            '',
+            '    # prefetch(QoS) 는 Channel 단위로 적용된다',
+            '    channel.basic_qos(prefetch_count=prefetch)',
+            '',
+            '    def handle(ch, method, properties, body):',
+            '        # 이 콜백은 이 스레드의 전용 채널에서만 호출된다 (공유 X)',
+            '        process(body)',
+            '        ch.basic_ack(delivery_tag=method.delivery_tag)  # ack 해야 다음 배달',
+            '',
+            '    channel.basic_consume(queue="orders.queue", on_message_callback=handle)',
+            '    print(f"[worker-{worker_id}] prefetch={prefetch} consuming...")',
+            '    channel.start_consuming()',
+            '',
+            '',
+            '# ── 스레드별로 전용 채널을 띄운다 ────────────────',
+            'threads = [',
+            '    threading.Thread(target=start_worker, args=(1, 10), daemon=True),',
+            '    threading.Thread(target=start_worker, args=(2, 10), daemon=True),',
+            '    threading.Thread(target=start_worker, args=(3, 1),  daemon=True),  # 무거운 작업',
+            ']',
+            'for t in threads:',
+            '    t.start()',
+            '',
+            '# ── ❌ 절대 금지 ─────────────────────────────────',
+            '#   shared_ch = conn.channel()',
+            '#   for _ in range(N): Thread(target=publish, args=(shared_ch,)).start()',
+            '#   → 여러 스레드가 한 Channel 에 write → 프레임 깨짐 → 연결 종료',
+          ],
+          highlight: [4, 5, 6, 7, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34, 52, 53, 54, 55],
+        },
+      },
+      {
+        title: 'Step 4. 자동 복구(automatic recovery) + Heartbeat',
+        desc: 'TCP 연결은 네트워크 순단, 브로커 재시작, 방화벽 유휴 종료로 언제든 끊긴다. Heartbeat 는 양쪽이 주기적으로(예: 60초) 작은 프레임을 주고받아 죽은 연결을 빠르게 감지하는 장치다 — 없으면 끊긴 소켓을 한참 살아있다고 착각한다. 자동 복구(automatic recovery)를 켜면 클라이언트가 연결이 끊긴 걸 감지하고 백오프하며 재연결한 뒤, Channel·exchange·queue·binding·consumer 까지 자동으로 다시 만든다(topology recovery). 단, in-flight 였던 미확인 메시지는 재배달될 수 있으니 컨슈머는 반드시 멱등해야 한다.',
+        actor: '♻️ Heartbeat 감지 → 자동 재연결 → 토폴로지 복구',
+        flow: [
+          { node: 'Heartbeat 타임아웃', state: 'error', detail: '60s 내 프레임 없음 → 연결 죽음 감지' },
+          { node: '재연결 (backoff)', state: 'warn', detail: '5초 간격 재시도 — 브로커 복귀 대기' },
+          { node: '토폴로지 복구', state: 'active', detail: 'Channel·queue·binding·consumer 재생성' },
+          { node: '소비 재개', state: 'success', detail: '미확인 메시지 재배달 → 멱등 처리 필요' },
+        ],
+        conn: {
+          heartbeat: '타임아웃 감지 → 재연결',
+          recovery: '자동 (topology 포함)',
+          channels: [
+            { id: 'ch #1', thread: 'thread-A', prefetch: '10', state: 'active', note: '복구됨 — 컨슈머 재등록' },
+            { id: 'ch #2', thread: 'thread-B', prefetch: '10', state: 'active', note: '복구됨 — 컨슈머 재등록' },
+          ],
+          note: '자동 복구가 Connection→Channel→consumer 를 순서대로 재생성. 재배달 대비 컨슈머는 멱등해야 한다.',
+        },
+        alert: { tone: 'info', text: 'Heartbeat = 죽은 연결 감지, Automatic Recovery = 재연결+토폴로지 재생성. 재배달이 생기므로 컨슈머 멱등성은 필수.' },
+        code: {
+          lang: 'java',
+          filename: 'Recovery.java',
+          lines: [
+            '/**',
+            ' * Recovery.java — 자동 연결 복구 + Heartbeat 설정 (Java client)',
+            ' *',
+            ' * 핵심:',
+            ' *   - setAutomaticRecoveryEnabled(true): 끊기면 스스로 재연결',
+            ' *   - setTopologyRecoveryEnabled(true): Channel/queue/consumer 까지 재생성',
+            ' *   - setRequestedHeartbeat(n): n초 내 프레임 없으면 죽은 연결로 판정',
+            ' */',
+            'import com.rabbitmq.client.ConnectionFactory;',
+            'import com.rabbitmq.client.Connection;',
+            '',
+            'public class ResilientConnection {',
+            '',
+            '    public static Connection open() throws Exception {',
+            '        ConnectionFactory factory = new ConnectionFactory();',
+            '        factory.setHost("localhost");',
+            '',
+            '        // ── 자동 복구 ─────────────────────────────',
+            '        factory.setAutomaticRecoveryEnabled(true);      // 끊기면 재연결',
+            '        factory.setTopologyRecoveryEnabled(true);       // 채널/큐/컨슈머 재생성',
+            '        factory.setNetworkRecoveryInterval(5_000);      // 5초 간격 재시도',
+            '',
+            '        // ── Heartbeat / 타임아웃 ──────────────────',
+            '        factory.setRequestedHeartbeat(60);              // 60초 heartbeat',
+            '        factory.setConnectionTimeout(10_000);',
+            '',
+            '        Connection conn = factory.newConnection("resilient");',
+            '',
+            '        // 복구 이벤트 관찰 (운영 로깅용)',
+            '        ((com.rabbitmq.client.Recoverable) conn).addRecoveryListener(',
+            '            new com.rabbitmq.client.RecoveryListener() {',
+            '                public void handleRecoveryStarted(com.rabbitmq.client.Recoverable r) {',
+            '                    System.out.println("[recovery] 재연결 시작...");',
+            '                }',
+            '                public void handleRecovery(com.rabbitmq.client.Recoverable r) {',
+            '                    System.out.println("[recovery] 복구 완료 — 소비 재개");',
+            '                }',
+            '            });',
+            '        return conn;',
+            '    }',
+            '}',
+            '',
+            '// ── 주의 ────────────────────────────────────────',
+            '//   • 복구 중 발행한 메시지는 유실될 수 있다 → publisher confirms 로 보완',
+            '//   • 미확인 메시지는 재배달된다 → 컨슈머는 반드시 멱등(idempotent)',
+            '//   • heartbeat 를 0 으로 끄지 말 것 (죽은 연결을 한참 못 잡는다)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 23, 24, 25, 44, 45, 46],
+        },
+      },
+      {
+        title: 'Step 5. 안티패턴 vs 실무 — 커넥션 풀 / 스레드-로컬 채널',
+        desc: '가장 흔한 사고는 두 가지다. ① Channel per message: 메시지마다 createChannel/close 를 반복하면 브로커에 channel.open/close 프레임 폭풍이 일고 GC·지연이 폭증한다. ② Connection 남발: 워커·요청마다 새 Connection 을 열어 소켓과 브로커 메모리를 소진한다. 실무 정답은 "Connection 은 소수를 풀(pool)로 관리, Channel 은 스레드-로컬로 재사용"이다. 발행 측은 작은 채널 풀(또는 스레드별 채널)을, 소비 측은 컨슈머 스레드마다 장수(long-lived) 채널을 둔다. rabbitmqctl 로 연결·채널 수를 상시 모니터링해 누수를 조기에 잡는다.',
+        actor: '🏊 커넥션 풀 · 스레드-로컬 채널 · 모니터링',
+        flow: [
+          { node: '❌ Channel per message', state: 'error', detail: '메시지마다 open/close → 프레임 폭풍' },
+          { node: '❌ Connection 남발', state: 'error', detail: '요청마다 새 TCP → 소켓/메모리 고갈' },
+          { node: '✅ Connection Pool', state: 'success', detail: '소수 Connection 을 풀로 공유' },
+          { node: '✅ 스레드-로컬 Channel', state: 'success', detail: '스레드당 장수 채널 재사용' },
+        ],
+        conn: {
+          heartbeat: '정상 (60s)',
+          recovery: '자동',
+          channels: [
+            { id: 'pool ch #1', thread: 'publisher-1', prefetch: '—',  state: 'success', note: '발행 채널 풀 (재사용)' },
+            { id: 'pool ch #2', thread: 'publisher-2', prefetch: '—',  state: 'success', note: '발행 채널 풀 (재사용)' },
+            { id: 'ch #3',      thread: 'consumer-1',  prefetch: '20', state: 'success', note: '소비 장수 채널' },
+            { id: 'ch #4',      thread: 'consumer-2',  prefetch: '20', state: 'success', note: '소비 장수 채널' },
+          ],
+          note: '소수 Connection + 재사용되는 스레드-로컬 Channel. list_connections / list_channels 로 누수 감시.',
+        },
+        alert: { tone: 'good', text: '규칙: Connection 은 소수를 풀로 · Channel 은 스레드별 장수 재사용 · 메시지마다 Channel 열지 말 것 · 연결/채널 수를 상시 모니터링.' },
+        code: {
+          lang: 'bash',
+          filename: 'monitor.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# monitor.sh — Connection / Channel 누수 감시 & 진단 (운영 스크립트)',
+            '#',
+            '# 핵심 규칙:',
+            '#   1) Connection 은 소수 (프로세스당 1~수개). 요청마다 열지 않는다.',
+            '#   2) Channel 은 스레드당 장수(long-lived) 로 재사용. 메시지마다 열지 않는다.',
+            '#   3) 아래 수치가 계속 증가하면 = 누수 (닫지 않은 채널/커넥션).',
+            'set -euo pipefail',
+            '',
+            '# ── 현재 Connection 수 / 상태 ────────────────────',
+            'echo "== connections =="',
+            'rabbitmqctl list_connections name user state channels',
+            '#  channels 컬럼이 비정상적으로 크면 = Channel per message 안티패턴 의심',
+            '',
+            '# ── 현재 Channel 수 / prefetch / 미확인 수 ───────',
+            'echo "== channels =="',
+            'rabbitmqctl list_channels connection number prefetch_count messages_unacknowledged',
+            '#  prefetch_count 0 = 무제한 (위험), messages_unacknowledged 누적 = 컨슈머 지연',
+            '',
+            '# ── 전체 개수 요약 (임계치 경보) ─────────────────',
+            'conn_count=$(rabbitmqctl list_connections name --quiet | wc -l)',
+            'chan_count=$(rabbitmqctl list_channels name --quiet | wc -l)',
+            'echo "connections=${conn_count} channels=${chan_count}"',
+            '',
+            'if [ "${conn_count}" -gt 500 ]; then',
+            '    echo "[ALERT] connection 수 과다 (${conn_count}) — Connection 남발 의심" >&2',
+            'fi',
+            'if [ "${chan_count}" -gt 5000 ]; then',
+            '    echo "[ALERT] channel 수 과다 (${chan_count}) — Channel per message 의심" >&2',
+            'fi',
+            '',
+            '# ── 참고: 권장 토폴로지 ─────────────────────────',
+            '#   publisher : 작은 Channel 풀 (예: 4~8개) 를 라운드로빈 재사용',
+            '#   consumer  : 컨슈머 스레드마다 장수 Channel 1개 + basic_qos(prefetch)',
+            '#   connection: 발행용 1개 + 소비용 1개 정도로 분리 (부하 격리)',
+          ],
+          highlight: [4, 5, 6, 7, 11, 12, 16, 17, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — Connection / Channel 상태 시뮬레이션
+    // ─────────────────────────────────────────────────────
+    const NODE_STATE = {
+      idle:    { ring: 'border-slate-300',  bg: 'bg-slate-50',    text: 'text-slate-600',  dot: 'bg-slate-300'  },
+      active:  { ring: 'border-orange-400', bg: 'bg-orange-50',   text: 'text-orange-800', dot: 'bg-orange-500' },
+      success: { ring: 'border-green-400',  bg: 'bg-green-50',    text: 'text-green-800',  dot: 'bg-green-500'  },
+      warn:    { ring: 'border-amber-400',  bg: 'bg-amber-50',    text: 'text-amber-800',  dot: 'bg-amber-500'  },
+      error:   { ring: 'border-red-400',    bg: 'bg-red-50',      text: 'text-red-800',    dot: 'bg-red-500'    },
+      info:    { ring: 'border-sky-400',    bg: 'bg-sky-50',      text: 'text-sky-800',    dot: 'bg-sky-500'    },
+    };
+
+    const ALERT_TONE = {
+      good: 'bg-green-50  border-green-300  text-green-900',
+      info: 'bg-sky-50    border-sky-300    text-sky-900',
+      warn: 'bg-amber-50  border-amber-300  text-amber-900',
+      err:  'bg-red-50    border-red-300    text-red-900',
+    };
+
+    function FlowNode({ node, idx, total }) {
+      const s = NODE_STATE[node.state] || NODE_STATE.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.ring} ${s.bg} px-3 py-2.5 shadow-sm`}>
+          <div className="flex items-center gap-2">
+            <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`}></span>
+            <span className={`text-xs font-mono ${s.text}`}>#{idx + 1} / {total}</span>
+            <span className={`ml-auto text-sm font-bold ${s.text}`}>{node.node}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-700 leading-relaxed">{node.detail}</div>
+        </div>
+      );
+    }
+
+    // TCP Connection 박스 안에 멀티플렉싱되는 Channel 들을 그린다
+    function ConnectionBoard({ conn }) {
+      const channels = conn.channels || [];
+      return (
+        <div className="rounded-lg border-2 border-orange-400 bg-white px-3 py-3 shadow-sm">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold" style={{ color: PRIMARY_DARK }}>🔌 TCP Connection (소켓 1개)</div>
+            <div className="text-[10px] text-slate-500">{channels.length} channel</div>
+          </div>
+
+          <div className="flex flex-wrap gap-2 mb-2 text-[10px]">
+            <span className="px-1.5 py-0.5 rounded bg-orange-100 text-orange-800">heartbeat: {conn.heartbeat}</span>
+            <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800">recovery: {conn.recovery}</span>
+          </div>
+
+          {channels.length === 0 ? (
+            <div className="text-xs text-slate-500 py-2 italic border-2 border-dashed border-slate-200 rounded text-center">
+              아직 Channel 없음
+            </div>
+          ) : (
+            <div className="space-y-1.5 pl-2 border-l-2 border-orange-200">
+              {channels.map((c, i) => {
+                const s = NODE_STATE[c.state] || NODE_STATE.active;
+                return (
+                  <div key={i} className={`rounded border ${s.ring} ${s.bg} px-2 py-1.5 text-xs`}>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`}></span>
+                      <span className="font-mono font-bold text-orange-900">{c.id}</span>
+                      {c.thread && c.thread !== '—' && (
+                        <span className="px-1.5 rounded bg-slate-100 text-slate-700 text-[10px]">thread: {c.thread}</span>
+                      )}
+                      {c.prefetch && c.prefetch !== '—' && (
+                        <span className="px-1.5 rounded bg-amber-100 text-amber-800 text-[10px]">prefetch: {c.prefetch}</span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 text-slate-700 text-[11px]">{c.note}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="mt-2 text-[10px] text-slate-500">{conn.note}</div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const flow = step.flow || [];
+      const alertCls = ALERT_TONE[step.alert.tone] || ALERT_TONE.info;
+      return (
+        <div className="rounded-xl bg-white border-2 border-orange-200 shadow-md p-4 h-full flex flex-col">
+          <div className="text-xs font-bold mb-2" style={{ color: PRIMARY_DARK }}>{step.actor}</div>
+
+          {/* 흐름 노드 */}
+          <div className="space-y-2 mb-3">
+            {flow.map((n, i) => <FlowNode key={i} node={n} idx={i} total={flow.length} />)}
+          </div>
+
+          {/* Connection / Channel 상태 보드 */}
+          <ConnectionBoard conn={step.conn} />
+
+          {/* 핵심 경고 / 안내 */}
+          <div className={`mt-3 rounded-lg border-2 ${alertCls} px-3 py-2 text-xs leading-relaxed`}>
+            💡 {step.alert.text}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ stepIdx, total }) {
+      const codeRef = useRef(null);
+      const code = STEPS[stepIdx].code;
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          {/* 5탭 헤더 */}
+          <div className="flex items-center gap-0 bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {STEPS.map((s, i) => {
+              const isActive = i === stepIdx;
+              return (
+                <div
+                  key={i}
+                  className={`px-3 py-2 text-[10px] font-mono whitespace-nowrap border-r border-slate-700 ${
+                    isActive
+                      ? 'bg-[#282c34] text-orange-300 border-t-2 border-t-orange-400'
+                      : 'bg-slate-900 text-slate-500'
+                  }`}
+                >
+                  {s.code.filename}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 파일명 바 */}
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-amber-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: PRIMARY }}>I</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: PRIMARY_DARK }}>I-1-3. Connection / Channel</h1>
+                <p className="text-sm" style={{ color: PRIMARY_DARK, opacity: 0.8 }}>비싼 TCP Connection 하나 위에 값싼 Channel 여럿 — AMQP 연결 모델</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: PRIMARY_DARK }}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className="h-1.5 flex-1 rounded-full transition"
+                  style={{ backgroundColor: i <= stepIdx ? PRIMARY : '#fed7aa' }}
+                />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-orange-50 px-5 py-4 shadow" style={{ backgroundColor: PRIMARY_DARK }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50"
+                style={{ color: PRIMARY_DARK }}
+                aria-label="처음으로"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: PRIMARY_DARK }}
+                aria-label="이전 단계"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className="px-4 py-1.5 text-xs rounded font-bold text-white"
+                style={{ backgroundColor: playing ? PRIMARY_DARK : PRIMARY }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: PRIMARY_DARK }}
+                aria-label="다음 단계"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: PRIMARY_DARK, opacity: 0.6 }}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-400 bg-white px-4 py-3 text-sm" style={{ color: PRIMARY_DARK }}>
+                <div className="font-bold mb-1">✅ 핵심 정리 — Connection / Channel</div>
+                <ul className="list-disc pl-5 space-y-1 leading-relaxed">
+                  <li><b>Connection = TCP 소켓 1개</b>, 열기 비용이 크다(멀티 RTT+인증). 소수를 오래 유지·재사용한다.</li>
+                  <li><b>Channel = Connection 위 경량 논리 채널</b>. 하나의 소켓 위에서 다중화(multiplexing)되어 값싸게 여러 개 연다.</li>
+                  <li><b>Channel 은 스레드 안전하지 않다</b> → 스레드당 Channel 1개. <b>prefetch(QoS)</b> 는 Channel 단위 흐름 제어.</li>
+                  <li><b>Heartbeat</b> 로 죽은 연결을 감지하고, <b>automatic recovery</b> 로 Connection·Channel·consumer 를 재생성한다(재배달 대비 멱등 필수).</li>
+                  <li><b>안티패턴</b>: Channel per message · Connection 남발 → <b>실무</b>: 커넥션 풀 + 스레드-로컬 장수 채널 + 연결/채널 수 모니터링.</li>
+                </ul>
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RabbitMQ', 'AMQP', 'Connection', 'Channel', 'multiplexing', 'thread-safety', 'prefetch', 'QoS', 'heartbeat', 'automatic-recovery', 'connection-pool', 'poison-pattern'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border border-orange-200" style={{ backgroundColor: '#fff4eb', color: PRIMARY_DARK }}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: PRIMARY_DARK }}>
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <div className="flex gap-4">
+                <a href="./I-1-2.html" className="underline hover:no-underline">← 이전: I-1-2</a>
+                <a href="./I-1-4.html" className="underline hover:no-underline">다음: I-1-4 →</a>
+              </div>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

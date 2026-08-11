@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitMQ 인터랙티브 학습 — III-1-3. Queue TTL + Length Limit</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    RabbitMQ III-1-3 — Queue TTL + Length Limit 큐 만료와 길이 제한
+    학습 목표: x-expires(미사용 큐 자동 삭제), x-max-length / x-max-length-bytes(길이 상한),
+              overflow 정책(drop-head / reject-publish / reject-publish-dlx)으로
+              무한 적재를 막고 메모리를 보호하는 백프레셔 설계를 5단계로 학습한다.
+    패턴: fastapi v1 — 좌(큐 적재 시뮬레이션) / 우(VSCode CodeViewer 5탭)
+    색상: orange (RabbitMQ 공식 #FF6600)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 브랜드 색상 (const 선언)
+    const BRAND = '#FF6600';
+    const BRAND_DARK = '#a64200';
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오
+    //   1: x-expires        — 미사용 큐 자동 삭제 (임시 큐 정리)
+    //   2: x-max-length     — 큐 길이 상한 (메시지 수 / 바이트)
+    //   3: overflow 정책     — drop-head vs reject-publish
+    //   4: reject-publish-dlx — 넘친 메시지를 DLX 로 격리
+    //   5: 실무 정리         — 백프레셔 · 상한선 설계
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. x-expires — 미사용 큐 자동 삭제',
+        desc: '임시 큐(reply-to, 세션별 큐, 워커별 전용 큐)를 만들다 보면 컨슈머가 사라져도 빈 큐가 브로커에 계속 남는다. 큐 하나하나가 메모리·메타데이터를 잡아먹어 수천 개가 쌓이면 브로커가 느려진다. x-expires 를 주면 "마지막으로 큐를 쓴 지 N ms 동안 컨슈머도 없고 basic_get 도 없으면 큐 자체를 삭제"한다. 주의: 메시지가 아니라 큐 전체가 사라진다. 큐가 잠깐 idle 이어도 지워지므로 상시 큐에는 쓰지 않는다.',
+        actor: '⏳ x-expires — 미사용 큐가 타이머로 소멸',
+        flow: [
+          { node: 'temp.session.42 큐', state: 'active', detail: 'x-expires=30000 (30초)' },
+          { node: 'Consumer', state: 'warn', detail: '세션 종료 → 컨슈머 disconnect' },
+          { node: 'idle 타이머', state: 'info', detail: '마지막 사용 후 카운트다운 시작' },
+          { node: '큐 삭제', state: 'error', detail: '30초 경과 → 큐 자체가 사라짐' },
+        ],
+        queue: { capacity: 6, used: 0, policy: 'expires', ttlLabel: 'x-expires 30s', ttlPct: 12, note: '메시지가 아니라 큐 전체가 삭제된다' },
+        alert: { tone: 'info', text: 'x-expires 는 "큐 만료". x-message-ttl(메시지 만료, III-1-2)과 헷갈리지 말 것. 임시 큐 청소용이며 상시 큐엔 금물.' },
+        code: {
+          lang: 'python',
+          filename: 'expires_queue.py',
+          lines: [
+            '"""',
+            'expires_queue.py — 미사용 시 자동 삭제되는 임시 큐',
+            '',
+            '핵심:',
+            '  - x-expires: 마지막 사용 후 N ms idle 이면 큐 전체 삭제',
+            '  - 대상: reply-to 큐, 세션별 큐, 워커 전용 임시 큐',
+            '  - 주의: 메시지가 아니라 QUEUE 가 사라진다',
+            '"""',
+            'import pika',
+            '',
+            '# ── 1. 연결 / 채널 ─────────────────────────────',
+            'connection = pika.BlockingConnection(',
+            '    pika.ConnectionParameters(host="localhost", port=5672)',
+            ')',
+            'channel = connection.channel()',
+            '',
+            '# ── 2. 임시 큐 선언 (30초 미사용 시 자동 삭제) ────',
+            '#    durable=False: 어차피 임시 큐라 재시작 시 사라져도 됨',
+            'channel.queue_declare(',
+            '    queue="temp.session.42",',
+            '    durable=False,',
+            '    arguments={',
+            '        "x-expires": 30000,   # 30초 idle → 큐 삭제',
+            '    },',
+            ')',
+            '',
+            '# ── 3. 잠깐 사용 후 컨슈머가 떠남 ─────────────────',
+            'def handle(ch, method, properties, body):',
+            '    """세션 메시지 처리 후 ack"""',
+            '    print("recv:", body)',
+            '    ch.basic_ack(delivery_tag=method.delivery_tag)',
+            '',
+            'channel.basic_consume("temp.session.42", on_message_callback=handle)',
+            '',
+            '# 세션이 끝나 컨슈머가 사라지면(연결 종료)',
+            '# RabbitMQ 는 30초 뒤 temp.session.42 큐를 자동 삭제한다.',
+            '# → 수천 개의 유령 큐가 브로커에 쌓이는 것을 예방',
+            '',
+            '',
+            '# ── 적합한 유스케이스 ────────────────────────────',
+            '#   ✓ RPC reply-to 큐 (요청자별 임시 응답 큐)',
+            '#   ✓ 웹소켓 세션별 큐 (연결 끊기면 자동 청소)',
+            '#   ✗ 상시 워커 큐 (잠깐 idle 이어도 지워지면 큰일)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 18, 19, 20, 21, 22, 23, 24, 34, 35, 36],
+        },
+      },
+      {
+        title: 'Step 2. x-max-length — 큐 길이 상한 (메시지 수 · 바이트)',
+        desc: '컨슈머가 죽거나 느려지면 메시지가 큐에 무한히 쌓인다. 수백만 건이 쌓이면 브로커 메모리가 터지고(RAM alarm) publish 가 전면 차단되어 전체 서비스가 멈춘다. x-max-length 는 큐에 담을 최대 메시지 "수", x-max-length-bytes 는 최대 "바이트"를 정한다. 둘 중 하나라도 초과하면 overflow 정책이 발동한다. 상한을 잡는 순간 "터지느냐"가 아니라 "무엇을 버리느냐"의 문제로 바뀌는 게 핵심이다.',
+        actor: '📏 x-max-length — 상한 도달 → overflow 발동',
+        flow: [
+          { node: 'Producer', state: 'active', detail: '초당 수천 건 publish (폭주)' },
+          { node: 'work.queue', state: 'warn', detail: 'x-max-length=5 (데모용 작은 값)' },
+          { node: 'Consumer', state: 'error', detail: '다운 → 소비 정지 → 적체' },
+          { node: 'overflow', state: 'error', detail: '상한 초과 → 정책에 따라 처리' },
+        ],
+        queue: { capacity: 5, used: 5, policy: 'full', overflowLabel: '상한 5 도달', note: 'x-max-length=5 · x-max-length-bytes 로 바이트 상한도 가능', incoming: true },
+        alert: { tone: 'warn', text: '상한이 없으면 컨슈머 장애가 곧 브로커 다운. x-max-length / x-max-length-bytes 로 "버틸 수 있는 최악"을 미리 정한다.' },
+        code: {
+          lang: 'python',
+          filename: 'max_length_queue.py',
+          lines: [
+            '"""',
+            'max_length_queue.py — 큐 길이 상한으로 메모리 보호',
+            '',
+            '핵심:',
+            '  - x-max-length:        최대 메시지 "수"',
+            '  - x-max-length-bytes:  최대 "바이트" (본문 합계)',
+            '  - 둘 중 하나라도 초과 → overflow 정책 발동 (Step 3)',
+            '"""',
+            'import pika',
+            '',
+            'connection = pika.BlockingConnection(',
+            '    pika.ConnectionParameters(host="localhost", port=5672)',
+            ')',
+            'channel = connection.channel()',
+            '',
+            '# ── 상한이 걸린 작업 큐 ──────────────────────────',
+            '#    수(length)와 바이트(bytes) 를 동시에 제한할 수 있다.',
+            'channel.queue_declare(',
+            '    queue="work.queue",',
+            '    durable=True,',
+            '    arguments={',
+            '        "x-max-length": 100000,            # 최대 10만 건',
+            '        "x-max-length-bytes": 512000000,   # 최대 약 512MB',
+            '        # overflow 미지정 시 기본은 drop-head (Step 3)',
+            '    },',
+            ')',
+            '',
+            '# ── 폭주 상황 시뮬레이션 ─────────────────────────',
+            'for i in range(1_000_000):',
+            '    channel.basic_publish(',
+            '        exchange="",',
+            '        routing_key="work.queue",',
+            '        body=f"job-{i}".encode(),',
+            '    )',
+            '    # 컨슈머가 죽어 있으면 큐가 10만 건에서 멈추고',
+            '    # 이후 도착분은 overflow 정책에 따라 처리된다.',
+            '',
+            '',
+            '# ── 값 선정 가이드 ──────────────────────────────',
+            '#   • x-max-length:  피크 트래픽 x 허용 지연(초) 정도로 산정',
+            '#   • x-max-length-bytes: (노드 RAM x 0.4) / 큐 개수 기준으로 상한',
+            '#   • 정책(Policy)으로도 걸 수 있어 코드 재배포 없이 조정 가능',
+          ],
+          highlight: [3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+        },
+      },
+      {
+        title: 'Step 3. overflow 정책 — drop-head vs reject-publish',
+        desc: '상한에 도달했을 때 "무엇을 버릴 것인가"가 overflow 정책이다. drop-head(기본): 가장 오래된 메시지를 head 에서 버리고 새 메시지를 받는다 — 최신 데이터가 중요한 로그·메트릭·실시간 이벤트에 적합. reject-publish: 새 publish 를 거절한다 — publisher confirm 을 쓰면 producer 가 nack 를 받아 "지금은 못 받는다"를 인지하고 백프레셔를 producer 쪽으로 되돌린다. 주문·결제처럼 오래된 것도 버리면 안 되는 데이터에 적합. 선택 기준은 "오래된 게 소중하냐, 최신이 소중하냐"다.',
+        actor: '🔀 overflow — drop-head(오래된 것 제거) vs reject-publish(신규 거절)',
+        flow: [
+          { node: 'work.queue (FULL)', state: 'warn', detail: '상한 도달 상태' },
+          { node: 'drop-head', state: 'info', detail: '가장 오래된 head 제거 → 최신 우선' },
+          { node: 'reject-publish', state: 'active', detail: '신규 publish 거절 → producer 로 nack' },
+          { node: 'publisher confirm', state: 'success', detail: 'producer 가 nack 인지 → 재시도/감속' },
+        ],
+        queue: { capacity: 5, used: 5, policy: 'overflow', note: 'drop-head: head 제거 · reject-publish: 신규 거절', dropHead: true },
+        alert: { tone: 'info', text: '기본은 drop-head(오래된 것 제거). 데이터가 소중하면 reject-publish + publisher confirm 으로 producer 에 백프레셔를 넘긴다.' },
+        code: {
+          lang: 'bash',
+          filename: 'set_overflow_policy.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# set_overflow_policy.sh — overflow 정책을 Policy 로 적용',
+            '#',
+            '# 큐 재선언 없이(코드 재배포 없이) 정책으로 상한·overflow 를 건다.',
+            '# 정책은 이름 패턴(pattern)에 매칭되는 모든 큐에 일괄 적용된다.',
+            'set -euo pipefail',
+            '',
+            '# ── 1) drop-head: 오래된 것부터 버림 (기본) ──────',
+            '#    로그/메트릭/실시간 이벤트 — 최신 데이터가 중요할 때',
+            'rabbitmqctl set_policy metrics-limit \\',
+            '  "^metrics\\." \\',
+            '  \'{"max-length":100000,"overflow":"drop-head"}\' \\',
+            '  --apply-to queues',
+            '',
+            '# ── 2) reject-publish: 신규 publish 거절 ─────────',
+            '#    주문/결제 — 오래된 것도 버리면 안 될 때',
+            '#    producer 가 publisher confirm 을 켜야 nack 를 받는다.',
+            'rabbitmqctl set_policy orders-limit \\',
+            '  "^orders\\." \\',
+            '  \'{"max-length":50000,"overflow":"reject-publish"}\' \\',
+            '  --apply-to queues',
+            '',
+            '# ── 3) 바이트 상한도 정책으로 ────────────────────',
+            'rabbitmqctl set_policy media-limit \\',
+            '  "^media\\." \\',
+            '  \'{"max-length-bytes":536870912,"overflow":"drop-head"}\' \\',
+            '  --apply-to queues',
+            '',
+            '# ── 확인 ────────────────────────────────────────',
+            'rabbitmqctl list_policies',
+            '#   vhost  name           pattern      apply-to  definition',
+            '#   /      metrics-limit  ^metrics\\.   queues    {...drop-head}',
+            '#   /      orders-limit   ^orders\\.    queues    {...reject-publish}',
+            '',
+            '# ── 선택 기준 요약 ──────────────────────────────',
+            '#   drop-head       → 최신이 소중 (로그, 메트릭, 위치정보)',
+            '#   reject-publish  → 전부 소중 (주문, 결제, 정산)',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 4. reject-publish-dlx — 넘친 메시지를 DLX 로 격리',
+        desc: 'reject-publish 는 신규를 그냥 버린다. 하지만 "버리되 흔적은 남기고 나중에 재처리"하고 싶을 때가 있다. reject-publish-dlx(3.13+) 를 overflow 로 주고 x-dead-letter-exchange 를 함께 걸면, 상한 초과로 거절된 메시지가 사라지지 않고 DLX 로 라우팅되어 dead letter 큐에 쌓인다(III-1-1 의 DLX 와 결합). 넘친 주문을 잃지 않고 별도 큐에서 재처리하거나 감사 로그로 보관할 수 있다. 백프레셔(신규 거절) + 데이터 보존(DLX)을 동시에 얻는 조합이다.',
+        actor: '📦 reject-publish-dlx — 넘친 메시지가 DLX 로 이동',
+        flow: [
+          { node: 'orders.queue (FULL)', state: 'warn', detail: 'x-max-length 초과' },
+          { node: 'reject-publish-dlx', state: 'active', detail: '신규 거절 + DLX 라우팅' },
+          { node: 'dlx.exchange', state: 'active', detail: 'x-dead-letter-exchange 로 전달' },
+          { node: 'dlq.orders 큐', state: 'success', detail: 'reason=maxlen 으로 보존 → 재처리' },
+        ],
+        queue: { capacity: 5, used: 5, policy: 'dlx', note: '넘친 메시지 → DLX → dlq.orders (reason: maxlen)', toDlx: true },
+        alert: { tone: 'good', text: 'reject-publish-dlx = 백프레셔 + 데이터 보존. 넘쳐도 버리지 않고 dead letter 로 격리해 나중에 재처리한다. (RabbitMQ 3.13+)' },
+        code: {
+          lang: 'java',
+          filename: 'MaxLengthDlx.java',
+          lines: [
+            '/**',
+            ' * MaxLengthDlx.java — 상한 초과 메시지를 DLX 로 격리하는 큐 선언',
+            ' *',
+            ' * 핵심:',
+            ' *   - overflow=reject-publish-dlx : 넘친 신규를 DLX 로 보냄 (3.13+)',
+            ' *   - x-dead-letter-exchange      : 격리 대상 exchange',
+            ' *   - dead letter 헤더 reason=maxlen 으로 사유 기록',
+            ' */',
+            'import com.rabbitmq.client.Channel;',
+            'import com.rabbitmq.client.Connection;',
+            'import com.rabbitmq.client.ConnectionFactory;',
+            'import java.util.HashMap;',
+            'import java.util.Map;',
+            '',
+            'public class MaxLengthDlx {',
+            '',
+            '    public static void main(String[] args) throws Exception {',
+            '        ConnectionFactory factory = new ConnectionFactory();',
+            '        factory.setHost("localhost");',
+            '',
+            '        try (Connection conn = factory.newConnection();',
+            '             Channel ch = conn.createChannel()) {',
+            '',
+            '            // ── 1) DLX 와 DLQ 선언 ───────────────────',
+            '            ch.exchangeDeclare("dlx.exchange", "direct", true);',
+            '            ch.queueDeclare("dlq.orders", true, false, false, null);',
+            '            ch.queueBind("dlq.orders", "dlx.exchange", "orders.dead");',
+            '',
+            '            // ── 2) 상한 + reject-publish-dlx 큐 ──────',
+            '            Map<String, Object> args2 = new HashMap<>();',
+            '            args2.put("x-max-length", 50000);',
+            '            args2.put("x-overflow", "reject-publish-dlx");',
+            '            args2.put("x-dead-letter-exchange", "dlx.exchange");',
+            '            args2.put("x-dead-letter-routing-key", "orders.dead");',
+            '',
+            '            ch.queueDeclare("orders.queue", true, false, false, args2);',
+            '',
+            '            // 이제 orders.queue 가 5만 건을 넘으면',
+            '            // 신규 메시지는 버려지지 않고 dlx.exchange → dlq.orders',
+            '            // 로 이동한다 (reason=maxlen). 나중에 재처리 가능.',
+            '            System.out.println("declared orders.queue with reject-publish-dlx");',
+            '        }',
+            '    }',
+            '}',
+            '',
+            '/* ── drop-head 와의 차이 ─────────────────────────',
+            ' *   drop-head          : 오래된 것 소리없이 사라짐',
+            ' *   reject-publish     : 신규 거절, 데이터 소멸',
+            ' *   reject-publish-dlx : 신규 거절 + DLX 보존 (재처리 가능)',
+            ' */',
+          ],
+          highlight: [3, 4, 5, 6, 7, 29, 30, 31, 32, 33, 34, 36, 46, 47, 48, 49],
+        },
+      },
+      {
+        title: 'Step 5. 실무 정리 — 백프레셔와 상한선 설계',
+        desc: '핵심은 "무한 적재는 곧 브로커 다운"이라는 것. 상한을 걸면 장애가 전체 정지가 아니라 "일부 손실 또는 백프레셔"로 국소화된다. 설계 체크리스트: ① 모든 큐에 x-max-length 또는 x-max-length-bytes 를 건다 ② 데이터 성격으로 overflow 를 고른다(로그=drop-head, 주문=reject-publish 또는 reject-publish-dlx) ③ 임시 큐엔 x-expires 로 유령 큐를 청소한다 ④ Policy 로 걸어 코드 재배포 없이 튜닝한다 ⑤ 큐 depth 를 모니터링해 상한의 80%에서 알람을 울린다. 상한은 "언젠가 반드시 온다"고 가정하고 미리 정해두는 안전벨트다.',
+        actor: '🧭 실무 SOP — 상한 · overflow · 만료 · 모니터링',
+        flow: [
+          { node: '① 상한 설정', state: 'active', detail: '모든 큐에 max-length / bytes' },
+          { node: '② overflow 선택', state: 'active', detail: 'drop-head / reject-publish(-dlx)' },
+          { node: '③ 임시 큐 청소', state: 'info', detail: 'x-expires 로 유령 큐 제거' },
+          { node: '④ 모니터링·알람', state: 'success', detail: 'queue depth 80% 알람' },
+        ],
+        queue: { capacity: 5, used: 4, policy: 'guard', note: '상한의 80%에서 미리 알람 → 사고 전에 대응', gauge: true },
+        alert: { tone: 'good', text: '상한 없는 큐는 "언제 터질지 모르는 폭탄". max-length + overflow + x-expires + depth 알람이 4종 안전장치다.' },
+        code: {
+          lang: 'bash',
+          filename: 'queue_guard_ops.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# queue_guard_ops.sh — 큐 상한/만료/모니터링 운영 스크립트',
+            '#',
+            '# "무한 적재 방지"를 위한 4종 안전장치를 한 번에 적용/점검한다.',
+            'set -euo pipefail',
+            '',
+            '# ── 1) 전 큐 기본 상한 정책 (가드레일) ───────────',
+            '#    이름 패턴에 안 걸린 큐가 없도록 catch-all 을 낮은 우선순위로',
+            'rabbitmqctl set_policy default-guard \\',
+            '  ".*" \\',
+            '  \'{"max-length":200000,"overflow":"drop-head"}\' \\',
+            '  --apply-to queues --priority 0',
+            '',
+            '# ── 2) 임시 큐 자동 만료 (유령 큐 청소) ──────────',
+            'rabbitmqctl set_policy temp-expire \\',
+            '  "^temp\\." \\',
+            '  \'{"expires":60000}\' \\',
+            '  --apply-to queues --priority 10',
+            '',
+            '# ── 3) 큐 depth 점검 (상한의 80% 이상 경보) ──────',
+            'THRESHOLD=160000   # 200000 의 80%',
+            'rabbitmqadmin list queues name messages \\',
+            '  | awk -v t="$THRESHOLD" \'NR>3 && $4+0 > t {',
+            '        print "[ALERT] queue " $2 " depth=" $4 " (>80%)"',
+            '    }\'',
+            '',
+            '# ── 4) 메모리/알람 상태 확인 ─────────────────────',
+            'rabbitmqctl status | grep -A3 "memory"',
+            'rabbitmqctl list_queues name messages memory \\',
+            '  | sort -k2 -n -r | head -20   # 무거운 큐 top 20',
+            '',
+            '# ── 설계 체크리스트 ─────────────────────────────',
+            '#   [x] 모든 큐에 max-length 또는 max-length-bytes',
+            '#   [x] 데이터 성격별 overflow (log=drop-head, order=reject*)',
+            '#   [x] 임시 큐는 x-expires 로 자동 삭제',
+            '#   [x] Policy 로 관리 → 코드 재배포 없이 튜닝',
+            '#   [x] depth 80% 알람 → 사고 전에 스케일아웃',
+            '#   상한은 "안전벨트": 사고가 나야 고마움을 안다.',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 33, 34, 35, 36, 37, 38],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 큐 적재 시각화 + overflow/만료
+    // ─────────────────────────────────────────────────────
+    const NODE_STATE = {
+      idle:    { ring: 'border-slate-300',  bg: 'bg-slate-50',    text: 'text-slate-600',  dot: 'bg-slate-300'  },
+      active:  { ring: 'border-orange-400', bg: 'bg-orange-50',   text: 'text-orange-800', dot: 'bg-orange-500' },
+      success: { ring: 'border-green-400',  bg: 'bg-green-50',    text: 'text-green-800',  dot: 'bg-green-500'  },
+      warn:    { ring: 'border-amber-400',  bg: 'bg-amber-50',    text: 'text-amber-800',  dot: 'bg-amber-500'  },
+      error:   { ring: 'border-red-400',    bg: 'bg-red-50',      text: 'text-red-800',    dot: 'bg-red-500'    },
+      info:    { ring: 'border-sky-400',    bg: 'bg-sky-50',      text: 'text-sky-800',    dot: 'bg-sky-500'    },
+    };
+
+    const ALERT_TONE = {
+      good: 'bg-green-50  border-green-300  text-green-900',
+      info: 'bg-sky-50    border-sky-300    text-sky-900',
+      warn: 'bg-amber-50  border-amber-300  text-amber-900',
+      err:  'bg-red-50    border-red-300    text-red-900',
+    };
+
+    function FlowNode({ node, idx, total }) {
+      const s = NODE_STATE[node.state] || NODE_STATE.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.ring} ${s.bg} px-3 py-2.5 shadow-sm`}>
+          <div className="flex items-center gap-2">
+            <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`}></span>
+            <span className={`text-xs font-mono ${s.text}`}>#{idx + 1} / {total}</span>
+            <span className={`ml-auto text-sm font-bold ${s.text}`}>{node.node}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-700 leading-relaxed">{node.detail}</div>
+        </div>
+      );
+    }
+
+    // 큐 슬롯 시각화: capacity 만큼 칸을 그리고 used 만큼 채운다
+    function QueueBoard({ queue }) {
+      const cap = queue.capacity || 5;
+      const used = queue.used || 0;
+      const slots = [];
+      for (let i = 0; i < cap; i++) {
+        const filled = i < used;
+        slots.push({ i, filled });
+      }
+      const pct = Math.round((used / cap) * 100);
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-orange-800">📥 큐 적재 상태</div>
+            <div className="text-[10px] text-slate-500">{used} / {cap} 슬롯 ({pct}%)</div>
+          </div>
+
+          {/* 슬롯 칸 */}
+          <div className="flex gap-1.5 mb-2">
+            {slots.map((s) => (
+              <div
+                key={s.i}
+                className={`flex-1 h-9 rounded flex items-center justify-center text-[10px] font-mono border-2 ${
+                  s.filled
+                    ? 'bg-orange-100 border-orange-400 text-orange-800'
+                    : 'bg-slate-50 border-dashed border-slate-300 text-slate-400'
+                }`}
+              >
+                {s.filled ? 'msg' : '·'}
+              </div>
+            ))}
+            {/* incoming / overflow 표시 */}
+            {queue.incoming && (
+              <div className="flex-1 h-9 rounded flex items-center justify-center text-[10px] font-mono border-2 bg-red-100 border-red-400 text-red-700 animate-pulse">
+                &rarr;신규
+              </div>
+            )}
+          </div>
+
+          {/* 게이지 바 */}
+          <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden mb-2">
+            <div
+              className="h-full rounded-full transition-all"
+              style={{ width: pct + '%', backgroundColor: pct >= 100 ? '#dc2626' : pct >= 80 ? '#f59e0b' : BRAND }}
+            />
+          </div>
+
+          {/* 정책별 동작 배지 */}
+          <div className="flex flex-wrap gap-1.5 text-[10px]">
+            {queue.policy === 'expires' && (
+              <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800">⏳ {queue.ttlLabel} — idle 시 큐 삭제</span>
+            )}
+            {queue.policy === 'full' && (
+              <span className="px-1.5 py-0.5 rounded bg-red-100 text-red-800">🚫 {queue.overflowLabel} → overflow 발동</span>
+            )}
+            {queue.dropHead && (
+              <React.Fragment>
+                <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800">drop-head: head 제거</span>
+                <span className="px-1.5 py-0.5 rounded bg-orange-100 text-orange-800">reject-publish: 신규 거절</span>
+              </React.Fragment>
+            )}
+            {queue.toDlx && (
+              <span className="px-1.5 py-0.5 rounded bg-green-100 text-green-800">📦 넘친 메시지 &rarr; DLX &rarr; dlq.orders</span>
+            )}
+            {queue.gauge && (
+              <span className="px-1.5 py-0.5 rounded bg-green-100 text-green-800">80% 도달 시 사전 알람</span>
+            )}
+          </div>
+
+          <div className="mt-2 text-[10px] text-slate-500">{queue.note}</div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const flow = step.flow || [];
+      const alertCls = ALERT_TONE[step.alert.tone] || ALERT_TONE.info;
+      return (
+        <div className="rounded-xl bg-white border-2 border-orange-200 shadow-md p-4 h-full flex flex-col">
+          <div className="text-xs font-bold text-orange-800 mb-2">{step.actor}</div>
+
+          {/* 흐름 노드 */}
+          <div className="space-y-2 mb-3">
+            {flow.map((n, i) => <FlowNode key={i} node={n} idx={i} total={flow.length} />)}
+          </div>
+
+          {/* 큐 적재 보드 */}
+          <QueueBoard queue={step.queue} />
+
+          {/* 핵심 경고 / 안내 */}
+          <div className={`mt-3 rounded-lg border-2 ${alertCls} px-3 py-2 text-xs leading-relaxed`}>
+            💡 {step.alert.text}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ stepIdx, total }) {
+      const codeRef = useRef(null);
+      const code = STEPS[stepIdx].code;
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          {/* 5탭 헤더 */}
+          <div className="flex items-center gap-0 bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {STEPS.map((s, i) => {
+              const isActive = i === stepIdx;
+              return (
+                <div
+                  key={i}
+                  className={`px-3 py-2 text-[10px] font-mono whitespace-nowrap border-r border-slate-700 ${
+                    isActive
+                      ? 'bg-[#282c34] text-orange-300 border-t-2 border-t-orange-400'
+                      : 'bg-slate-900 text-slate-500'
+                  }`}
+                >
+                  {s.code.filename}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 파일명 바 */}
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-amber-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: BRAND }}>III</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: BRAND_DARK }}>III-1-3. Queue TTL + Length Limit</h1>
+                <p className="text-sm" style={{ color: BRAND_DARK, opacity: 0.8 }}>큐 만료와 길이 제한 — 무한 적재를 막는 안전벨트</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: BRAND_DARK }}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className="h-1.5 flex-1 rounded-full transition"
+                  style={{ backgroundColor: i <= stepIdx ? BRAND : '#fed7aa' }}
+                />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-orange-50 px-5 py-4 shadow" style={{ backgroundColor: BRAND_DARK }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50"
+                style={{ color: BRAND_DARK }}
+                aria-label="처음으로"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: BRAND_DARK }}
+                aria-label="이전 단계"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className="px-4 py-1.5 text-xs rounded font-bold text-white"
+                style={{ backgroundColor: playing ? BRAND_DARK : BRAND }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: BRAND_DARK }}
+                aria-label="다음 단계"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: BRAND_DARK, opacity: 0.6 }}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-400 bg-white px-4 py-3 text-sm" style={{ color: BRAND_DARK }}>
+                <div className="font-bold mb-1">✅ 핵심 정리 — Queue TTL + Length Limit</div>
+                x-expires 로 유령 큐를 청소하고, x-max-length / x-max-length-bytes 로 상한을 건다. 상한 초과 시 overflow 정책이 drop-head(오래된 것 제거·최신 우선), reject-publish(신규 거절·백프레셔), reject-publish-dlx(거절 + DLX 보존) 중 하나로 동작한다. 무한 적재는 브로커 다운으로 직결되므로, 모든 큐에 상한 + overflow + depth 알람을 걸어두는 것이 실무 기본이다. 다음(III-1-4)에서는 Priority Queue — 우선순위 기반 소비를 다룬다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RabbitMQ', 'x-expires', 'x-max-length', 'x-max-length-bytes', 'overflow', 'drop-head', 'reject-publish', 'reject-publish-dlx', 'backpressure', 'DLX', 'policy'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border border-orange-200" style={{ backgroundColor: '#fff4eb', color: BRAND_DARK }}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: BRAND_DARK }}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <div className="flex gap-4">
+                <a href="./III-1-2.html" className="underline hover:no-underline">← 이전: III-1-2</a>
+                <a href="./III-1-4.html" className="underline hover:no-underline">다음: III-1-4 →</a>
+              </div>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

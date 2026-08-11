@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitMQ 인터랙티브 학습 — III-1-1. Dead Letter Exchange (DLX)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    RabbitMQ III-1-1 — Dead Letter Exchange (DLX) 실패 메시지 격리
+    학습 목표: nack / reject / TTL 만료 / queue 길이 초과로 죽은 메시지가
+              어떻게 별도 큐로 옮겨져 디버깅·재처리 대상이 되는지 4단계로 학습한다.
+    패턴: fastapi v1 — 좌(메시지 흐름 시뮬레이션) / 우(VSCode CodeViewer 4탭)
+    색상: orange (RabbitMQ 공식 #FF6600)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 4단계 시나리오
+    //   1: 정상 처리 (ack)        — 메시지가 큐에 들어가 컨슈머가 ack
+    //   2: 처리 실패 → nack       — 컨슈머가 nack(requeue=false)
+    //   3: DLX로 라우팅           — 큐의 x-dead-letter-exchange 설정 발동
+    //   4: DLQ에서 디버그·재처리   — 운영자가 dead letter 큐를 조사
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 정상 처리 — ack 흐름',
+        desc: '프로듀서가 orders exchange로 주문 메시지를 publish한다. orders.queue 가 메시지를 받아 컨슈머에게 deliver. 컨슈머가 비즈니스 로직(결제 처리)을 마치고 basic_ack 를 보낸다. RabbitMQ는 메시지를 큐에서 영구 삭제한다. 이게 정상 경로다. DLX는 이 흐름이 깨질 때 비로소 등장한다.',
+        actor: '🐰 정상 처리 — 컨슈머가 ack',
+        flow: [
+          { node: 'Producer', state: 'active', detail: 'publish: order_id=42' },
+          { node: 'orders exchange (direct)', state: 'active', detail: 'routing_key=order.created' },
+          { node: 'orders.queue', state: 'active', detail: '1건 enqueue → deliver' },
+          { node: 'Consumer', state: 'success', detail: 'process → basic_ack' },
+        ],
+        dlqState: { messages: [], note: 'dead letter 큐는 비어 있음' },
+        alert: { tone: 'good', text: '정상 경로: producer → exchange → queue → consumer → ack. DLX는 발동하지 않음.' },
+        code: {
+          lang: 'python',
+          filename: 'normal_ack.py',
+          lines: [
+            '"""',
+            'normal_ack.py — RabbitMQ 정상 처리 흐름 (ack 경로)',
+            '',
+            '핵심:',
+            '  - 컨슈머가 처리 완료 후 basic_ack 를 보낸다',
+            '  - RabbitMQ 는 메시지를 큐에서 영구 삭제한다',
+            '  - DLX 는 설정되어 있지만 발동하지 않는다 (정상 경로)',
+            '"""',
+            'import json',
+            'import pika',
+            '',
+            '# ── 1. 연결 / 채널 ─────────────────────────────',
+            'connection = pika.BlockingConnection(',
+            '    pika.ConnectionParameters(host="localhost", port=5672)',
+            ')',
+            'channel = connection.channel()',
+            '',
+            '# ── 2. Exchange / Queue 선언 (DLX 포함) ─────────',
+            '#    orders.queue 가 죽으면 dlx.exchange 로 라우팅된다',
+            'channel.exchange_declare("orders", exchange_type="direct", durable=True)',
+            'channel.exchange_declare("dlx.exchange", exchange_type="direct", durable=True)',
+            '',
+            'channel.queue_declare(',
+            '    queue="orders.queue",',
+            '    durable=True,',
+            '    arguments={',
+            '        "x-dead-letter-exchange": "dlx.exchange",',
+            '        "x-dead-letter-routing-key": "orders.dead",',
+            '    },',
+            ')',
+            'channel.queue_bind("orders.queue", "orders", routing_key="order.created")',
+            '',
+            '',
+            '# ── 3. Consumer: 처리 후 ack ──────────────────',
+            'def handle_order(ch, method, properties, body):',
+            '    """주문을 처리한다 — 성공하면 ack',
+            '',
+            '    Args:',
+            '        ch: 채널 객체',
+            '        method: 전달 메서드 (delivery_tag 포함)',
+            '        properties: 메시지 헤더/속성',
+            '        body: 메시지 본문 (bytes)',
+            '',
+            '    Side Effects:',
+            '        성공 시 basic_ack → 큐에서 메시지 제거',
+            '    """',
+            '    order = json.loads(body)',
+            '    process_payment(order)  # 결제 처리 (도메인 로직)',
+            '    ch.basic_ack(delivery_tag=method.delivery_tag)',
+            '    # ✅ 정상 경로: 큐에서 영구 삭제',
+            '',
+            '',
+            'channel.basic_qos(prefetch_count=10)',
+            'channel.basic_consume(queue="orders.queue", on_message_callback=handle_order)',
+            'channel.start_consuming()',
+            '',
+            '',
+            '# ── 적합한 유스케이스 ────────────────────────────',
+            '#   ✓ 모든 RabbitMQ 컨슈머의 기본 패턴',
+            '#   ✓ at-least-once 보장 (auto_ack=False 가 핵심)',
+            '#   ✓ 멱등 처리와 함께 사용하면 사실상 안전',
+          ],
+          highlight: [3, 4, 5, 6, 7, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 45, 46, 47],
+        },
+      },
+      {
+        title: 'Step 2. 처리 실패 → nack (requeue=false)',
+        desc: '컨슈머가 메시지를 처리하다 예외가 발생했다 (예: 결제 API 4xx, JSON 파싱 실패). basic_nack(requeue=False) 를 호출한다. requeue=True 면 같은 큐로 돌아가 무한 재시도되어 poison message 가 큐를 막는다. requeue=False 라야 RabbitMQ가 이 메시지를 "죽은 것"으로 판정하고 다음 단계(DLX 라우팅)로 넘어간다.',
+        actor: '⚠️ 처리 실패 — nack(requeue=False)',
+        flow: [
+          { node: 'Producer', state: 'idle', detail: 'publish: order_id=42 (잘못된 amount)' },
+          { node: 'orders exchange (direct)', state: 'idle', detail: 'routing_key=order.created' },
+          { node: 'orders.queue', state: 'warn', detail: 'deliver → 컨슈머 처리 실패' },
+          { node: 'Consumer', state: 'error', detail: 'ValidationError → basic_nack(requeue=False)' },
+        ],
+        dlqState: { messages: [], note: 'DLX는 아직 라우팅 전' },
+        alert: { tone: 'warn', text: 'requeue=True 면 같은 큐로 돌아가 무한 루프! poison message 가 큐 전체를 멈춘다. 반드시 requeue=False.' },
+        code: {
+          lang: 'python',
+          filename: 'nack_pattern.py',
+          lines: [
+            '"""',
+            'nack_pattern.py — RabbitMQ 처리 실패 시 안전한 nack 패턴',
+            '',
+            '핵심:',
+            '  - requeue=True  → 같은 큐로 돌려보냄 (poison message 위험)',
+            '  - requeue=False → DLX 라우팅 트리거 (권장)',
+            '  - 재시도가 필요하면 retry counter + DLX-TTL 패턴 (III-2-2)',
+            '"""',
+            'import json',
+            'import pika',
+            'from pydantic import ValidationError',
+            'from app.schemas import OrderSchema',
+            'from app.payment import PaymentError, charge',
+            '',
+            '',
+            'def handle_order(ch, method, properties, body):',
+            '    """주문 처리 — 예외 발생 시 nack(requeue=False) → DLX',
+            '',
+            '    Args:',
+            '        ch: 채널',
+            '        method: delivery_tag 포함',
+            '        properties: AMQP basic_properties',
+            '        body: bytes 페이로드',
+            '',
+            '    Raises:',
+            '        ValidationError: 스키마 불일치',
+            '        PaymentError: 결제 게이트웨이 거부',
+            '    """',
+            '    delivery_tag = method.delivery_tag',
+            '    try:',
+            '        # 1) 스키마 검증',
+            '        order = OrderSchema.model_validate_json(body)',
+            '        # 2) 비즈니스 로직',
+            '        charge(order.user_id, order.amount)',
+            '        # 3) 성공',
+            '        ch.basic_ack(delivery_tag=delivery_tag)',
+            '    except ValidationError as e:',
+            '        # 스키마 깨진 메시지 → 재시도 의미 없음 → DLX',
+            '        print(f"[nack-validation] {e}")',
+            '        ch.basic_nack(delivery_tag=delivery_tag, requeue=False)',
+            '    except PaymentError as e:',
+            '        # 결제 거부 (예: 4xx) → 재시도 의미 없음 → DLX',
+            '        print(f"[nack-payment] {e}")',
+            '        ch.basic_nack(delivery_tag=delivery_tag, requeue=False)',
+            '    except Exception as e:',
+            '        # 알 수 없는 예외 → 한 번만 재시도 (단순화 예시)',
+            '        # 실제로는 redelivered 플래그를 보고 결정 (Step 4 참고)',
+            '        print(f"[nack-unknown] {e}")',
+            '        ch.basic_nack(delivery_tag=delivery_tag, requeue=False)',
+            '',
+            '',
+            '# ── ❌ 절대 금지 패턴 ────────────────────────────',
+            'def bad_handler(ch, method, properties, body):',
+            '    """❌ requeue=True 는 poison message 무한 루프"""',
+            '    try:',
+            '        process(body)',
+            '        ch.basic_ack(delivery_tag=method.delivery_tag)',
+            '    except Exception:',
+            '        # 같은 메시지가 즉시 재투입 → 무한 nack → CPU 100%',
+            '        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)',
+            '',
+            '',
+            '# ── 결론 ────────────────────────────────────────',
+            '#   • requeue=False 가 기본. DLX 로 격리.',
+            '#   • requeue=True 는 "잠깐 끊긴 네트워크"처럼 회복 가능한 일시 오류에만.',
+            '#   • 재시도 횟수가 필요하면 III-2-2 DLX+TTL 패턴.',
+          ],
+          highlight: [3, 4, 5, 6, 7, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 52, 53, 54, 55, 56, 57, 58, 59, 60],
+        },
+      },
+      {
+        title: 'Step 3. DLX로 라우팅 — RabbitMQ가 자동으로 죽은 메시지 이동',
+        desc: 'orders.queue 선언 시 x-dead-letter-exchange="dlx.exchange" 를 지정했다. nack(requeue=False) 가 들어오면 RabbitMQ가 메시지를 dlx.exchange 로 publish 하고, x-dead-letter-routing-key 가 있으면 routing_key 를 치환한다. dlx.exchange 에 바인딩된 dlq.orders 큐로 메시지가 들어간다. 헤더에는 x-death 가 자동으로 추가되어 "왜 죽었는지(reason: rejected/expired/maxlen), 몇 번 죽었는지(count), 원래 어디서 왔는지(queue)" 가 기록된다.',
+        actor: '🔀 DLX 라우팅 — RabbitMQ가 자동으로 dlq.orders 큐로',
+        flow: [
+          { node: 'orders.queue', state: 'warn', detail: 'nack(requeue=False) 수신' },
+          { node: 'dlx.exchange (direct)', state: 'active', detail: 'routing_key=orders.dead 로 publish' },
+          { node: 'dlq.orders 큐', state: 'success', detail: '메시지 도착 + x-death 헤더 추가' },
+          { node: 'x-death 헤더', state: 'info', detail: 'reason / count / queue / time / exchange / routing-keys' },
+        ],
+        dlqState: {
+          messages: [
+            { id: 'order-42', reason: 'rejected', count: 1, queue: 'orders.queue', time: '2026-05-20T10:24Z' },
+            { id: 'order-77', reason: 'expired',  count: 1, queue: 'orders.queue', time: '2026-05-20T10:25Z' },
+            { id: 'order-99', reason: 'maxlen',   count: 1, queue: 'orders.queue', time: '2026-05-20T10:26Z' },
+          ],
+          note: '3가지 dead 사유 — rejected(nack) / expired(TTL) / maxlen(큐 길이 초과)',
+        },
+        alert: { tone: 'info', text: 'DLX는 일반 exchange. 큐의 x-dead-letter-exchange 옵션 하나로 자동 라우팅. 헤더 x-death 가 메타데이터를 다 적어준다.' },
+        code: {
+          lang: 'yaml',
+          filename: 'definitions.yaml',
+          lines: [
+            '# definitions.yaml — RabbitMQ Management 정의 export',
+            '#',
+            '# 핵심 설정:',
+            '#   1) 일반 큐(orders.queue) 에 x-dead-letter-exchange 지정',
+            '#   2) DLX(dlx.exchange) 는 일반 direct exchange',
+            '#   3) DLQ(dlq.orders) 가 DLX 에 바인딩',
+            '#',
+            '# 적용:',
+            '#   rabbitmqctl import_definitions definitions.yaml',
+            '#   또는 Management UI > Overview > Import',
+            '',
+            'exchanges:',
+            '  - name: orders',
+            '    vhost: /',
+            '    type: direct',
+            '    durable: true',
+            '    auto_delete: false',
+            '',
+            '  - name: dlx.exchange    # ← Dead Letter Exchange',
+            '    vhost: /',
+            '    type: direct',
+            '    durable: true',
+            '    auto_delete: false',
+            '',
+            'queues:',
+            '  - name: orders.queue',
+            '    vhost: /',
+            '    durable: true',
+            '    auto_delete: false',
+            '    arguments:',
+            '      x-dead-letter-exchange: dlx.exchange      # ← DLX 라우팅 트리거',
+            '      x-dead-letter-routing-key: orders.dead    # ← routing_key 치환',
+            '      x-message-ttl: 60000                       # 60초 후 expired → DLX',
+            '      x-max-length: 10000                        # 큐 초과 → maxlen → DLX',
+            '',
+            '  - name: dlq.orders     # ← Dead Letter Queue',
+            '    vhost: /',
+            '    durable: true',
+            '    auto_delete: false',
+            '    arguments:',
+            '      x-message-ttl: 604800000   # DLQ 도 7일 TTL (무한 적재 방지)',
+            '',
+            'bindings:',
+            '  - source: orders',
+            '    vhost: /',
+            '    destination: orders.queue',
+            '    destination_type: queue',
+            '    routing_key: order.created',
+            '    arguments: {}',
+            '',
+            '  - source: dlx.exchange',
+            '    vhost: /',
+            '    destination: dlq.orders',
+            '    destination_type: queue',
+            '    routing_key: orders.dead',
+            '    arguments: {}',
+            '',
+            '# ── x-death 헤더 (RabbitMQ 가 자동 주입) ────────',
+            '# x-death:',
+            '#   - reason: rejected | expired | maxlen | delivery_limit',
+            '#     count: 1                # 같은 메시지가 죽은 횟수',
+            '#     queue: orders.queue     # 원래 큐',
+            '#     time: 2026-05-20T10:24Z # 죽은 시각',
+            '#     exchange: orders        # 원래 exchange',
+            '#     routing-keys: [order.created]',
+            '',
+            '# ── 알람 권장 ────────────────────────────────────',
+            '#   • dlq.orders messages_ready > 0   → Slack 경보',
+            '#   • dlq.orders messages_ready > 100 → PagerDuty',
+            '#   • dlq.orders messages_ready > 1000 → 서비스 정지 검토',
+          ],
+          highlight: [12, 13, 14, 15, 16, 21, 22, 23, 24, 27, 28, 29, 30, 31, 32, 33, 34, 35, 38, 39, 40, 41, 42, 43, 53, 54, 55, 56, 57],
+        },
+      },
+      {
+        title: 'Step 4. DLQ에서 디버그 + 재처리 — 운영자의 워크플로우',
+        desc: 'dlq.orders 에 쌓인 메시지를 어떻게 처리할 것인가? ① Slack 알람으로 인지 → ② Management UI 또는 rabbitmqadmin get queue=dlq.orders 로 메시지 본문 + x-death 헤더를 본다. ③ 사유 분류: 스키마 오류는 코드 수정·재배포 후 shovel로 원복, 일시 장애는 단순 재발행, 비즈니스 거부는 영구 보관·CRM 알림. ④ 재처리는 별도 "re-publisher" 스크립트가 dlq.orders → orders.queue 로 옮긴다 (헤더 x-death 는 그대로 둬서 재시도 흔적 보존).',
+        actor: '🔧 운영자 워크플로우 — 인지 → 분석 → 분류 → 재처리',
+        flow: [
+          { node: '① 알람', state: 'warn', detail: 'Slack/PagerDuty: dlq.orders > 0' },
+          { node: '② 분석', state: 'active', detail: 'rabbitmqadmin get + x-death 헤더 분석' },
+          { node: '③ 분류', state: 'active', detail: '스키마 / 일시 장애 / 영구 거부' },
+          { node: '④ 재처리', state: 'success', detail: 'shovel 또는 re-publisher 스크립트' },
+        ],
+        dlqState: {
+          messages: [
+            { id: 'order-42', reason: 'rejected', count: 1, queue: 'orders.queue', action: '🔧 코드 fix 후 republish' },
+            { id: 'order-77', reason: 'expired',  count: 1, queue: 'orders.queue', action: '↻ 단순 republish (일시 장애)' },
+            { id: 'order-99', reason: 'maxlen',   count: 1, queue: 'orders.queue', action: '📦 보관 (재고 0으로 reject)' },
+          ],
+          note: '운영자가 사유별로 다른 액션을 취한다',
+        },
+        alert: { tone: 'good', text: 'DLQ는 "사후 대응의 출발점". 알람 → 분석 → 분류 → 재처리 4단계 SOP를 미리 합의해두면 사고 시 우왕좌왕하지 않는다.' },
+        code: {
+          lang: 'python',
+          filename: 'republish.py',
+          lines: [
+            '"""',
+            'republish.py — DLQ → 원래 큐로 안전하게 재처리하는 운영 스크립트',
+            '',
+            '사용:',
+            '  python republish.py --queue dlq.orders --target orders --routing-key order.created \\',
+            '                       --max 100 --filter rejected --dry-run',
+            '',
+            '핵심 원칙:',
+            '  1) get_ok 로 한 건씩 가져와서 x-death 분석',
+            '  2) sub-domain 필터 (reason, count) 로 안전한 메시지만 골라 재발행',
+            '  3) republish 후 ack — 실패 시 nack(requeue=True) 로 dlq 에 다시 둠',
+            '  4) --dry-run 으로 먼저 미리보기',
+            '"""',
+            'import argparse',
+            'import json',
+            'import pika',
+            '',
+            '',
+            'def parse_x_death(headers: dict) -> list[dict]:',
+            '    """RabbitMQ 의 x-death 헤더를 dict 리스트로 정규화한다',
+            '',
+            '    Args:',
+            '        headers: properties.headers (없으면 빈 dict)',
+            '',
+            '    Returns:',
+            '        [{reason, count, queue, time, exchange, routing-keys}, ...]',
+            '    """',
+            '    raw = (headers or {}).get("x-death", [])',
+            '    return list(raw)  # 그대로 — 헤더는 보존 (재시도 흔적)',
+            '',
+            '',
+            'def should_republish(deaths: list[dict], allow: str, max_count: int) -> bool:',
+            '    """재발행 조건 — 사유 매칭 + 무한 루프 방지',
+            '',
+            '    Args:',
+            '        deaths: x-death 헤더',
+            '        allow: 허용 사유 (rejected / expired / maxlen)',
+            '        max_count: 최대 재시도 횟수 (예: 3)',
+            '',
+            '    Returns:',
+            '        True 면 재발행',
+            '    """',
+            '    if not deaths:',
+            '        return False',
+            '    head = deaths[0]',
+            '    if head.get("reason") != allow:',
+            '        return False',
+            '    if int(head.get("count", 1)) >= max_count:',
+            '        return False  # 더 이상 재시도 X — 영구 보관 대상',
+            '    return True',
+            '',
+            '',
+            'def main():',
+            '    """DLQ → 원래 큐 재발행 메인 루프"""',
+            '    p = argparse.ArgumentParser()',
+            '    p.add_argument("--queue", required=True)         # dlq.orders',
+            '    p.add_argument("--target", required=True)        # orders',
+            '    p.add_argument("--routing-key", required=True)   # order.created',
+            '    p.add_argument("--max", type=int, default=100)',
+            '    p.add_argument("--filter", default="rejected")',
+            '    p.add_argument("--max-retry", type=int, default=3)',
+            '    p.add_argument("--dry-run", action="store_true")',
+            '    args = p.parse_args()',
+            '',
+            '    conn = pika.BlockingConnection(pika.ConnectionParameters("localhost"))',
+            '    ch = conn.channel()',
+            '    ch.confirm_delivery()  # publisher confirms ON',
+            '',
+            '    moved = 0',
+            '    for _ in range(args.max):',
+            '        method, props, body = ch.basic_get(queue=args.queue, auto_ack=False)',
+            '        if method is None:',
+            '            break  # 큐가 비었음',
+            '',
+            '        deaths = parse_x_death(props.headers if props else {})',
+            '        if not should_republish(deaths, args.filter, args.max_retry):',
+            '            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)',
+            '            continue',
+            '',
+            '        if args.dry_run:',
+            '            print(f"[dry] would republish: {body!r}")',
+            '            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)',
+            '            continue',
+            '',
+            '        try:',
+            '            ch.basic_publish(',
+            '                exchange=args.target,',
+            '                routing_key=args.routing_key,',
+            '                body=body,',
+            '                properties=props,  # 헤더 보존',
+            '                mandatory=True,',
+            '            )',
+            '            ch.basic_ack(delivery_tag=method.delivery_tag)',
+            '            moved += 1',
+            '        except Exception as e:',
+            '            print(f"[fail] republish error: {e}")',
+            '            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)',
+            '',
+            '    print(f"[done] moved {moved} messages from {args.queue} → {args.target}")',
+            '    conn.close()',
+            '',
+            '',
+            'if __name__ == "__main__":',
+            '    main()',
+            '',
+            '# ── 운영 팁 ─────────────────────────────────────',
+            '#   1) 항상 --dry-run 으로 먼저 검토',
+            '#   2) --max 작게 시작 (10 → 100 → 1000)',
+            '#   3) Slack 알람으로 진행 상황 추적',
+            '#   4) 사유별로 별도 스크립트 (--filter rejected, expired, maxlen)',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 메시지 흐름 + DLQ 상태
+    // ─────────────────────────────────────────────────────
+    const NODE_STATE = {
+      idle:    { ring: 'border-slate-300',  bg: 'bg-slate-50',    text: 'text-slate-600',  dot: 'bg-slate-300'  },
+      active:  { ring: 'border-orange-400', bg: 'bg-orange-50',   text: 'text-orange-800', dot: 'bg-orange-500' },
+      success: { ring: 'border-green-400',  bg: 'bg-green-50',    text: 'text-green-800',  dot: 'bg-green-500'  },
+      warn:    { ring: 'border-amber-400',  bg: 'bg-amber-50',    text: 'text-amber-800',  dot: 'bg-amber-500'  },
+      error:   { ring: 'border-red-400',    bg: 'bg-red-50',      text: 'text-red-800',    dot: 'bg-red-500'    },
+      info:    { ring: 'border-sky-400',    bg: 'bg-sky-50',      text: 'text-sky-800',    dot: 'bg-sky-500'    },
+    };
+
+    const ALERT_TONE = {
+      good: 'bg-green-50  border-green-300  text-green-900',
+      info: 'bg-sky-50    border-sky-300    text-sky-900',
+      warn: 'bg-amber-50  border-amber-300  text-amber-900',
+      err:  'bg-red-50    border-red-300    text-red-900',
+    };
+
+    function FlowNode({ node, idx, total }) {
+      const s = NODE_STATE[node.state] || NODE_STATE.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.ring} ${s.bg} px-3 py-2.5 shadow-sm`}>
+          <div className="flex items-center gap-2">
+            <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`}></span>
+            <span className={`text-xs font-mono ${s.text}`}>#{idx + 1} / {total}</span>
+            <span className={`ml-auto text-sm font-bold ${s.text}`}>{node.node}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-700 leading-relaxed">{node.detail}</div>
+        </div>
+      );
+    }
+
+    function DlqBoard({ dlqState }) {
+      const items = dlqState.messages || [];
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-bold text-orange-800">📦 dlq.orders 큐 상태</div>
+            <div className="text-[10px] text-slate-500">{items.length} 건</div>
+          </div>
+          {items.length === 0 ? (
+            <div className="text-xs text-slate-500 py-2 italic">{dlqState.note}</div>
+          ) : (
+            <div className="space-y-1.5">
+              {items.map((m, i) => (
+                <div key={i} className="rounded border border-orange-200 bg-orange-50 px-2 py-1.5 text-xs">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono font-bold text-orange-900">{m.id}</span>
+                    <span className="px-1.5 rounded bg-red-100 text-red-800 text-[10px]">reason: {m.reason}</span>
+                    <span className="px-1.5 rounded bg-amber-100 text-amber-800 text-[10px]">count: {m.count}</span>
+                    {m.queue && <span className="text-slate-600 text-[10px]">from: {m.queue}</span>}
+                  </div>
+                  {m.action && <div className="mt-0.5 text-slate-700 text-[11px]">{m.action}</div>}
+                  {m.time && <div className="mt-0.5 text-slate-500 text-[10px]">{m.time}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-2 text-[10px] text-slate-500">{dlqState.note}</div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const flow = step.flow || [];
+      const alertCls = ALERT_TONE[step.alert.tone] || ALERT_TONE.info;
+      return (
+        <div className="rounded-xl bg-white border-2 border-orange-200 shadow-md p-4 h-full flex flex-col">
+          <div className="text-xs font-bold text-orange-800 mb-2">{step.actor}</div>
+
+          {/* 메시지 흐름 노드 */}
+          <div className="space-y-2 mb-3">
+            {flow.map((n, i) => <FlowNode key={i} node={n} idx={i} total={flow.length} />)}
+          </div>
+
+          {/* DLQ 상태 보드 */}
+          <DlqBoard dlqState={step.dlqState} />
+
+          {/* 핵심 경고 / 안내 */}
+          <div className={`mt-3 rounded-lg border-2 ${alertCls} px-3 py-2 text-xs leading-relaxed`}>
+            💡 {step.alert.text}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ stepIdx, total }) {
+      const codeRef = useRef(null);
+      const code = STEPS[stepIdx].code;
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          {/* 4탭 헤더 */}
+          <div className="flex items-center gap-0 bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {STEPS.map((s, i) => {
+              const isActive = i === stepIdx;
+              return (
+                <div
+                  key={i}
+                  className={`px-3 py-2 text-[10px] font-mono whitespace-nowrap border-r border-slate-700 ${
+                    isActive
+                      ? 'bg-[#282c34] text-orange-300 border-t-2 border-t-orange-400'
+                      : 'bg-slate-900 text-slate-500'
+                  }`}
+                >
+                  {s.code.filename}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 파일명 바 */}
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-amber-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: '#FF6600' }}>III</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: '#cc5200' }}>III-1-1. Dead Letter Exchange (DLX)</h1>
+                <p className="text-sm" style={{ color: '#cc5200', opacity: 0.8 }}>실패 메시지가 자동으로 격리·재처리되는 길</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: '#cc5200' }}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className="h-1.5 flex-1 rounded-full transition"
+                  style={{ backgroundColor: i <= stepIdx ? '#FF6600' : '#fed7aa' }}
+                />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-orange-50 px-5 py-4 shadow" style={{ backgroundColor: '#cc5200' }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50"
+                style={{ color: '#cc5200' }}
+                aria-label="처음으로"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: '#cc5200' }}
+                aria-label="이전 단계"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className="px-4 py-1.5 text-xs rounded font-bold text-white"
+                style={{ backgroundColor: playing ? '#a64200' : '#FF6600' }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: '#cc5200' }}
+                aria-label="다음 단계"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: '#cc5200', opacity: 0.6 }}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-400 bg-white px-4 py-3 text-sm" style={{ color: '#cc5200' }}>
+                <div className="font-bold mb-1">✅ DLX 학습 완료</div>
+                정상 ack → nack → DLX 자동 라우팅 → DLQ 운영 SOP 까지 4단계로 RabbitMQ 실패 메시지 격리 패턴을 익혔다. 다음 챕터(III-1-2)는 Message TTL — 메시지가 큐에서 일정 시간 후 자동 만료되어 dead 처리되는 흐름을 다룬다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RabbitMQ', 'DLX', 'dead-letter', 'x-dead-letter-exchange', 'x-death', 'nack', 'requeue', 'DLQ', 'poison-message', 'pika', 'AMQP'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border border-orange-200" style={{ backgroundColor: '#fff4eb', color: '#cc5200' }}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: '#cc5200' }}>
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./III-1-2.html" className="underline hover:no-underline">다음: III-1-2 Message TTL →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

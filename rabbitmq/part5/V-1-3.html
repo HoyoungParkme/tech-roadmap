@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitMQ 인터랙티브 학습 — V-1-3. Security (TLS / SASL / vhost)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    RabbitMQ V-1-3 — Security (TLS / SASL / vhost)
+    학습 목표: 클라이언트가 TLS 핸드셰이크 → SASL 인증 → vhost 권한 검사라는
+              3중 보안 게이트를 통과해야만 큐에 접근할 수 있음을 5단계로 학습한다.
+    패턴: fastapi v1 — 좌(보안 게이트 시뮬레이션) / 우(VSCode CodeViewer 5탭)
+    색상: orange (RabbitMQ 공식 #FF6600)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 브랜드 색상
+    const BRAND = '#FF6600';
+    const BRAND_DARK = '#a64200';
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 시나리오 — RabbitMQ 보안 게이트
+    //   1: vhost      — 논리적 격리 단위 (네임스페이스)
+    //   2: user/perm  — 사용자 + tag + configure/write/read 정규식 권한
+    //   3: TLS        — 5671 암호화 + 인증서 검증 + mTLS(peer verify)
+    //   4: SASL       — PLAIN / AMQPLAIN / EXTERNAL 인증 메커니즘
+    //   5: 프로덕션    — guest 제거 · TLS · vhost 분리 · 최소 권한
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. vhost — 논리적 격리 단위',
+        desc: 'vhost(virtual host)는 하나의 RabbitMQ 브로커 안에서 exchange·queue·binding·user 권한을 완전히 분리하는 네임스페이스다. /prod 의 orders.queue 와 /staging 의 orders.queue 는 이름이 같아도 서로 다른 큐다. 멀티테넌시(팀·서비스·환경별 격리)의 기본 단위이며, 권한은 언제나 "user × vhost" 조합으로 부여된다. 기본 vhost 는 "/" 이지만 프로덕션에서는 반드시 용도별로 나눈다.',
+        actor: '🛂 게이트 0 — 어느 vhost 로 들어갈 것인가',
+        gates: [
+          { name: 'TLS 핸드셰이크', icon: '🔒', state: 'idle', detail: '(Step 3에서 검사)' },
+          { name: 'SASL 인증', icon: '🔑', state: 'idle', detail: '(Step 4에서 검사)' },
+          { name: 'vhost 권한', icon: '🛂', state: 'active', detail: '접속 대상 vhost=/prod 선택' },
+          { name: '큐 접근', icon: '📥', state: 'idle', detail: '/prod 네임스페이스의 큐만 보임' },
+        ],
+        board: {
+          kind: 'vhosts',
+          title: 'vhost 목록 (논리적 격리)',
+          rows: [
+            { name: '/', note: '기본 vhost — 프로덕션에서는 사용 자제', tone: 'warn' },
+            { name: '/prod', note: 'orders.queue · payments.queue', tone: 'good' },
+            { name: '/staging', note: 'orders.queue (이름 같아도 별개!)', tone: 'info' },
+            { name: '/analytics', note: 'events.queue — 팀 격리', tone: 'info' },
+          ],
+        },
+        alert: { tone: 'info', text: 'vhost 는 "폴더"가 아니라 "독립된 브로커처럼 동작하는 네임스페이스"다. /prod 사용자는 /staging 의 큐를 아예 볼 수 없다.' },
+        code: {
+          lang: 'bash',
+          filename: 'vhost_setup.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# vhost_setup.sh — RabbitMQ vhost(논리적 격리) 구성',
+            '#',
+            '# 핵심:',
+            '#   - vhost 는 exchange/queue/binding/권한을 완전히 분리한다',
+            '#   - 권한은 항상 (user x vhost) 조합으로 부여된다',
+            '#   - 환경/팀/서비스 단위로 나누는 것이 멀티테넌시의 기본',
+            '',
+            'set -euo pipefail',
+            '',
+            '# ── 1. vhost 생성 ────────────────────────────────',
+            'rabbitmqctl add_vhost /prod',
+            'rabbitmqctl add_vhost /staging',
+            'rabbitmqctl add_vhost /analytics',
+            '',
+            '# ── 2. 설명 태그(메타데이터) 부여 (선택) ─────────',
+            'rabbitmqctl set_vhost_tags /prod production',
+            'rabbitmqctl set_vhost_tags /staging non-production',
+            '',
+            '# ── 3. 목록 확인 ─────────────────────────────────',
+            'rabbitmqctl list_vhosts name tracing',
+            '',
+            '# ── 4. 기본 vhost "/" 정리 검토 ──────────────────',
+            '#   기본 "/" 는 예제/테스트 잔재가 쌓이기 쉽다.',
+            '#   프로덕션 트래픽을 여기에 두지 말 것.',
+            '# rabbitmqctl delete_vhost /   # (신중히! 되돌릴 수 없음)',
+            '',
+            '# ── 결과 ─────────────────────────────────────────',
+            '#   /prod 의 orders.queue 와 /staging 의 orders.queue 는',
+            '#   이름이 같아도 서로 다른 큐 → 환경 간 사고 격리',
+          ],
+          highlight: [11, 12, 13, 14, 22],
+        },
+      },
+      {
+        title: 'Step 2. 사용자 · tag · 권한 정규식 — 최소 권한 원칙',
+        desc: '사용자는 두 가지로 통제된다. ① tag: administrator / monitoring / management / (없음) — Management UI 접근 범위를 정한다. ② vhost별 권한: set_permissions 가 configure / write / read 세 가지를 각각 정규식으로 받는다. configure 는 큐·exchange 선언, write 는 publish/bind, read 는 consume/get 권한이다. 정규식 "^" (아무것도 매치 안 함)으로 시작해 꼭 필요한 리소스만 여는 것이 최소 권한 원칙이다.',
+        actor: '🔑 게이트 — 이 사용자가 무엇을 할 수 있는가',
+        gates: [
+          { name: 'TLS 핸드셰이크', icon: '🔒', state: 'idle', detail: '(Step 3에서 검사)' },
+          { name: 'SASL 인증', icon: '🔑', state: 'active', detail: 'app_prod 사용자 식별' },
+          { name: 'vhost 권한', icon: '🛂', state: 'active', detail: '/prod 의 configure/write/read 정규식 검사' },
+          { name: '큐 접근', icon: '📥', state: 'warn', detail: 'read 정규식에 매치되는 큐만 consume 가능' },
+        ],
+        board: {
+          kind: 'perms',
+          title: 'app_prod @ /prod 권한 (정규식)',
+          rows: [
+            { perm: 'configure', regex: '^$', note: '큐/exchange 선언 불가 (앱은 선언 안 함)', tone: 'warn' },
+            { perm: 'write', regex: '^orders\\.', note: 'orders.* 로 publish/bind 가능', tone: 'good' },
+            { perm: 'read', regex: '^orders\\.', note: 'orders.* 를 consume 가능', tone: 'good' },
+            { perm: 'tag', regex: '(none)', note: 'Management UI 접근 불가 — 앱 계정', tone: 'info' },
+          ],
+        },
+        alert: { tone: 'warn', text: '앱 계정에 administrator tag 를 주지 말 것. 권한 정규식은 ".*"(전체 허용) 대신 "^orders\\." 처럼 접두사로 좁힌다.' },
+        code: {
+          lang: 'bash',
+          filename: 'user_perms.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# user_perms.sh — 사용자 생성 + tag + vhost별 최소 권한',
+            '#',
+            '# set_permissions <user> -p <vhost> <configure> <write> <read>',
+            '#   configure : 큐/exchange 선언·삭제 권한',
+            '#   write     : publish / queue-bind 권한',
+            '#   read      : consume / basic_get 권한',
+            '#   각 인자는 리소스 이름에 매칭되는 정규식',
+            '',
+            'set -euo pipefail',
+            '',
+            '# ── 1. 애플리케이션 계정 (UI 접근 불필요) ────────',
+            'rabbitmqctl add_user app_prod "S3cure-Pass!"',
+            '#   tag 없음 → Management UI 로그인 불가 (앱 전용)',
+            '',
+            '# ── 2. /prod 에서 orders.* 만 다루도록 최소 권한 ──',
+            'rabbitmqctl set_permissions -p /prod app_prod \\',
+            '  "^$" \\',
+            '  "^orders\\." \\',
+            '  "^orders\\."',
+            '#   configure=^$  → 아무 리소스도 선언 못함 (인프라가 미리 선언)',
+            '#   write=^orders\\.  → orders.* 로만 publish',
+            '#   read=^orders\\.   → orders.* 만 consume',
+            '',
+            '# ── 3. 운영/모니터링 계정 (읽기 UI 만) ───────────',
+            'rabbitmqctl add_user ops_view "Ops-ReadOnly!"',
+            'rabbitmqctl set_user_tags ops_view monitoring',
+            'rabbitmqctl set_permissions -p /prod ops_view "^$" "^$" "^$"',
+            '#   monitoring tag → 메트릭/큐 상태 조회 UI 접근',
+            '#   권한 정규식은 모두 ^$ → 메시지 흐름엔 관여 못함',
+            '',
+            '# ── 4. 확인 ──────────────────────────────────────',
+            'rabbitmqctl list_permissions -p /prod',
+            'rabbitmqctl list_users            # name / tags',
+          ],
+          highlight: [13, 17, 18, 19, 20, 25, 26, 27],
+        },
+      },
+      {
+        title: 'Step 3. TLS — 전송 구간 암호화와 mTLS',
+        desc: 'AMQP 기본 포트 5672 는 평문이다 — 사용자 비밀번호와 메시지가 네트워크에 그대로 흐른다. 5671(amqps) 에 TLS 를 걸면 클라이언트-브로커 구간이 암호화되고, 클라이언트는 CA 로 서버 인증서를 검증한다. 한 걸음 더 나아가 mTLS(peer verification)는 브로커도 클라이언트 인증서를 요구한다 — verify=verify_peer, fail_if_no_peer_cert=true. 이러면 인증서를 가진 클라이언트만 TCP 연결 자체가 성립한다.',
+        actor: '🔒 게이트 1 — 암호화 채널이 먼저 서야 한다',
+        gates: [
+          { name: 'TLS 핸드셰이크', icon: '🔒', state: 'active', detail: '5671(amqps) · 서버+클라이언트 인증서 교환' },
+          { name: 'SASL 인증', icon: '🔑', state: 'idle', detail: 'TLS 성립 후 진행' },
+          { name: 'vhost 권한', icon: '🛂', state: 'idle', detail: '인증 후 검사' },
+          { name: '큐 접근', icon: '📥', state: 'idle', detail: '대기' },
+        ],
+        board: {
+          kind: 'tls',
+          title: 'TLS 핸드셰이크 (mTLS)',
+          rows: [
+            { step: '1. ClientHello', note: '지원 TLS 버전(1.2/1.3)·cipher 제시', tone: 'info' },
+            { step: '2. 서버 인증서', note: '클라이언트가 CA 로 검증 (도메인·만료·체인)', tone: 'good' },
+            { step: '3. 클라이언트 인증서', note: 'mTLS: 브로커가 peer cert 검증', tone: 'good' },
+            { step: '4. 암호화 채널 확립', note: '이후 AMQP 프레임 전부 암호화', tone: 'good' },
+          ],
+        },
+        alert: { tone: 'warn', text: '5672(평문)를 프로덕션에서 열어두면 TLS 를 걸어도 우회된다. tcp_listeners 를 비우고 ssl_listeners 만 남겨 5672 를 닫아라.' },
+        code: {
+          lang: 'ini',
+          filename: 'rabbitmq.conf (TLS)',
+          lines: [
+            '# rabbitmq.conf — TLS / mTLS 설정',
+            '#',
+            '# 목표:',
+            '#   1) 평문 5672 를 닫고 암호화 5671(amqps) 만 연다',
+            '#   2) 서버 인증서로 클라이언트가 브로커를 검증',
+            '#   3) mTLS: 브로커도 클라이언트 인증서를 요구 (peer verify)',
+            '',
+            '# ── 1. 평문 리스너 비활성화 ──────────────────────',
+            '#   빈 목록 = 5672 를 아예 열지 않음',
+            'listeners.tcp = none',
+            '',
+            '# ── 2. TLS 리스너 (amqps, 5671) ──────────────────',
+            'listeners.ssl.default = 5671',
+            '',
+            '# ── 3. 인증서 경로 ───────────────────────────────',
+            'ssl_options.cacertfile = /etc/rabbitmq/tls/ca_certificate.pem',
+            'ssl_options.certfile   = /etc/rabbitmq/tls/server_certificate.pem',
+            'ssl_options.keyfile    = /etc/rabbitmq/tls/server_key.pem',
+            '',
+            '# ── 4. mTLS (상호 인증) ──────────────────────────',
+            '#   verify_peer          : 클라이언트 인증서를 검증한다',
+            '#   fail_if_no_peer_cert : 인증서 없으면 연결 거부',
+            'ssl_options.verify = verify_peer',
+            'ssl_options.fail_if_no_peer_cert = true',
+            '',
+            '# ── 5. 취약 프로토콜/암호 차단 ───────────────────',
+            'ssl_options.versions.1 = tlsv1.3',
+            'ssl_options.versions.2 = tlsv1.2',
+            '#   TLS 1.0 / 1.1 은 넣지 않는다 (취약)',
+            '',
+            '# ── 6. Management UI 도 HTTPS 로 ─────────────────',
+            'management.ssl.port       = 15671',
+            'management.ssl.cacertfile = /etc/rabbitmq/tls/ca_certificate.pem',
+            'management.ssl.certfile   = /etc/rabbitmq/tls/server_certificate.pem',
+            'management.ssl.keyfile    = /etc/rabbitmq/tls/server_key.pem',
+          ],
+          highlight: [10, 13, 23, 24, 27, 28],
+        },
+      },
+      {
+        title: 'Step 4. SASL — 인증 메커니즘 (PLAIN / AMQPLAIN / EXTERNAL)',
+        desc: 'TLS 채널이 서면 AMQP 는 SASL 로 "너 누구냐"를 검증한다. PLAIN 은 user/password 를 보낸다 — TLS 위에서만 안전하다. AMQPLAIN 은 RabbitMQ 고유의 유사 방식. EXTERNAL 은 비밀번호를 아예 보내지 않고 TLS 클라이언트 인증서의 CN/SAN 을 사용자 이름으로 삼는다 — mTLS 와 결합하면 "인증서 = 신원"이 되어 비밀번호 유출 위험 자체가 사라진다. 브로커는 enabled 목록에 있는 메커니즘만 허용한다.',
+        actor: '🔑 게이트 2 — 신원 증명 (비밀번호 vs 인증서)',
+        gates: [
+          { name: 'TLS 핸드셰이크', icon: '🔒', state: 'success', detail: '암호화 채널 확립됨' },
+          { name: 'SASL 인증', icon: '🔑', state: 'active', detail: 'EXTERNAL: 인증서 CN=app_prod → 사용자 매핑' },
+          { name: 'vhost 권한', icon: '🛂', state: 'idle', detail: '인증 성공 후 검사' },
+          { name: '큐 접근', icon: '📥', state: 'idle', detail: '대기' },
+        ],
+        board: {
+          kind: 'sasl',
+          title: 'SASL 메커니즘 비교',
+          rows: [
+            { mech: 'PLAIN', note: 'user+password 전송 · TLS 필수', tone: 'warn' },
+            { mech: 'AMQPLAIN', note: 'RabbitMQ 고유 · PLAIN 유사', tone: 'info' },
+            { mech: 'EXTERNAL', note: '인증서 CN/SAN = 사용자 · 비번 없음', tone: 'good' },
+            { mech: 'guest 기본', note: 'localhost 외 차단 · 프로덕션 제거', tone: 'warn' },
+          ],
+        },
+        alert: { tone: 'good', text: 'mTLS + EXTERNAL 조합이 가장 강력하다. 비밀번호가 없으므로 유출·회전 관리 부담이 사라지고, 신원은 CA 가 서명한 인증서로 증명된다.' },
+        code: {
+          lang: 'ini',
+          filename: 'rabbitmq.conf (SASL)',
+          lines: [
+            '# rabbitmq.conf — SASL 인증 메커니즘 + guest 제한',
+            '#',
+            '# 인증 흐름: (TLS 확립 후) 클라이언트가 메커니즘 하나를 골라 신원 증명',
+            '#   PLAIN     : user/password  (TLS 위에서만 사용)',
+            '#   AMQPLAIN  : RabbitMQ 고유, PLAIN 유사',
+            '#   EXTERNAL  : TLS 클라이언트 인증서로 신원 결정 (비번 없음)',
+            '',
+            '# ── 1. 허용할 메커니즘 목록 ──────────────────────',
+            '#   EXTERNAL 을 우선, PLAIN 은 백업으로만',
+            'auth_mechanisms.1 = EXTERNAL',
+            'auth_mechanisms.2 = PLAIN',
+            '',
+            '# ── 2. EXTERNAL: 인증서 → 사용자 매핑 ────────────',
+            '#   rabbitmq_auth_mechanism_ssl 플러그인 필요',
+            '#     rabbitmq-plugins enable rabbitmq_auth_mechanism_ssl',
+            '#   ssl_cert_login_from: 인증서의 어떤 필드를 username 으로 쓸지',
+            'ssl_cert_login_from = common_name',
+            '#   → 인증서 CN=app_prod 이면 사용자 app_prod 로 인증',
+            '',
+            '# ── 3. 기본 guest 계정 제한 ──────────────────────',
+            '#   guest 는 기본적으로 localhost 에서만 로그인 가능',
+            '#   loopback_users 를 비우면 어디서도 guest 로그인 불가',
+            'loopback_users = none',
+            '#   프로덕션 권장: guest 를 아예 삭제',
+            '#     rabbitmqctl delete_user guest',
+            '',
+            '# ── 4. EXTERNAL 로 접속하는 클라이언트 예 (pika) ─',
+            '#   import ssl, pika',
+            '#   ctx = ssl.create_default_context(cafile="ca.pem")',
+            '#   ctx.load_cert_chain("client.pem", "client.key")',
+            '#   params = pika.ConnectionParameters(',
+            '#       host="mq.internal", port=5671, virtual_host="/prod",',
+            '#       ssl_options=pika.SSLOptions(ctx),',
+            '#       credentials=pika.credentials.ExternalCredentials(),',
+            '#   )',
+          ],
+          highlight: [9, 10, 16, 17, 22, 23],
+        },
+      },
+      {
+        title: 'Step 5. 프로덕션 보안 체크리스트 — 모든 게이트 통과',
+        desc: '세 게이트를 다 세우면 그림이 완성된다. ① guest 삭제(또는 loopback 제한), ② 5672 닫고 5671 만 열기 + mTLS, ③ vhost 를 환경/서비스별로 분리, ④ 계정마다 최소 권한 정규식, ⑤ administrator tag 는 사람 운영자에게만. 이 순서로 점검하면 "인증서 없는 연결은 TCP 도 못 붙고, 붙어도 신원이 없으면 인증 실패, 인증돼도 권한 정규식 밖 리소스는 못 만진다"는 다층 방어가 완성된다.',
+        actor: '✅ 3중 게이트 모두 통과 — 큐 접근 허용',
+        gates: [
+          { name: 'TLS 핸드셰이크', icon: '🔒', state: 'success', detail: '5671 · mTLS peer verify 통과' },
+          { name: 'SASL 인증', icon: '🔑', state: 'success', detail: 'EXTERNAL · 인증서 CN=app_prod' },
+          { name: 'vhost 권한', icon: '🛂', state: 'success', detail: '/prod · read ^orders\\. 매치' },
+          { name: '큐 접근', icon: '📥', state: 'success', detail: 'orders.queue consume 허용' },
+        ],
+        board: {
+          kind: 'checklist',
+          title: '프로덕션 보안 체크리스트',
+          rows: [
+            { item: 'guest 계정 삭제 / loopback 제한', done: true },
+            { item: '5672 닫기 · 5671(amqps)만 오픈', done: true },
+            { item: 'mTLS: verify_peer + fail_if_no_peer_cert', done: true },
+            { item: 'vhost 환경/서비스별 분리', done: true },
+            { item: '계정별 최소 권한 정규식 (^$ 부터 시작)', done: true },
+            { item: 'administrator tag 는 사람 운영자만', done: true },
+          ],
+        },
+        alert: { tone: 'good', text: '보안은 한 겹이 아니라 층위다. 인증서 없으면 TCP 불가 → 신원 없으면 인증 실패 → 권한 없으면 리소스 거부. 세 겹 중 하나만 뚫려도 나머지가 막는다.' },
+        code: {
+          lang: 'bash',
+          filename: 'hardening_check.sh',
+          lines: [
+            '#!/usr/bin/env bash',
+            '# hardening_check.sh — 프로덕션 보안 점검 스크립트',
+            '#',
+            '# "다층 방어"를 순서대로 검증한다:',
+            '#   TLS(TCP 차단) → SASL(신원) → vhost 권한(리소스)',
+            '',
+            'set -euo pipefail',
+            '',
+            '# ── 1. guest 제거 확인 ───────────────────────────',
+            'if rabbitmqctl list_users | grep -q "^guest"; then',
+            '  echo "[FAIL] guest 계정이 남아있음 → delete_user guest"',
+            'else',
+            '  echo "[OK] guest 계정 없음"',
+            'fi',
+            '',
+            '# ── 2. 평문 5672 리스너가 닫혔는지 ───────────────',
+            'if rabbitmq-diagnostics listeners | grep -q "5672"; then',
+            '  echo "[FAIL] 평문 5672 가 열려있음 → listeners.tcp = none"',
+            'else',
+            '  echo "[OK] 5672 닫힘 · 5671(amqps)만 오픈"',
+            'fi',
+            '',
+            '# ── 3. TLS mTLS 옵션 확인 ────────────────────────',
+            'rabbitmq-diagnostics tls_versions',
+            'grep -E "verify_peer|fail_if_no_peer_cert" /etc/rabbitmq/rabbitmq.conf \\',
+            '  && echo "[OK] mTLS 설정 존재"',
+            '',
+            '# ── 4. vhost 분리 확인 ───────────────────────────',
+            'rabbitmqctl list_vhosts name | grep -E "prod|staging" \\',
+            '  && echo "[OK] 환경별 vhost 분리됨"',
+            '',
+            '# ── 5. 과대 권한 계정 탐지 ───────────────────────',
+            '#   read=".*" 처럼 전체 허용된 앱 계정을 찾아낸다',
+            'rabbitmqctl list_permissions -p /prod',
+            'echo "→ configure/write/read 가 .* 인 앱 계정이 없는지 검토"',
+            '',
+            '# ── 6. administrator tag 남용 점검 ───────────────',
+            'rabbitmqctl list_users \\',
+            '  | grep administrator \\',
+            '  && echo "→ 사람 운영자만 administrator 인지 확인"',
+            '',
+            'echo "[DONE] 3중 게이트(TLS·SASL·vhost) 점검 완료"',
+          ],
+          highlight: [9, 10, 16, 17, 24, 25, 28, 29],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 상태 색상
+    // ─────────────────────────────────────────────────────
+    const GATE_STATE = {
+      idle:    { ring: 'border-slate-300',  bg: 'bg-slate-50',   text: 'text-slate-500',  dot: 'bg-slate-300'  },
+      active:  { ring: 'border-orange-400', bg: 'bg-orange-50',  text: 'text-orange-800', dot: 'bg-orange-500' },
+      success: { ring: 'border-green-400',  bg: 'bg-green-50',   text: 'text-green-800',  dot: 'bg-green-500'  },
+      warn:    { ring: 'border-amber-400',  bg: 'bg-amber-50',   text: 'text-amber-800',  dot: 'bg-amber-500'  },
+      error:   { ring: 'border-red-400',    bg: 'bg-red-50',     text: 'text-red-800',    dot: 'bg-red-500'    },
+    };
+
+    const ALERT_TONE = {
+      good: 'bg-green-50  border-green-300  text-green-900',
+      info: 'bg-sky-50    border-sky-300    text-sky-900',
+      warn: 'bg-amber-50  border-amber-300  text-amber-900',
+      err:  'bg-red-50    border-red-300    text-red-900',
+    };
+
+    const ROW_TONE = {
+      good: 'border-green-200 bg-green-50',
+      info: 'border-sky-200 bg-sky-50',
+      warn: 'border-amber-200 bg-amber-50',
+    };
+
+    function Gate({ gate, idx, total }) {
+      const s = GATE_STATE[gate.state] || GATE_STATE.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.ring} ${s.bg} px-3 py-2.5 shadow-sm`}>
+          <div className="flex items-center gap-2">
+            <span className="text-base">{gate.icon}</span>
+            <span className={`inline-block w-2 h-2 rounded-full ${s.dot}`}></span>
+            <span className={`text-xs font-mono ${s.text}`}>게이트 {idx + 1}/{total}</span>
+            <span className={`ml-auto text-sm font-bold ${s.text}`}>{gate.name}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-700 leading-relaxed">{gate.detail}</div>
+        </div>
+      );
+    }
+
+    function DetailBoard({ board }) {
+      return (
+        <div className="rounded-lg border-2 border-orange-300 bg-white px-3 py-3 shadow-sm">
+          <div className="text-xs font-bold text-orange-800 mb-2">📋 {board.title}</div>
+          <div className="space-y-1.5">
+            {board.kind === 'vhosts' && board.rows.map((r, i) => (
+              <div key={i} className={`rounded border px-2 py-1.5 text-xs ${ROW_TONE[r.tone] || ROW_TONE.info}`}>
+                <span className="font-mono font-bold text-slate-800">{r.name}</span>
+                <span className="ml-2 text-slate-600 text-[11px]">{r.note}</span>
+              </div>
+            ))}
+            {board.kind === 'perms' && board.rows.map((r, i) => (
+              <div key={i} className={`rounded border px-2 py-1.5 text-xs ${ROW_TONE[r.tone] || ROW_TONE.info}`}>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="px-1.5 rounded bg-slate-800 text-orange-200 text-[10px] font-mono">{r.perm}</span>
+                  <span className="font-mono font-bold text-slate-800">{r.regex}</span>
+                </div>
+                <div className="mt-0.5 text-slate-600 text-[11px]">{r.note}</div>
+              </div>
+            ))}
+            {board.kind === 'tls' && board.rows.map((r, i) => (
+              <div key={i} className={`rounded border px-2 py-1.5 text-xs ${ROW_TONE[r.tone] || ROW_TONE.info}`}>
+                <span className="font-mono font-bold text-slate-800">{r.step}</span>
+                <span className="ml-2 text-slate-600 text-[11px]">{r.note}</span>
+              </div>
+            ))}
+            {board.kind === 'sasl' && board.rows.map((r, i) => (
+              <div key={i} className={`rounded border px-2 py-1.5 text-xs ${ROW_TONE[r.tone] || ROW_TONE.info}`}>
+                <span className="px-1.5 rounded bg-slate-800 text-orange-200 text-[10px] font-mono">{r.mech}</span>
+                <span className="ml-2 text-slate-600 text-[11px]">{r.note}</span>
+              </div>
+            ))}
+            {board.kind === 'checklist' && board.rows.map((r, i) => (
+              <div key={i} className="rounded border border-green-200 bg-green-50 px-2 py-1.5 text-xs flex items-center gap-2">
+                <span className="text-green-600 font-bold">{r.done ? '✓' : '○'}</span>
+                <span className="text-slate-700 text-[11px]">{r.item}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ step }) {
+      const gates = step.gates || [];
+      const alertCls = ALERT_TONE[step.alert.tone] || ALERT_TONE.info;
+      return (
+        <div className="rounded-xl bg-white border-2 border-orange-200 shadow-md p-4 h-full flex flex-col">
+          <div className="text-xs font-bold text-orange-800 mb-2">{step.actor}</div>
+
+          {/* 보안 게이트 파이프라인 */}
+          <div className="space-y-2 mb-3">
+            {gates.map((g, i) => <Gate key={i} gate={g} idx={i} total={gates.length} />)}
+          </div>
+
+          {/* 단계별 상세 보드 */}
+          <DetailBoard board={step.board} />
+
+          {/* 핵심 경고 / 안내 */}
+          <div className={`mt-3 rounded-lg border-2 ${alertCls} px-3 py-2 text-xs leading-relaxed`}>
+            💡 {step.alert.text}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ stepIdx, total }) {
+      const codeRef = useRef(null);
+      const code = STEPS[stepIdx].code;
+
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          {/* 5탭 헤더 */}
+          <div className="flex items-center gap-0 bg-slate-900 border-b border-slate-700 overflow-x-auto">
+            {STEPS.map((s, i) => {
+              const isActive = i === stepIdx;
+              return (
+                <div
+                  key={i}
+                  className={`px-3 py-2 text-[10px] font-mono whitespace-nowrap border-r border-slate-700 ${
+                    isActive
+                      ? 'bg-[#282c34] text-orange-300 border-t-2 border-t-orange-400'
+                      : 'bg-slate-900 text-slate-500'
+                  }`}
+                >
+                  {s.code.filename}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 파일명 바 */}
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-amber-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-500/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: BRAND }}>V</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: BRAND_DARK }}>V-1-3. Security (TLS / SASL / vhost)</h1>
+                <p className="text-sm" style={{ color: BRAND_DARK, opacity: 0.8 }}>TLS 핸드셰이크 → SASL 인증 → vhost 권한, 3중 보안 게이트</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: BRAND_DARK }}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className="h-1.5 flex-1 rounded-full transition"
+                  style={{ backgroundColor: i <= stepIdx ? BRAND : '#fed7aa' }}
+                />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-orange-50 px-5 py-4 shadow" style={{ backgroundColor: BRAND_DARK }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed opacity-95">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane step={step} />
+              <CodeViewer stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50"
+                style={{ color: BRAND_DARK }}
+                aria-label="처음으로"
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: BRAND_DARK }}
+                aria-label="이전 단계"
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                className="px-4 py-1.5 text-xs rounded font-bold text-white"
+                style={{ backgroundColor: playing ? BRAND_DARK : BRAND }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                className="px-3 py-1.5 text-xs rounded border border-orange-300 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: BRAND_DARK }}
+                aria-label="다음 단계"
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: BRAND_DARK, opacity: 0.6 }}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-400 bg-white px-4 py-3 text-sm" style={{ color: BRAND_DARK }}>
+                <div className="font-bold mb-1">✅ 핵심 정리 — RabbitMQ 보안 3중 게이트</div>
+                vhost(격리) → user/권한 정규식(최소 권한) → TLS/mTLS(암호화·TCP 차단) → SASL EXTERNAL(인증서 신원)로 이어지는 다층 방어를 익혔다. 인증서 없으면 연결 자체가 안 되고, 신원이 없으면 인증에서 막히며, 권한 정규식 밖 리소스는 손댈 수 없다. 프로덕션에서는 guest 제거·5672 폐쇄·vhost 분리·최소 권한을 반드시 점검한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RabbitMQ', 'Security', 'vhost', 'TLS', 'mTLS', 'SASL', 'EXTERNAL', 'PLAIN', 'set_permissions', '최소권한', 'guest', 'amqps-5671'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border border-orange-200" style={{ backgroundColor: '#fff4eb', color: BRAND_DARK }}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: BRAND_DARK }}>
+              <a href="../index.html" className="underline hover:no-underline">← 목차</a>
+              <div className="flex gap-4">
+                <a href="./V-1-2.html" className="underline hover:no-underline">← 이전: V-1-2</a>
+                <a href="./V-1-4.html" className="underline hover:no-underline">다음: V-1-4 →</a>
+              </div>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

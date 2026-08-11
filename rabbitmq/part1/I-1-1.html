@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitMQ 인터랙티브 학습 — I-1-1. Exchange / Queue / Binding</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐰</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    RabbitMQ I-1-1 — Exchange / Queue / Binding
+    학습 목표: producer → exchange → (binding) → queue → consumer 흐름 5단계 추적
+              "왜 exchange가 따로 있는지", "binding이 라우팅을 어떻게 결정하는지" 이해
+    패턴: fastapi v1 — 좌(LiveDataPane: AMQP 토폴로지 시각화) / 우(VSCode CodeViewer)
+    색상: orange (rabbitmq 브랜드 #FF6600)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────
+    // 5단계 — exchange/queue/binding 의 역할을 한 컷씩 분리
+    //   producer  : { name, status, msg } — 최근 보낸 메시지
+    //   exchange  : { name, type, status } — direct/topic/fanout/headers
+    //   bindings  : [{ exchange, queue, routingKey, matched }]
+    //   queues    : [{ name, depth, status }]  depth = 적체 수
+    //   consumers : [{ queue, name, status, lastMsg }]
+    //   alert     : 핵심 안내
+    // ─────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 가장 단순한 그림 — Producer → Queue → Consumer (직접 연결 X)',
+        desc: '메시지 큐 입문 시 가장 흔한 오해는 "Producer가 Queue에 직접 보낸다"는 그림이다. 사실은 그렇지 않다. RabbitMQ에서 Producer는 항상 Exchange에 메시지를 던진다. Exchange가 Binding 규칙을 보고 어느 Queue에 넣을지 결정한다. 이 한 가지 사실이 RabbitMQ의 라우팅 유연성을 만든다. 먼저 잘못된 그림(Producer → Queue 직접)부터 보고, 실제 흐름과 비교한다.',
+        actor: '❌ 잘못된 그림 — Producer가 Queue로 직접?',
+        producer: { name: 'order-svc', status: 'idle', msg: '' },
+        exchange: null,
+        bindings: [],
+        queues: [{ name: 'orders.q', depth: 0, status: 'idle' }],
+        consumers: [{ queue: 'orders.q', name: 'worker-1', status: 'wait', lastMsg: '' }],
+        showWrong: true,
+        alert: { tone: 'warn', text: '이 그림은 틀렸다. Producer는 Queue 이름을 모른다. 모두 Exchange를 통한다.' },
+        code: {
+          lang: 'python',
+          filename: 'wrong_model.py',
+          lines: [
+            '"""',
+            'I-1-1 Step 1 — 입문자의 오해: "Producer가 Queue에 직접 보낸다"',
+            '실제 RabbitMQ는 그렇게 동작하지 않는다. 모든 메시지는 Exchange를 거친다.',
+            '"""',
+            '',
+            '# ── 흔히 잘못 그리는 그림 ─────────────────────────',
+            '#',
+            '#   [Producer] ───직접 push?──> [Queue] ──> [Consumer]',
+            '#',
+            '#   ↑ 이건 Kafka 의 그림이지 AMQP 의 그림이 아니다.',
+            '#   AMQP 에서는 Producer 가 Queue 이름을 모른다.',
+            '',
+            '',
+            '# ── 그래서 pika 의 publish API 를 보면 ───────────',
+            'channel.basic_publish(',
+            '    exchange="orders.ex",        # ← Exchange 이름이 들어간다',
+            '    routing_key="orders.new",    # ← routing key 가 들어간다',
+            '    body=b"{\\"id\\": 1042}",',
+            ')',
+            '# Queue 이름은 publish 인자에 없다.',
+            '# Queue 는 Consumer 가 구독할 때만 필요하다.',
+            '',
+            '',
+            '# ── 핵심 명제 ────────────────────────────────────',
+            '# (1) Producer 는 Exchange 에만 던진다',
+            '# (2) Exchange 는 Binding 규칙을 보고 Queue 를 고른다',
+            '# (3) Consumer 는 Queue 를 구독한다',
+            '# (4) Producer 와 Consumer 는 서로 모른다 (Exchange/Queue 만 안다)',
+            '',
+            '# → Step 2 에서 실제 흐름을 그려본다',
+          ],
+          highlight: [6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29],
+        },
+      },
+      {
+        title: 'Step 2. 실제 그림 — Producer → Exchange → Binding → Queue → Consumer',
+        desc: 'Producer는 "orders.ex"라는 Exchange에 메시지를 던지면서 routing key "orders.new"를 함께 보낸다. Exchange는 자기에게 묶인 Binding 목록을 본다. "orders.new" 라는 routing key와 일치하는 Binding이 있으면 그 Queue로 메시지를 넣는다. Queue에 들어간 메시지는 그곳을 구독하는 Consumer가 받아간다. 이 5개 부품 — Producer / Exchange / Binding / Queue / Consumer — 이 RabbitMQ의 전부다.',
+        actor: '📨 order-svc → orders.ex (routing_key="orders.new")',
+        producer: { name: 'order-svc', status: 'sent', msg: '{"id":1042,"amount":59000}' },
+        exchange: { name: 'orders.ex', type: 'direct', status: 'routed' },
+        bindings: [
+          { exchange: 'orders.ex', queue: 'orders.q', routingKey: 'orders.new', matched: true },
+        ],
+        queues: [{ name: 'orders.q', depth: 1, status: 'enqueued' }],
+        consumers: [{ queue: 'orders.q', name: 'worker-1', status: 'wait', lastMsg: '' }],
+        alert: { tone: 'info', text: 'Exchange 가 Binding 규칙을 보고 Queue 를 골랐다. 이게 라우팅의 본질이다.' },
+        code: {
+          lang: 'python',
+          filename: 'producer_basic.py',
+          lines: [
+            '"""',
+            'I-1-1 Step 2 — Producer 가 Exchange 에 publish 하는 실제 흐름',
+            'Exchange / Queue / Binding 3가지를 먼저 선언하고 메시지를 던진다.',
+            '"""',
+            'import pika',
+            'import json',
+            '',
+            '# ── 1) 연결 ─────────────────────────────────────',
+            'params = pika.ConnectionParameters(host="localhost", port=5672)',
+            'conn = pika.BlockingConnection(params)',
+            'channel = conn.channel()',
+            '',
+            '# ── 2) Exchange 선언 ──────────────────────────',
+            'channel.exchange_declare(',
+            '    exchange="orders.ex",',
+            '    exchange_type="direct",   # routing_key 정확히 일치하는 Queue 로',
+            '    durable=True,             # 브로커 재시작 후에도 살아남음',
+            ')',
+            '',
+            '# ── 3) Queue 선언 ─────────────────────────────',
+            'channel.queue_declare(queue="orders.q", durable=True)',
+            '',
+            '# ── 4) Binding — Exchange 와 Queue 를 routing key 로 연결 ─',
+            'channel.queue_bind(',
+            '    exchange="orders.ex",',
+            '    queue="orders.q",',
+            '    routing_key="orders.new",',
+            ')',
+            '',
+            '# ── 5) publish — Exchange 에 메시지를 던진다 ─',
+            'order = {"id": 1042, "amount": 59000}',
+            'channel.basic_publish(',
+            '    exchange="orders.ex",',
+            '    routing_key="orders.new",',
+            '    body=json.dumps(order).encode(),',
+            '    properties=pika.BasicProperties(delivery_mode=2),  # 영속화',
+            ')',
+            'print("✓ published")',
+            'conn.close()',
+            '',
+            '# ── 데이터 흐름 ────────────────────────────────',
+            '#   [order-svc]',
+            '#       ↓ basic_publish',
+            '#   [orders.ex] (exchange, direct type)',
+            '#       ↓ binding match: routing_key="orders.new"',
+            '#   [orders.q] (queue)',
+            '#       ↓ basic_consume',
+            '#   [worker-1] (다음 Step 에서)',
+          ],
+          highlight: [13, 14, 15, 16, 17, 18, 21, 24, 25, 26, 27, 28, 31, 32, 33, 34, 35, 36, 37],
+        },
+      },
+      {
+        title: 'Step 3. Consumer 가 Queue 를 구독한다 — 실제 메시지 수령',
+        desc: 'Queue에 메시지가 쌓여 있다. 이제 Consumer(worker-1)가 "orders.q" 를 구독한다. RabbitMQ는 prefetch 한도 안에서 메시지를 push 해주고, Consumer는 처리 후 basic_ack 로 "잘 받았다"고 알린다. ack 가 오지 않으면 메시지는 다시 다른 Consumer에게 전달된다. 이게 RabbitMQ가 메시지 손실 없이 동작하는 핵심 약속이다.',
+        actor: '📥 worker-1 ← orders.q (basic_consume + ack)',
+        producer: { name: 'order-svc', status: 'idle', msg: '' },
+        exchange: { name: 'orders.ex', type: 'direct', status: 'idle' },
+        bindings: [
+          { exchange: 'orders.ex', queue: 'orders.q', routingKey: 'orders.new', matched: true },
+        ],
+        queues: [{ name: 'orders.q', depth: 0, status: 'delivered' }],
+        consumers: [{ queue: 'orders.q', name: 'worker-1', status: 'ack', lastMsg: '{"id":1042,"amount":59000}' }],
+        alert: { tone: 'good', text: 'Consumer 가 ack 를 보내야 메시지가 Queue 에서 영구 삭제된다. ack 없으면 재전송.' },
+        code: {
+          lang: 'python',
+          filename: 'consumer_basic.py',
+          lines: [
+            '"""',
+            'I-1-1 Step 3 — Consumer 가 Queue 를 구독하고 ack 로 수령 확인',
+            'manual ack 패턴: 처리 성공 시 basic_ack, 실패 시 basic_nack(requeue=True)',
+            '"""',
+            'import pika',
+            'import json',
+            '',
+            'params = pika.ConnectionParameters(host="localhost", port=5672)',
+            'conn = pika.BlockingConnection(params)',
+            'channel = conn.channel()',
+            '',
+            '# Consumer 가 한 번에 들고 갈 메시지 수 (공정한 분배)',
+            'channel.basic_qos(prefetch_count=1)',
+            '',
+            '',
+            'def handle(ch, method, properties, body):',
+            '    """주문 처리 — 성공하면 ack, 실패하면 nack"""',
+            '    try:',
+            '        order = json.loads(body)',
+            '        print(f"⏳ processing order {order[\'id\']}")',
+            '',
+            '        # 실제 비즈니스 로직 (DB 저장, 결제 호출 등)',
+            '        save_to_db(order)',
+            '',
+            '        # ✓ 성공 — 브로커에 "잘 받았다" 통보',
+            '        ch.basic_ack(delivery_tag=method.delivery_tag)',
+            '        print(f"✓ ack order {order[\'id\']}")',
+            '    except Exception as e:',
+            '        # ✗ 실패 — requeue=True 로 다시 큐에 넣기',
+            '        print(f"✗ nack: {e}")',
+            '        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)',
+            '',
+            '',
+            'def save_to_db(order: dict) -> None:',
+            '    """DB 저장 자리표시자"""',
+            '    pass',
+            '',
+            '',
+            'channel.basic_consume(',
+            '    queue="orders.q",',
+            '    on_message_callback=handle,',
+            '    auto_ack=False,  # 반드시 manual ack',
+            ')',
+            'print("[*] waiting for messages on orders.q")',
+            'channel.start_consuming()',
+            '',
+            '# ── 핵심 약속 ────────────────────────────────────',
+            '# (1) ack 가 와야 Queue 에서 메시지 삭제',
+            '# (2) Consumer 가 죽으면 (TCP 끊김) 자동 재전송',
+            '# (3) prefetch_count=1 → 한 명이 끝낼 때까지 다음 메시지 X',
+            '# (4) auto_ack=True 는 메시지 손실 위험 (요청자 죽으면 사라짐)',
+          ],
+          highlight: [12, 13, 16, 17, 18, 19, 22, 25, 26, 28, 29, 30, 31, 38, 39, 40, 41, 42, 46, 47, 48, 49, 50],
+        },
+      },
+      {
+        title: 'Step 4. Binding 이 바뀌면 라우팅이 바뀐다 — Queue 추가로 fan-out',
+        desc: '같은 메시지를 알림 서비스(notify-svc)도 받아야 한다고 하자. 코드 변경 없이 새 Queue("notify.q")를 만들고 같은 routing key로 Binding을 추가하면 끝이다. 이제 Exchange는 같은 메시지를 두 Queue에 복사해서 보낸다. Producer는 자기 코드를 한 줄도 안 바꿔도 된다. 이게 "느슨한 결합"의 실체다.',
+        actor: '➕ Binding 추가: orders.ex → notify.q (orders.new)',
+        producer: { name: 'order-svc', status: 'sent', msg: '{"id":1043}' },
+        exchange: { name: 'orders.ex', type: 'direct', status: 'routed' },
+        bindings: [
+          { exchange: 'orders.ex', queue: 'orders.q', routingKey: 'orders.new', matched: true },
+          { exchange: 'orders.ex', queue: 'notify.q', routingKey: 'orders.new', matched: true },
+        ],
+        queues: [
+          { name: 'orders.q', depth: 1, status: 'enqueued' },
+          { name: 'notify.q', depth: 1, status: 'enqueued' },
+        ],
+        consumers: [
+          { queue: 'orders.q', name: 'order-worker', status: 'busy', lastMsg: '{"id":1043}' },
+          { queue: 'notify.q', name: 'notify-worker', status: 'busy', lastMsg: '{"id":1043}' },
+        ],
+        alert: { tone: 'good', text: 'Producer 코드 0줄 변경. Binding 만 추가해서 새 구독자를 붙였다.' },
+        code: {
+          lang: 'python',
+          filename: 'add_subscriber.py',
+          lines: [
+            '"""',
+            'I-1-1 Step 4 — 새 구독자 추가 = Queue + Binding 만 추가',
+            'Producer 는 그대로. 같은 메시지가 두 Queue 로 분기된다.',
+            '"""',
+            'import pika',
+            '',
+            'params = pika.ConnectionParameters(host="localhost", port=5672)',
+            'channel = pika.BlockingConnection(params).channel()',
+            '',
+            '# ── 기존 Exchange 는 그대로 사용 ─────────────',
+            'channel.exchange_declare(exchange="orders.ex", exchange_type="direct", durable=True)',
+            '',
+            '# ── 새 Queue 1개 추가 (alert 발송용) ─────────',
+            'channel.queue_declare(queue="notify.q", durable=True)',
+            '',
+            '# ── 같은 routing_key 로 Binding 추가 ─────────',
+            'channel.queue_bind(',
+            '    exchange="orders.ex",',
+            '    queue="notify.q",',
+            '    routing_key="orders.new",',
+            ')',
+            '',
+            'print("✓ notify.q bound to orders.ex with key orders.new")',
+            '',
+            '',
+            '# ── 결과 ─────────────────────────────────────────',
+            '#   orders.ex 가 receive("orders.new") 받으면',
+            '#     → orders.q  (기존)',
+            '#     → notify.q  (신규)  ← 같은 메시지 복사',
+            '#',
+            '#   Producer 코드는 한 줄도 안 바꿨다.',
+            '#',
+            '# ── 운영 팁 ──────────────────────────────────────',
+            '# - Binding 은 management UI 에서도 만들 수 있다',
+            '# - 운영 중 새 구독자 추가는 거의 다 이 패턴',
+            '# - 메시지 복사이므로 각 Queue 의 ack 는 독립적',
+            '',
+            '# notify-worker 는 이렇게 본다:',
+            '',
+            'def notify(ch, method, properties, body):',
+            '    """주문 발생 알림 발송 — 슬랙/SMS 등"""',
+            '    send_slack(f"new order: {body!r}")',
+            '    ch.basic_ack(method.delivery_tag)',
+            '',
+            '',
+            'def send_slack(text: str) -> None:',
+            '    """슬랙 전송 자리표시자"""',
+            '    pass',
+            '',
+            '',
+            'channel.basic_consume(queue="notify.q", on_message_callback=notify)',
+            'channel.start_consuming()',
+          ],
+          highlight: [10, 11, 13, 14, 16, 17, 18, 19, 20, 26, 27, 28, 29, 30, 31, 38, 39, 40, 41, 42, 50, 51],
+        },
+      },
+      {
+        title: 'Step 5. 정리 — 5개 부품의 역할과 책임',
+        desc: 'Producer · Exchange · Binding · Queue · Consumer. RabbitMQ의 모든 그림은 이 5개 조합이다. Exchange가 라우팅의 두뇌, Binding이 라우팅 규칙, Queue가 버퍼, Producer/Consumer가 양 끝이다. Exchange 타입(direct/topic/fanout/headers)을 바꾸면 같은 5부품으로 전혀 다른 토폴로지를 만들 수 있다. 다음 챕터(I-1-2)에서는 이 흐름을 실제로 운반하는 AMQP 0-9-1 프로토콜의 frame을 들여다본다.',
+        actor: '🎉 5부품 정리 — Producer/Exchange/Binding/Queue/Consumer',
+        producer: { name: 'order-svc', status: 'idle', msg: '' },
+        exchange: { name: 'orders.ex', type: 'direct', status: 'idle' },
+        bindings: [
+          { exchange: 'orders.ex', queue: 'orders.q', routingKey: 'orders.new', matched: true },
+          { exchange: 'orders.ex', queue: 'notify.q', routingKey: 'orders.new', matched: true },
+        ],
+        queues: [
+          { name: 'orders.q', depth: 0, status: 'idle' },
+          { name: 'notify.q', depth: 0, status: 'idle' },
+        ],
+        consumers: [
+          { queue: 'orders.q', name: 'order-worker', status: 'wait', lastMsg: '' },
+          { queue: 'notify.q', name: 'notify-worker', status: 'wait', lastMsg: '' },
+        ],
+        recapBox: {
+          title: '5부품의 역할',
+          features: [
+            'Producer — Exchange 에만 던진다. Queue 이름을 모른다.',
+            'Exchange — Binding 규칙을 보고 메시지를 어느 Queue 로 보낼지 결정',
+            'Binding — Exchange↔Queue 사이의 라우팅 규칙 (routing_key 기반)',
+            'Queue — 메시지를 ack 받기 전까지 영속 보관, FIFO',
+            'Consumer — Queue 를 구독, manual ack 로 수령 확인',
+          ],
+        },
+        alert: { tone: 'good', text: 'Exchange 타입을 direct → topic → fanout 으로 바꾸면 같은 5부품으로 전혀 다른 라우팅.' },
+        code: {
+          lang: 'yaml',
+          filename: 'topology.yaml',
+          lines: [
+            '# I-1-1 Step 5 — 토폴로지를 선언적으로 정의 (관리 UI 임포트 형식)',
+            '# 운영에서는 코드 대신 yaml/json 으로 토폴로지를 형상관리한다',
+            '',
+            'rabbit_version: "3.13.0"',
+            '',
+            'exchanges:',
+            '  - name: orders.ex',
+            '    vhost: /',
+            '    type: direct          # routing_key 정확히 매칭',
+            '    durable: true         # 브로커 재시작 후에도 유지',
+            '    auto_delete: false',
+            '',
+            'queues:',
+            '  - name: orders.q',
+            '    vhost: /',
+            '    durable: true',
+            '    auto_delete: false',
+            '    arguments: {}',
+            '',
+            '  - name: notify.q',
+            '    vhost: /',
+            '    durable: true',
+            '    auto_delete: false',
+            '    arguments: {}',
+            '',
+            'bindings:',
+            '  - source: orders.ex',
+            '    destination: orders.q',
+            '    destination_type: queue',
+            '    routing_key: orders.new',
+            '',
+            '  - source: orders.ex',
+            '    destination: notify.q',
+            '    destination_type: queue',
+            '    routing_key: orders.new',
+            '',
+            '# ── 핵심 규칙 ──────────────────────────────────',
+            '# (1) Producer 는 exchanges.name 만 알면 된다',
+            '# (2) bindings 가 라우팅을 결정 → 운영 중 추가/제거 가능',
+            '# (3) durable=true 는 브로커 재시작 시 보존 (메시지 영속은 별도 옵션)',
+            '# (4) 같은 토폴로지를 dev/stage/prod 환경에 동일하게 배포 가능',
+          ],
+          highlight: [5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 20, 21, 22, 23, 26, 27, 28, 29, 30, 32, 33, 34, 35],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────
+    // 색상/스타일 토큰
+    // ─────────────────────────────────────────────────────
+    const PRIMARY = '#FF6600';
+    const PRIMARY_DARK = '#cc5200';
+
+    const NODE_STATUS = {
+      idle:      { bg: 'bg-slate-50',   border: 'border-slate-300', text: 'text-slate-700',  label: 'IDLE' },
+      sent:      { bg: 'bg-orange-50',  border: 'border-orange-500', text: 'text-orange-800', label: 'SENT' },
+      routed:    { bg: 'bg-orange-50',  border: 'border-orange-600', text: 'text-orange-900', label: 'ROUTED' },
+      enqueued:  { bg: 'bg-amber-50',   border: 'border-amber-500', text: 'text-amber-900',  label: 'ENQUEUED' },
+      delivered: { bg: 'bg-emerald-50', border: 'border-emerald-400', text: 'text-emerald-800', label: 'DELIVERED' },
+      wait:      { bg: 'bg-slate-50',   border: 'border-slate-300', text: 'text-slate-700',  label: 'WAIT' },
+      ack:       { bg: 'bg-emerald-50', border: 'border-emerald-500', text: 'text-emerald-900', label: 'ACK' },
+      busy:      { bg: 'bg-amber-50',   border: 'border-amber-500', text: 'text-amber-900',  label: 'BUSY' },
+    };
+
+    function NodeBox({ icon, title, sub, status, extra }) {
+      const s = NODE_STATUS[status] || NODE_STATUS.idle;
+      return (
+        <div className={`rounded-lg border-2 ${s.bg} ${s.border} px-2 py-1.5`}>
+          <div className={`text-[11px] font-bold ${s.text} flex items-center gap-1`}>
+            <span>{icon}</span>
+            <span className="truncate">{title}</span>
+            <span className="ml-auto text-[9px] px-1 rounded bg-white/70 border border-current/20">{s.label}</span>
+          </div>
+          {sub && <div className="text-[10px] text-slate-600 truncate mt-0.5">{sub}</div>}
+          {extra && <div className="text-[10px] font-mono text-slate-700 mt-0.5 truncate">{extra}</div>}
+        </div>
+      );
+    }
+
+    function Arrow({ label, broken }) {
+      const color = broken ? 'text-red-500' : 'text-orange-600';
+      return (
+        <div className={`flex flex-col items-center justify-center px-1 ${color}`}>
+          <span className="text-lg leading-none">{broken ? '✗' : '→'}</span>
+          {label && <span className="text-[8px] mt-0.5">{label}</span>}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 잘못된 그림 박스 (Step 1)
+    // ─────────────────────────────────────────────────────
+    function WrongDiagram() {
+      return (
+        <div className="rounded-lg border-2 border-dashed border-red-400 bg-red-50 p-3">
+          <div className="text-xs font-bold text-red-800 mb-2">❌ 잘못된 그림 — Producer가 Queue 직접 호출?</div>
+          <div className="flex items-stretch gap-0">
+            <NodeBox icon="📤" title="Producer" sub="order-svc" status="sent" />
+            <Arrow label="direct?" broken />
+            <NodeBox icon="📦" title="Queue" sub="orders.q" status="idle" />
+            <Arrow label="pull" />
+            <NodeBox icon="🛠" title="Consumer" sub="worker-1" status="wait" />
+          </div>
+          <div className="mt-2 text-[11px] text-red-800">
+            이 그림은 Kafka 식이다. AMQP 는 항상 Exchange 를 거친다.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 정상 토폴로지 박스
+    // ─────────────────────────────────────────────────────
+    function TopologyDiagram({ state }) {
+      const { producer, exchange, bindings, queues, consumers } = state;
+      return (
+        <div className="rounded-lg border-2 border-orange-400 bg-white overflow-hidden">
+          <div className="px-3 py-1.5 text-xs font-bold text-white flex items-center gap-2"
+               style={{ background: `linear-gradient(to right, ${PRIMARY}, #ff9933)` }}>
+            <span>🐰</span>
+            <span>AMQP 토폴로지 (Producer → Exchange → Binding → Queue → Consumer)</span>
+          </div>
+          <div className="p-2 space-y-2">
+            {/* Producer */}
+            <NodeBox
+              icon="📤"
+              title={`Producer: ${producer.name}`}
+              sub={producer.status === 'sent' ? `publish → exchange` : 'no traffic'}
+              status={producer.status}
+              extra={producer.msg}
+            />
+            {/* down arrow */}
+            <div className="flex justify-center text-orange-600 text-xs">↓ basic_publish (exchange, routing_key)</div>
+            {/* Exchange */}
+            {exchange && (
+              <NodeBox
+                icon="🔀"
+                title={`Exchange: ${exchange.name}`}
+                sub={`type=${exchange.type}`}
+                status={exchange.status}
+              />
+            )}
+            {/* bindings → queues */}
+            {exchange && (
+              <div className="flex justify-center text-orange-600 text-xs">↓ binding match (routing_key)</div>
+            )}
+            <div className={`grid gap-2 ${queues.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+              {queues.map((q, i) => {
+                const binding = bindings.find((b) => b.queue === q.name);
+                const consumer = consumers.find((c) => c.queue === q.name);
+                return (
+                  <div key={q.name} className="space-y-1">
+                    {binding && (
+                      <div className="text-[10px] font-mono text-orange-700 bg-orange-50 border border-orange-200 rounded px-1.5 py-0.5">
+                        binding: key="{binding.routingKey}"
+                      </div>
+                    )}
+                    <NodeBox
+                      icon="📥"
+                      title={`Queue: ${q.name}`}
+                      sub={`depth=${q.depth}`}
+                      status={q.status}
+                    />
+                    {consumer && (
+                      <>
+                        <div className="text-center text-orange-600 text-[10px]">↓ basic_consume</div>
+                        <NodeBox
+                          icon="🛠"
+                          title={`Consumer: ${consumer.name}`}
+                          sub={consumer.status === 'ack' ? 'ack sent' : consumer.status === 'busy' ? 'processing' : 'waiting'}
+                          status={consumer.status}
+                          extra={consumer.lastMsg}
+                        />
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 5부품 요약 박스 (Step 5)
+    // ─────────────────────────────────────────────────────
+    function RecapBox({ box }) {
+      if (!box) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-orange-500 bg-gradient-to-br from-orange-50 to-amber-50 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-2xl">🎉</span>
+            <span className="text-lg font-bold" style={{ color: PRIMARY_DARK }}>{box.title}</span>
+          </div>
+          <ul className="space-y-1.5">
+            {box.features.map((f, i) => (
+              <li key={i} className="text-sm text-orange-900 flex gap-2">
+                <span className="text-orange-600 mt-0.5">✓</span>
+                <span>{f}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 경고/알림 박스
+    // ─────────────────────────────────────────────────────
+    const ALERT_STYLE = {
+      info:   { bg: 'bg-orange-50',  border: 'border-orange-300',  text: 'text-orange-900',  icon: '💡' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-300',   text: 'text-amber-900',   icon: '⚠️' },
+      danger: { bg: 'bg-red-50',     border: 'border-red-300',     text: 'text-red-900',     icon: '🚨' },
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-900', icon: '✅' },
+    };
+
+    function AlertBox({ alert }) {
+      if (!alert) return null;
+      const s = ALERT_STYLE[alert.tone] || ALERT_STYLE.info;
+      return (
+        <div className={`mt-3 rounded-lg border ${s.bg} ${s.border} ${s.text} p-2 text-xs flex gap-2`}>
+          <span>{s.icon}</span>
+          <span>{alert.text}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 좌측 LiveDataPane
+    // ─────────────────────────────────────────────────────
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border border-orange-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{ color: PRIMARY_DARK }}>RabbitMQ 토폴로지</h3>
+            <span className="text-[10px] text-slate-500">{state.actor}</span>
+          </div>
+          {state.showWrong ? <WrongDiagram /> : <TopologyDiagram state={state} />}
+          <RecapBox box={state.recapBox} />
+          <AlertBox alert={state.alert} />
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer (highlight.js)
+    // ─────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-orange-400/15 border-l-2 border-orange-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            {/* 헤더 */}
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold"
+                    style={{ background: PRIMARY }}>R</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: PRIMARY_DARK }}>I-1-1. Exchange / Queue / Binding</h1>
+                <p className="text-sm" style={{ color: PRIMARY_DARK, opacity: 0.8 }}>
+                  Producer → Exchange → Binding → Queue → Consumer 5부품의 역할 분리
+                </p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: PRIMARY_DARK }}>← 챕터 목록</a>
+            </header>
+
+            {/* 진행 바 */}
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div
+                  key={i}
+                  className="h-1.5 flex-1 rounded-full transition"
+                  style={{ background: i <= stepIdx ? PRIMARY : '#fed7aa' }}
+                />
+              ))}
+            </div>
+
+            {/* 설명 패널 */}
+            <div className="mb-4 rounded-xl text-orange-50 px-5 py-4 shadow"
+                 style={{ background: PRIMARY_DARK }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-orange-100/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            {/* 컨트롤 */}
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setStepIdx(0)}
+                aria-label="처음으로"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white hover:bg-orange-50"
+                style={{ color: PRIMARY_DARK }}
+              >처음</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.max(0, i - 1))}
+                disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: PRIMARY_DARK }}
+              >← 이전</button>
+              <button
+                onClick={() => {
+                  if (isLast) setStepIdx(0);
+                  setPlaying((p) => !p);
+                }}
+                aria-pressed={playing}
+                aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'}
+                className="px-4 py-1.5 text-xs rounded font-bold text-white"
+                style={{ background: playing ? PRIMARY_DARK : PRIMARY }}
+              >{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button
+                onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))}
+                disabled={isLast}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 text-xs rounded border border-orange-400 bg-white hover:bg-orange-50 disabled:opacity-40"
+                style={{ color: PRIMARY_DARK }}
+              >다음 →</button>
+            </div>
+            <div className="text-center text-[10px] mt-2" style={{ color: PRIMARY_DARK, opacity: 0.6 }}>키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {/* 마지막 단계 안내 */}
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-orange-500 bg-white px-4 py-3 text-sm text-orange-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                Producer는 Exchange에만 메시지를 던지고, Exchange는 Binding 규칙으로 Queue를 고른다. Queue는 Consumer가 ack를 보낼 때까지 메시지를 보관한다. Exchange 타입(direct/topic/fanout/headers)을 바꾸면 같은 5부품으로 전혀 다른 라우팅을 만들 수 있다. 다음 챕터에서는 이 흐름을 옮기는 AMQP 0-9-1 프로토콜의 frame 구조를 본다.
+              </div>
+            )}
+
+            {/* 키워드 */}
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['RabbitMQ', 'AMQP', 'Exchange', 'Queue', 'Binding', 'routingKey', 'ack', '느슨한결합'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-orange-100 text-orange-900 border border-orange-200">#{k}</span>
+              ))}
+            </div>
+
+            {/* 네비 */}
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: PRIMARY_DARK }}>
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./I-1-2.html" className="underline hover:no-underline">다음: I-1-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
