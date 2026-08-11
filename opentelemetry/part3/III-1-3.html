@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — III-1-3. Processor — batch / sample / filter</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚙️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root {
+      --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-mid: #6E80C4; --otel-light: #D6DCEE;
+      --otel-lighter: #eef0f9;
+    }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-bg-lighter { background-color: var(--otel-lighter); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    III-1-3. Processor — batch / sample / filter
+    학습 목표: Collector processor로 텔레메트리를 가공하는 순서·비용절감·PII 제거 이해
+    핵심 비유: "우편 공장 컨베이어 라인" — 과부하 차단(memory_limiter) → 불필요 폐기(filter)
+               → 라벨 마스킹(attributes) → 묶음 포장(batch) → 대표 표본만 보관(tail_sampling)
+    패턴: fastapi 표준 — 좌(processor 파이프라인 애니메이션) / 우(VSCode YAML)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5 STEPS — Collector processor 파이프라인
+    const STEPS = [
+      {
+        title: 'Step 1. memory_limiter — 가장 먼저, OOM 방지',
+        desc: 'processor 파이프라인의 맨 앞에 두는 안전 밸브다. Collector로 데이터가 몰려 힙이 한계를 넘으면 memory_limiter가 새 데이터를 거절(back-pressure)해서 프로세스 자체가 OOM으로 죽는 것을 막는다. 왜 맨 앞이냐면, 뒤쪽 processor가 메모리를 더 쓰기 전에 입구에서 막아야 효과가 있기 때문이다. batch보다 앞에 두지 않으면 이미 쌓인 배치가 터져서 의미가 없어진다. check_interval을 너무 길게 잡으면 그 사이에 스파이크로 죽을 수 있으니 1s 정도로 촘촘히 본다.',
+        focus: 'memory_limiter',
+        code: {
+          lang: 'yaml',
+          filename: 'processors.yaml — 안전 밸브(맨 앞)',
+          lines: [
+            '# processor 순서: memory_limiter 를 항상 첫 번째로',
+            '',
+            'processors:',
+            '  # ① memory_limiter — 과부하 시 back-pressure 로 데이터 거절',
+            '  memory_limiter:',
+            '    check_interval: 1s            # 촘촘히 점검(스파이크 대비)',
+            '    limit_mib: 512                # 소프트 한계: 넘으면 거절 시작',
+            '    spike_limit_mib: 128          # 하드 여유분(순간 급증 흡수)',
+            '    # 힙이 (limit - spike) 를 넘으면 GC 강제 + 신규 거절',
+            '',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      receivers:  [otlp]',
+            '      # ★ memory_limiter 를 반드시 맨 앞에',
+            '      processors: [memory_limiter, filter, attributes, batch]',
+            '      exporters:  [otlp/tempo]',
+            '',
+            '# 함정: memory_limiter 를 batch 뒤에 두면',
+            '#   → 이미 쌓인 배치가 메모리를 다 먹은 뒤라 무용지물',
+          ],
+          highlight: [5, 6, 7, 8, 16],
+        },
+      },
+      {
+        title: 'Step 2. filter — 불필요한 데이터 폐기(비용 절감)',
+        desc: 'health check, 정적 리소스, 노이즈 로그처럼 관측 가치가 없는 텔레메트리를 파이프라인 초반에 버려서 백엔드 저장 비용과 전송량을 줄인다. 관측 백엔드는 보통 수집량 기준 과금이라 filter 하나로 비용이 눈에 띄게 준다. OTTL(OpenTelemetry Transformation Language) 조건식으로 span/metric/log 를 선별한다. 다만 과하게 버리면 정작 장애 때 근거 데이터가 사라지므로, /health 같이 확실히 무가치한 것만 지운다. drop 조건은 OR 로 묶이니 하나라도 참이면 폐기된다는 점을 유의한다.',
+        focus: 'filter',
+        code: {
+          lang: 'yaml',
+          filename: 'processors.yaml — filter(OTTL 조건)',
+          lines: [
+            '# filter — OTTL 조건에 걸리면 그 데이터를 폐기(drop)',
+            '',
+            'processors:',
+            '  filter/noise:',
+            '    error_mode: ignore            # 조건 평가 실패 시 통과',
+            '    traces:',
+            '      span:',
+            '        # 아래 조건 중 하나라도 참이면 span 폐기',
+            '        - \'attributes["http.target"] == "/health"\'',
+            '        - \'attributes["http.target"] == "/metrics"\'',
+            '        - \'name == "GET /favicon.ico"\'',
+            '    metrics:',
+            '      metric:',
+            '        # 특정 메트릭 이름을 통째로 제외',
+            '        - \'name == "queue.internal.debug"\'',
+            '    logs:',
+            '      log_record:',
+            '        - \'severity_number < SEVERITY_NUMBER_WARN\'',
+            '',
+            '# 효과: 저장/전송 비용 절감 (백엔드는 수집량 과금)',
+            '# 함정: 과다 filter → 장애 분석 근거까지 소실',
+          ],
+          highlight: [4, 8, 9, 10, 11],
+        },
+      },
+      {
+        title: 'Step 3. attributes / redaction — PII 마스킹·해시',
+        desc: 'span·log 에 붙은 속성을 추가·삭제·해시·마스킹한다. 실무에서 가장 중요한 용도는 개인정보(PII) 제거다. Authorization 헤더, 카드번호, 이메일 같은 값이 트레이스에 그대로 실려 백엔드에 저장되면 컴플라이언스 사고가 된다. delete 로 통째로 지우거나 hash 로 되돌릴 수 없게 만들고, 필요하면 값에 정규식을 걸어 부분 마스킹한다. filter 다음에 두는 이유는 어차피 버릴 데이터를 굳이 가공하지 않기 위해서다. action 순서대로 적용되니 insert 후 hash 처럼 조합할 수 있다.',
+        focus: 'attributes',
+        code: {
+          lang: 'yaml',
+          filename: 'processors.yaml — attributes(PII 제거)',
+          lines: [
+            '# attributes — 속성 추가/삭제/해시/마스킹 (action 순서대로)',
+            '',
+            'processors:',
+            '  attributes/pii:',
+            '    actions:',
+            '      # 민감 헤더는 통째로 삭제',
+            '      - key: http.request.header.authorization',
+            '        action: delete',
+            '      # user.id 는 되돌릴 수 없게 해시',
+            '      - key: user.id',
+            '        action: hash',
+            '      # 공통 라벨 부착(팀 소유권 태깅)',
+            '      - key: team',
+            '        value: payments',
+            '        action: upsert',
+            '',
+            '  # 값 일부만 정규식으로 마스킹',
+            '  redaction/card:',
+            '    allow_all_keys: true',
+            '    blocked_values:',
+            '      - \'[0-9]{13,16}\'             # 카드번호 패턴',
+            '    summary: debug',
+            '',
+            '# 함정: PII 를 exporter 직전 batch 뒤에 지우면 이미 늦음',
+          ],
+          highlight: [4, 7, 8, 10, 11],
+        },
+      },
+      {
+        title: 'Step 4. batch — 마지막에, 효율적 전송',
+        desc: 'processor 파이프라인의 맨 뒤에 두어, 가공이 끝난 텔레메트리를 일정 크기·시간 단위로 묶어 한 번에 exporter로 보낸다. 개별 전송은 네트워크 왕복과 압축 효율이 나빠서 batch 없이 운영하면 CPU와 대역폭이 크게 낭비된다. send_batch_size 로 목표 묶음 크기를, timeout 으로 그 크기에 못 미쳐도 강제 flush 하는 최대 대기를 정한다. filter·attributes 로 이미 줄이고 지운 뒤에 묶어야 헛일이 없으므로 batch 는 항상 마지막이다. send_batch_max_size 를 두면 한 배치가 지나치게 커져 exporter가 거부하는 것을 막는다.',
+        focus: 'batch',
+        code: {
+          lang: 'yaml',
+          filename: 'processors.yaml — batch(맨 뒤)',
+          lines: [
+            '# batch — 묶음 전송으로 왕복/압축 효율 극대화 (항상 마지막)',
+            '',
+            'processors:',
+            '  batch:',
+            '    timeout: 5s                   # 크기 미달이어도 5s 마다 flush',
+            '    send_batch_size: 512          # 목표 묶음 크기(도달 시 즉시 전송)',
+            '    send_batch_max_size: 1024     # 상한(초과분은 분할)',
+            '',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      receivers:  [otlp]',
+            '      # 가공을 끝낸 뒤 마지막에 batch',
+            '      processors: [memory_limiter, filter, attributes, batch]',
+            '      exporters:  [otlp/tempo]',
+            '',
+            '# 효과: 요청 수↓ 압축률↑ → CPU/대역폭 절감',
+            '# 함정: batch 없이 운영 → 소량 전송 폭증으로 비효율',
+          ],
+          highlight: [4, 5, 6, 7, 14],
+        },
+      },
+      {
+        title: 'Step 5. tail_sampling — 트레이스 단위 표본 추출',
+        desc: 'head 샘플링은 트레이스 시작 시점에 무작위로 남길지 정하지만, tail_sampling 은 트레이스가 끝날 때까지 span 을 모아두고 전체를 본 뒤에 남길지 결정한다. 덕분에 "에러가 났거나 1초 이상 느린 트레이스는 무조건 보존, 나머지 정상 트레이스는 10%만" 같은 가치 기반 표본이 가능하다. 비용은 크게 줄이면서 정작 중요한 문제 트레이스는 놓치지 않는다. 대가로 한 트레이스의 모든 span 이 도착할 때까지 메모리에 버퍼링해야 하므로, decision_wait 와 num_traces 를 넘기면 메모리가 급증한다. 여러 Collector 로 분산하면 같은 trace_id 가 한 인스턴스로 모이도록 load-balancing exporter 를 앞단에 둔다.',
+        focus: 'tail_sampling',
+        code: {
+          lang: 'yaml',
+          filename: 'processors.yaml — tail_sampling(정책)',
+          lines: [
+            '# tail_sampling — 트레이스 전체를 보고 남길지 결정',
+            '',
+            'processors:',
+            '  tail_sampling:',
+            '    decision_wait: 10s            # trace 완성 대기(이후 판정)',
+            '    num_traces: 50000             # 동시 버퍼링 트레이스 상한',
+            '    expected_new_traces_per_sec: 2000',
+            '    policies:',
+            '      # ① 에러 트레이스는 무조건 보존',
+            '      - name: keep-errors',
+            '        type: status_code',
+            '        status_code: { status_codes: [ERROR] }',
+            '      # ② 1s 이상 느린 트레이스 보존',
+            '      - name: keep-slow',
+            '        type: latency',
+            '        latency: { threshold_ms: 1000 }',
+            '      # ③ 나머지 정상은 10%만 표본',
+            '      - name: sample-rest',
+            '        type: probabilistic',
+            '        probabilistic: { sampling_percentage: 10 }',
+            '',
+            '# 함정: decision_wait/num_traces 초과 시 메모리 급증',
+            '# 분산 시: load-balancing exporter 로 trace_id 고정 라우팅',
+          ],
+          highlight: [4, 5, 6, 10, 14, 18],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — Processor 파이프라인 애니메이션
+    // ─────────────────────────────────────────────────────────
+    // 컨베이어를 흐르는 텔레메트리 표본(span 8개)
+    const SAMPLE = [
+      { id: 'sp1', name: 'POST /pay',     kind: 'ok',    target: '/pay',     slow: false, err: false, pii: true },
+      { id: 'sp2', name: 'GET /health',   kind: 'noise', target: '/health',  slow: false, err: false, pii: false },
+      { id: 'sp3', name: 'GET /orders',   kind: 'ok',    target: '/orders',  slow: false, err: false, pii: true },
+      { id: 'sp4', name: 'GET /metrics',  kind: 'noise', target: '/metrics', slow: false, err: false, pii: false },
+      { id: 'sp5', name: 'POST /refund',  kind: 'err',   target: '/refund',  slow: false, err: true,  pii: true },
+      { id: 'sp6', name: 'GET /report',   kind: 'slow',  target: '/report',  slow: true,  err: false, pii: false },
+      { id: 'sp7', name: 'GET /favicon',  kind: 'noise', target: '/favicon', slow: false, err: false, pii: false },
+      { id: 'sp8', name: 'GET /items',    kind: 'ok',    target: '/items',   slow: false, err: false, pii: false },
+    ];
+
+    const STAGES = [
+      { key: 'memory_limiter', icon: '🛡️', label: 'memory_limiter', sub: '과부하 차단' },
+      { key: 'filter',         icon: '🗑️', label: 'filter',         sub: '노이즈 폐기' },
+      { key: 'attributes',     icon: '🏷️', label: 'attributes',     sub: 'PII 마스킹' },
+      { key: 'batch',          icon: '📦', label: 'batch',          sub: '묶음 포장' },
+      { key: 'tail_sampling',  icon: '🎯', label: 'tail_sampling',  sub: '표본 추출' },
+    ];
+
+    // 각 stage 를 통과한 뒤 남는 span 판정
+    function survives(sp, stageKey) {
+      if (stageKey === 'filter' && sp.kind === 'noise') return false;
+      if (stageKey === 'tail_sampling') {
+        // 에러/느림은 보존, 정상은 표본(여기선 sp1 만 대표로 남김)
+        if (sp.err || sp.slow) return true;
+        return sp.id === 'sp1';
+      }
+      return true;
+    }
+
+    function ProcessorLiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const focusIdx = STAGES.findIndex((s) => s.key === focus);
+
+      // 현재 focus stage 까지 통과한 span 집합
+      const passed = SAMPLE.filter((sp) => {
+        for (let i = 0; i <= focusIdx; i++) {
+          if (!survives(sp, STAGES[i].key)) return false;
+        }
+        return true;
+      });
+
+      const inCount = SAMPLE.length;
+      const outCount = passed.length;
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-lighter px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">⚙️</span>
+              <span className="text-xs font-bold otel-text-dark">Processor 컨베이어 — 가공 라인</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">otel-col · pipeline: traces</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={`step-${stepIdx}`}>
+
+            {/* 파이프라인 stage 바 */}
+            <div className="flex items-stretch gap-1">
+              {STAGES.map((s, i) => {
+                const active = s.key === focus;
+                const done = i < focusIdx;
+                return (
+                  <React.Fragment key={s.key}>
+                    <div className={
+                      'flex-1 rounded-lg px-1 py-2 text-center transition-all duration-500 fade-in ' +
+                      (active
+                        ? 'otel-bg text-white shadow-lg scale-[1.04]'
+                        : done
+                        ? 'otel-bg-light otel-text-dark'
+                        : 'bg-slate-50 text-slate-400 border border-slate-200')
+                    }>
+                      <div className="text-base leading-none">{s.icon}</div>
+                      <div className="text-[9px] font-bold font-mono mt-1 truncate">{s.label}</div>
+                      <div className="text-[8px] opacity-80 truncate">{s.sub}</div>
+                    </div>
+                    {i < STAGES.length - 1 && (
+                      <div className="flex items-center text-slate-300 text-xs">{'→'}</div>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
+            {/* 입출력 카운터 */}
+            <div className="flex items-center justify-between otel-bg-lighter rounded-lg px-3 py-2 border border-slate-200">
+              <div className="text-[11px]">
+                <span className="text-slate-500">입력 span </span>
+                <span className="font-bold text-slate-700 font-mono">{inCount}</span>
+              </div>
+              <div className="text-slate-300">{'→'}</div>
+              <div className="text-[11px]">
+                <span className="text-slate-500">{STAGES[focusIdx].label} 통과 </span>
+                <span className="font-bold otel-text font-mono text-sm">{outCount}</span>
+                {outCount < inCount && (
+                  <span className="ml-1 text-[10px] text-red-500 font-bold">(-{inCount - outCount})</span>
+                )}
+              </div>
+            </div>
+
+            {/* span 표본 카드 */}
+            <div className="space-y-1.5">
+              <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">텔레메트리 표본 (span)</div>
+              {SAMPLE.map((sp) => {
+                const kept = passed.some((p) => p.id === sp.id);
+                // 이 stage 에서 방금 탈락했는지
+                const droppedHere = !kept && (focusIdx === 0
+                  ? false
+                  : SAMPLE.filter((x) => {
+                      for (let i = 0; i < focusIdx; i++) if (!survives(x, STAGES[i].key)) return false;
+                      return true;
+                    }).some((x) => x.id === sp.id));
+                return (
+                  <SpanRow key={sp.id} sp={sp} focus={focus} kept={kept} droppedHere={droppedHere} />
+                );
+              })}
+            </div>
+
+            {/* stage 별 요약 배너 */}
+            <div className="otel-bg-lighter border border-slate-200 rounded-lg px-3 py-2">
+              <div className="text-[11px] otel-text-dark font-bold mb-0.5">{STAGES[focusIdx].icon} {STAGES[focusIdx].label}</div>
+              <div className="text-[10px] text-slate-600 leading-snug">
+                {focus === 'memory_limiter' && '과부하 시 신규 데이터를 거절해 OOM 을 막는다. 여기선 모두 통과(정상 부하).'}
+                {focus === 'filter'         && '/health · /metrics · /favicon 노이즈 span 을 폐기해 비용을 줄인다.'}
+                {focus === 'attributes'     && 'PII(authorization·user.id) 를 삭제·해시로 마스킹한다. 개수는 그대로.'}
+                {focus === 'batch'          && '가공 끝난 span 을 하나의 묶음으로 포장해 exporter 로 한 번에 전송.'}
+                {focus === 'tail_sampling'  && '에러·느린 트레이스는 보존, 정상은 표본만 남겨 대표 데이터만 저장.'}
+              </div>
+            </div>
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              권장 순서: memory_limiter {'→'} filter {'→'} attributes {'→'} batch (tail_sampling 은 별도 정책)
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── span 한 줄
+    function SpanRow({ sp, focus, kept, droppedHere }) {
+      const kindTag = {
+        ok:    { t: 'ok',    c: 'bg-slate-100 text-slate-600 border-slate-300' },
+        noise: { t: 'noise', c: 'bg-amber-100 text-amber-700 border-amber-300' },
+        err:   { t: 'error', c: 'bg-red-100 text-red-700 border-red-300' },
+        slow:  { t: 'slow',  c: 'bg-orange-100 text-orange-700 border-orange-300' },
+      }[sp.kind];
+
+      const base = 'flex items-center gap-2 rounded-lg border px-2.5 py-1.5 transition-all duration-500 ';
+      const stateCls = !kept
+        ? (droppedHere ? 'bg-red-50 border-red-200 opacity-50 line-through' : 'bg-slate-50 border-slate-100 opacity-30')
+        : 'bg-white border-slate-200';
+
+      // attributes 단계에서 PII span 마스킹 표시
+      const showMask = focus === 'attributes' && kept && sp.pii;
+
+      return (
+        <div className={base + stateCls + ' fade-in'}>
+          <span className={'text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border ' + kindTag.c}>{kindTag.t}</span>
+          <span className="text-[11px] font-mono text-slate-700 flex-1 truncate">{sp.name}</span>
+          {showMask ? (
+            <span className="text-[9px] font-mono text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">
+              user.id={'→'}sha256 · auth=del
+            </span>
+          ) : sp.pii ? (
+            <span className="text-[9px] font-mono text-slate-400">has PII</span>
+          ) : (
+            <span className="text-[9px] font-mono text-slate-300">—</span>
+          )}
+          {!kept && droppedHere && <span className="text-[9px] font-bold text-red-500">drop</span>}
+          {kept && focus === 'batch' && <span className="text-[9px] otel-text font-bold">{'→'}box</span>}
+          {kept && focus === 'tail_sampling' && <span className="text-[9px] otel-text font-bold">keep</span>}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-1-3</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. Collector &amp; Processor &gt; III-1-3</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Processor — batch / sample / filter</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                Collector에서 텔레메트리를 가공하는 프로세서 —
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">memory_limiter</code>
+                <code className="bg-slate-100 px-1 rounded text-xs">filter</code>
+                <code className="bg-slate-100 px-1 rounded text-xs">attributes</code>
+                <code className="bg-slate-100 px-1 rounded text-xs">batch</code>
+                <code className="bg-slate-100 px-1 rounded text-xs">tail_sampling</code>
+                순서로 비용을 줄이고 PII를 제거한다.
+              </p>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <ProcessorLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 진행바 */}
+            <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
+              <div className="otel-bg h-full transition-all duration-500"
+                   style={{ width: `${((stepIdx + 1) / STEPS.length) * 100}%` }}></div>
+            </div>
+
+            {/* 설명 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 핵심 정리 — processor 순서는 <strong>memory_limiter(먼저) → filter → attributes → batch(마지막)</strong>.
+                비용 절감은 filter·sample, 컴플라이언스는 attributes 마스킹, tail_sampling 은 메모리 상한을 항상 감시한다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'} aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브로</a>
+              <a href="./III-1-4.html" className="otel-text hover:otel-text-dark font-medium">III-1-4 다음 자료 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — V-1-2. 샘플링 전략 — head vs tail</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🎚️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-mid: #6E80C4; --otel-light: #D6DCEE; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    V-1-2. 샘플링 전략 — head vs tail
+    학습 목표: 비용과 가시성의 균형 — head sampling(시작 시 확률 결정)과 tail sampling(완료 후 에러/느린 것 우선 보존)의 트레이드오프 이해
+    핵심 비유: "CCTV 녹화 정책" — 무조건 다 녹화(비용 폭발) vs 사건 있을 때만 보존(가시성 확보)
+    패턴: fastapi 표준 — 좌(샘플링 결정 시각화) / 우(VSCode 코드: python SDK · yaml Collector)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 데모용 고정 트레이스 12개 — kind: ok(정상)/slow(느림)/err(에러)
+    // headKeep: head 샘플링(확률 10%)이 우연히 남긴 것 — 에러 여부와 무관
+    const TRACES = [
+      { id: 't01', kind: 'ok',   lat: 42,   headKeep: false },
+      { id: 't02', kind: 'ok',   lat: 55,   headKeep: true  },
+      { id: 't03', kind: 'err',  lat: 120,  headKeep: false },
+      { id: 't04', kind: 'ok',   lat: 31,   headKeep: false },
+      { id: 't05', kind: 'slow', lat: 940,  headKeep: false },
+      { id: 't06', kind: 'ok',   lat: 60,   headKeep: false },
+      { id: 't07', kind: 'ok',   lat: 47,   headKeep: false },
+      { id: 't08', kind: 'err',  lat: 210,  headKeep: true  },
+      { id: 't09', kind: 'ok',   lat: 50,   headKeep: false },
+      { id: 't10', kind: 'ok',   lat: 38,   headKeep: false },
+      { id: 't11', kind: 'slow', lat: 1520, headKeep: false },
+      { id: 't12', kind: 'ok',   lat: 44,   headKeep: false },
+    ];
+
+    // tail 정책: 에러 100% + 느린 것(500ms 초과) 100% + 정상 10% 확률(t02만 통과 가정)
+    function tailKeep(t) {
+      if (t.kind === 'err') return true;
+      if (t.kind === 'slow') return true;
+      return t.id === 't02';
+    }
+
+    const KIND_STYLE = {
+      ok:   { chip: 'bg-slate-100 text-slate-500 border-slate-300', dot: 'bg-slate-400', label: '정상' },
+      slow: { chip: 'bg-amber-100 text-amber-700 border-amber-300', dot: 'bg-amber-500', label: '느림' },
+      err:  { chip: 'bg-red-100 text-red-700 border-red-300',       dot: 'bg-red-500',   label: '에러' },
+    };
+
+    // 5 STEPS
+    const STEPS = [
+      {
+        title: 'Step 1. 왜 샘플링인가 — 전량 저장의 비용',
+        desc: '요청량이 초당 수만 건이면 모든 트레이스를 저장하는 순간 스토리지·인덱싱·네트워크 비용이 폭발하고 백엔드가 병목이 된다. 하지만 대부분의 트레이스는 정상 요청이라 디버깅 가치가 낮다. 그래서 "무엇을 버리고 무엇을 남길까"를 정하는 샘플링이 관측성 운영의 핵심 비용 레버가 된다. CCTV를 24시간 풀녹화하면 디스크가 남아나지 않는 것과 같은 문제다. 목표는 비용은 줄이되 사건(에러·지연)은 놓치지 않는 균형점을 찾는 것이다.',
+        focus: 'why',
+        code: {
+          lang: 'yaml',
+          filename: 'cost-estimate.yaml — 전량 저장 비용 감각',
+          lines: [
+            '# 전량 저장이 왜 위험한가 — 대략적인 규모 감각',
+            '',
+            'traffic:',
+            '  requests_per_sec: 20000        # 초당 요청 수',
+            '  spans_per_trace: 25            # 트레이스당 평균 span',
+            '  bytes_per_span: 1500           # span 1개 직렬화 크기',
+            '',
+            'derived:',
+            '  spans_per_sec: 500000          # 20000 * 25',
+            '  ingest_bytes_per_sec: 750000000  # 약 750 MB/s (!!)',
+            '  per_day_tb: 64                 # 하루 약 64 TB 원시 데이터',
+            '',
+            'problem:',
+            '  - storage_cost: 스토리지·핫 인덱스 비용 폭발',
+            '  - backend_bottleneck: 백엔드 ingest 큐가 병목',
+            '  - low_value: 99% 는 정상 요청이라 조회조차 안 함',
+            '',
+            'goal:',
+            '  keep_signal: 에러·느린 트레이스는 반드시 보존',
+            '  drop_noise: 평범한 정상 트레이스는 비율로 축소',
+            '  # → 여기서 head / tail 샘플링이 등장한다',
+          ],
+          highlight: [4, 10, 11, 18, 19],
+        },
+      },
+      {
+        title: 'Step 2. Head sampling — 시작 시점에 결정',
+        desc: 'head 샘플링은 트레이스가 시작되는 순간(root span 생성 시) SDK에서 확률적으로 남길지 버릴지 결정한다. TraceIdRatioBased가 대표적이고, trace_id 해시를 기준 삼아 예: 10%만 통과시킨다. 결정이 매우 빠르고 메모리 부담이 없어 SDK만으로 끝나는 장점이 있다. 단점은 결과를 보기 전에 버리므로, 하필 에러가 난 트레이스도 확률에 걸려 통째로 유실될 수 있다는 것이다. 아래에서 에러 t03이 통과 못 해 사라지는 것을 보라.',
+        focus: 'head',
+        code: {
+          lang: 'python',
+          filename: 'head_sampling.py — SDK 확률 샘플러',
+          lines: [
+            '# Head sampling — 트레이스 시작 시점에 SDK가 결정',
+            'from opentelemetry import trace',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.sampling import (',
+            '    TraceIdRatioBased,',
+            '    ParentBased,',
+            ')',
+            '',
+            '# 전체의 10% 만 남긴다 (trace_id 해시 기준, 결정적)',
+            'ratio_sampler = TraceIdRatioBased(0.10)',
+            '',
+            '# 부모(상위 서비스)의 결정을 존중 — 분산 추적 일관성',
+            '# 부모가 sampled=true 면 자식도 유지, 아니면 root 정책 적용',
+            'sampler = ParentBased(root=ratio_sampler)',
+            '',
+            'provider = TracerProvider(sampler=sampler)',
+            'trace.set_tracer_provider(provider)',
+            'tracer = trace.get_tracer(__name__)',
+            '',
+            'with tracer.start_as_current_span(\'checkout\') as span:',
+            '    span.set_attribute(\'order.id\', 1042)',
+            '    # 이 시점엔 성공/실패를 아직 모른다 →',
+            '    # 확률에 걸리면 에러 트레이스도 그냥 버려진다',
+            '',
+            '# 장점: 빠르다 · 메모리 0 · SDK 만으로 완결',
+            '# 함정: 시작 시 결정이라 에러/지연을 놓칠 수 있다',
+          ],
+          highlight: [9, 10, 13, 14, 22],
+        },
+      },
+      {
+        title: 'Step 3. Tail sampling — 완료 후에 결정',
+        desc: 'tail 샘플링은 트레이스의 모든 span이 도착해 완성될 때까지 Collector가 잠시 버퍼링한 뒤, 결과를 보고 남길지 정한다. 그래서 에러 상태(status_code)나 높은 지연(latency) 같은 정책으로 "중요한 것"을 100% 보존할 수 있다. 정상 트레이스는 확률로 줄여 비용도 잡는다. 대신 완성을 기다리므로 메모리에 트레이스를 들고 있어야 하고, decision_wait 만큼 지연이 생기며, tailsamplingprocessor를 갖춘 Collector가 필요하다. 아래에서 에러 t03·t08과 느린 t05·t11이 모두 살아남는 것을 보라.',
+        focus: 'tail',
+        code: {
+          lang: 'yaml',
+          filename: 'tail_sampling.yaml — Collector 정책',
+          lines: [
+            '# Tail sampling — Collector가 트레이스 완성 후 결정',
+            'processors:',
+            '  tail_sampling:',
+            '    decision_wait: 10s        # 완성 대기(그만큼 지연·메모리)',
+            '    num_traces: 100000        # 동시에 버퍼링할 최대 트레이스',
+            '    expected_new_traces_per_sec: 2000',
+            '    policies:',
+            '      # ① 에러는 무조건 보존',
+            '      - name: keep-errors',
+            '        type: status_code',
+            '        status_code: { status_codes: [ERROR] }',
+            '      # ② 느린 트레이스(500ms 초과) 보존',
+            '      - name: keep-slow',
+            '        type: latency',
+            '        latency: { threshold_ms: 500 }',
+            '      # ③ 나머지 정상은 10% 확률로 축소',
+            '      - name: sample-normal',
+            '        type: probabilistic',
+            '        probabilistic: { sampling_percentage: 10 }',
+            '',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      receivers:  [otlp]',
+            '      processors: [tail_sampling, batch]',
+            '      exporters:  [otlp/tempo]',
+            '# 함정: 한 트레이스의 모든 span 이 같은 Collector 로 가야 함',
+          ],
+          highlight: [3, 4, 9, 13, 18],
+        },
+      },
+      {
+        title: 'Step 4. head vs tail — 무엇을 언제 쓰나',
+        desc: 'head는 빠르고 저렴하지만 에러를 확률로 놓치고, tail은 에러·지연을 100% 잡지만 메모리·지연·완성 대기 비용을 낸다. 실무에선 둘을 조합한다 — SDK에서 head로 명백한 헬스체크·정적 파일 같은 노이즈를 미리 쳐내 Collector 부하를 줄이고, 남은 트레이스는 tail로 에러·지연 기준 정밀 보존한다. 트래픽이 폭증하면 tail 앞단에 rate limiting을 두어 메모리 폭주를 막는다. 규모가 작으면 head만으로 충분할 수 있으니 과설계하지 말 것.',
+        focus: 'compare',
+        code: {
+          lang: 'yaml',
+          filename: 'combined.yaml — head + tail 조합',
+          lines: [
+            '# 실무 조합: SDK head(노이즈 컷) → Collector tail(정밀 보존)',
+            '',
+            '# [1] SDK 쪽(head): 명백한 노이즈만 미리 제거',
+            '#   TraceIdRatioBased(1.0) 로 대부분 넘기되',
+            '#   /health, /metrics 같은 경로는 span 자체를 안 만든다',
+            '',
+            '# [2] Collector 쪽(tail): 진짜 취사선택',
+            'processors:',
+            '  # tail 앞 rate limiting — 폭주 시 메모리 보호',
+            '  memory_limiter:',
+            '    check_interval: 1s',
+            '    limit_mib: 1024',
+            '  tail_sampling:',
+            '    decision_wait: 8s',
+            '    policies:',
+            '      - name: errors',
+            '        type: status_code',
+            '        status_code: { status_codes: [ERROR] }',
+            '      - name: slow',
+            '        type: latency',
+            '        latency: { threshold_ms: 500 }',
+            '      - name: baseline',
+            '        type: probabilistic',
+            '        probabilistic: { sampling_percentage: 5 }',
+            '',
+            '# 선택 기준:',
+            '#   소규모/단순 → head 만으로 충분(과설계 금지)',
+            '#   에러 100% 보존 필요 → tail 필수',
+          ],
+          highlight: [3, 9, 10, 16, 19],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — 메트릭 왜곡과 복잡도',
+        desc: '샘플링 후 span 수를 그대로 세면 실제 트래픽보다 10배 적게 보여 지표가 왜곡된다. 그래서 확률 샘플링에는 반드시 비율 보정(가중치 = 1/샘플링율)을 곱해 카운트를 복원하거나, 아예 메트릭은 SpanMetrics로 샘플링 전에 뽑아야 한다. tail은 완성 대기 때문에 지연되고 메모리를 먹으며, 한 트레이스의 모든 span이 같은 Collector로 모여야 정책이 정확하다(로드밸런싱 주의). 정책이 늘수록 복잡도와 디버깅 난도가 오르니, 꼭 필요한 정책만 최소로 유지하라.',
+        focus: 'pitfall',
+        code: {
+          lang: 'python',
+          filename: 'metric_correction.py — 비율 보정',
+          lines: [
+            '# 함정: 샘플링된 카운트를 그대로 쓰면 트래픽이 축소돼 보인다',
+            '',
+            'SAMPLE_RATE = 0.10                 # 10% 만 저장 중',
+            '',
+            '# [잘못] 저장된 트레이스 수로 요청량 추정 → 실제의 1/10',
+            'observed = 5000                    # 저장된 정상 트레이스',
+            'wrong_total = observed             # 5000 (과소 집계)',
+            '',
+            '# [보정] 가중치 = 1 / 샘플링율 을 곱해 원본 규모 복원',
+            'weight = 1 / SAMPLE_RATE           # 10.0',
+            'estimated_total = observed * weight  # 50000 (실제에 근접)',
+            '',
+            '# 더 나은 방법: 샘플링 전에 메트릭을 뽑는다',
+            '#   Collector spanmetrics connector 로',
+            '#   요청 수/에러율/지연을 tail 이전 단계에서 집계',
+            '#   → 카운트는 100% 정확, 트레이스는 샘플링',
+            '',
+            'checklist = [',
+            '    \'확률 샘플링엔 비율 보정 필수\',',
+            '    \'tail 은 decision_wait 만큼 지연·메모리\',',
+            '    \'같은 trace 의 span 은 같은 Collector 로\',',
+            '    \'정책은 최소로 — 복잡도가 곧 비용\',',
+            ']',
+          ],
+          highlight: [6, 7, 10, 11, 14],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 샘플링 결정 시각화 (head vs tail)
+    // ─────────────────────────────────────────────────────────
+    function SamplingLiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+
+      const totalErr  = TRACES.filter((t) => t.kind === 'err').length;
+      const totalSlow = TRACES.filter((t) => t.kind === 'slow').length;
+
+      // head 유지 집합
+      const headKept    = TRACES.filter((t) => t.headKeep);
+      const headErrKept = headKept.filter((t) => t.kind === 'err').length;
+      // tail 유지 집합
+      const tailKept    = TRACES.filter(tailKeep);
+      const tailErrKept = tailKept.filter((t) => t.kind === 'err').length;
+
+      const showHead = focus === 'head' || focus === 'compare';
+      const showTail = focus === 'tail' || focus === 'compare' || focus === 'pitfall';
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🎚️</span>
+              <span className="text-xs font-bold otel-text-dark">Sampling Lab — 무엇을 저장할까</span>
+            </div>
+            <span className="text-[10px] text-slate-600 font-mono">12개 트레이스 · CCTV 녹화 정책</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={animKey}>
+
+            {/* 유입 트레이스 원본 */}
+            <div className="rounded-lg border border-slate-300 bg-slate-50 p-3 fade-in">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold text-slate-700">유입 트레이스 (원본 100%)</span>
+                <span className="text-[10px] font-mono text-slate-500">
+                  에러 {totalErr} · 느림 {totalSlow} · 정상 {12 - totalErr - totalSlow}
+                </span>
+              </div>
+              <div className="grid grid-cols-6 gap-1.5">
+                {TRACES.map((t) => {
+                  const s = KIND_STYLE[t.kind];
+                  return (
+                    <div key={t.id} className={`rounded border px-1 py-1 text-center ${s.chip}`}>
+                      <div className="text-[9px] font-bold font-mono leading-tight">{t.id}</div>
+                      <div className="text-[8px] opacity-80">{t.lat}ms</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* WHY: 비용 게이지 */}
+            {focus === 'why' && (
+              <div className="rounded-lg border-2 otel-border otel-bg-light p-3 fade-in space-y-2">
+                <div className="text-xs font-bold otel-text-dark">전량 저장 시 비용 감각</div>
+                <CostBar label="스토리지/일" value={100} caption="약 64 TB/day" tone="red" />
+                <CostBar label="ingest 대역폭" value={92} caption="약 750 MB/s" tone="red" />
+                <CostBar label="실제 조회 가치" value={8} caption="99%는 안 봄" tone="slate" />
+                <div className="text-[10px] text-slate-600 leading-snug">
+                  대부분 정상 요청이라 저장 가치가 낮다 — 에러·지연만 남기면 비용은 급감한다.
+                </div>
+              </div>
+            )}
+
+            {/* HEAD 결정 */}
+            {showHead && (
+              <DecisionBlock
+                title="Head — 시작 시 확률(10%)로 결정"
+                subtitle="SDK · 결과 보기 전 · 에러도 버려질 수 있음"
+                tone="amber"
+                traces={TRACES}
+                keep={(t) => t.headKeep}
+                lostNote={`에러 ${totalErr}건 중 ${headErrKept}건만 우연히 보존`}
+              />
+            )}
+
+            {/* TAIL 결정 */}
+            {showTail && (
+              <DecisionBlock
+                title="Tail — 완성 후 정책으로 결정"
+                subtitle="Collector · 에러/느림 100% 보존 · 정상 10%"
+                tone="emerald"
+                traces={TRACES}
+                keep={tailKeep}
+                lostNote={`에러 ${totalErr}건 전부 보존 · 느림 ${totalSlow}건 전부 보존`}
+              />
+            )}
+
+            {/* PITFALL: 메트릭 왜곡 */}
+            {focus === 'pitfall' && (
+              <div className="rounded-lg border-2 otel-border bg-white p-3 fade-in space-y-2">
+                <div className="text-xs font-bold otel-text-dark">샘플링 후 메트릭 왜곡 → 비율 보정</div>
+                <div className="grid grid-cols-2 gap-2 text-center">
+                  <div className="rounded-lg bg-red-50 border border-red-200 p-2">
+                    <div className="text-[10px] text-red-600 font-bold">보정 없음</div>
+                    <div className="text-lg font-bold text-red-700 font-mono">5,000</div>
+                    <div className="text-[9px] text-red-500">실제의 1/10 (과소)</div>
+                  </div>
+                  <div className="rounded-lg bg-emerald-50 border border-emerald-200 p-2">
+                    <div className="text-[10px] text-emerald-600 font-bold">가중치 x10 보정</div>
+                    <div className="text-lg font-bold text-emerald-700 font-mono">50,000</div>
+                    <div className="text-[9px] text-emerald-500">실제 규모 복원</div>
+                  </div>
+                </div>
+                <div className="text-[10px] text-slate-600 leading-snug">
+                  가중치 = 1 / 샘플링율. 더 안전한 길은 샘플링 전에 SpanMetrics로 카운트를 뽑는 것.
+                </div>
+              </div>
+            )}
+
+            {/* COMPARE: 요약 스코어보드 */}
+            {focus === 'compare' && (
+              <div className="rounded-lg otel-bg-dark text-white p-3 fade-in">
+                <div className="grid grid-cols-2 gap-3 text-center">
+                  <div>
+                    <div className="text-[10px] text-indigo-200 font-bold uppercase">Head</div>
+                    <div className="text-sm font-bold">빠름 · 메모리 0</div>
+                    <div className="text-[10px] text-amber-200 mt-1">에러 {totalErr}건 중 {headErrKept}건만</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-indigo-200 font-bold uppercase">Tail</div>
+                    <div className="text-sm font-bold">에러 100% 보존</div>
+                    <div className="text-[10px] text-emerald-200 mt-1">대기·메모리 비용 발생</div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'why'     && '전량 저장은 비용 폭발 — 무엇을 버리고 남길지가 핵심'}
+              {focus === 'head'    && '시작 시 확률 결정 — 빠르지만 에러를 놓칠 수 있다'}
+              {focus === 'tail'    && '완성 후 정책 결정 — 에러/느림을 확실히 보존'}
+              {focus === 'compare' && 'head로 노이즈 컷 + tail로 정밀 보존 = 실무 조합'}
+              {focus === 'pitfall' && '메트릭은 비율 보정, 정책은 최소로 — 복잡도가 곧 비용'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── head/tail 공용 결정 블록 (유지=컬러, 폐기=흐림)
+    function DecisionBlock({ title, subtitle, tone, traces, keep, lostNote }) {
+      const keptCount = traces.filter(keep).length;
+      const toneCls = {
+        amber:   'border-amber-300 bg-amber-50',
+        emerald: 'border-emerald-300 bg-emerald-50',
+      }[tone];
+      const badgeCls = {
+        amber:   'bg-amber-500 text-white',
+        emerald: 'bg-emerald-500 text-white',
+      }[tone];
+
+      return (
+        <div className={`rounded-lg border-2 p-3 fade-in ${toneCls}`}>
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-xs font-bold text-slate-800">{title}</span>
+            <span className={`ml-auto text-[10px] px-2 py-0.5 rounded-full font-bold ${badgeCls}`}>
+              보존 {keptCount}/12
+            </span>
+          </div>
+          <div className="text-[10px] text-slate-500 mb-2">{subtitle}</div>
+          <div className="grid grid-cols-6 gap-1.5">
+            {traces.map((t) => {
+              const kept = keep(t);
+              const s = KIND_STYLE[t.kind];
+              return (
+                <div key={t.id}
+                  className={`rounded border px-1 py-1 text-center transition-all duration-500 ${
+                    kept ? s.chip + ' shadow-sm' : 'bg-slate-100 text-slate-300 border-slate-200 opacity-50 line-through'
+                  }`}>
+                  <div className="text-[9px] font-bold font-mono leading-tight">{t.id}</div>
+                  <div className="text-[8px]">{kept ? '보존' : '폐기'}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="text-[10px] text-slate-600 mt-2 font-medium">{lostNote}</div>
+        </div>
+      );
+    }
+
+    // ── 비용 게이지 바
+    function CostBar({ label, value, caption, tone }) {
+      const barCls = { red: 'bg-red-500', slate: 'bg-slate-400' }[tone];
+      return (
+        <div>
+          <div className="flex items-center justify-between text-[10px] mb-0.5">
+            <span className="font-bold text-slate-700">{label}</span>
+            <span className="font-mono text-slate-500">{caption}</span>
+          </div>
+          <div className="h-2 rounded-full bg-white border border-slate-200 overflow-hidden">
+            <div className={`h-full ${barCls} transition-all duration-700`} style={{ width: value + '%' }}></div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-1-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 실전 운영 &gt; Chapter 1. 비용 관리 &gt; V-1-2</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">샘플링 전략 — head vs tail</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                비용과 가시성의 균형, 무엇을 저장할까 —
+                <strong> head</strong>(시작 시 확률로 결정, SDK) 와
+                <strong> tail</strong>(완성 후 에러·지연 보존, Collector) 의 트레이드오프를 본다.
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">TraceIdRatioBased</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">tail_sampling</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">비율 보정</code>
+              </p>
+              {/* 진행바 */}
+              <div className="mt-3 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: progress + '%' }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <SamplingLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 배너 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(V-1-3)에서는 <strong>카디널리티 관리</strong> — 메트릭 라벨 폭발과 비용을 다룬다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label={isPlaying ? '자동 재생 정지' : '자동 재생 시작'} aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./V-1-3.html" className="otel-text hover:otel-text-dark font-medium">V-1-3 카디널리티 관리 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

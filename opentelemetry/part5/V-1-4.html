@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — V-1-4. 통합 패턴 (k8s · Mesh · FastAPI)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🎓</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-mid: #6E80C4; --otel-light: #D6DCEE; --otel-bglight: #eef0f9; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-bg-light { background-color: var(--otel-bglight); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    V-1-4. 통합 패턴 — k8s · Mesh · FastAPI (OTel 완주)
+    학습 목표: 실전 환경에서 OTel Operator·Collector 2-tier·Service Mesh·FastAPI 자동 계측을 하나로 통합
+    핵심 비유: "완성 공장 라인" — 앱 파드에서 백엔드까지 텔레메트리 전 구간 통합
+    패턴: fastapi 표준 — 좌(k8s 통합 아키텍처) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 5 STEPS — 실전 통합 패턴 (OTel 완주)
+    const STEPS = [
+      {
+        title: 'Step 1. Kubernetes 통합 — Operator 자동 계측 주입',
+        desc: 'OTel Operator를 쓰는 이유는 앱 코드를 한 줄도 고치지 않고 파드에 SDK를 주입할 수 있기 때문이다. Instrumentation CR로 언어별 계측 설정을 선언하고, 파드에 annotation 하나만 달면 Operator가 init container로 SDK 라이브러리를 공유 볼륨에 복사하고 OTEL_ 환경변수를 주입한다. 수백 개 마이크로서비스에 일일이 SDK를 넣는 대신 클러스터 정책으로 한 번에 계측하는 것이 핵심이다. 단, 자동 계측은 프레임워크 span만 만들므로 비즈니스 커스텀 span은 여전히 앱에서 추가해야 한다.',
+        focus: 'k8s',
+        code: {
+          lang: 'yaml',
+          filename: 'instrumentation.yaml — Operator 자동 주입',
+          lines: [
+            '# ① OTel Operator에게 언어별 계측 방법을 알려주는 CR',
+            'apiVersion: opentelemetry.io/v1alpha1',
+            'kind: Instrumentation',
+            'metadata:',
+            '  name: python-instrumentation',
+            '  namespace: shop',
+            'spec:',
+            '  # 자동 계측이 보낼 곳 = 노드 로컬 agent Collector',
+            '  exporter:',
+            '    endpoint: http://otel-agent.observability:4317',
+            '  propagators:',
+            '    - tracecontext          # W3C traceparent (표준)',
+            '    - baggage',
+            '  sampler:',
+            '    type: parentbased_traceidratio',
+            '    argument: "0.1"          # gateway에서 재조정 전 1차 비율',
+            '  python:',
+            '    env:',
+            '      - name: OTEL_EXPORTER_OTLP_PROTOCOL',
+            '        value: grpc',
+            '---',
+            '# ② 앱 Deployment — annotation 한 줄로 주입 활성화',
+            'apiVersion: apps/v1',
+            'kind: Deployment',
+            'metadata: { name: catalog-api, namespace: shop }',
+            'spec:',
+            '  template:',
+            '    metadata:',
+            '      annotations:',
+            '        # Operator가 이 파드에 init container + env 주입',
+            '        instrumentation.opentelemetry.io/inject-python: "true"',
+            '    spec:',
+            '      containers:',
+            '        - name: app',
+            '          image: registry.local/catalog-api:1.4.0',
+            '# → 앱 이미지 변경 없이 계측 완료',
+          ],
+          highlight: [3, 9, 10, 30],
+        },
+      },
+      {
+        title: 'Step 2. Collector 2-tier — agent(DaemonSet) + gateway(Deployment)',
+        desc: '실전에서는 Collector를 한 대만 두지 않고 2단으로 나눈다. agent는 DaemonSet으로 모든 노드에 떠서 같은 노드 파드의 텔레메트리를 짧은 홉으로 받고, gateway는 Deployment로 중앙에 떠서 집계·테일 샘플링·백엔드 전송을 담당한다. 이렇게 나누면 앱은 항상 localhost 수준의 가까운 agent로만 보내 저지연이고, 무거운 처리와 백엔드 연결은 gateway가 모아서 한다. 핵심은 agent에 k8sattributes processor를 두어 파드 IP만으로 파드명·namespace·deployment·노드 같은 메타를 span에 자동 부착하는 것이다.',
+        focus: 'collector',
+        code: {
+          lang: 'yaml',
+          filename: 'collector-2tier.yaml — agent · gateway',
+          lines: [
+            '# ── agent Collector (DaemonSet, 노드마다 1개) ──',
+            'receivers:',
+            '  otlp:',
+            '    protocols:',
+            '      grpc: { endpoint: 0.0.0.0:4317 }',
+            'processors:',
+            '  # 파드 IP → 파드 메타데이터 자동 부착 (실전 필수)',
+            '  k8sattributes:',
+            '    auth_type: serviceAccount',
+            '    extract:',
+            '      metadata:',
+            '        - k8s.pod.name',
+            '        - k8s.namespace.name',
+            '        - k8s.deployment.name',
+            '        - k8s.node.name',
+            '  batch: { timeout: 5s }',
+            'exporters:',
+            '  # agent는 처리하지 않고 gateway로 넘긴다',
+            '  otlp/gateway:',
+            '    endpoint: otel-gateway.observability:4317',
+            '    tls: { insecure: true }',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      receivers:  [otlp]',
+            '      processors: [k8sattributes, batch]',
+            '      exporters:  [otlp/gateway]',
+            '# ── gateway Collector (Deployment, 중앙 N개) ──',
+            '#   여기서 tail_sampling + 백엔드 전송을 담당',
+            '#   traces  -> tempo,  metrics -> prometheus,  logs -> loki',
+          ],
+          highlight: [1, 8, 18, 27],
+        },
+      },
+      {
+        title: 'Step 3. Service Mesh — Envoy 자동 span + 앱 계측 결합',
+        desc: 'Istio 같은 서비스 메시를 쓰면 Envoy 사이드카가 서비스 간 요청마다 자동으로 span을 만든다. 이 메시 span과 앱 계측 span을 하나의 트레이스로 잇는 조건은 단 하나, traceparent 헤더 전파다. 앱이 컨텍스트를 전파하지 않으면 메시 span과 앱 span이 따로 놀아 트레이스가 끊긴다. 가장 흔한 실무 함정은 이중 계측이다. 메시도 span을 만들고 앱도 같은 구간 span을 만들어 중복되므로, 역할을 나눠 메시는 네트워크 홉(L7 라우팅·재시도)을, 앱 계측은 비즈니스 로직 구간을 담당하게 하고 샘플링을 한쪽 기준으로 통일한다.',
+        focus: 'mesh',
+        code: {
+          lang: 'yaml',
+          filename: 'istio-telemetry.yaml — 메시 트레이싱',
+          lines: [
+            '# Istio Telemetry API — 메시 span을 OTel로 내보내기',
+            'apiVersion: telemetry.istio.io/v1',
+            'kind: Telemetry',
+            'metadata:',
+            '  name: mesh-tracing',
+            '  namespace: istio-system   # 메시 전역 기본값',
+            'spec:',
+            '  tracing:',
+            '    - providers:',
+            '        - name: otel-tracing   # meshConfig에 정의한 provider',
+            '      # 함정 방지: 메시·앱 샘플링 비율을 한쪽으로 통일',
+            '      randomSamplingPercentage: 10.0',
+            '      customTags:',
+            '        mesh.source:',
+            '          literal: { value: istio-envoy }',
+            '---',
+            '# meshConfig extensionProviders (참고) — Envoy가 보낼 곳',
+            '#   provider otel-tracing -> otel-agent.observability:4317',
+            '#',
+            '# 트레이스가 이어지는 유일한 조건:',
+            '#   앱이 traceparent(W3C) 헤더를 그대로 다음 홉에 전파',
+            '#   -> Envoy span(부모) 아래 앱 span(자식)으로 연결',
+            '#',
+            '# 이중 계측 회피 원칙:',
+            '#   Envoy = 네트워크 홉(L7 라우팅/재시도) 구간',
+            '#   App   = 비즈니스 로직(핸들러/DB/외부호출) 구간',
+          ],
+          highlight: [2, 9, 12, 20],
+        },
+      },
+      {
+        title: 'Step 4. FastAPI 자동 계측 — instrument + 커스텀 span',
+        desc: 'FastAPI는 FastAPIInstrumentor로 앱 인스턴스를 감싸면 모든 라우트에 대해 HTTP 서버 span이 자동 생성된다. requests·httpx·psycopg 등 인기 라이브러리도 계측기를 붙이면 하위 span이 자동으로 붙어 외부 호출과 DB 쿼리가 트레이스에 나타난다. 자동 계측이 뼈대를 만들어 주므로 앱에서는 정말 중요한 비즈니스 구간에만 커스텀 span과 속성을 추가하면 된다. k8s에서는 endpoint를 노드 로컬 agent(4317)로 두어 짧은 홉으로 내보내고, 컨텍스트 전파기를 W3C tracecontext로 맞춰 메시 span과 이어지게 한다.',
+        focus: 'fastapi',
+        code: {
+          lang: 'python',
+          filename: 'main.py — FastAPI 계측 통합',
+          lines: [
+            '"""catalog-api — OTel 자동 + 커스텀 계측 통합 예제."""',
+            'import os',
+            'from fastapi import FastAPI',
+            'from opentelemetry import trace',
+            'from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor',
+            'from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor',
+            'import httpx',
+            '',
+            'app = FastAPI(title="catalog-api")',
+            '',
+            '# ① 프레임워크 자동 계측 — 모든 라우트에 서버 span 생성',
+            'FastAPIInstrumentor.instrument_app(app)',
+            '# ② 외부 호출 자동 계측 — 하위 client span 자동 부착',
+            'HTTPXClientInstrumentor().instrument()',
+            '',
+            'tracer = trace.get_tracer(__name__)',
+            'PRICE_URL = os.environ["PRICE_SVC_URL"]',
+            '',
+            '@app.get("/catalog/{sku}")',
+            'async def get_catalog(sku: str):',
+            '    # ③ 비즈니스 구간만 커스텀 span 추가',
+            '    with tracer.start_as_current_span("catalog.enrich") as span:',
+            '        span.set_attribute("catalog.sku", sku)',
+            '        async with httpx.AsyncClient() as client:',
+            '            # traceparent 자동 전파 -> 메시/하위 서비스와 연결',
+            '            resp = await client.get(f"{PRICE_URL}/price/{sku}")',
+            '        span.set_attribute("catalog.price", resp.json()["amount"])',
+            '        return {"sku": sku, "price": resp.json()["amount"]}',
+            '',
+            '# 실행(Operator 미사용 시): opentelemetry-instrument uvicorn main:app',
+            '# k8s Operator 사용 시: annotation 주입으로 위 명령 불필요',
+          ],
+          highlight: [12, 14, 22, 25],
+        },
+      },
+      {
+        title: 'Step 5. 종합 — 앱 → agent → gateway → 백엔드 (OTel 완주)',
+        desc: '이제 모든 조각이 하나로 이어진다. FastAPI 앱이 Operator/SDK로 계측되고, 컨텍스트가 메시와 앱을 관통하며, 노드 로컬 agent가 파드 메타를 붙여 중앙 gateway로 보내고, gateway가 신호별로 Tempo·Prometheus·Loki에 저장한다. 앞 챕터 전부가 이 그림에 녹아 있다. 신호(trace/metric/log) → SDK 계측 → Collector 파이프라인 → 백엔드 → 운영(샘플링·카디널리티 관리)까지가 한 흐름이다. 실무 배포 체크리스트로 이중 계측 여부, Operator RBAC(k8sattributes는 파드 read 권한 필요), 리소스 부착 순서, 환경별 설정 분리를 마지막에 반드시 점검한다.',
+        focus: 'complete',
+        code: {
+          lang: 'yaml',
+          filename: 'deploy-env.yaml — 환경 종합 설정',
+          lines: [
+            '# 앱 파드에 최종 주입되는 OTEL_ 환경(요지)',
+            'env:',
+            '  - name: OTEL_SERVICE_NAME',
+            '    value: catalog-api',
+            '  # 신호가 나갈 곳 = 노드 로컬 agent (짧은 홉)',
+            '  - name: OTEL_EXPORTER_OTLP_ENDPOINT',
+            '    value: http://otel-agent.observability:4317',
+            '  # 메시와 트레이스를 잇는 표준 전파기',
+            '  - name: OTEL_PROPAGATORS',
+            '    value: tracecontext,baggage',
+            '  # 리소스 속성 — 환경별로 분리(dev/stage/prod)',
+            '  - name: OTEL_RESOURCE_ATTRIBUTES',
+            '    value: deployment.environment=prod,service.version=1.4.0',
+            '  # 앱 1차 샘플링(최종 비율은 gateway tail_sampling에서 결정)',
+            '  - name: OTEL_TRACES_SAMPLER',
+            '    value: parentbased_traceidratio',
+            '  - name: OTEL_TRACES_SAMPLER_ARG',
+            '    value: "0.1"',
+            '# ── 전체 흐름 ──',
+            '#  app(SDK) -> agent(k8sattributes) -> gateway(tail_sampling)',
+            '#           -> tempo(trace) / prometheus(metric) / loki(log)',
+            '# ── 배포 체크리스트 ──',
+            '#  [ ] 메시+앱 이중 계측 중복 확인',
+            '#  [ ] Operator/k8sattributes RBAC(파드 read) 부여',
+            '#  [ ] 리소스 부착 순서: k8sattributes -> resource -> batch',
+            '#  [ ] 환경별 설정 분리(dev/stage/prod)  # OpenTelemetry 완주',
+          ],
+          highlight: [6, 9, 19, 26],
+        },
+      },
+    ];
+
+    // 챕터 종합 배지 — 앞 챕터 개념
+    const CHAPTER_BADGES = [
+      { key: 'signal',   label: '신호 trace/metric/log', color: 'sky' },
+      { key: 'sdk',      label: 'SDK 계측',              color: 'violet' },
+      { key: 'collector',label: 'Collector 파이프라인',  color: 'amber' },
+      { key: 'backend',  label: '백엔드 Tempo/Prom/Loki',color: 'emerald' },
+      { key: 'ops',      label: '운영 샘플링·카디널리티', color: 'rose' },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — k8s 실전 통합 아키텍처
+    // ─────────────────────────────────────────────────────────
+    function IntegrationLiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+      const on = (f) => focus === f || focus === 'complete';
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🎓</span>
+              <span className="text-xs font-bold otel-text-dark">실전 통합 — 앱에서 백엔드까지</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">k8s · Istio · OTel</span>
+          </div>
+
+          <div className="p-4 space-y-2.5 min-h-[470px]" key={animKey}>
+
+            {/* k8s Pod: FastAPI + 주입 + Envoy */}
+            <PaneBox active={on('k8s') || on('fastapi') || on('mesh')} title="Pod · shop/catalog-api" icon="📦" color="otel">
+              <div className="grid grid-cols-3 gap-1.5">
+                <MiniCard active={on('fastapi')} name="FastAPI app" sub="라우트 span" tag="App" color="violet" />
+                <MiniCard active={on('k8s')} name="auto-inject" sub="Operator init" tag="SDK" color="amber" />
+                <MiniCard active={on('mesh')} name="Envoy sidecar" sub="mesh span" tag="Mesh" color="sky" />
+              </div>
+              <div className="mt-1.5 text-[9px] font-mono text-slate-500 text-center">
+                traceparent(W3C) 전파 &rarr; 메시 span + 앱 span 한 트레이스로 연결
+              </div>
+            </PaneBox>
+
+            <ArrowRow active={on('collector')} label="OTLP :4317 (노드 로컬 홉)" />
+
+            {/* agent Collector — DaemonSet */}
+            <PaneBox active={on('collector')} title="agent Collector · DaemonSet (노드마다)" icon="🚚" color="otel">
+              <div className="grid grid-cols-2 gap-1.5">
+                <MiniCard active={on('collector')} name="k8sattributes" sub="파드 메타 부착" tag="proc" color="emerald" />
+                <MiniCard active={on('collector')} name="batch" sub="묶어 전송" tag="proc" color="amber" />
+              </div>
+            </PaneBox>
+
+            <ArrowRow active={on('collector')} label="OTLP &rarr; 중앙 집계" />
+
+            {/* gateway Collector — Deployment */}
+            <PaneBox active={on('collector')} title="gateway Collector · Deployment (중앙)" icon="🏭" color="otel">
+              <div className="grid grid-cols-2 gap-1.5">
+                <MiniCard active={on('collector')} name="tail_sampling" sub="최종 샘플링" tag="proc" color="rose" />
+                <MiniCard active={on('collector')} name="routing" sub="신호별 분기" tag="proc" color="violet" />
+              </div>
+            </PaneBox>
+
+            <ArrowRow active={focus === 'complete'} label="신호별 백엔드 저장" />
+
+            {/* 백엔드 */}
+            <div className="grid grid-cols-3 gap-1.5">
+              <MiniCard active={focus === 'complete'} name="Tempo" sub="trace" tag="🔭" color="sky" />
+              <MiniCard active={focus === 'complete'} name="Prometheus" sub="metric" tag="📈" color="amber" />
+              <MiniCard active={focus === 'complete'} name="Loki" sub="log" tag="📜" color="emerald" />
+            </div>
+
+            {/* 챕터 종합 배지 (마지막 단계) */}
+            {focus === 'complete' && (
+              <div className="otel-bg-light border-2 otel-border rounded-lg p-2.5 mt-1 fade-in">
+                <div className="text-[11px] font-bold otel-text-dark mb-1.5">🎓 앞 챕터 종합 — OpenTelemetry 완주</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {CHAPTER_BADGES.map((b) => (
+                    <span key={b.key}
+                      className={`text-[9px] font-bold font-mono px-2 py-0.5 rounded-full border bg-${b.color}-100 text-${b.color}-700 border-${b.color}-300`}>
+                      {b.label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'k8s'       && 'Operator가 파드에 SDK를 주입 — 앱 이미지 변경 없이 자동 계측'}
+              {focus === 'collector' && 'agent(노드 로컬) + gateway(중앙) 2-tier — k8sattributes로 파드 메타 부착'}
+              {focus === 'mesh'      && 'Envoy 자동 span + 앱 span — traceparent로 연결, 이중 계측 주의'}
+              {focus === 'fastapi'   && 'FastAPIInstrumentor 자동 span + 비즈니스 커스텀 span 결합'}
+              {focus === 'complete'  && '앱 → agent → gateway → 백엔드 — 전 구간 통합 완주'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 공용 박스
+    function PaneBox({ active, title, icon, color, children }) {
+      const cls = active
+        ? 'otel-bg-light border-2 otel-border shadow-md scale-[1.005]'
+        : 'bg-white border border-slate-300 opacity-60';
+      return (
+        <div className={`rounded-lg p-2.5 transition-all duration-500 ${cls} fade-in`}>
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-sm">{icon}</span>
+            <span className="text-[11px] font-bold text-slate-800">{title}</span>
+            {active && <span className="ml-auto text-[9px] otel-bg text-white px-2 py-0.5 rounded-full font-bold">ON</span>}
+          </div>
+          {children}
+        </div>
+      );
+    }
+
+    function MiniCard({ active, name, sub, tag, color }) {
+      const base = {
+        sky:     'bg-sky-100 text-sky-700 border-sky-300',
+        violet:  'bg-violet-100 text-violet-700 border-violet-300',
+        emerald: 'bg-emerald-100 text-emerald-700 border-emerald-300',
+        amber:   'bg-amber-100 text-amber-700 border-amber-300',
+        rose:    'bg-rose-100 text-rose-700 border-rose-300',
+      }[color];
+      return (
+        <div className={`rounded border px-1.5 py-1 text-center transition-all duration-500 ${base} ${active ? 'ring-2 ring-offset-1 ring-slate-400/50' : 'opacity-70'}`}>
+          <div className="text-[10px] font-bold font-mono leading-tight truncate">{name}</div>
+          <div className="text-[8px] opacity-70 font-mono truncate">{sub}</div>
+          <div className="text-[8px] mt-0.5 px-1 inline-block bg-white/70 rounded">{tag}</div>
+        </div>
+      );
+    }
+
+    function ArrowRow({ active, label }) {
+      return (
+        <div className="flex flex-col items-center -my-0.5">
+          <div className={`text-xl leading-none transition-all duration-500 ${active ? 'otel-text' : 'text-slate-300'}`}>↓</div>
+          {label && (
+            <div className={`text-[9px] font-mono transition-colors ${active ? 'otel-text-dark font-bold' : 'text-slate-400'}`}>
+              {label}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-1-4</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs otel-text-dark font-bold">Part V. 실전 운영 &gt; Chapter 1. 통합</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">통합 패턴 — k8s · Mesh · FastAPI (OTel 완주)</h1>
+                </div>
+                <span className="ml-auto text-[11px] font-mono otel-bg-light otel-text-dark px-2 py-1 rounded">V-1-4</span>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                실전 환경에서 OTel을 통합하는 종합 패턴 —
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">Operator</code> 자동 주입 /
+                <code className="bg-slate-100 px-1 rounded text-xs">Collector 2-tier</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Service Mesh</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">FastAPI</code> 를 하나로 잇는다.
+              </p>
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: `${progress}%` }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <IntegrationLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 배너 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 완주 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                🎓 <strong>OpenTelemetry 완주</strong> — 신호·SDK·Collector·백엔드·운영을 거쳐 실전 통합까지 마쳤다.
+                이제 앱 파드에서 백엔드까지 전 구간을 하나의 관측 파이프라인으로 설계·배포할 수 있다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">🎓 OpenTelemetry 완주 — 허브로 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

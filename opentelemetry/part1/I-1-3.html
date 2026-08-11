@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — I-1-3. Context 전파 (Propagation)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔗</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root {
+      --otel:        #4F62AD;
+      --otel-dark:   #3D4E8C;
+      --otel-light:  #EAEDF7;
+      --otel-mid:    #6E80C4;
+      --otel-pale:   #D6DCEE;
+    }
+    .bg-otel       { background-color: var(--otel); }
+    .bg-otel-dark  { background-color: var(--otel-dark); }
+    .bg-otel-light { background-color: var(--otel-light); }
+    .bg-otel-mid   { background-color: var(--otel-mid); }
+    .bg-otel-pale  { background-color: var(--otel-pale); }
+    .text-otel     { color: var(--otel); }
+    .text-otel-dark{ color: var(--otel-dark); }
+    .border-otel   { border-color: var(--otel); }
+    .ring-otel     { --tw-ring-color: var(--otel); }
+    .shadow-otel   { box-shadow: 0 8px 20px -4px rgba(79, 98, 173, 0.35); }
+    .hover-bg-otel-dark:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    I-1-3. Context 전파 (Propagation)
+    학습 목표: 서비스 A 에서 만든 trace context 를 헤더로 실어 서비스 B 로 넘겨 하나의 trace 로 잇는다.
+    핵심 비유: "손편지에 붙인 우표" — traceparent 헤더가 봉투에 붙어 다음 서비스까지 문맥을 실어 나른다.
+    패턴: otel 표준 — 좌(LiveDataPane: A→헤더→B 전파 애니메이션) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 문제 — 서비스 경계에서 trace 가 끊긴다',
+        desc: '서비스 A 가 B 를 HTTP 로 호출할 때 A 의 trace_id 를 넘겨주지 않으면, B 의 SDK 는 "부모가 없는 새 요청"으로 판단해 새 trace_id 로 별개의 trace 를 시작한다. 그러면 하나의 사용자 요청이 A trace, B trace 두 조각으로 쪼개져 Jaeger 에서 연결이 안 보인다. 병목이 A 인지 B 인지 추적할 수 없고, "왜 느리지"를 서비스별로 따로 뒤져야 한다. 해결의 핵심은 A 의 문맥(trace_id, span_id)을 요청에 실어 B 로 넘기는 것 — 이것이 context 전파(propagation)다.',
+        focus: 'problem',
+        code: {
+          lang: 'http',
+          filename: 'no_propagation.http — 헤더 없이 호출하면 trace 가 쪼개진다',
+          lines: [
+            '# 서비스 A 가 B 를 호출 — 그런데 traceparent 헤더가 없다',
+            'POST http://order-service/orders HTTP/1.1',
+            'Host: order-service',
+            'Content-Type: application/json',
+            '# (traceparent 헤더 누락 — 여기가 문제)',
+            '',
+            '{ "userId": "u123", "itemId": "i2" }',
+            '',
+            '# 결과: B 의 SDK 는 부모 문맥을 못 찾는다',
+            '#   → B 는 새 root span 을 만들고 새 trace_id 를 발급',
+            '',
+            '# service A 로그:',
+            'trace_id=5b8aa5a2d2c872e8321cf37308d69df2  span=checkout',
+            '',
+            '# service B 로그 (다른 trace_id!):',
+            'trace_id=a14fe0091b7724cc90d2e51a0c8b7711  span=create_order',
+            '',
+            '# Jaeger 에서: 한 요청이 두 개의 끊긴 trace 로 보인다',
+            '#   → A 와 B 를 잇는 선이 없다 = 분산 추적의 의미가 사라짐',
+          ],
+          highlight: [5, 13, 16],
+        },
+      },
+      {
+        title: 'Step 2. traceparent — W3C Trace Context 헤더',
+        desc: 'W3C 가 표준화한 traceparent 헤더는 네 조각을 하이픈으로 잇는다: version(00) - trace_id(32 hex) - parent_span_id(16 hex) - trace_flags(01=sampled). 서비스 A 는 자기 현재 span 의 trace_id 와 span_id 를 이 형식으로 직렬화해 요청 헤더에 넣는다. 벤더 중립 표준이라 언어·프레임워크가 달라도 서로 통한다. 이 한 줄이 서비스 경계를 넘어 "너의 부모는 나야"라고 알려주는 유일한 연결고리다.',
+        focus: 'header',
+        code: {
+          lang: 'http',
+          filename: 'with_traceparent.http — 표준 헤더로 문맥을 실어 보낸다',
+          lines: [
+            '# 서비스 A → B 요청. 이번엔 traceparent 헤더를 붙였다',
+            'POST http://order-service/orders HTTP/1.1',
+            'Host: order-service',
+            'Content-Type: application/json',
+            'traceparent: 00-5b8aa5a2d2c872e8321cf37308d69df2-051581bf3cb55c13-01',
+            '#            ^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^ ^^',
+            '#            버전   trace_id (32 hex, 요청 식별) parent_span_id  flags',
+            '#            00                                 (A 의 현재 span) 01=sampled',
+            '',
+            '{ "userId": "u123", "itemId": "i2" }',
+            '',
+            '# flags 마지막 바이트: 01 = 이 trace 는 샘플링됨(수집 대상)',
+            '#                     00 = 샘플링 안 됨 → B 도 수집 생략 가능',
+            '',
+            '# 선택: tracestate 헤더로 벤더별 부가 정보 전달 (W3C 표준 쌍)',
+            'tracestate: rojo=00f067aa0ba902b7,congo=t61rcWkgMzE',
+          ],
+          highlight: [5, 6, 7, 8],
+        },
+      },
+      {
+        title: 'Step 3. Propagator — inject 로 넣고 extract 로 꺼낸다',
+        desc: 'Propagator 는 context 객체(현재 trace_id·span_id 를 담은)를 헤더 문자열로 직렬화(inject)하고, 반대편에서 헤더를 다시 context 로 역직렬화(extract)하는 규약이다. 자동 계측을 쓰면 HTTP 클라이언트가 요청 직전에 inject 를, 서버가 요청 수신 시 extract 를 알아서 호출한다. 표준은 TraceContext(W3C traceparent) 이고, 그 외 B3(Zipkin 계열) 등이 있다. 양쪽 서비스가 같은 propagator 를 써야 헤더 이름·형식이 맞아 문맥이 이어진다.',
+        focus: 'propagator',
+        code: {
+          lang: 'python',
+          filename: 'propagate.py — inject / extract 흐름 (보통 자동)',
+          lines: [
+            '# 개념 확인용: 자동 계측이 내부에서 이렇게 한다',
+            'from opentelemetry import trace',
+            'from opentelemetry.propagate import inject, extract',
+            'import httpx',
+            '',
+            'tracer = trace.get_tracer("checkout-gateway")',
+            '',
+            '# --- 보내는 쪽 (service A) ---',
+            'with tracer.start_as_current_span("checkout") as span:',
+            '    headers = {}',
+            '    inject(headers)   # 현재 context 를 traceparent 헤더로 직렬화',
+            '    # headers == {"traceparent": "00-5b8a..-0515..-01"}',
+            '    httpx.post("http://order-service/orders", headers=headers)',
+            '',
+            '# --- 받는 쪽 (service B) ---',
+            'def handle_request(request):',
+            '    ctx = extract(request.headers)   # 헤더 → 부모 context 복원',
+            '    with tracer.start_as_current_span("create_order", context=ctx):',
+            '        # 이 span 의 부모 = A 의 checkout span → 같은 trace_id',
+            '        save_order()',
+            '',
+            '# 실무: FastAPIInstrumentor / HTTPXClientInstrumentor 가',
+            '#       inject·extract 를 자동 호출한다 → 위 코드는 안 짜도 된다',
+          ],
+          highlight: [11, 13, 17, 18],
+        },
+      },
+      {
+        title: 'Step 4. Baggage — trace 를 따라 흐르는 key-value',
+        desc: 'Baggage 는 trace_id 처럼 전파되지만 용도가 다르다. 진입점에서 넣은 임의의 key-value(예: user.tier=gold, tenant=acme)가 모든 다운스트림 서비스에서 그대로 읽힌다. 덕분에 하위 서비스가 원 요청의 사용자 등급·실험군 같은 문맥을 재조회 없이 활용해 로그·분기에 쓸 수 있다. 단, baggage 는 전 서비스로 퍼지는 HTTP 헤더라 개인정보·민감정보를 담으면 유출 위험이 있고, 키가 많아지면 모든 요청 헤더가 무거워진다 — 딱 필요한 소수만.',
+        focus: 'baggage',
+        code: {
+          lang: 'python',
+          filename: 'baggage.py — 요청 문맥을 하위 서비스로 전달',
+          lines: [
+            'from opentelemetry import baggage, context',
+            'from opentelemetry import trace',
+            '',
+            'tracer = trace.get_tracer("checkout-gateway")',
+            '',
+            '# --- 진입점(A): baggage 에 값 심기 ---',
+            'ctx = baggage.set_baggage("user.tier", "gold")',
+            'ctx = baggage.set_baggage("experiment", "new_checkout", context=ctx)',
+            'context.attach(ctx)   # 현재 실행 문맥에 반영',
+            '',
+            '# 이후 A 가 호출하는 모든 서비스의 헤더에 자동 동봉:',
+            '#   baggage: user.tier=gold,experiment=new_checkout',
+            '',
+            '# --- 하위 서비스(B, C): 재조회 없이 읽기 ---',
+            'tier = baggage.get_baggage("user.tier")   # "gold"',
+            'if tier == "gold":',
+            '    span = trace.get_current_span()',
+            '    span.set_attribute("user.tier", tier)   # 로그/분기에 활용',
+            '',
+            '# 주의: baggage 는 전 서비스로 퍼지는 헤더다',
+            '#   - 민감정보(주민번호·카드번호) 금지 → 유출 표면이 넓다',
+            '#   - 키를 남발하면 모든 요청 헤더가 비대해진다 → 소수만',
+          ],
+          highlight: [7, 8, 15, 21],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — 전파가 조용히 끊기는 지점',
+        desc: '전파는 성공하면 티가 안 나지만 실패하면 trace 가 조용히 쪼개져 원인 파악이 어렵다. 대표 함정 넷: (1) 자동 계측이 안 걸린 커스텀 클라이언트에서 헤더 주입 누락, (2) A 는 B3, B 는 W3C 처럼 propagator 불일치로 헤더 형식이 안 맞아 extract 실패, (3) 스레드풀·큐·asyncio 등 비동기 경계에서 context 가 넘어가지 않아 유실, (4) baggage 남용으로 헤더 비대·정보 유출. 조직 전체가 동일 propagator 로 표준화하고, 비동기에는 context 를 명시적으로 넘겨야 한다.',
+        focus: 'pitfalls',
+        code: {
+          lang: 'python',
+          filename: 'pitfalls.py — 전파가 끊기는 지점과 방어',
+          lines: [
+            '# 함정 2 방어: 조직 전체가 같은 propagator 를 쓰도록 고정',
+            'from opentelemetry.propagate import set_global_textmap',
+            'from opentelemetry.propagators.composite import CompositePropagator',
+            'from opentelemetry.trace.propagation.tracecontext import (',
+            '    TraceContextTextMapPropagator )',
+            'from opentelemetry.baggage.propagation import W3CBaggagePropagator',
+            '',
+            'set_global_textmap(CompositePropagator([',
+            '    TraceContextTextMapPropagator(),   # W3C traceparent',
+            '    W3CBaggagePropagator(),            # baggage 헤더',
+            ']))',
+            '',
+            '# 함정 3 방어: 비동기 경계엔 context 를 명시적으로 넘긴다',
+            'from opentelemetry import context',
+            'from concurrent.futures import ThreadPoolExecutor',
+            '',
+            'ctx = context.get_current()          # 현재 문맥 캡처',
+            'def worker():',
+            '    token = context.attach(ctx)      # 워커 스레드에 문맥 복원',
+            '    try:',
+            '        do_work()                    # 여기 span 이 부모와 이어진다',
+            '    finally:',
+            '        context.detach(token)',
+            'ThreadPoolExecutor().submit(worker)',
+            '',
+            '# 함정 1: 커스텀 클라이언트는 inject() 를 직접 호출해 헤더 주입',
+            '# 함정 4: baggage 는 소수 키·비민감 정보만',
+          ],
+          highlight: [8, 9, 10, 17, 19],
+        },
+      },
+    ];
+
+    function LiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🔗</span>
+              <span className="text-xs font-bold text-slate-700">Propagation — 경계를 넘는 문맥</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">W3C traceparent</span>
+          </div>
+
+          <div className="p-4 min-h-[460px]" key={animKey}>
+            {focus === 'problem'    && <ProblemView />}
+            {focus === 'header'     && <HeaderView />}
+            {focus === 'propagator' && <PropagatorView />}
+            {focus === 'baggage'    && <BaggageView />}
+            {focus === 'pitfalls'   && <PitfallsView />}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'problem'    && '헤더가 없으면 B 는 새 trace 를 시작 — 한 요청이 두 조각으로 끊긴다'}
+              {focus === 'header'     && 'traceparent 한 줄이 trace_id·parent_span 을 경계 너머로 전달'}
+              {focus === 'propagator' && 'Propagator 가 inject(직렬화)·extract(역직렬화)로 문맥을 잇는다'}
+              {focus === 'baggage'    && 'Baggage key-value 가 trace 를 따라 모든 하위 서비스로 흐른다'}
+              {focus === 'pitfalls'   && '헤더 누락·propagator 불일치·비동기 유실이 trace 를 조용히 끊는다'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 1: 전파 없음 — trace 가 둘로 쪼개진다
+    function ProblemView() {
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">서비스 A → B 호출. traceparent 헤더가 없으면 문맥이 끊긴다.</div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex-1 text-center bg-otel-light border-2 rounded-lg px-2 py-3" style={{ borderColor: 'var(--otel)' }}>
+              <div className="text-2xl">🚪</div>
+              <div className="text-[11px] font-bold text-otel-dark">service A</div>
+              <div className="text-[9px] text-slate-500 font-mono">checkout span</div>
+              <div className="text-[9px] text-otel-dark font-mono mt-1">trace=5b8a..9df2</div>
+            </div>
+            <div className="flex flex-col items-center shrink-0">
+              <div className="text-lg leading-none text-red-500">⇢</div>
+              <div className="text-[8px] text-red-500 font-mono">no header</div>
+              <div className="text-[8px] text-red-500">✂ 끊김</div>
+            </div>
+            <div className="flex-1 text-center bg-red-50 border-2 border-red-300 rounded-lg px-2 py-3">
+              <div className="text-2xl">📦</div>
+              <div className="text-[11px] font-bold text-red-700">service B</div>
+              <div className="text-[9px] text-slate-500 font-mono">create_order span</div>
+              <div className="text-[9px] text-red-600 font-mono mt-1">trace=a14f..7711</div>
+            </div>
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            <div className="p-2 rounded-lg bg-otel-light border border-otel" style={{ borderColor: 'var(--otel)' }}>
+              <div className="text-[10px] text-otel-dark font-bold">Trace #1 (A)</div>
+              <div className="text-[9px] font-mono text-slate-600">checkout — 142ms</div>
+            </div>
+            <div className="p-2 rounded-lg bg-red-50 border border-red-300">
+              <div className="text-[10px] text-red-700 font-bold">Trace #2 (B) — 별개</div>
+              <div className="text-[9px] font-mono text-slate-600">create_order — 10ms</div>
+            </div>
+          </div>
+          <div className="mt-4 p-3 rounded-lg bg-amber-50 border border-amber-300">
+            <div className="text-[11px] text-amber-800 font-bold mb-1">❓ 한 요청인데 두 trace</div>
+            <div className="text-[10px] text-amber-700">A 와 B 를 잇는 선이 없어 병목이 어디인지 추적 불가</div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2: traceparent 헤더 구조
+    function HeaderView() {
+      const parts = [
+        { label: 'version', val: '00', color: 'text-slate-300' },
+        { label: 'trace_id (32 hex)', val: '5b8aa5a2d2c872e8321cf37308d69df2', color: 'text-emerald-300' },
+        { label: 'parent_span_id', val: '051581bf3cb55c13', color: 'text-amber-300' },
+        { label: 'flags', val: '01', color: 'text-sky-300' },
+      ];
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">A 가 자기 span 의 문맥을 표준 헤더 한 줄로 직렬화한다.</div>
+          <div className="p-3 rounded-lg bg-slate-900 text-slate-100 font-mono text-[10px] overflow-x-auto">
+            <div className="text-slate-400 mb-1"># request header (W3C Trace Context)</div>
+            <div className="whitespace-nowrap">
+              <span style={{ color: '#A5B4F0' }}>traceparent:</span>{' '}
+              <span className="text-slate-300">00</span>-<span className="text-emerald-300">5b8aa5a2d2c872e8321cf37308d69df2</span>-<span className="text-amber-300">051581bf3cb55c13</span>-<span className="text-sky-300">01</span>
+            </div>
+          </div>
+          <div className="mt-4 space-y-1.5">
+            {parts.map(p => (
+              <div key={p.label} className="flex items-center gap-2 rounded border border-slate-200 bg-slate-50 px-3 py-2">
+                <span className={`font-mono text-[11px] font-bold ${p.color === 'text-slate-300' ? 'text-slate-600' : p.color.replace('300', '600')}`}>{p.val}</span>
+                <span className="text-[10px] text-slate-500 ml-auto">{p.label}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 p-3 rounded-lg bg-otel-light border border-otel" style={{ borderColor: 'var(--otel)' }}>
+            <div className="text-[10px] text-otel-dark">
+              <span className="font-bold">💡</span> flags 의 <span className="font-mono">01</span> = 이 trace 는 샘플링됨(수집 대상). 벤더 중립 표준이라 언어가 달라도 통한다.
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3: propagator inject/extract
+    function PropagatorView() {
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">Propagator 가 context 를 헤더로 넣고(inject) 꺼낸다(extract).</div>
+          <div className="flex items-center justify-between gap-1">
+            <div className="flex-1 text-center bg-otel-light border-2 rounded-lg px-1 py-2" style={{ borderColor: 'var(--otel)' }}>
+              <div className="text-xl">🚪</div>
+              <div className="text-[10px] font-bold text-otel-dark">service A</div>
+              <div className="text-[8px] text-slate-500 font-mono">context</div>
+            </div>
+            <div className="flex flex-col items-center shrink-0 px-1">
+              <div className="text-[9px] text-otel-dark font-bold">inject()</div>
+              <div className="text-base leading-none text-otel">→</div>
+            </div>
+            <div className="text-center bg-slate-900 rounded-lg px-2 py-2 shrink-0">
+              <div className="text-lg">✉️</div>
+              <div className="text-[8px] text-emerald-300 font-mono">traceparent</div>
+            </div>
+            <div className="flex flex-col items-center shrink-0 px-1">
+              <div className="text-[9px] text-otel-dark font-bold">extract()</div>
+              <div className="text-base leading-none text-otel">→</div>
+            </div>
+            <div className="flex-1 text-center bg-otel-light border-2 rounded-lg px-1 py-2" style={{ borderColor: 'var(--otel)' }}>
+              <div className="text-xl">📦</div>
+              <div className="text-[10px] font-bold text-otel-dark">service B</div>
+              <div className="text-[8px] text-slate-500 font-mono">child span</div>
+            </div>
+          </div>
+          <div className="mt-4 p-2 rounded-lg bg-emerald-50 border border-emerald-300">
+            <div className="text-[10px] text-emerald-800 font-bold">✅ B 의 span parent = A 의 span → 같은 trace_id 로 하나의 trace</div>
+          </div>
+          <div className="mt-3 space-y-1.5">
+            <div className="text-[10px] text-slate-500 font-bold">Propagator 종류 (양쪽이 같아야 함)</div>
+            <div className="flex items-center gap-2 rounded border border-otel bg-otel-light px-3 py-1.5" style={{ borderColor: 'var(--otel)' }}>
+              <span className="text-[10px] font-bold text-otel-dark w-28 shrink-0">TraceContext</span>
+              <span className="text-[9px] text-slate-600 font-mono">W3C 표준 · traceparent (기본)</span>
+            </div>
+            <div className="flex items-center gap-2 rounded border border-slate-200 bg-slate-50 px-3 py-1.5">
+              <span className="text-[10px] font-bold text-slate-600 w-28 shrink-0">B3</span>
+              <span className="text-[9px] text-slate-600 font-mono">Zipkin 계열 · X-B3-TraceId</span>
+            </div>
+            <div className="flex items-center gap-2 rounded border border-slate-200 bg-slate-50 px-3 py-1.5">
+              <span className="text-[10px] font-bold text-slate-600 w-28 shrink-0">Baggage</span>
+              <span className="text-[9px] text-slate-600 font-mono">key-value 동봉 · baggage 헤더</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: baggage 흐름
+    function BaggageView() {
+      const services = [
+        { icon: '🚪', name: 'gateway (A)', note: 'set_baggage', active: true },
+        { icon: '📦', name: 'order (B)',   note: 'get_baggage', active: false },
+        { icon: '💳', name: 'payment (C)', note: 'get_baggage', active: false },
+      ];
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">진입점이 넣은 key-value 가 trace 를 따라 모든 하위 서비스로 흐른다.</div>
+          <div className="mb-3 p-2 rounded-lg bg-slate-900 text-slate-100 font-mono text-[10px] overflow-x-auto">
+            <span style={{ color: '#A5B4F0' }}>baggage:</span> <span className="text-emerald-300">user.tier</span>=<span className="text-amber-300">gold</span>,<span className="text-emerald-300">experiment</span>=<span className="text-amber-300">new_checkout</span>
+          </div>
+          <div className="space-y-2">
+            {services.map((s, i) => (
+              <div key={s.name} className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-1 rounded border border-otel bg-otel-light px-3 py-2" style={{ borderColor: 'var(--otel)' }}>
+                  <span className="text-base">{s.icon}</span>
+                  <span className="text-[11px] font-bold text-otel-dark w-28 shrink-0">{s.name}</span>
+                  <span className="text-[9px] font-mono text-slate-600">{s.note}</span>
+                  <span className="ml-auto text-[9px] font-mono text-otel-dark font-bold">tier=gold</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 p-3 rounded-lg bg-amber-50 border border-amber-300">
+            <div className="text-[11px] text-amber-800 font-bold mb-1">⚠️ baggage 는 전 서비스로 퍼지는 헤더</div>
+            <ul className="text-[10px] text-amber-700 space-y-0.5 list-disc list-inside">
+              <li>민감정보(주민번호·카드번호) 금지 — 유출 표면이 넓다</li>
+              <li>키 남발 금지 — 모든 요청 헤더가 비대해진다</li>
+            </ul>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5: 함정 목록
+    function PitfallsView() {
+      const traps = [
+        { icon: '🚫', title: '헤더 주입 누락', body: '자동 계측 안 걸린 커스텀 클라이언트 → inject() 직접 호출', color: 'bg-red-50 border-red-300 text-red-700' },
+        { icon: '🔀', title: 'Propagator 불일치', body: 'A 는 B3, B 는 W3C → 헤더 형식 달라 extract 실패', color: 'bg-red-50 border-red-300 text-red-700' },
+        { icon: '🧵', title: '비동기 경계 유실', body: '스레드풀·큐·asyncio 에서 context 미전달 → trace 끊김', color: 'bg-amber-50 border-amber-300 text-amber-800' },
+        { icon: '🎒', title: 'Baggage 남용', body: '키 남발·민감정보 → 헤더 비대·정보 유출', color: 'bg-amber-50 border-amber-300 text-amber-800' },
+      ];
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">전파는 실패해도 티가 안 난다 — trace 가 조용히 쪼개진다.</div>
+          <div className="space-y-2">
+            {traps.map(t => (
+              <div key={t.title} className={`flex items-start gap-2 rounded-lg border px-3 py-2 ${t.color}`}>
+                <span className="text-base leading-none mt-0.5">{t.icon}</span>
+                <div>
+                  <div className="text-[11px] font-bold">{t.title}</div>
+                  <div className="text-[10px] leading-snug">{t.body}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 p-3 rounded-lg bg-emerald-50 border border-emerald-300">
+            <div className="text-[11px] text-emerald-800 font-bold mb-1">✅ 방어 원칙</div>
+            <ul className="text-[10px] text-emerald-700 space-y-0.5 list-disc list-inside">
+              <li>조직 전체를 동일 propagator 로 표준화 (CompositePropagator)</li>
+              <li>비동기 경계엔 context 를 명시적으로 attach/detach</li>
+            </ul>
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium text-otel hover:text-otel-dark">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum I-1-3</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-otel text-white flex items-center justify-center rounded-full font-bold text-sm">I</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part I. OTel 기초 &gt; Chapter 1. Trace / Span</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Context 전파 (Propagation)</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                서비스 경계를 넘어 트레이스를 잇는 문맥 전파 — <strong>A 의 문맥을 헤더로 실어 B 로 넘겨 하나의 trace 로</strong>.
+                <code className="bg-slate-100 px-1 rounded text-xs">문제</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">traceparent</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Propagator</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Baggage</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">함정</code> 5 단계.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl bg-otel-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#D6DCEE' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#D6DCEE' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-otel-light border-2 border-otel text-otel-dark text-sm">
+                💡 다음(I-1-4)에서는 <strong>Sampling — 얼마나 수집할지 결정하기</strong>
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-otel text-white hover-bg-otel-dark transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./I-1-4.html" className="font-medium text-otel hover:text-otel-dark">I-1-4 Sampling &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

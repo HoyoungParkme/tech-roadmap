@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — IV-1-4. Loki — Log 백엔드 (Grafana 스택)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🗄️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root {
+      --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-mid: #6E80C4; --otel-light: #D6DCEE;
+      --loki: #F59E0B; --loki-dark: #B45309;
+    }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+    .loki-text { color: var(--loki-dark); }
+    .loki-border { border-color: var(--loki); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    IV-1-4. Loki — Log 백엔드 (Grafana 스택)
+    학습 목표: OTel 로그를 라벨 기반으로 Loki에 저장하고, trace_id로 트레이스와 상관시키며,
+               LogQL로 조회하고 Grafana(LGTM 스택)에서 로그와 트레이스를 왕복 이동한다.
+    핵심 비유: "도서관 색인 카드" — 본문(로그)은 서가에 그대로 쌓고, 라벨(색인)만 인덱싱한다.
+    패턴: fastapi 표준 — 좌(LGTM 상관 시각화) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────────
+    // 5 STEPS — Loki 로그 백엔드 & LGTM 상관
+    // ─────────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 전송 — OTel 로그를 Loki로',
+        desc: '로그도 trace/metric과 같은 OTLP 파이프라인을 탄다. 예전 lokiexporter는 deprecated이므로, Loki 3.0+ 가 자체 제공하는 /otlp 수신 엔드포인트로 보내는 것이 표준이다. 앱을 Loki에 직접 묶지 않고 Collector를 한 단계 두는 이유는, batch로 전송 효율을 올리고 재시도·큐로 백엔드 장애를 흡수하며, 나중에 백엔드를 Loki에서 다른 곳으로 바꿔도 앱 코드를 건드리지 않기 위해서다.',
+        focus: 'ship',
+        code: {
+          lang: 'yaml',
+          filename: 'otel-collector.yaml — 로그 파이프라인',
+          lines: [
+            '# OTel Collector — 로그 파이프라인 (OTLP 네이티브 전송)',
+            '',
+            '# lokiexporter(deprecated) 대신 Loki 3.0+ 의 /otlp 수신 사용',
+            'exporters:',
+            '  otlphttp/loki:',
+            '    endpoint: http://loki:3100/otlp     # Loki OTLP 엔드포인트',
+            '    tls: { insecure: true }',
+            '    retry_on_failure: { enabled: true } # 백엔드 장애 흡수',
+            '',
+            'processors:',
+            '  memory_limiter: { limit_mib: 512, check_interval: 1s }',
+            '  batch: { timeout: 5s, send_batch_size: 1024 }',
+            '',
+            'service:',
+            '  pipelines:',
+            '    logs:',
+            '      receivers:  [otlp]                # SDK가 OTLP로 push',
+            '      processors: [memory_limiter, batch]',
+            '      exporters:  [otlphttp/loki]       # Loki로 발송',
+          ],
+          highlight: [5, 6, 16, 19],
+        },
+      },
+      {
+        title: 'Step 2. 라벨 인덱스 — 무엇을 인덱싱하나',
+        desc: 'Loki의 핵심은 "로그 본문을 인덱싱하지 않는다"는 것이다. 오직 라벨(스트림 식별자)만 인덱싱하고 본문은 압축해 그대로 쌓는다. 그래서 Elasticsearch보다 훨씬 저렴하다. 라벨은 service_name, environment, namespace처럼 값의 종류가 적은(저카디널리티) 것만 골라야 한다. trace_id나 user_id를 라벨로 넣으면 스트림이 폭발적으로 늘어(고카디널리티) 인덱스가 터지고 쿼리가 느려진다 — 실무에서 가장 흔한 사고다.',
+        focus: 'label',
+        code: {
+          lang: 'yaml',
+          filename: 'loki-config.yaml — 라벨 vs 본문',
+          lines: [
+            '# Loki 설정 — 무엇을 인덱싱할지 결정 (라벨 vs 본문)',
+            '',
+            'limits_config:',
+            '  # OTLP resource 속성 중 라벨로 승격할 것 (저카디널리티만!)',
+            '  otlp_config:',
+            '    resource_attributes:',
+            '      attributes_config:',
+            '        - action: index_label',
+            '          attributes:',
+            '            - service.name',
+            '            - deployment.environment',
+            '            - k8s.namespace.name',
+            '  # 스트림당 라벨 수 상한 — 카디널리티 방어선',
+            '  max_label_names_per_series: 15',
+            '  # trace_id / user_id 처럼 값이 무한한 속성은 라벨 금지',
+            '  # → structured_metadata 로 저장 (인덱스 폭발 방지)',
+            '  allow_structured_metadata: true',
+          ],
+          highlight: [8, 9, 10, 11, 12, 14, 17],
+        },
+      },
+      {
+        title: 'Step 3. 상관 — 로그에 trace_id 주입',
+        desc: '3신호(로그·트레이스·메트릭) 상관의 출발점은 로그 한 줄에 trace_id와 span_id가 박혀 있는 것이다. OTel 로그 SDK(또는 로깅 라이브러리 appender)를 쓰면 현재 활성 span의 trace context가 로그 레코드에 자동으로 붙는다. 단, trace_id는 값이 무한하므로 라벨이 아니라 structured_metadata에 저장해야 한다. 이렇게 하면 라벨 카디널리티를 지키면서도 나중에 특정 요청의 trace_id로 로그를 정확히 집어낼 수 있다.',
+        focus: 'correlate',
+        code: {
+          lang: 'yaml',
+          filename: 'log-record.yaml — trace context 주입',
+          lines: [
+            '# OTel 로그 레코드 — 활성 span의 trace context 자동 첨부',
+            '# (SDK LoggingHandler / log appender 사용 시 자동)',
+            'log_record:',
+            '  body: "order created"',
+            '  severity: INFO',
+            '  trace_id: 4bf92f3577b34da6a3ce929d0e0e4736   # ← 자동 주입',
+            '  span_id:  00f067aa0ba902b7',
+            '  attributes:',
+            '    service.name: checkout',
+            '    user.id: u-8842                # 본문 속성 (라벨 아님)',
+            '',
+            '# Collector: trace_id 를 structured_metadata 로 (라벨 아님)',
+            'processors:',
+            '  transform:',
+            '    log_statements:',
+            '      - context: log',
+            '        statements:',
+            '          - set(attributes["trace_id"], trace_id.string)',
+          ],
+          highlight: [6, 7, 12, 18],
+        },
+      },
+      {
+        title: 'Step 4. 조회 — LogQL 문법',
+        desc: 'LogQL은 두 부분으로 읽는다. 앞의 라벨 셀렉터 {service_name="checkout"}는 인덱스를 써서 스트림을 빠르게 좁히고, 뒤의 파이프라인 필터 |= "error"는 좁혀진 본문을 훑어 파고든다. 반드시 라벨로 먼저 좁히는 습관이 중요하다 — 라벨 셀렉터 없이 필터만 쓰면 전체 로그를 스캔해 매우 느려진다. rate(...)로 감싸면 로그를 시계열 메트릭으로 바꿔 대시보드에 그릴 수 있다.',
+        focus: 'query',
+        code: {
+          lang: 'sql',
+          filename: 'queries.logql — LogQL 조회',
+          lines: [
+            '-- LogQL: 라벨 셀렉터(인덱스)로 좁히고 → 필터로 파고든다',
+            '',
+            '-- (1) 라벨 셀렉터: 인덱스 사용, 스트림을 먼저 좁힌다',
+            '{service_name="checkout", deployment_environment="prod"}',
+            '',
+            '-- (2) 파이프라인 필터: 본문을 훑는다 (인덱스 아님)',
+            '{service_name="checkout"} |= "error" | json | status >= 500',
+            '',
+            '-- (3) structured_metadata 의 trace_id 로 특정 요청 추적',
+            '{service_name="checkout"} | trace_id = "4bf92f3577b34da6"',
+            '',
+            '-- (4) metric query: 5분간 에러 로그 초당 발생률',
+            'sum(rate({service_name="checkout"} |= "error" [5m])) by (level)',
+            '',
+            '-- 라벨 없이 필터만 쓰면 전체 스캔 → 매우 느리다',
+          ],
+          highlight: [3, 4, 6, 7, 12, 13],
+        },
+      },
+      {
+        title: 'Step 5. 통합 — Grafana LGTM 왕복',
+        desc: 'LGTM은 Loki(로그)·Grafana(뷰)·Tempo(트레이스)·Mimir(메트릭)를 묶은 Grafana 관측 스택이다. 상관의 마지막 조각은 Grafana의 derived field로, 로그에 박힌 trace_id를 클릭 가능한 Tempo 링크로 바꿔 로그에서 트레이스로 곧장 점프하게 한다. 반대로 Tempo의 tracesToLogsV2는 트레이스에서 관련 로그로 돌아온다. 이 왕복이 갖춰지면 장애 조사 때 "이 에러 로그 → 이 요청의 전체 트레이스 → 관련 로그"를 몇 초 만에 오간다.',
+        focus: 'grafana',
+        code: {
+          lang: 'yaml',
+          filename: 'grafana-datasources.yaml — 상관 링크',
+          lines: [
+            '# Grafana — 로그↔트레이스 왕복 (LGTM 스택 상관)',
+            'datasources:',
+            '  # Loki: 로그의 trace_id 를 Tempo 링크로 (derived field)',
+            '  - name: Loki',
+            '    type: loki',
+            '    url: http://loki:3100',
+            '    jsonData:',
+            '      derivedFields:',
+            '        - name: TraceID',
+            '          matcherType: label',
+            '          matcherRegex: trace_id',
+            '          url: "${__value.raw}"',
+            '          datasourceUid: tempo        # 클릭 → Tempo로 점프',
+            '  # Tempo: 트레이스에서 다시 관련 로그로 (역방향)',
+            '  - name: Tempo',
+            '    type: tempo',
+            '    uid: tempo',
+            '    jsonData:',
+            '      tracesToLogsV2:',
+            '        datasourceUid: loki',
+            '        filterByTraceID: true',
+          ],
+          highlight: [8, 9, 10, 11, 12, 13, 18, 19],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — LGTM 상관 시각화
+    // ─────────────────────────────────────────────────────────
+    const NODES = [
+      { key: 'sdk',     icon: '📝', label: 'OTel SDK', sub: 'log + trace_id' },
+      { key: 'col',     icon: '🏭', label: 'Collector', sub: 'batch · OTLP' },
+      { key: 'loki',    icon: '🗄️', label: 'Loki', sub: 'labels + body' },
+      { key: 'grafana', icon: '📊', label: 'Grafana', sub: 'LogQL · derived' },
+      { key: 'tempo',   icon: '🔗', label: 'Tempo', sub: 'trace' },
+    ];
+
+    const ACTIVE_NODES = {
+      ship:      ['sdk', 'col', 'loki'],
+      label:     ['loki'],
+      correlate: ['sdk', 'loki'],
+      query:     ['loki', 'grafana'],
+      grafana:   ['grafana', 'tempo'],
+    };
+
+    function LokiLiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const active = ACTIVE_NODES[focus] || [];
+      const animKey = `step-${stepIdx}`;
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🗄️</span>
+              <span className="text-xs font-bold otel-text-dark">LGTM 스택 — 로그↔트레이스 상관</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">Loki 3.x · Grafana · Tempo</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={animKey}>
+
+            {/* LGTM 파이프라인 노드 5개 */}
+            <div className="flex items-stretch justify-between gap-1">
+              {NODES.map((n, i) => {
+                const on = active.includes(n.key);
+                return (
+                  <React.Fragment key={n.key}>
+                    <div className={`flex-1 rounded-lg border px-1.5 py-2 text-center transition-all duration-500 ${on ? 'otel-bg-light otel-border border-2 shadow-md scale-[1.03]' : 'bg-slate-50 border-slate-200 opacity-60'}`}>
+                      <div className="text-lg leading-none">{n.icon}</div>
+                      <div className={`text-[10px] font-bold mt-1 leading-tight ${on ? 'otel-text-dark' : 'text-slate-500'}`}>{n.label}</div>
+                      <div className="text-[8px] text-slate-400 font-mono leading-tight truncate">{n.sub}</div>
+                    </div>
+                    {i < NODES.length - 1 && (
+                      <div className={`self-center text-sm font-bold ${active.includes(n.key) && active.includes(NODES[i + 1].key) ? 'otel-text' : 'text-slate-300'}`}>
+                        {n.key === 'grafana' ? '↔' : '→'}
+                      </div>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </div>
+
+            {/* 포커스별 디테일 카드 */}
+            <div className="pt-1 fade-in" key={focus}>
+              <FocusDetail focus={focus} />
+            </div>
+
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'ship'      && 'OTLP로 Loki /otlp 엔드포인트에 전송 — Collector가 batch·재시도로 흡수'}
+              {focus === 'label'     && '라벨(색인)만 인덱싱, 본문은 그대로 저장 — 고카디널리티 라벨은 금물'}
+              {focus === 'correlate' && 'trace_id는 라벨이 아닌 structured_metadata로 — 3신호 상관의 열쇠'}
+              {focus === 'query'     && '라벨 셀렉터로 먼저 좁히고(빠름) → 파이프라인 필터로 파고든다(느림)'}
+              {focus === 'grafana'   && 'derived field로 로그→Tempo 점프, tracesToLogsV2로 트레이스→로그 복귀'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 포커스별 상세 시각화
+    function FocusDetail({ focus }) {
+      if (focus === 'ship') {
+        return (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+            <div className="text-xs font-bold text-slate-700 mb-2">📦 전송 흐름 — OTLP HTTP push</div>
+            <div className="space-y-2 text-[11px] font-mono">
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-1 rounded bg-white border border-slate-200">batch(1024)</span>
+                <span className="otel-text font-bold">→</span>
+                <span className="px-2 py-1 rounded otel-bg-light otel-text-dark border otel-border font-bold">POST :3100/otlp</span>
+                <span className="text-emerald-600 font-bold">200 OK</span>
+              </div>
+              <div className="text-[10px] text-slate-500 leading-snug font-sans">
+                큐가 차 있어도 <strong>retry_on_failure</strong>가 Loki 재시작을 흡수한다. 앱은 Collector만 알면 되고, 백엔드 교체 시 앱 코드는 그대로다.
+              </div>
+            </div>
+          </div>
+        );
+      }
+      if (focus === 'label') {
+        return (
+          <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="text-xs font-bold text-slate-700 mb-2">🏷️ 인덱싱되는 것 vs 아닌 것</div>
+            <div className="grid grid-cols-2 gap-2 text-[10px]">
+              <div className="rounded border border-emerald-300 bg-emerald-50 p-2">
+                <div className="font-bold text-emerald-700 mb-1">라벨 = 인덱싱 O</div>
+                <div className="font-mono text-emerald-800 space-y-0.5">
+                  <div>service_name</div>
+                  <div>environment</div>
+                  <div>namespace</div>
+                </div>
+                <div className="mt-1 text-emerald-600 font-sans">저카디널리티만</div>
+              </div>
+              <div className="rounded border border-red-300 bg-red-50 p-2">
+                <div className="font-bold text-red-700 mb-1">본문/메타 = 인덱싱 X</div>
+                <div className="font-mono text-red-800 space-y-0.5">
+                  <div>trace_id</div>
+                  <div>user_id</div>
+                  <div>log body</div>
+                </div>
+                <div className="mt-1 text-red-600 font-sans">라벨로 넣으면 폭발</div>
+              </div>
+            </div>
+            <div className="mt-2 text-[10px] text-amber-700 bg-amber-50 border loki-border rounded px-2 py-1 leading-snug">
+              ⚠️ 함정: trace_id를 라벨로 넣으면 요청마다 새 스트림 → 인덱스 폭발·쿼리 급감속
+            </div>
+          </div>
+        );
+      }
+      if (focus === 'correlate') {
+        return (
+          <div className="rounded-lg border border-slate-200 bg-[#282c34] p-3 font-mono text-[11px]">
+            <div className="text-slate-400 mb-2 font-sans font-bold text-xs">🧾 로그 레코드 (구조적 JSON)</div>
+            <div className="space-y-0.5 text-slate-300">
+              <div><span className="text-sky-300">"body"</span>: <span className="text-emerald-300">"order created"</span>,</div>
+              <div><span className="text-sky-300">"severity"</span>: <span className="text-emerald-300">"INFO"</span>,</div>
+              <div className="bg-amber-500/20 rounded px-1">
+                <span className="text-amber-300">"trace_id"</span>: <span className="text-amber-200">"4bf92f...4736"</span>,
+              </div>
+              <div><span className="text-sky-300">"span_id"</span>: <span className="text-slate-300">"00f067aa0ba902b7"</span>,</div>
+              <div><span className="text-sky-300">"service.name"</span>: <span className="text-emerald-300">"checkout"</span></div>
+            </div>
+            <div className="mt-2 text-[10px] text-slate-400 font-sans leading-snug">
+              활성 span의 trace context가 자동 주입 → structured_metadata로 저장되어 라벨 카디널리티는 그대로.
+            </div>
+          </div>
+        );
+      }
+      if (focus === 'query') {
+        const rows = [
+          { level: 'error', color: 'text-red-600 bg-red-50', msg: 'payment gateway timeout' },
+          { level: 'error', color: 'text-red-600 bg-red-50', msg: 'retry exhausted (3/3)' },
+          { level: 'warn',  color: 'text-amber-600 bg-amber-50', msg: 'slow query 1.2s' },
+        ];
+        return (
+          <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="text-[10px] font-mono bg-slate-800 text-slate-100 rounded px-2 py-1 mb-2 overflow-x-auto whitespace-nowrap">
+              {'{service_name="checkout"} |= "error"'}
+            </div>
+            <div className="space-y-1">
+              {rows.map((r, i) => (
+                <div key={i} className="flex items-center gap-2 text-[10px] font-mono">
+                  <span className={`px-1.5 py-0.5 rounded font-bold ${r.color}`}>{r.level}</span>
+                  <span className="text-slate-600 truncate">{r.msg}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-[10px] text-slate-500 font-sans leading-snug">
+              라벨 셀렉터가 스트림을 먼저 좁혀 스캔량을 줄인다. rate(...)로 감싸면 시계열 메트릭이 된다.
+            </div>
+          </div>
+        );
+      }
+      // grafana
+      return (
+        <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="text-xs font-bold text-slate-700 mb-2">🔗 로그 → 트레이스 점프</div>
+          <div className="text-[10px] font-mono flex items-center gap-2 flex-wrap">
+            <span className="px-1.5 py-0.5 rounded bg-red-50 text-red-600 font-bold">error</span>
+            <span className="text-slate-600">timeout</span>
+            <span className="px-1.5 py-0.5 rounded otel-bg text-white font-bold cursor-pointer">TraceID: 4bf92f</span>
+            <span className="otel-text font-bold">→</span>
+            <span className="px-1.5 py-0.5 rounded bg-violet-100 text-violet-700 border border-violet-300">Tempo</span>
+          </div>
+          <div className="mt-2 space-y-0.5">
+            {[
+              { w: 'w-full', name: 'checkout', color: 'bg-violet-400' },
+              { w: 'w-3/4', name: 'payment', color: 'bg-violet-300' },
+              { w: 'w-1/3', name: 'db.query', color: 'bg-red-400' },
+            ].map((s, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="text-[9px] font-mono text-slate-500 w-16 shrink-0 truncate">{s.name}</span>
+                <div className={`h-2 rounded ${s.w} ${s.color}`}></div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-[10px] text-slate-500 font-sans leading-snug">
+            derived field가 trace_id를 링크로 바꾼다. tracesToLogsV2로 역방향(트레이스→로그) 복귀도 가능.
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-4</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part IV. Exporter &amp; Backend &gt; Chapter 1. 백엔드</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Loki — Log 백엔드 (Grafana 스택)</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                로그를 <strong>라벨 기반</strong>으로 저장하고 <strong>trace와 연결</strong>한다.
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">OTLP</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">라벨 인덱스</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">LogQL</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">LGTM 상관</code> 으로 이어진다.
+              </p>
+              {/* 진행바 */}
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: `${progress}%` }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LokiLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음 파트(Part V)에서는 <strong>수집한 텔레메트리를 실제로 활용</strong>한다 — 대시보드·알림·SLO로 이어진다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="../part5/V-1-1.html" className="otel-text hover:otel-text-dark font-medium">Part V. 활용 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

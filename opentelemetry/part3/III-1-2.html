@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — III-1-2. Receiver 패턴</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3d4d8a; --otel-light: #eef0f9; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    III-1-2. Receiver 패턴 심화
+    학습 목표: Push vs Pull, 4가지 대표 receiver(OTLP·Prometheus·Filelog·K8s) 활용 패턴 이해
+    핵심 비유: "공항 입국 게이트" — 직접 비행기 도착(push) / 셔틀 마중(pull) / 짐 자동 분류(file) / 공항 안내(K8s 이벤트)
+    패턴: fastapi 표준 — 좌(4개 receiver 다이어그램) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. OTLP Receiver — Push 모델 (SDK 직송)',
+        desc: 'OpenTelemetry SDK가 앱 안에서 텔레메트리를 만들어 Collector로 직접 push 하는 가장 표준적인 방식이다. gRPC :4317(권장)와 HTTP :4318(브라우저/모바일 친화)을 동시에 열 수 있다. SDK가 batch + retry까지 책임지므로 Collector는 받기만 하면 된다. 공항으로 치면 비행기가 직접 게이트에 도착하는 직항 노선이다.',
+        focus: 'otlp',
+        code: {
+          lang: 'yaml',
+          filename: 'otlp-receiver.yaml — SDK 직송 입구',
+          lines: [
+            '# OTLP — OpenTelemetry 표준 push 프로토콜',
+            '# SDK 가 batch + retry 까지 책임',
+            '',
+            'receivers:',
+            '  otlp:',
+            '    protocols:',
+            '      # ① gRPC — 권장 (성능·압축 우수)',
+            '      grpc:',
+            '        endpoint: 0.0.0.0:4317',
+            '        max_recv_msg_size_mib: 16    # 큰 batch 허용',
+            '        max_concurrent_streams: 100',
+            '        read_buffer_size: 524288',
+            '        write_buffer_size: 524288',
+            '        keepalive:',
+            '          server_parameters:',
+            '            max_connection_idle: 11s',
+            '            max_connection_age: 12s',
+            '          enforcement_policy:',
+            '            min_time: 10s',
+            '            permit_without_stream: true',
+            '        tls:                          # mTLS 권장 (프로덕션)',
+            '          cert_file: /etc/otel/server.crt',
+            '          key_file:  /etc/otel/server.key',
+            '          client_ca_file: /etc/otel/ca.crt',
+            '',
+            '      # ② HTTP — 브라우저/모바일/방화벽 친화',
+            '      http:',
+            '        endpoint: 0.0.0.0:4318',
+            '        max_request_body_size: 16777216   # 16 MiB',
+            '        include_metadata: true             # 헤더 보존',
+            '        cors:',
+            '          allowed_origins:',
+            '            - http://localhost:*',
+            '            - https://*.example.com',
+            '          allowed_headers: [Authorization, X-Trace-Id]',
+            '          max_age: 7200',
+            '',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      receivers:  [otlp]',
+            '      processors: [batch]',
+            '      exporters:  [otlp/tempo]',
+            '',
+            '# SDK 환경변수만 맞추면 끝:',
+            '#   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-col:4317',
+            '#   OTEL_EXPORTER_OTLP_PROTOCOL=grpc',
+            '#   OTEL_SERVICE_NAME=checkout-api',
+          ],
+          highlight: [4, 8, 27, 38],
+        },
+      },
+      {
+        title: 'Step 2. Prometheus Receiver — Pull 모델 (scrape)',
+        desc: '기존 Prometheus 생태계와 호환하기 위한 receiver. Collector가 Prometheus처럼 동작하여 /metrics 엔드포인트를 주기적으로 scrape 한다. ServiceMonitor·PodMonitor를 그대로 사용할 수 있고, K8s SD(service discovery)도 동일하게 동작한다. 이미 Prometheus exporter를 가진 앱(레거시 포함)을 OTLP 세계로 가져올 때 다리 역할을 한다.',
+        focus: 'prometheus',
+        code: {
+          lang: 'yaml',
+          filename: 'prom-receiver.yaml — 기존 /metrics 흡수',
+          lines: [
+            '# Prometheus receiver — Collector 가 직접 scrape',
+            '# → 기존 Prometheus exporter / ServiceMonitor 그대로 활용',
+            '',
+            'receivers:',
+            '  prometheus:',
+            '    config:',
+            '      global:',
+            '        scrape_interval: 30s',
+            '        scrape_timeout: 10s',
+            '        external_labels:',
+            '          cluster: prod-seoul',
+            '',
+            '      scrape_configs:',
+            '        # ① 정적 타겟 — 단순 호스트 목록',
+            '        - job_name: app-static',
+            '          metrics_path: /metrics',
+            '          static_configs:',
+            '            - targets:',
+            '                - api-1:9090',
+            '                - api-2:9090',
+            '                - worker:9090',
+            '              labels:',
+            '                tier: backend',
+            '',
+            '        # ② Kubernetes SD — pod 자동 발견',
+            '        - job_name: k8s-pods',
+            '          kubernetes_sd_configs:',
+            '            - role: pod',
+            '          relabel_configs:',
+            '            # annotation 으로 scrape 여부 결정',
+            '            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]',
+            '              action: keep',
+            '              regex: "true"',
+            '            # 포트 추출',
+            '            - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]',
+            '              action: replace',
+            '              regex: ([^:]+)(?::\\d+)?;(\\d+)',
+            '              replacement: $1:$2',
+            '              target_label: __address__',
+            '            # 표준 라벨로 변환',
+            '            - source_labels: [__meta_kubernetes_namespace]',
+            '              target_label: k8s_namespace',
+            '            - source_labels: [__meta_kubernetes_pod_name]',
+            '              target_label: k8s_pod',
+            '',
+            '        # ③ 인증 — Bearer 토큰 / mTLS',
+            '        - job_name: secured-app',
+            '          metrics_path: /metrics',
+            '          scheme: https',
+            '          tls_config:',
+            '            ca_file: /etc/otel/ca.crt',
+            '          authorization:',
+            '            credentials_file: /var/run/secrets/token',
+            '          static_configs:',
+            '            - targets: [secured:8443]',
+            '',
+            '# Pull 의 장점: 앱이 죽으면 그냥 scrape 실패 → 헬스체크 효과',
+            '# Push 의 장점: 단명 작업(cronjob/lambda)도 텔레메트리 보낼 수 있음',
+          ],
+          highlight: [4, 14, 25, 46],
+        },
+      },
+      {
+        title: 'Step 3. Filelog Receiver — 로그 파일 tail',
+        desc: '컨테이너 stdout이나 앱 로그 파일을 tail 해서 파싱하는 receiver. K8s 환경에서 /var/log/pods/**/*.log를 읽고, JSON·정규식·multiline 등 다양한 operator 체인으로 파싱한다. Fluent Bit 대체로 점점 표준화되는 추세다. 공항의 자동 짐 분류 라인 — 컨베이어 위 짐을 종류별로 자동 라벨링하는 느낌이다.',
+        focus: 'filelog',
+        code: {
+          lang: 'yaml',
+          filename: 'filelog-receiver.yaml — 로그 파일 흡수',
+          lines: [
+            '# Filelog — 파일 tail + operator chain 으로 파싱',
+            '# 컨테이너 stdout (K8s) / 레거시 앱 로그 파일 모두 가능',
+            '',
+            'receivers:',
+            '  # ① 일반 JSON 라인 파일',
+            '  filelog/app:',
+            '    include: [/var/log/app/*.log]',
+            '    exclude: [/var/log/app/*.gz]',
+            '    start_at: beginning              # end: 끝부터, beginning: 처음부터',
+            '    fingerprint_size: 1024           # 파일 식별 (rotation 감지)',
+            '    poll_interval: 200ms',
+            '    operators:',
+            '      - type: json_parser',
+            '        parse_from: body',
+            '        timestamp:',
+            '          parse_from: attributes.ts',
+            '          layout: "%Y-%m-%dT%H:%M:%S.%LZ"',
+            '        severity:',
+            '          parse_from: attributes.level',
+            '          mapping:',
+            '            error: ERROR',
+            '            warn:  WARN',
+            '            info:  INFO',
+            '            debug: DEBUG',
+            '      - type: remove                  # 파싱 후 원본 ts 필드 제거',
+            '        field: attributes.ts',
+            '',
+            '  # ② Kubernetes pod 로그 (CRI 형식)',
+            '  filelog/k8s:',
+            '    include: [/var/log/pods/*/*/*.log]',
+            '    include_file_path: true',
+            '    operators:',
+            '      # CRI 라인: "2024-01-01T... stdout F {json}"',
+            '      - type: regex_parser',
+            '        regex: \'^(?P<time>\\S+) (?P<stream>stdout|stderr) (?P<flag>[FP]) (?P<log>.*)$\'',
+            '        timestamp:',
+            '          parse_from: attributes.time',
+            '          layout: "%Y-%m-%dT%H:%M:%S.%LNZ"',
+            '      # log 필드가 JSON이면 한 번 더 파싱',
+            '      - type: json_parser',
+            '        parse_from: attributes.log',
+            '        if: \'attributes.log matches "^\\\\{.*\\\\}$"\'',
+            '      # 파일 경로에서 namespace/pod/container 추출',
+            '      - type: regex_parser',
+            '        parse_from: attributes["log.file.path"]',
+            '        regex: \'/var/log/pods/(?P<ns>[^_]+)_(?P<pod>[^_]+)_[^/]+/(?P<ctr>[^/]+)/\'',
+            '        cache:',
+            '          size: 500',
+            '',
+            '  # ③ Multi-line (Java stacktrace)',
+            '  filelog/java:',
+            '    include: [/var/log/java/*.log]',
+            '    multiline:',
+            '      line_start_pattern: \'^\\d{4}-\\d{2}-\\d{2}\'    # 새 로그 시작 조건',
+            '    operators:',
+            '      - type: regex_parser',
+            '        regex: \'^(?P<ts>\\S+ \\S+) (?P<lvl>\\w+) (?P<msg>.*)$\'',
+            '',
+            '# 파일 → log signal 로 변환 → Loki/Elastic 으로 export',
+          ],
+          highlight: [5, 28, 48],
+        },
+      },
+      {
+        title: 'Step 4. K8s & Hostmetrics — 인프라 텔레메트리',
+        desc: '앱 외부의 인프라 신호도 같은 Collector 안에서 수집한다. k8s_events는 클러스터 이벤트(Pod 재시작·OOMKilled·Image Pull 실패)를 로그 신호로 받고, hostmetrics는 호스트 CPU·메모리·디스크·네트워크를 메트릭으로 받는다. K8scluster는 클러스터 리소스(Deployment·Node·Namespace)의 상태를 주기적으로 폴링한다. 공항으로 치면 항공편 안내 방송과 게이트 모니터에 해당한다.',
+        focus: 'k8s',
+        code: {
+          lang: 'yaml',
+          filename: 'infra-receivers.yaml — K8s + 호스트 수집',
+          lines: [
+            '# K8s 이벤트 + Hostmetrics + K8sCluster 통합',
+            '# → 인프라 시그널을 앱 텔레메트리와 같은 파이프라인으로',
+            '',
+            'receivers:',
+            '  # ① k8s_events — 클러스터 이벤트를 log 로',
+            '  k8s_events:',
+            '    auth_type: serviceAccount',
+            '    namespaces: []                  # 빈 배열 = 모든 ns',
+            '    # API server 부하 방지',
+            '    # → ServiceAccount 에 events get/list/watch 권한 필요',
+            '',
+            '  # ② hostmetrics — 노드 자체 메트릭',
+            '  hostmetrics:',
+            '    collection_interval: 30s',
+            '    root_path: /hostfs            # 컨테이너 안에서 호스트 본 위치',
+            '    scrapers:',
+            '      cpu:',
+            '        metrics:',
+            '          system.cpu.utilization:',
+            '            enabled: true',
+            '      memory:',
+            '        metrics:',
+            '          system.memory.utilization:',
+            '            enabled: true',
+            '      load:           {}',
+            '      disk:           {}',
+            '      filesystem:',
+            '        exclude_mount_points:',
+            '          mount_points: [/dev/*, /proc/*, /sys/*, /run/*]',
+            '          match_type: regexp',
+            '      network:        {}',
+            '      processes:      {}',
+            '      paging:         {}',
+            '',
+            '  # ③ k8s_cluster — 리소스 상태 메트릭',
+            '  k8s_cluster:',
+            '    auth_type: serviceAccount',
+            '    collection_interval: 30s',
+            '    node_conditions_to_report:',
+            '      - Ready',
+            '      - MemoryPressure',
+            '      - DiskPressure',
+            '    allocatable_types_to_report:',
+            '      - cpu',
+            '      - memory',
+            '      - storage',
+            '      - ephemeral-storage',
+            '    metrics:',
+            '      k8s.container.cpu_limit:    { enabled: true }',
+            '      k8s.container.memory_limit: { enabled: true }',
+            '      k8s.pod.phase:              { enabled: true }',
+            '',
+            'service:',
+            '  pipelines:',
+            '    metrics/infra:',
+            '      receivers:  [hostmetrics, k8s_cluster]',
+            '      processors: [memory_limiter, resource, batch]',
+            '      exporters:  [prometheus]',
+            '    logs/events:',
+            '      receivers:  [k8s_events]',
+            '      processors: [memory_limiter, resource, batch]',
+            '      exporters:  [loki]',
+            '',
+            '# DaemonSet 으로 노드마다 배포 → 노드별 hostmetrics 수집',
+            '# Deployment 하나로는 K8s API 만 폴링',
+          ],
+          highlight: [4, 12, 34, 52],
+        },
+      },
+    ];
+
+    // 좌 패널 별칭 (LiveDataPane 패턴)
+    const LiveDataPane = (props) => ReceiverPanel(props);
+
+    function ReceiverPanel({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+
+      const receivers = [
+        {
+          key: 'otlp', icon: '📡', name: 'OTLP', subtitle: 'Push · SDK 직송',
+          source: '앱 + OTel SDK', proto: 'gRPC :4317 / HTTP :4318',
+          color: 'sky', signals: ['Trace', 'Metric', 'Log'],
+        },
+        {
+          key: 'prometheus', icon: '🎯', name: 'Prometheus', subtitle: 'Pull · scrape',
+          source: '앱 /metrics', proto: 'HTTP scrape (30s)',
+          color: 'amber', signals: ['Metric'],
+        },
+        {
+          key: 'filelog', icon: '📜', name: 'Filelog', subtitle: 'tail · operator chain',
+          source: '/var/log/*.log', proto: 'tail + parse',
+          color: 'emerald', signals: ['Log'],
+        },
+        {
+          key: 'k8s', icon: '☸️', name: 'K8s / Host', subtitle: 'API + scrape',
+          source: 'K8s API · 호스트', proto: 'K8s SD · /hostfs',
+          color: 'violet', signals: ['Log', 'Metric'],
+        },
+      ];
+
+      const colorMap = {
+        sky: 'bg-sky-50 border-sky-400 shadow-sky-200/50',
+        amber: 'bg-amber-50 border-amber-400 shadow-amber-200/50',
+        emerald: 'bg-emerald-50 border-emerald-400 shadow-emerald-200/50',
+        violet: 'bg-violet-50 border-violet-400 shadow-violet-200/50',
+      };
+      const sigColor = {
+        Trace: 'bg-red-100 text-red-700 border-red-300',
+        Metric: 'bg-amber-100 text-amber-700 border-amber-300',
+        Log: 'bg-blue-100 text-blue-700 border-blue-300',
+      };
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📥</span>
+              <span className="text-xs font-bold otel-text-dark">Receivers — 공항 입국 게이트</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">Push · Pull · Tail · API</span>
+          </div>
+
+          <div className="p-4 space-y-2.5 min-h-[460px]" key={animKey}>
+            {receivers.map((r) => {
+              const isFocus = focus === r.key;
+              const cls = isFocus
+                ? `border-2 ${colorMap[r.color]} shadow-lg scale-[1.02]`
+                : 'bg-slate-50 border border-slate-200 opacity-60';
+              return (
+                <div key={r.key} className={`rounded-lg p-3 transition-all duration-500 ${cls} fade-in`}>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="text-xl">{r.icon}</span>
+                    <div className="flex-1">
+                      <div className="text-sm font-bold text-slate-800">{r.name}</div>
+                      <div className="text-[10px] text-slate-500 font-mono">{r.subtitle}</div>
+                    </div>
+                    {isFocus && <span className="text-[10px] otel-bg text-white px-2 py-0.5 rounded-full font-bold">FOCUS</span>}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-[10px]">
+                    <div className="bg-white/70 rounded border border-slate-200 px-2 py-1">
+                      <div className="text-slate-500 mb-0.5">source</div>
+                      <div className="font-mono font-bold text-slate-800 truncate">{r.source}</div>
+                    </div>
+                    <div className="bg-white/70 rounded border border-slate-200 px-2 py-1">
+                      <div className="text-slate-500 mb-0.5">protocol</div>
+                      <div className="font-mono font-bold text-slate-800 truncate">{r.proto}</div>
+                    </div>
+                  </div>
+                  <div className="mt-1.5 flex gap-1">
+                    <span className="text-[9px] text-slate-500 self-center">signals:</span>
+                    {r.signals.map((s) => (
+                      <span key={s} className={`text-[9px] font-bold border rounded px-1.5 py-0.5 ${sigColor[s]}`}>
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'otlp'       && '앱 SDK 가 직접 push · gRPC 권장 · batch+retry SDK 책임'}
+              {focus === 'prometheus' && '기존 /metrics scrape · K8s SD 그대로 · 레거시와 호환'}
+              {focus === 'filelog'    && '파일 tail + operator chain · CRI/multi-line 파싱'}
+              {focus === 'k8s'        && '클러스터 이벤트 · 노드 호스트 메트릭 · DaemonSet 배포'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-1-2</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. OpenTelemetry &gt; Chapter 1. Collector</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Receiver 패턴 심화</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                공항 입국 게이트 — <strong>4가지 수신 패턴</strong>으로 텔레메트리를 받는다.
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">OTLP push</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Prom pull</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Filelog tail</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">K8s API</code> 조합으로 누락 없는 수집.
+              </p>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <ReceiverPanel step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(III-2-1)에서는 <strong>Processor 핵심</strong> — batch · memory_limiter · resource · attributes 의 적용 순서와 패턴.
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="./III-1-1.html" className="text-slate-500 hover:text-slate-700">&larr; III-1-1 Collector 아키텍처</a>
+              <a href="./III-2-1.html" className="otel-text hover:otel-text-dark font-medium">III-2-1 Processor 핵심 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

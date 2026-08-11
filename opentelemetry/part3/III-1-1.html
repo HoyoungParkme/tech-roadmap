@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — III-1-1. Collector 아키텍처</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🏭</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3d4d8a; --otel-light: #eef0f9; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    III-1-1. Collector 아키텍처
+    학습 목표: receiver → processor → exporter 3단 파이프라인 구조와 데이터 흐름 이해
+    핵심 비유: "우체국 분류 공장" — 들어온 우편물(receiver) → 분류·라벨링(processor) → 발송(exporter)
+    패턴: fastapi 표준 — 좌(Collector 파이프라인 시각화) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 4 STEPS — Collector 파이프라인 구조
+    const STEPS = [
+      {
+        title: 'Step 1. Receivers — 텔레메트리 수집 입구',
+        desc: 'Collector의 첫 단계 receiver는 다양한 소스로부터 텔레메트리를 받아들이는 입구다. OTLP(gRPC :4317, HTTP :4318)가 OpenTelemetry 표준이지만, 기존 Prometheus scrape, Jaeger 프로토콜, Filelog, K8s 이벤트 등도 모두 수신 가능하다. 우체국에 들어오는 다양한 우편 접수창구(국제·국내·등기·일반)라고 보면 된다. 한 Collector가 여러 receiver를 동시에 운영한다.',
+        focus: 'receivers',
+        code: {
+          lang: 'yaml',
+          filename: 'config-receivers.yaml — 수집 입구 정의',
+          lines: [
+            '# Collector receivers 블록 — 어떤 입구로 받을지 선언',
+            '',
+            'receivers:',
+            '  # ① OTLP — OpenTelemetry 표준 (SDK가 push)',
+            '  otlp:',
+            '    protocols:',
+            '      grpc:',
+            '        endpoint: 0.0.0.0:4317      # SDK gRPC push',
+            '      http:',
+            '        endpoint: 0.0.0.0:4318      # SDK HTTP push',
+            '        cors:',
+            '          allowed_origins: ["http://localhost:*"]',
+            '',
+            '  # ② Prometheus scrape — 기존 /metrics 엔드포인트 polling',
+            '  prometheus:',
+            '    config:',
+            '      scrape_configs:',
+            '        - job_name: app-metrics',
+            '          scrape_interval: 30s',
+            '          static_configs:',
+            '            - targets: [api:9090, worker:9090]',
+            '',
+            '  # ③ Filelog — 로그 파일 tail',
+            '  filelog:',
+            '    include: [/var/log/app/*.log]',
+            '    start_at: beginning',
+            '    operators:',
+            '      - type: json_parser',
+            '        timestamp:',
+            '          parse_from: attributes.ts',
+            '          layout: "%Y-%m-%dT%H:%M:%S.%LZ"',
+            '',
+            '  # ④ Jaeger — 레거시 호환',
+            '  jaeger:',
+            '    protocols:',
+            '      thrift_http: { endpoint: 0.0.0.0:14268 }',
+            '      grpc:        { endpoint: 0.0.0.0:14250 }',
+            '',
+            '  # ⑤ Hostmetrics — 호스트 CPU/메모리/디스크',
+            '  hostmetrics:',
+            '    collection_interval: 10s',
+            '    scrapers:',
+            '      cpu:        {}',
+            '      memory:     {}',
+            '      disk:       {}',
+            '      filesystem: {}',
+            '      network:    {}',
+            '',
+            '# 한 Collector 인스턴스가 여러 receiver를 동시 운영',
+            '# → service.pipelines 에서 골라 조합한다',
+          ],
+          highlight: [4, 14, 24, 33, 39],
+        },
+      },
+      {
+        title: 'Step 2. Processors — 가공·필터링·집계',
+        desc: 'receiver와 exporter 사이에서 데이터를 가공하는 중간 단계. batch로 묶어 전송 효율을 올리고, memory_limiter로 OOM을 방지하고, attributes/resource로 공통 속성을 부착하고, filter로 노이즈를 제거하고, sampling으로 양을 줄인다. 우편 공장의 자동 분류·라벨링 라인이라고 보면 된다. 순서가 중요해서 보통 memory_limiter → resource → filter → batch 순으로 둔다.',
+        focus: 'processors',
+        code: {
+          lang: 'yaml',
+          filename: 'config-processors.yaml — 가공 단계',
+          lines: [
+            '# Collector processors 블록 — 가공 파이프라인 부품',
+            '',
+            'processors:',
+            '  # ① memory_limiter — OOM 차단 (가장 먼저 적용)',
+            '  memory_limiter:',
+            '    check_interval: 1s',
+            '    limit_mib: 512                # 하드 한계',
+            '    spike_limit_mib: 128          # 일시적 스파이크 허용',
+            '',
+            '  # ② resource — 공통 리소스 속성 부착',
+            '  resource:',
+            '    attributes:',
+            '      - key: cluster',
+            '        value: prod-seoul',
+            '        action: upsert',
+            '      - key: env',
+            '        value: production',
+            '        action: insert',
+            '',
+            '  # ③ attributes — span/log 속성 가공',
+            '  attributes:',
+            '    actions:',
+            '      - key: http.request.header.authorization',
+            '        action: delete            # 민감정보 제거',
+            '      - key: user.id',
+            '        action: hash              # PII 해싱',
+            '',
+            '  # ④ filter — 노이즈 제거 (health check 등)',
+            '  filter:',
+            '    traces:',
+            '      span:',
+            '        - \'attributes["http.target"] == "/health"\'',
+            '        - \'attributes["http.target"] == "/metrics"\'',
+            '',
+            '  # ⑤ batch — 효율적 전송 (마지막에 적용)',
+            '  batch:',
+            '    timeout: 5s',
+            '    send_batch_size: 512',
+            '    send_batch_max_size: 1024',
+            '',
+            '# 권장 순서: memory_limiter → resource → attributes → filter → batch',
+            '# → 메모리 보호 먼저, 그다음 가공, 마지막에 배치',
+          ],
+          highlight: [4, 10, 20, 28, 35],
+        },
+      },
+      {
+        title: 'Step 3. Exporters — 백엔드로 전송',
+        desc: '가공된 텔레메트리를 최종 목적지(Jaeger, Tempo, Prometheus, Datadog 등)로 보내는 단계. 한 Collector가 여러 exporter를 동시 운영할 수 있고, 같은 데이터를 여러 곳으로 fan-out 하거나 신호별(trace/metric/log)로 다른 백엔드에 보낼 수 있다. 우체국의 발송 트럭들이다 — 각각의 목적지(도시) 별로 트럭이 따로 있다.',
+        focus: 'exporters',
+        code: {
+          lang: 'yaml',
+          filename: 'config-exporters.yaml — 발송 트럭들',
+          lines: [
+            '# Collector exporters 블록 — 어디로 보낼지',
+            '',
+            'exporters:',
+            '  # ① OTLP — 표준 (Tempo, Jaeger 새 버전 등)',
+            '  otlp/tempo:',
+            '    endpoint: tempo:4317',
+            '    tls:',
+            '      insecure: true',
+            '    sending_queue:',
+            '      enabled: true',
+            '      num_consumers: 4',
+            '      queue_size: 5000',
+            '    retry_on_failure:',
+            '      enabled: true',
+            '      initial_interval: 5s',
+            '      max_interval: 30s',
+            '      max_elapsed_time: 300s',
+            '',
+            '  # ② Prometheus — pull 방식 노출 (Collector가 /metrics 서빙)',
+            '  prometheus:',
+            '    endpoint: 0.0.0.0:8889',
+            '    const_labels:',
+            '      cluster: prod-seoul',
+            '',
+            '  # ③ Loki — 로그 백엔드',
+            '  loki:',
+            '    endpoint: http://loki:3100/loki/api/v1/push',
+            '    default_labels_enabled:',
+            '      exporter: false',
+            '      job: true',
+            '',
+            '  # ④ debug — 로컬 디버깅용 (콘솔 출력)',
+            '  debug:',
+            '    verbosity: detailed',
+            '    sampling_initial: 5',
+            '    sampling_thereafter: 200',
+            '',
+            '  # ⑤ file — 파일로 dump (감사/리플레이)',
+            '  file:',
+            '    path: /var/log/otel/audit.json',
+            '    rotation:',
+            '      max_megabytes: 100',
+            '      max_days: 7',
+            '',
+            '# exporter 별로 큐·재시도 정책을 각자 설정',
+            '# → 한 곳이 느려도 다른 곳은 영향 받지 않음',
+          ],
+          highlight: [4, 19, 25, 32, 38],
+        },
+      },
+      {
+        title: 'Step 4. Service Pipelines — 부품 조립',
+        desc: '앞 단계에서 정의한 receivers/processors/exporters는 부품일 뿐이고, 실제 데이터 흐름은 service.pipelines에서 신호별(traces/metrics/logs)로 조립한다. 같은 receiver를 여러 파이프라인이 공유할 수 있고, 같은 processor도 재사용 가능하다. 공장의 전체 조립 라인 설계도라고 보면 된다. 이 부분만 보면 데이터가 어떻게 흐르는지 한눈에 파악된다.',
+        focus: 'pipelines',
+        code: {
+          lang: 'yaml',
+          filename: 'config-service.yaml — 조립 라인 정의',
+          lines: [
+            '# 부품들을 신호별 파이프라인으로 조립',
+            '',
+            'service:',
+            '  # 텔레메트리 자체 모니터링 (Collector 자기 메트릭)',
+            '  telemetry:',
+            '    logs:',
+            '      level: info',
+            '    metrics:',
+            '      level: detailed',
+            '      address: 0.0.0.0:8888       # Collector 자체 /metrics',
+            '',
+            '  # extensions — health_check, pprof, zpages 등',
+            '  extensions: [health_check, pprof]',
+            '',
+            '  # ★ 핵심: 신호별 파이프라인 조립',
+            '  pipelines:',
+            '',
+            '    # ① Trace 파이프라인',
+            '    traces:',
+            '      receivers:  [otlp, jaeger]',
+            '      processors: [memory_limiter, resource, filter, batch]',
+            '      exporters:  [otlp/tempo, debug]',
+            '',
+            '    # ② Metric 파이프라인 — 여러 소스 합치기',
+            '    metrics:',
+            '      receivers:  [otlp, prometheus, hostmetrics]',
+            '      processors: [memory_limiter, resource, batch]',
+            '      exporters:  [prometheus]',
+            '',
+            '    # ③ Log 파이프라인 — 파일 + SDK 두 소스',
+            '    logs:',
+            '      receivers:  [otlp, filelog]',
+            '      processors: [memory_limiter, resource, attributes, batch]',
+            '      exporters:  [loki, file]',
+            '',
+            '    # ④ 동일 신호 다중 파이프라인 (이름 뒤에 / 식별자)',
+            '    traces/audit:',
+            '      receivers:  [otlp]',
+            '      processors: [batch]',
+            '      exporters:  [file]              # 감사용 별도 흐름',
+            '',
+            '# pipelines 단위로 데이터가 흐른다',
+            '# → 부품 재사용 + 신호별 독립 라우팅',
+          ],
+          highlight: [18, 24, 30, 36],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — Collector 파이프라인 시각화
+    // ─────────────────────────────────────────────────────────
+    function CollectorPipeline({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🏭</span>
+              <span className="text-xs font-bold otel-text-dark">Collector — 우체국 분류 공장</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">otel-col v0.96 · CNCF</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={animKey}>
+
+            {/* Step 1: Receivers */}
+            <PipelineStage
+              active={focus === 'receivers'}
+              dimmed={focus !== 'receivers' && focus !== 'pipelines'}
+              title="Receivers — 입구"
+              icon="📥"
+              items={[
+                { name: 'otlp/grpc', port: ':4317', tag: 'OTel' },
+                { name: 'otlp/http', port: ':4318', tag: 'OTel' },
+                { name: 'prometheus', port: 'scrape', tag: 'Pull' },
+                { name: 'filelog', port: 'tail', tag: 'File' },
+                { name: 'jaeger', port: ':14250', tag: 'Legacy' },
+                { name: 'hostmetrics', port: '—', tag: 'Host' },
+              ]}
+              color="sky"
+            />
+
+            <ArrowDown active={focus !== 'receivers'} label="signal in" />
+
+            {/* Step 2: Processors */}
+            <PipelineStage
+              active={focus === 'processors'}
+              dimmed={!['processors','pipelines'].includes(focus)}
+              title="Processors — 가공 라인"
+              icon="⚙️"
+              items={[
+                { name: 'memory_limiter', port: '512MiB', tag: '1st' },
+                { name: 'resource', port: 'upsert', tag: '2nd' },
+                { name: 'attributes', port: 'hash/del', tag: '3rd' },
+                { name: 'filter', port: '/health', tag: '4th' },
+                { name: 'batch', port: '5s/512', tag: 'last' },
+              ]}
+              color="violet"
+            />
+
+            <ArrowDown active={focus !== 'receivers' && focus !== 'processors'} label="processed" />
+
+            {/* Step 3: Exporters */}
+            <PipelineStage
+              active={focus === 'exporters'}
+              dimmed={!['exporters','pipelines'].includes(focus)}
+              title="Exporters — 발송 트럭"
+              icon="📤"
+              items={[
+                { name: 'otlp/tempo', port: ':4317', tag: 'Trace' },
+                { name: 'prometheus', port: ':8889', tag: 'Metric' },
+                { name: 'loki', port: ':3100', tag: 'Log' },
+                { name: 'debug', port: 'stdout', tag: 'Dev' },
+                { name: 'file', port: 'audit.json', tag: 'Audit' },
+              ]}
+              color="emerald"
+            />
+
+            {/* Step 4: Service.Pipelines 강조 */}
+            {focus === 'pipelines' && (
+              <div className="otel-bg-light border-2 otel-border rounded-lg p-3 fade-in mt-2">
+                <div className="text-xs font-bold otel-text-dark mb-2">⚙️ service.pipelines 조립</div>
+                <div className="space-y-1.5">
+                  {[
+                    { sig: 'traces', from: '[otlp, jaeger]', via: '[mem, res, filter, batch]', to: '[tempo, debug]' },
+                    { sig: 'metrics', from: '[otlp, prom, host]', via: '[mem, res, batch]', to: '[prometheus]' },
+                    { sig: 'logs', from: '[otlp, filelog]', via: '[mem, res, attr, batch]', to: '[loki, file]' },
+                  ].map((p) => (
+                    <div key={p.sig} className="text-[10px] font-mono bg-white rounded border border-slate-200 px-2 py-1">
+                      <span className="font-bold otel-text">{p.sig}</span>
+                      <span className="text-slate-500">: </span>
+                      <span className="text-sky-700">{p.from}</span>
+                      <span className="text-slate-400"> → </span>
+                      <span className="text-violet-700">{p.via}</span>
+                      <span className="text-slate-400"> → </span>
+                      <span className="text-emerald-700">{p.to}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'receivers'  && '여러 소스의 텔레메트리를 한 곳에서 수신 (OTLP/Prom/File/Jaeger)'}
+              {focus === 'processors' && '가공 단계 — memory 보호 → 속성 부착 → 노이즈 제거 → 배치'}
+              {focus === 'exporters'  && '신호별 백엔드로 전송 — 큐 + 재시도 정책 내장'}
+              {focus === 'pipelines'  && '부품을 신호별로 조립 — 데이터 흐름이 한눈에'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 공용 stage 박스
+    function PipelineStage({ active, dimmed, title, icon, items, color }) {
+      const cls = active
+        ? `bg-${color}-50 border-2 border-${color}-400 shadow-lg shadow-${color}-200/40 scale-[1.01]`
+        : dimmed
+        ? 'bg-slate-50 border border-slate-200 opacity-50'
+        : 'bg-white border border-slate-300';
+      const tagCls = {
+        sky:     'bg-sky-100 text-sky-700 border-sky-300',
+        violet:  'bg-violet-100 text-violet-700 border-violet-300',
+        emerald: 'bg-emerald-100 text-emerald-700 border-emerald-300',
+      }[color];
+
+      return (
+        <div className={`rounded-lg p-3 transition-all duration-500 ${cls} fade-in`}>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-base">{icon}</span>
+            <span className="text-sm font-bold text-slate-800">{title}</span>
+            {active && <span className="ml-auto text-[10px] otel-bg text-white px-2 py-0.5 rounded-full font-bold">FOCUS</span>}
+          </div>
+          <div className="grid grid-cols-3 gap-1.5">
+            {items.map((it) => (
+              <div key={it.name} className={`rounded border ${tagCls} px-1.5 py-1 text-center`}>
+                <div className="text-[10px] font-bold font-mono leading-tight truncate">{it.name}</div>
+                <div className="text-[8px] opacity-70 font-mono truncate">{it.port}</div>
+                <div className="text-[8px] mt-0.5 px-1 inline-block bg-white/70 rounded">{it.tag}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function ArrowDown({ active, label }) {
+      return (
+        <div className="flex flex-col items-center -my-1">
+          <div className={`text-2xl leading-none transition-all duration-500 ${active ? 'otel-text' : 'text-slate-300'}`}>
+            ↓
+          </div>
+          {label && (
+            <div className={`text-[9px] font-mono transition-colors ${active ? 'otel-text-dark font-bold' : 'text-slate-400'}`}>
+              {label}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum III-1-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">III</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part III. OpenTelemetry &gt; Chapter 1. Collector</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Collector 아키텍처</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                우체국 분류 공장 — <strong>receiver → processor → exporter</strong> 3단 파이프라인으로 텔레메트리를 받아 가공하고 발송한다.
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">receivers</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">processors</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">exporters</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">service.pipelines</code> 부품을 조립한다.
+              </p>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <CollectorPipeline step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(III-1-2)에서는 <strong>Receiver 패턴 심화</strong> — OTLP·Prometheus·Filelog·K8s 이벤트 수집을 자세히 본다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브로</a>
+              <a href="./III-1-2.html" className="otel-text hover:otel-text-dark font-medium">III-1-2 Receiver 패턴 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

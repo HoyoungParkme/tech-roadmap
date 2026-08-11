@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — IV-1-3. Prometheus — Metric 백엔드</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-light: #D6DCEE; --otel-mid: #6E80C4; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    IV-1-3. Prometheus — Metric 백엔드
+    학습 목표: OTel 메트릭을 Prometheus로 저장·조회하는 두 경로(scrape / remote_write)와
+               OTLP→Prometheus 변환 규칙, temporality, exemplar, PromQL 실무 이해
+    핵심 비유: "센서 데이터 창고" — 두 배송 방식(수거 트럭 vs 직송)으로 시계열 창고에 적재
+    패턴: fastapi 표준 — 좌(두 경로 애니메이션) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 6 STEPS — OTel Metric → Prometheus
+    const STEPS = [
+      {
+        title: 'Step 1. 두 경로 — scrape vs remote_write',
+        desc: 'OTel 메트릭을 Prometheus에 넣는 길은 크게 둘이다. 첫째, Collector의 prometheusexporter가 /metrics 엔드포인트를 열어두면 Prometheus가 주기적으로 긁어(scrape)간다. 둘째, prometheusremotewriteexporter가 Prometheus의 remote_write API로 직접 밀어(push)넣는다. scrape는 Prometheus가 타깃 상태(up/down)를 스스로 관리하고 서비스 디스커버리와 잘 맞아 표준적이지만, 방화벽 뒤 단기 실행 작업에는 약하다. remote_write는 push라 짧게 사는 배치·서버리스에 유리하지만 백프레셔·큐 관리를 직접 신경 써야 한다.',
+        focus: 'overview',
+        code: {
+          lang: 'yaml',
+          filename: 'collector.yaml — 두 exporter 정의',
+          lines: [
+            '# 같은 OTel 메트릭을 두 방식으로 Prometheus에 태울 수 있다',
+            '',
+            'exporters:',
+            '  # 경로 A — pull: Collector가 /metrics 를 서빙, Prometheus가 scrape',
+            '  prometheus:',
+            '    endpoint: 0.0.0.0:8889          # 여기로 Prometheus가 긁어감',
+            '    const_labels:',
+            '      cluster: prod-seoul',
+            '    resource_to_telemetry_conversion:',
+            '      enabled: true                 # resource 속성을 라벨로',
+            '',
+            '  # 경로 B — push: Collector가 remote_write API로 직접 전송',
+            '  prometheusremotewrite:',
+            '    endpoint: http://prometheus:9090/api/v1/write',
+            '    tls:',
+            '      insecure: true',
+            '    resource_to_telemetry_conversion:',
+            '      enabled: true',
+            '',
+            'service:',
+            '  pipelines:',
+            '    metrics:',
+            '      receivers:  [otlp]',
+            '      processors: [batch]',
+            '      exporters:  [prometheus, prometheusremotewrite]',
+            '',
+            '# 보통 둘 중 하나만 고른다 — 여기선 대비용으로 함께 표기',
+          ],
+          highlight: [4, 5, 12, 13],
+        },
+      },
+      {
+        title: 'Step 2. OTLP → Prometheus 이름·라벨·단위 변환',
+        desc: 'OTLP 메트릭 모델과 Prometheus 텍스트 모델은 표기법이 달라 자동 변환이 일어난다. 점(.)이 들어간 OTLP 이름은 언더스코어(_)로 바뀌고, 단위가 이름 접미사로 붙으며(예: 초 단위는 _seconds), Counter 계열에는 관례상 _total이 붙는다. Resource 속성(service.name 등)은 옵션을 켜야 라벨로 승격된다. 이 규칙을 모르면 대시보드에서 기대한 메트릭 이름이 안 잡혀 헤매게 된다. 특히 이름 충돌·중복 라벨은 스크레이프 자체를 깨뜨리므로 변환 결과를 항상 /metrics 원문으로 확인하는 습관이 중요하다.',
+        focus: 'convert',
+        code: {
+          lang: 'yaml',
+          filename: '/metrics 원문 — 변환 결과 확인',
+          lines: [
+            '# curl http://collector:8889/metrics 로 실제 노출 형태 확인',
+            '',
+            '# OTLP 이름:  http.server.request.duration  (unit: s)',
+            '# Prometheus: http_server_request_duration_seconds  (+_seconds)',
+            '',
+            '# TYPE http_server_request_duration_seconds histogram',
+            'http_server_request_duration_seconds_bucket{le="0.1"} 240',
+            'http_server_request_duration_seconds_bucket{le="0.5"} 512',
+            'http_server_request_duration_seconds_bucket{le="+Inf"} 530',
+            'http_server_request_duration_seconds_sum   18.7',
+            'http_server_request_duration_seconds_count 530',
+            '',
+            '# OTLP Counter:  orders.created  →  orders_created_total (+_total)',
+            '# TYPE orders_created_total counter',
+            'orders_created_total{service_name="checkout",env="prod"} 1042',
+            '',
+            '# 변환 규칙 요약',
+            '#  1) 점(.) → 언더스코어(_)',
+            '#  2) 단위 접미사 부착: s→_seconds, By→_bytes',
+            '#  3) Counter → _total 접미사',
+            '#  4) resource 속성은 conversion 옵션 켜야 라벨로 승격',
+          ],
+          highlight: [3, 4, 13, 15],
+        },
+      },
+      {
+        title: 'Step 3. Temporality — delta vs cumulative',
+        desc: 'Prometheus는 태생이 cumulative(단조 증가 누적) 모델이다. Counter는 계속 커지고, rate()가 증가분을 계산한다. 반면 OTel SDK는 delta(구간 증가분)로 내보내는 경우가 많다(특히 일부 언어·서버리스 기본값). delta 메트릭을 그대로 Prometheus에 태우면 값이 튀거나 rate()가 엉뚱하게 나온다. 그래서 Collector에서 cumulative로 맞춰줘야 한다. SDK의 temporality preference를 cumulative로 두거나, deltatocumulative 프로세서로 창고 입고 전에 변환한다. 이 불일치가 Prometheus 연동 최악의 함정 1순위다.',
+        focus: 'temporality',
+        code: {
+          lang: 'yaml',
+          filename: 'collector.yaml — delta를 cumulative로',
+          lines: [
+            '# 함정: SDK가 delta 로 보내면 Prometheus 에서 값이 튄다',
+            '',
+            'processors:',
+            '  # delta counter/histogram 을 cumulative 로 변환',
+            '  deltatocumulative:',
+            '    max_stale: 5m                  # 오래된 스트림은 폐기',
+            '    max_streams: 100000            # 메모리 상한 (카디널리티 방어)',
+            '',
+            '  batch: {}',
+            '',
+            'service:',
+            '  pipelines:',
+            '    metrics:',
+            '      receivers:  [otlp]',
+            '      # deltatocumulative 를 배치 앞에 배치',
+            '      processors: [deltatocumulative, batch]',
+            '      exporters:  [prometheus]',
+            '',
+            '# 대안 1) SDK 환경변수로 아예 cumulative 로 내보내기',
+            '#   OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative',
+            '# 대안 2) 위처럼 Collector 에서 변환 (SDK 손 못 댈 때)',
+          ],
+          highlight: [5, 6, 7, 16],
+        },
+      },
+      {
+        title: 'Step 4. Exemplar — metric에서 trace로 점프',
+        desc: 'exemplar는 특정 메트릭 샘플에 대표 trace_id를 붙여두는 기능이다. 지연 히스토그램의 꼬리(느린 요청)가 왜 느린지 궁금할 때, 그 버킷의 exemplar를 클릭하면 바로 해당 trace로 점프한다 — 메트릭(무엇이)과 트레이스(왜)를 잇는 다리다. Prometheus는 exemplar 저장을 위해 별도 스토리지 플래그를, remote_write는 send_exemplars 옵션을 켜야 한다. exemplar가 없으면 대시보드에서 이상치를 봐도 근본 원인 트레이스를 찾기 위해 다시 로그를 헤매야 한다.',
+        focus: 'exemplar',
+        code: {
+          lang: 'yaml',
+          filename: 'exemplar 활성화 — metric↔trace 연결',
+          lines: [
+            '# exemplar: 히스토그램 버킷에 대표 trace_id 를 첨부',
+            '',
+            'exporters:',
+            '  prometheusremotewrite:',
+            '    endpoint: http://prometheus:9090/api/v1/write',
+            '    send_exemplars: true             # exemplar 함께 전송',
+            '',
+            '# Prometheus 쪽도 exemplar 저장을 켜야 한다 (기동 플래그)',
+            '#   --enable-feature=exemplar-storage',
+            '#   --storage.exemplars.exemplars-limit=100000',
+            '',
+            '# /metrics 노출 예 — 값 뒤 # 로 exemplar 가 붙는다',
+            '# http_server_request_duration_seconds_bucket{le="0.5"} 512 # {trace_id="a1b2c3"} 0.47',
+            '',
+            '# 효과: Grafana 히스토그램 패널에서 느린 버킷의 점을 클릭 →',
+            '#       trace_id 로 Tempo/Jaeger 트레이스 상세로 바로 이동',
+            '# 주의: exemplar 는 표본이라 모든 요청이 아니라 대표 몇 개만 남는다',
+          ],
+          highlight: [6, 9, 13],
+        },
+      },
+      {
+        title: 'Step 5. PromQL — 저장된 메트릭 조회',
+        desc: '창고에 적재됐으면 PromQL로 꺼내 본다. Counter는 절대값이 아니라 rate()/increase()로 초당 증가율을 보고, 히스토그램은 histogram_quantile()로 p95/p99를 뽑는다. 라벨로 서비스·엔드포인트별 분해(by)와 합산(sum)을 한다. 여기서 Step 2의 변환 규칙이 다시 중요해진다 — 이름에 _total, _seconds가 붙었다는 걸 알아야 쿼리가 맞는다. 잘못된 rate 구간(너무 짧으면 데이터 부족, 너무 길면 급변 놓침)은 흔한 실수라 scrape_interval의 4배 이상을 관례로 쓴다.',
+        focus: 'promql',
+        code: {
+          lang: 'sql',
+          filename: 'queries.promql — 실전 조회',
+          lines: [
+            '-- 1) 초당 주문 생성률 (Counter → rate)',
+            'sum(rate(orders_created_total[5m])) by (service_name)',
+            '',
+            '-- 2) p95 응답시간 (Histogram → quantile)',
+            'histogram_quantile(',
+            '  0.95,',
+            '  sum(rate(http_server_request_duration_seconds_bucket[5m])) by (le, route)',
+            ')',
+            '',
+            '-- 3) 에러율 (%) — 5xx 비중',
+            '100 * sum(rate(http_requests_total{status=~"5.."}[5m]))',
+            '    / sum(rate(http_requests_total[5m]))',
+            '',
+            '-- 4) 특정 서비스만 필터 + 상위 5개',
+            'topk(5, sum(rate(orders_created_total[5m])) by (route))',
+            '',
+            '-- 팁: rate 윈도우는 scrape_interval 의 4배 이상 (예 30s→2m 이상)',
+            '-- 팁: Counter 에만 rate/increase, Gauge 엔 그대로 avg/max',
+          ],
+          highlight: [2, 5, 6, 7],
+        },
+      },
+      {
+        title: 'Step 6. 실무 함정 정리',
+        desc: '연동을 깨는 단골 원인은 넷이다. 첫째 temporality 불일치 — delta를 cumulative로 안 맞추면 그래프가 톱니처럼 튄다. 둘째 메트릭 이름 규칙 — _total, _seconds 접미사를 모르고 쿼리하면 데이터가 없다고 착각한다. 셋째 고카디널리티 라벨 — user_id, request_id 같은 무한 값 라벨을 붙이면 시계열이 폭발해 Prometheus 메모리가 터진다. 넷째 방식 선택 — 안정적 서비스는 scrape, 단기·서버리스는 remote_write가 정석이다. 배포 전 /metrics 원문과 up 메트릭, TSDB 카디널리티를 반드시 눈으로 확인하라.',
+        focus: 'pitfalls',
+        code: {
+          lang: 'yaml',
+          filename: 'checklist.yaml — 배포 전 점검',
+          lines: [
+            '# Prometheus 연동 배포 전 체크리스트',
+            '',
+            'temporality:',
+            '  check: SDK 또는 Collector 에서 cumulative 로 통일했는가',
+            '  fix:   deltatocumulative 프로세서 또는 TEMPORALITY_PREFERENCE',
+            '',
+            'naming:',
+            '  check: 쿼리 이름에 _total / _seconds 접미사를 반영했는가',
+            '  verify: curl collector:8889/metrics 로 원문 확인',
+            '',
+            'cardinality:',
+            '  danger: [user_id, request_id, session_id, full_url]',
+            '  reason: 값이 무한 → 시계열 폭발 → OOM',
+            '  fix:    attributes processor 로 고카디널리티 라벨 제거',
+            '',
+            'transport:',
+            '  scrape:       안정적 상시 서비스 (서비스 디스커버리 궁합)',
+            '  remote_write: 단기 배치 / 서버리스 / 방화벽 뒤 push',
+            '',
+            '# 마지막: up{job="..."} == 1 과 prometheus_tsdb_head_series 확인',
+          ],
+          highlight: [3, 7, 11, 16],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 두 경로(scrape / remote_write) 시각화
+    // ─────────────────────────────────────────────────────────
+    function LiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+
+      const scrapeActive = focus === 'overview' || focus === 'promql';
+      const pushActive = focus === 'overview' || focus === 'exemplar';
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🔥</span>
+              <span className="text-xs font-bold otel-text-dark">OTel Metric → Prometheus 창고</span>
+            </div>
+            <span className="text-[10px] text-slate-600 font-mono">otel-col · prometheus 2.x</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={animKey}>
+
+            {/* 소스: OTel SDK → Collector */}
+            <div className="flex items-center gap-2">
+              <Node icon="📦" label="OTel SDK" sub="metrics" tone="mid" active />
+              <Flow active label="OTLP" />
+              <Node icon="🏭" label="Collector" sub="metrics pipeline" tone="dark" active />
+            </div>
+
+            {/* 변환 박스 (Step 2 강조) */}
+            <ConvertBox focus={focus} />
+
+            {/* temporality 박스 (Step 3 강조) */}
+            {focus === 'temporality' && <TemporalityBox />}
+
+            {/* 두 경로 분기 */}
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <PathCard
+                active={scrapeActive}
+                dimmed={!scrapeActive && focus !== 'convert'}
+                title="경로 A · scrape (pull)"
+                exporter="prometheusexporter"
+                arrow="⟵"
+                arrowLabel=":8889/metrics 를 Prometheus가 긁어감"
+                tone="sky"
+              />
+              <PathCard
+                active={pushActive}
+                dimmed={!pushActive && focus !== 'convert'}
+                title="경로 B · remote_write (push)"
+                exporter="remotewriteexporter"
+                arrow="⟶"
+                arrowLabel="api/v1/write 로 직접 밀어넣음"
+                tone="emerald"
+              />
+            </div>
+
+            {/* Prometheus 창고 */}
+            <div className={`rounded-lg border-2 p-3 transition-all duration-500 fade-in ${focus === 'promql' ? 'otel-bg-light otel-border shadow-lg' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-base">🗄️</span>
+                <span className="text-sm font-bold text-slate-800">Prometheus TSDB — 시계열 창고</span>
+                {focus === 'promql' && <span className="ml-auto text-[10px] otel-bg text-white px-2 py-0.5 rounded-full font-bold">QUERY</span>}
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 text-[10px] font-mono">
+                <Series name="orders_created_total" val="1042" hot={focus === 'convert' || focus === 'promql'} />
+                <Series name="..._duration_seconds_bucket" val="530" hot={focus === 'convert' || focus === 'exemplar'} />
+                <Series name="http_requests_total" val="8.1k" hot={focus === 'promql'} />
+                <Series name="up{job=api}" val="1" hot={focus === 'pitfalls'} />
+              </div>
+              {focus === 'exemplar' && (
+                <div className="mt-2 text-[10px] font-mono bg-white rounded border border-slate-200 px-2 py-1 fade-in">
+                  <span className="text-slate-500">bucket le=0.5 </span>
+                  <span className="text-slate-700">512 </span>
+                  <span className="otel-text font-bold">＃ trace_id=a1b2c3 → 트레이스로 점프</span>
+                </div>
+              )}
+            </div>
+
+            {/* 소비: PromQL / Grafana */}
+            <div className="flex items-center gap-2">
+              <Node icon="🔎" label="PromQL" sub="rate/quantile" tone="mid" active={focus === 'promql'} />
+              <Flow active={focus === 'promql'} label="query" />
+              <Node icon="📊" label="Grafana" sub="대시보드·알림" tone="light" active={focus === 'promql'} />
+            </div>
+
+            {/* pitfalls 배너 */}
+            {focus === 'pitfalls' && (
+              <div className="rounded-lg border-2 border-red-300 bg-red-50 p-2 fade-in">
+                <div className="text-[11px] font-bold text-red-700 mb-1">⚠️ 배포 전 필수 점검 4</div>
+                <div className="grid grid-cols-2 gap-1 text-[9px] text-red-700 font-mono">
+                  <span>1. temporality 통일</span>
+                  <span>2. _total/_seconds 이름</span>
+                  <span>3. 고카디널리티 제거</span>
+                  <span>4. scrape vs remote_write</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'overview' && 'scrape(pull)와 remote_write(push) 두 경로를 한눈에 대비'}
+              {focus === 'convert' && '점→언더스코어, 단위·_total 접미사, resource→라벨 변환'}
+              {focus === 'temporality' && 'delta를 cumulative로 맞춰야 Prometheus에서 안 튄다'}
+              {focus === 'exemplar' && '메트릭 샘플에 trace_id를 붙여 트레이스로 점프'}
+              {focus === 'promql' && 'rate·histogram_quantile로 저장된 시계열 조회'}
+              {focus === 'pitfalls' && '연동을 깨는 단골 함정 4가지를 배포 전 확인'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 노드 박스
+    function Node({ icon, label, sub, tone, active }) {
+      const toneCls = {
+        mid: 'otel-bg-mid text-white',
+        dark: 'otel-bg-dark text-white',
+        light: 'otel-bg-light otel-text-dark',
+      }[tone];
+      return (
+        <div className={`flex-1 rounded-lg px-2 py-2 text-center transition-all duration-500 ${toneCls} ${active ? 'shadow-md scale-[1.02]' : 'opacity-60'}`}>
+          <div className="text-lg leading-none">{icon}</div>
+          <div className="text-[11px] font-bold mt-0.5">{label}</div>
+          <div className="text-[8px] opacity-80 font-mono">{sub}</div>
+        </div>
+      );
+    }
+
+    function Flow({ active, label }) {
+      return (
+        <div className="flex flex-col items-center shrink-0 w-14">
+          <div className={`text-xl leading-none transition-colors ${active ? 'otel-text' : 'text-slate-300'}`}>→</div>
+          <div className={`text-[8px] font-mono ${active ? 'otel-text-dark font-bold' : 'text-slate-400'}`}>{label}</div>
+        </div>
+      );
+    }
+
+    // ── 변환 박스
+    function ConvertBox({ focus }) {
+      const on = focus === 'convert';
+      return (
+        <div className={`rounded-lg border-2 p-2.5 transition-all duration-500 fade-in ${on ? 'otel-bg-light otel-border shadow-lg' : 'bg-slate-50 border-slate-200 opacity-70'}`}>
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-sm">🔤</span>
+            <span className="text-xs font-bold text-slate-800">OTLP → Prometheus 변환</span>
+            {on && <span className="ml-auto text-[10px] otel-bg text-white px-2 py-0.5 rounded-full font-bold">FOCUS</span>}
+          </div>
+          <div className="grid grid-cols-2 gap-1.5 text-[9px] font-mono">
+            <div className="bg-white rounded border border-slate-200 px-2 py-1">
+              <span className="text-slate-400">otlp </span>orders.created
+            </div>
+            <div className="bg-white rounded border border-slate-200 px-2 py-1">
+              <span className="otel-text font-bold">→ </span>orders_created_total
+            </div>
+            <div className="bg-white rounded border border-slate-200 px-2 py-1">
+              <span className="text-slate-400">unit </span>s (초)
+            </div>
+            <div className="bg-white rounded border border-slate-200 px-2 py-1">
+              <span className="otel-text font-bold">→ </span>..._seconds
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── temporality 박스
+    function TemporalityBox() {
+      return (
+        <div className="rounded-lg border-2 border-amber-300 bg-amber-50 p-2.5 fade-in">
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-sm">📈</span>
+            <span className="text-xs font-bold text-amber-800">Temporality — delta vs cumulative</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-[10px]">
+            <div className="bg-white rounded border border-red-200 px-2 py-1.5">
+              <div className="font-bold text-red-600">delta (구간 증가분)</div>
+              <div className="font-mono text-slate-600 mt-0.5">+3 +1 +4 +1 ...</div>
+              <div className="text-[9px] text-red-500 mt-0.5">그대로 넣으면 튄다</div>
+            </div>
+            <div className="bg-white rounded border border-emerald-200 px-2 py-1.5">
+              <div className="font-bold text-emerald-600">cumulative (누적)</div>
+              <div className="font-mono text-slate-600 mt-0.5">3 4 8 9 ...</div>
+              <div className="text-[9px] text-emerald-600 mt-0.5">Prometheus 표준</div>
+            </div>
+          </div>
+          <div className="text-[9px] text-amber-700 font-mono mt-1.5">deltatocumulative 프로세서로 변환 → 안정</div>
+        </div>
+      );
+    }
+
+    // ── 경로 카드
+    function PathCard({ active, dimmed, title, exporter, arrow, arrowLabel, tone }) {
+      const toneCls = {
+        sky: 'bg-sky-50 border-sky-300 text-sky-800',
+        emerald: 'bg-emerald-50 border-emerald-300 text-emerald-800',
+      }[tone];
+      const cls = active
+        ? `${toneCls} border-2 shadow-md scale-[1.01]`
+        : dimmed
+        ? 'bg-slate-50 border border-slate-200 opacity-50'
+        : 'bg-white border border-slate-300';
+      return (
+        <div className={`rounded-lg p-2.5 transition-all duration-500 fade-in ${cls}`}>
+          <div className="text-[11px] font-bold mb-1">{title}</div>
+          <div className="text-[10px] font-mono bg-white/70 rounded px-1.5 py-0.5 inline-block mb-1">{exporter}</div>
+          <div className="flex items-center gap-1 text-[9px] font-mono">
+            <span className="text-base leading-none">{arrow}</span>
+            <span className="opacity-80">{arrowLabel}</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 시계열 항목
+    function Series({ name, val, hot }) {
+      return (
+        <div className={`rounded border px-1.5 py-1 flex justify-between transition-colors ${hot ? 'otel-bg-light otel-border font-bold' : 'bg-white border-slate-200'}`}>
+          <span className="truncate otel-text-dark">{name}</span>
+          <span className="text-slate-500 ml-1">{val}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-3</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs otel-text-dark font-bold">Part IV. Exporter &amp; Backend &gt; Chapter 1</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Prometheus — Metric 백엔드</h1>
+                </div>
+                <span className="ml-auto text-[11px] font-mono otel-bg-light otel-text-dark px-2 py-1 rounded">IV-1-3</span>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                OTel 메트릭을 Prometheus로 저장·조회 —
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">prometheusexporter</code>(scrape) /
+                <code className="bg-slate-100 px-1 rounded text-xs">prometheusremotewrite</code>(push) 두 경로,
+                변환 규칙·temporality·exemplar·PromQL을 실무 관점으로 본다.
+              </p>
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: `${progress}%` }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 배너 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(IV-1-4)에서는 <strong>Tempo — Trace 백엔드</strong> — OTLP 트레이스를 Tempo로 저장하고 exemplar로 연결한다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./IV-1-4.html" className="otel-text hover:otel-text-dark font-medium">IV-1-4 Tempo — Trace 백엔드 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

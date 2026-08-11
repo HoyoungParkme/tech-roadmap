@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — II-1-2. SDK 구조 — Provider / Processor / Exporter</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🛠️</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root {
+      --otel:        #4F62AD;
+      --otel-dark:   #3D4E8C;
+      --otel-light:  #EAEDF7;
+      --otel-mid:    #6E80C4;
+      --otel-pale:   #D6DCEE;
+    }
+    .bg-otel       { background-color: var(--otel); }
+    .bg-otel-dark  { background-color: var(--otel-dark); }
+    .bg-otel-light { background-color: var(--otel-light); }
+    .bg-otel-mid   { background-color: var(--otel-mid); }
+    .bg-otel-pale  { background-color: var(--otel-pale); }
+    .text-otel     { color: var(--otel); }
+    .text-otel-dark{ color: var(--otel-dark); }
+    .border-otel   { border-color: var(--otel); }
+    .ring-otel     { --tw-ring-color: var(--otel); }
+    .shadow-otel   { box-shadow: 0 8px 20px -4px rgba(79, 98, 173, 0.35); }
+    .hover-bg-otel-dark:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    II-1-2. SDK 구조 — Provider / Processor / Exporter
+    학습 목표: 텔레메트리가 생성되어 백엔드로 내보내지는 SDK 파이프라인(3단 구조)을 이해한다.
+    핵심 비유: "공장 → 컨베이어(배치) → 출하 트럭" — TracerProvider(공장) / SpanProcessor(컨베이어) / Exporter(출하)
+    패턴: fastapi 표준 — 좌(LiveDataPane: SDK 파이프라인 애니메이션) / 우(VSCode 코드, python)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. TracerProvider — tracer 를 만드는 공장 + 전역 설정',
+        desc: 'TracerProvider 는 SDK 의 진입점이자 tracer 공장이다. tracer 를 만들어 나눠주고, Resource(서비스 이름·버전·환경)와 Sampler(얼마나 수집할지) 같은 전역 설정을 한곳에 보유한다. 글로벌에 한 번만 등록(set_tracer_provider)하고 앱 전체가 같은 provider 에서 tracer 를 받는 이유는, 파이프라인과 설정을 한 지점에서 통제하기 위해서다. provider 가 없거나 잘못 등록되면 이후 만드는 모든 span 이 아무 데도 안 가는 no-op 이 되어 조용히 사라진다.',
+        focus: 'provider',
+        code: {
+          lang: 'python',
+          filename: 'tracer_provider.py — SDK 진입점 만들기',
+          lines: [
+            '# 1) SDK 진입점 = TracerProvider — tracer 공장 + 전역 설정 보유',
+            'from opentelemetry import trace',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.resources import Resource',
+            '',
+            '# Resource: 모든 span 에 붙는 공통 꼬리표 (어느 서비스인지 식별)',
+            'resource = Resource.create({',
+            '    "service.name": "checkout-api",',
+            '    "service.version": "1.4.2",',
+            '    "deployment.environment": "production",',
+            '})',
+            '',
+            '# provider 를 만들고 글로벌로 한 번만 등록한다',
+            'provider = TracerProvider(resource=resource)',
+            'trace.set_tracer_provider(provider)',
+            '',
+            '# 앱 전체가 같은 provider 에서 tracer 를 받아 쓴다',
+            'tracer = trace.get_tracer("checkout.service")',
+            '',
+            '# provider 미등록 시 tracer 는 no-op — span 이 아무 데도 안 감',
+          ],
+          highlight: [14, 15, 18],
+        },
+      },
+      {
+        title: 'Step 2. SpanProcessor — Simple vs Batch (성능·손실)',
+        desc: 'SpanProcessor 는 완성된 span 을 받아 Exporter 로 넘기는 중간 처리기다. SimpleSpanProcessor 는 span 이 끝날 때마다 즉시 동기로 export 한다 — 구현은 단순하지만 매 span 마다 네트워크 I/O 가 블로킹돼 프로덕션에서 지연·처리량이 폭락한다. BatchSpanProcessor 는 span 을 큐에 모아 백그라운드 스레드가 배치로 내보내므로 성능이 좋고 표준이다. 대신 큐가 꽉 차면 span 이 조용히 drop 되므로 max_queue_size·배치 타임아웃 튜닝이 필요하다.',
+        focus: 'processor',
+        code: {
+          lang: 'python',
+          filename: 'span_processor.py — Simple vs Batch',
+          lines: [
+            '# 2) SpanProcessor — 완성된 span 을 Exporter 로 넘기는 중간 처리기',
+            'from opentelemetry.sdk.trace.export import (',
+            '    SimpleSpanProcessor,',
+            '    BatchSpanProcessor,',
+            ')',
+            'from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (',
+            '    OTLPSpanExporter,',
+            ')',
+            '',
+            'exporter = OTLPSpanExporter(endpoint="http://collector:4317")',
+            '',
+            '# Simple: span 끝날 때마다 즉시 동기 export → 매번 네트워크 블로킹',
+            '# provider.add_span_processor(SimpleSpanProcessor(exporter))',
+            '',
+            '# Batch: 큐에 모아 백그라운드 스레드가 배치 전송 (프로덕션 표준)',
+            'provider.add_span_processor(BatchSpanProcessor(',
+            '    exporter,',
+            '    max_queue_size=2048,         # 큐 초과분은 drop → 크기 튜닝 필요',
+            '    max_export_batch_size=512,   # 한 배치 최대 span 수',
+            '    schedule_delay_millis=5000,  # 배치 전송 주기(ms)',
+            '))',
+          ],
+          highlight: [12, 13, 15, 16, 17, 18, 19, 20],
+        },
+      },
+      {
+        title: 'Step 3. Exporter — OTLP / Console / Jaeger',
+        desc: 'Exporter 는 데이터를 실제로 외부로 보내는 어댑터다. OTLP Exporter 가 사실상 표준으로, Collector 나 백엔드로 gRPC/HTTP 로 전송한다. ConsoleExporter 는 로컬 디버깅용으로 stdout 에 span 을 찍는다. Jaeger 같은 벤더 전용 exporter 도 있지만, 요즘은 OTLP 로 Collector 에 보내고 Collector 가 여러 백엔드로 분배하는 구조를 권장한다. Exporter 를 아예 안 붙이면 span 은 만들어져도 어디에도 도착하지 않아 데이터가 통째로 유실된다.',
+        focus: 'exporter',
+        code: {
+          lang: 'python',
+          filename: 'exporters.py — 어디로 보낼 것인가',
+          lines: [
+            '# 3) Exporter — 데이터를 실제로 외부로 보내는 어댑터',
+            'from opentelemetry.sdk.trace.export import ConsoleSpanExporter',
+            'from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (',
+            '    OTLPSpanExporter,',
+            ')',
+            '',
+            '# (a) OTLP — 사실상 표준. Collector/백엔드로 gRPC 전송',
+            'otlp = OTLPSpanExporter(endpoint="http://collector:4317", insecure=True)',
+            '',
+            '# (b) Console — 로컬 디버깅용. stdout 으로 span 을 출력',
+            'console = ConsoleSpanExporter()',
+            '',
+            '# 권장 구조: 앱 → OTLP → Collector → (Jaeger / Tempo / 벤더)',
+            'provider.add_span_processor(BatchSpanProcessor(otlp))',
+            '',
+            '# Exporter 를 안 붙이면 span 은 만들어져도 도착지가 없다 = 유실',
+          ],
+          highlight: [7, 8, 13, 14],
+        },
+      },
+      {
+        title: 'Step 4. 전체 파이프라인 — Resource · Sampler 로 완성',
+        desc: '전체 그림은 tracer 가 span 을 생성 → Processor 큐에 적재 → 배치로 묶여 Exporter → Collector/백엔드 도착이다. Resource 는 모든 span 에 붙는 공통 꼬리표(service.name 등)로, 백엔드에서 어느 서비스인지 구분하는 근거가 된다. Sampler 는 트래픽이 많을 때 전부 저장하면 비용이 폭발하므로 일부만 샘플링해 저장량을 조절한다. MeterProvider(메트릭)·LoggerProvider(로그)도 Provider → Processor(Reader) → Exporter 의 같은 3 단 구조를 그대로 따른다.',
+        focus: 'pipeline',
+        code: {
+          lang: 'python',
+          filename: 'pipeline.py — 생성→Processor→Exporter→백엔드',
+          lines: [
+            '# 4) 전체 파이프라인 — 생성 → Processor → Exporter → 백엔드',
+            'from opentelemetry.sdk.trace.sampling import TraceIdRatioBased',
+            '',
+            '# Sampler: 트래픽 많으면 전부 저장 시 비용 폭발 → 일부만 샘플링',
+            'provider = TracerProvider(',
+            '    resource=resource,',
+            '    sampler=TraceIdRatioBased(0.1),  # 10% 만 수집',
+            ')',
+            'provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))',
+            'trace.set_tracer_provider(provider)',
+            '',
+            'tracer = trace.get_tracer("checkout.service")',
+            '',
+            '# 실제 사용: span 생성 → 자동으로 파이프라인을 탄다',
+            'with tracer.start_as_current_span("checkout") as span:',
+            '    span.set_attribute("order.id", "o9")',
+            '    charge_payment()   # 내부 span 들도 같은 파이프라인으로',
+            '',
+            '# 메트릭(MeterProvider)·로그(LoggerProvider)도 같은 3 단 구조',
+          ],
+          highlight: [4, 5, 6, 7, 8, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — flush 안 하면 마지막 배치가 사라진다',
+        desc: '가장 흔한 사고는 셋이다. 첫째, 프로덕션에 SimpleSpanProcessor 를 써서 요청마다 export I/O 로 블로킹되는 것 — 반드시 Batch 를 쓴다. 둘째, Exporter 엔드포인트를 잘못 설정하거나 빠뜨려 데이터가 조용히 사라지는 것. 셋째, 앱 종료 시 provider.shutdown() 으로 flush 하지 않아 큐에 남은 마지막 배치가 유실되는 것 — 특히 짧게 실행되는 배치 잡·서버리스에서 치명적이다. 종료 훅에서 force_flush/shutdown 을 부르는 습관이 데이터 완결성을 지킨다.',
+        focus: 'pitfall',
+        code: {
+          lang: 'python',
+          filename: 'shutdown.py — 종료 훅에서 flush',
+          lines: [
+            '# 5) 실무 함정 — flush 안 하면 마지막 배치가 사라진다',
+            'import atexit',
+            '',
+            '# 함정 1: 프로덕션에 SimpleSpanProcessor → 요청마다 export 블로킹',
+            '# 함정 2: Exporter 엔드포인트 오타/누락 → 데이터 조용히 유실',
+            '# 함정 3: 종료 시 flush 안 함 → 큐에 남은 배치 통째로 손실',
+            '',
+            'def shutdown_telemetry():',
+            '    # 큐에 남은 span 을 강제로 내보낸 뒤 provider 종료',
+            '    provider.force_flush()',
+            '    provider.shutdown()',
+            '',
+            '# 서버리스·배치 잡처럼 짧게 사는 프로세스에서 특히 치명적',
+            'atexit.register(shutdown_telemetry)',
+            '',
+            '# 종료 훅에서 flush → 마지막 배치까지 도착 = 데이터 완결성',
+          ],
+          highlight: [4, 5, 6, 10, 11, 14],
+        },
+      },
+    ];
+
+    function SdkPipelineLiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🛠️</span>
+              <span className="text-xs font-bold text-slate-700">SDK 파이프라인 — 공장 · 컨베이어 · 출하</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">Provider · Processor · Exporter</span>
+          </div>
+
+          <div className="p-4 min-h-[460px]" key={animKey}>
+            {focus === 'provider'  && <ProviderView />}
+            {focus === 'processor' && <ProcessorView />}
+            {focus === 'exporter'  && <ExporterView />}
+            {focus === 'pipeline'  && <PipelineView />}
+            {focus === 'pitfall'   && <PitfallView />}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'provider'  && 'TracerProvider — tracer 를 만들어 나눠주고 Resource·Sampler 를 보유'}
+              {focus === 'processor' && 'Simple(즉시 동기 블로킹) vs Batch(큐에 모아 배치 전송, 표준)'}
+              {focus === 'exporter'  && 'OTLP(표준)·Console(디버깅)·Jaeger — 어디로 보낼지 결정'}
+              {focus === 'pipeline'  && '생성 → Processor → Exporter → 백엔드, Resource·Sampler 로 완성'}
+              {focus === 'pitfall'   && 'Simple 프로덕션 · Exporter 누락 · flush 미실행 = 3대 데이터 유실'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 1: TracerProvider = 공장
+    function ProviderView() {
+      const tracers = ['checkout.service', 'payment.service', 'order.service'];
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">글로벌 provider 하나가 앱 전체의 tracer 를 만들어 나눠준다</div>
+          <div className="flex items-stretch gap-4">
+            <div className="flex-1 rounded-lg border-2 shadow-otel p-3" style={{ borderColor: 'var(--otel)', background: 'var(--otel-light)' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-xl">🏭</span>
+                <span className="text-[12px] font-bold text-otel-dark">TracerProvider</span>
+              </div>
+              <div className="space-y-1">
+                <div className="text-[10px] font-mono bg-white rounded px-2 py-1 border border-otel text-otel-dark">Resource: service.name</div>
+                <div className="text-[10px] font-mono bg-white rounded px-2 py-1 border border-otel text-otel-dark">Sampler: 수집 비율</div>
+                <div className="text-[10px] font-mono bg-white rounded px-2 py-1 border border-otel text-otel-dark">Processor 파이프라인</div>
+              </div>
+              <div className="mt-2 text-[9px] text-slate-500 font-mono">set_tracer_provider(provider)</div>
+            </div>
+            <div className="flex flex-col justify-center items-center shrink-0">
+              <div className="text-2xl text-otel">&rarr;</div>
+              <div className="text-[8px] text-slate-500 font-mono">get_tracer</div>
+            </div>
+            <div className="flex-1 space-y-2">
+              {tracers.map((t) => (
+                <div key={t} className="flex items-center gap-2 rounded border border-slate-300 bg-white px-2 py-2 shadow-sm">
+                  <span className="text-base">🔧</span>
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-700">tracer</div>
+                    <div className="text-[9px] font-mono text-slate-500">{t}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="mt-4 p-3 rounded-lg bg-amber-50 border border-amber-300">
+            <div className="text-[11px] text-amber-800 font-bold">provider 미등록 = tracer 가 no-op</div>
+            <div className="text-[10px] text-amber-700 mt-0.5">span 은 만들어지는 척하지만 아무 데도 안 가고 조용히 사라진다</div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 2: Simple vs Batch
+    function ProcessorView() {
+      return (
+        <div className="fade-in space-y-4">
+          <div className="text-[11px] text-slate-500">같은 span 4 개를 두 방식이 어떻게 처리하는지 비교</div>
+
+          <div className="rounded-lg border border-red-300 bg-red-50 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[11px] font-bold text-red-700">SimpleSpanProcessor</span>
+              <span className="text-[9px] font-mono text-red-500">동기 · 블로킹</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {[1,2,3,4].map((n) => (
+                <React.Fragment key={n}>
+                  <span className="w-6 h-6 rounded bg-red-400 text-white text-[9px] flex items-center justify-center font-mono">s{n}</span>
+                  <span className="text-[10px] text-red-500">&rarr;</span>
+                  <span className="text-[9px] font-mono text-red-600 px-1">export</span>
+                  {n < 4 && <span className="text-[10px] text-red-400">|</span>}
+                </React.Fragment>
+              ))}
+            </div>
+            <div className="text-[10px] text-red-700 mt-2">span 마다 즉시 네트워크 export — 요청 스레드가 매번 블로킹된다</div>
+          </div>
+
+          <div className="rounded-lg border border-emerald-300 bg-emerald-50 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[11px] font-bold text-emerald-700">BatchSpanProcessor</span>
+              <span className="text-[9px] font-mono text-emerald-600">비동기 · 배치 (표준)</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="flex gap-1 p-1.5 rounded bg-white border border-emerald-300">
+                {[1,2,3,4].map((n) => (
+                  <span key={n} className="w-6 h-6 rounded bg-emerald-400 text-white text-[9px] flex items-center justify-center font-mono">s{n}</span>
+                ))}
+              </div>
+              <span className="text-[10px] text-emerald-600">&rarr;</span>
+              <div className="px-2 py-1 rounded bg-emerald-500 text-white text-[9px] font-mono">1 배치 export</div>
+            </div>
+            <div className="text-[10px] text-emerald-700 mt-2">큐에 모아 백그라운드 스레드가 한 번에 전송 — 요청은 안 막힌다</div>
+          </div>
+
+          <div className="p-2 rounded-lg bg-otel-light border border-otel text-[10px] text-otel-dark" style={{ background: 'var(--otel-light)', borderColor: 'var(--otel)' }}>
+            큐가 꽉 차면 초과 span 은 drop — max_queue_size 튜닝이 필요하다
+          </div>
+        </div>
+      );
+    }
+
+    // Step 3: Exporter fan-out
+    function ExporterView() {
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">Exporter 종류 — 어디로 보낼지 결정하는 어댑터</div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 rounded-lg border-2 p-2 shadow-otel" style={{ borderColor: 'var(--otel)', background: 'var(--otel-light)' }}>
+              <span className="text-lg">📡</span>
+              <div className="w-24 shrink-0">
+                <div className="text-[11px] font-bold text-otel-dark">OTLP</div>
+                <div className="text-[9px] font-mono text-slate-500">표준 · gRPC</div>
+              </div>
+              <span className="text-otel">&rarr;</span>
+              <span className="text-[10px] font-mono px-2 py-1 rounded bg-otel text-white">Collector</span>
+              <span className="text-otel">&rarr;</span>
+              <span className="text-[9px] font-mono text-slate-600">Jaeger / Tempo / 벤더</span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white p-2">
+              <span className="text-lg">🖥️</span>
+              <div className="w-24 shrink-0">
+                <div className="text-[11px] font-bold text-slate-700">Console</div>
+                <div className="text-[9px] font-mono text-slate-500">디버깅용</div>
+              </div>
+              <span className="text-slate-400">&rarr;</span>
+              <span className="text-[10px] font-mono px-2 py-1 rounded bg-slate-800 text-slate-100">stdout (JSON)</span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white p-2">
+              <span className="text-lg">🔭</span>
+              <div className="w-24 shrink-0">
+                <div className="text-[11px] font-bold text-slate-700">Jaeger</div>
+                <div className="text-[9px] font-mono text-slate-500">벤더 전용</div>
+              </div>
+              <span className="text-slate-400">&rarr;</span>
+              <span className="text-[10px] font-mono px-2 py-1 rounded bg-slate-200 text-slate-600">Jaeger 백엔드</span>
+            </div>
+          </div>
+          <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-300">
+            <div className="text-[11px] text-red-800 font-bold">Exporter 미설정 = 데이터 유실</div>
+            <div className="text-[10px] text-red-700 mt-0.5">span 은 만들어져도 도착할 곳이 없어 통째로 버려진다</div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 4: 전체 파이프라인
+    function PipelineView() {
+      const stages = [
+        { icon: '🔧', name: 'tracer', sub: 'span 생성', color: 'var(--otel-mid)' },
+        { icon: '📥', name: 'Processor', sub: 'Batch 큐', color: 'var(--otel)' },
+        { icon: '📡', name: 'Exporter', sub: 'OTLP 전송', color: 'var(--otel-dark)' },
+        { icon: '🗄️', name: 'Backend', sub: 'Collector', color: '#334155' },
+      ];
+      return (
+        <div className="fade-in">
+          <div className="text-[11px] text-slate-500 mb-3">생성 → Processor → Exporter → 백엔드, 한 방향으로 흐른다</div>
+          <div className="relative flex items-center justify-between">
+            {stages.map((s, i) => (
+              <React.Fragment key={s.name}>
+                <div className="flex-1 text-center rounded-lg border-2 bg-white px-1 py-2 shadow-sm" style={{ borderColor: s.color }}>
+                  <div className="text-xl">{s.icon}</div>
+                  <div className="text-[10px] font-bold text-slate-700">{s.name}</div>
+                  <div className="text-[8px] font-mono text-slate-500">{s.sub}</div>
+                </div>
+                {i < stages.length - 1 && (
+                  <div className="relative w-8 shrink-0 h-1 mx-0.5 bg-otel-pale rounded overflow-hidden" style={{ background: 'var(--otel-pale)' }}>
+                    <span className="flow-dot absolute top-1/2 -mt-1 w-2 h-2 rounded-full bg-otel" style={{ background: 'var(--otel)' }}></span>
+                  </div>
+                )}
+              </React.Fragment>
+            ))}
+          </div>
+
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            <div className="p-2.5 rounded-lg border border-otel bg-otel-light" style={{ background: 'var(--otel-light)', borderColor: 'var(--otel)' }}>
+              <div className="text-[10px] font-bold text-otel-dark mb-0.5">🏷️ Resource</div>
+              <div className="text-[9px] text-slate-600">모든 span 공통 꼬리표 — service.name 으로 어느 서비스인지 식별</div>
+            </div>
+            <div className="p-2.5 rounded-lg border border-otel bg-otel-light" style={{ background: 'var(--otel-light)', borderColor: 'var(--otel)' }}>
+              <div className="text-[10px] font-bold text-otel-dark mb-0.5">🎚️ Sampler</div>
+              <div className="text-[9px] text-slate-600">일부만 수집(예: 10%) — 저장 비용 폭발을 막는 조리개</div>
+            </div>
+          </div>
+
+          <div className="mt-3 p-2.5 rounded-lg bg-slate-100 border border-slate-300">
+            <div className="text-[10px] text-slate-600">
+              <span className="font-bold text-slate-700">동일 3 단 구조:</span> Metrics(MeterProvider) · Logs(LoggerProvider)도 Provider &rarr; Processor &rarr; Exporter 를 그대로 따른다
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Step 5: 함정 + shutdown
+    function PitfallView() {
+      const traps = [
+        { icon: '⛔', title: 'Simple 프로덕션', body: '요청마다 export I/O 블로킹 → 지연·처리량 폭락. Batch 로 교체' },
+        { icon: '🕳️', title: 'Exporter 누락/오타', body: '엔드포인트 잘못 = 데이터가 조용히 사라짐. 도착 여부 확인' },
+        { icon: '💨', title: 'flush 미실행', body: '종료 시 큐에 남은 배치 손실. 서버리스·배치 잡에 치명적' },
+      ];
+      return (
+        <div className="fade-in space-y-3">
+          <div className="text-[11px] text-slate-500">데이터 유실 3대 원인 — 대부분 조용히 일어나서 늦게 발견된다</div>
+          {traps.map((t) => (
+            <div key={t.title} className="flex items-start gap-2 rounded-lg border border-red-300 bg-red-50 p-2.5">
+              <span className="text-lg leading-none">{t.icon}</span>
+              <div>
+                <div className="text-[11px] font-bold text-red-700">{t.title}</div>
+                <div className="text-[10px] text-red-700/90">{t.body}</div>
+              </div>
+            </div>
+          ))}
+          <div className="p-3 rounded-lg border-2 border-emerald-400 bg-emerald-50">
+            <div className="text-[11px] font-bold text-emerald-800 mb-1">✅ 종료 훅에서 flush</div>
+            <div className="flex items-center gap-2 text-[10px] font-mono">
+              <span className="px-2 py-1 rounded bg-emerald-500 text-white">force_flush()</span>
+              <span className="text-emerald-600">&rarr;</span>
+              <span className="px-2 py-1 rounded bg-emerald-600 text-white">shutdown()</span>
+              <span className="text-emerald-700">= 마지막 배치까지 도착</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[28rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setIsPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+            @keyframes flowRight { 0% { left: -10%; opacity: 0; } 20% { opacity: 1; } 80% { opacity: 1; } 100% { left: 100%; opacity: 0; } }
+            .flow-dot { animation: flowRight 1.8s linear infinite; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="font-medium text-otel hover:text-otel-dark">&larr; 허브로</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum II-1-2</span>
+            </nav>
+
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 bg-otel text-white flex items-center justify-center rounded-full font-bold text-sm">II</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part II. SDK &amp; 계측 &gt; Chapter 1. SDK 파이프라인</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">SDK 구조 — Provider / Processor / Exporter</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                텔레메트리가 생성되어 내보내지는 파이프라인 — <strong>공장(Provider) → 컨베이어(Processor) → 출하(Exporter)</strong>.
+                <code className="bg-slate-100 px-1 rounded text-xs">Provider</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Processor</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">Exporter</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">파이프라인</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">함정</code> 5 단계로 SDK 내부를 잡는다.
+              </p>
+              <div className="mt-3 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full bg-otel transition-all duration-300" style={{ width: `${progress}%` }}></div>
+              </div>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <SdkPipelineLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            <div className="p-4 rounded-xl bg-otel-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider" style={{ color: '#D6DCEE' }}>Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs" style={{ color: '#D6DCEE' }}>키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl bg-otel-light border-2 border-otel text-otel-dark text-sm">
+                💡 다음(II-1-3)에서는 <strong>자동 계측(auto-instrumentation)과 수동 span 만들기</strong>
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold bg-otel text-white hover-bg-otel-dark transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 허브</a>
+              <a href="./II-1-3.html" className="font-medium text-otel hover:text-otel-dark">II-1-3 자동/수동 계측 &rarr;</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

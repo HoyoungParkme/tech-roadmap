@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — V-1-3. 운영 체크리스트 (overhead / cost)</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📉</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root {
+      --otel: #4F62AD;
+      --otel-dark: #3D4E8C;
+      --otel-mid: #6E80C4;
+      --otel-light: #D6DCEE;
+    }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    V-1-3. 운영 체크리스트 — overhead / cost
+    학습 목표: 프로덕션 텔레메트리의 성능(오버헤드)·비용을 측정하고 통제하는 실무 체크리스트
+    핵심 비유: "관제탑 대시보드" — 계측이 앱을 얼마나 느리게 하는지, 지갑을 얼마나 여는지 계기판으로 본다
+    패턴: OpenTelemetry viz 표준 — 좌(운영 콘솔 LiveDataPane) / 우(VSCode CodeViewer)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─────────────────────────────────────────────────────────
+    // 운영 체크리스트 (누적 완료)
+    // ─────────────────────────────────────────────────────────
+    const CHECKLIST = [
+      { id: 'measure',     label: '오버헤드 벤치마크로 계측 비용 측정' },
+      { id: 'batch',       label: 'BatchSpanProcessor·비동기 exporter로 최소화' },
+      { id: 'sampling',    label: '샘플링으로 데이터 볼륨·비용 절감' },
+      { id: 'cardinality', label: '고카디널리티 라벨 제거로 시계열 통제' },
+      { id: 'stability',   label: 'memory_limiter·큐·재시도·이중화로 안정화' },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 5 STEPS — 오버헤드 측정 → 최소화 → 샘플링 → 카디널리티 → 안정성
+    // ─────────────────────────────────────────────────────────
+    const STEPS = [
+      {
+        title: 'Step 1. 오버헤드를 먼저 측정한다',
+        desc: '계측을 켜기 전에 "계측이 앱을 얼마나 느리게 만드는가"를 숫자로 재야 한다. 그래야 튜닝의 효과를 판단할 수 있다. 가장 흔한 함정은 SimpleSpanProcessor를 쓰는 것 — span마다 동기 export를 하기 때문에 요청 스레드가 네트워크를 기다리며 지연이 폭발한다. 벤치마크로 span당 CPU·지연을 재두면, 뒤에서 배치·샘플링을 적용했을 때 실제로 몇 배 좋아졌는지 근거를 갖게 된다.',
+        focus: 'measure',
+        metrics: { cpu: 12, latency: 8.0, cost: 4200, series: 2000000, volume: 100 },
+        code: {
+          lang: 'python',
+          filename: 'measure_overhead.py — 계측 비용 벤치마크',
+          lines: [
+            '# 계측 오버헤드 측정 — 프로세서 종류별로 span당 비용을 잰다',
+            'import time',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.export import (',
+            '    SimpleSpanProcessor, BatchSpanProcessor, ConsoleSpanExporter,',
+            ')',
+            '',
+            'def bench(processor, n=100_000):',
+            '    provider = TracerProvider()',
+            '    provider.add_span_processor(processor)',
+            '    tracer = provider.get_tracer(\'bench\')',
+            '    start = time.perf_counter()',
+            '    for _ in range(n):',
+            '        with tracer.start_as_current_span(\'work\'):',
+            '            pass  # span 생성·종료 비용만 순수 측정',
+            '    return (time.perf_counter() - start) / n * 1e6  # us/span',
+            '',
+            '# SimpleSpanProcessor: span마다 동기 export → 요청 스레드가 대기',
+            'simple_us = bench(SimpleSpanProcessor(ConsoleSpanExporter()))',
+            '# BatchSpanProcessor: 큐에 모아 백그라운드 export → 앱 방해 최소',
+            'batch_us = bench(BatchSpanProcessor(ConsoleSpanExporter()))',
+            '',
+            'print(f\'simple={simple_us:.1f}us  batch={batch_us:.1f}us\')',
+            '# 실측 감각: simple ~40us, batch ~2us → 약 20배 차이',
+          ],
+          highlight: [19, 21],
+        },
+      },
+      {
+        title: 'Step 2. 배치·비동기 exporter로 최소화',
+        desc: '오버헤드를 줄이는 1순위는 BatchSpanProcessor다. span을 큐에 쌓아두었다가 백그라운드 스레드가 모아서 보내므로 요청 경로에서 네트워크 대기가 사라진다. 핵심은 큐 상한(max_queue_size)을 두는 것 — 백엔드가 느려 큐가 가득 차면 새 span을 버려서라도 앱을 멈추지 않게 한다. 계측은 절대 애플리케이션을 죽이면 안 된다는 원칙이 여기서 지켜진다. gRPC(:4317)는 HTTP보다 오버헤드가 낮아 대량 전송에 유리하다.',
+        focus: 'batch',
+        metrics: { cpu: 2, latency: 0.3, cost: 4200, series: 2000000, volume: 100 },
+        code: {
+          lang: 'python',
+          filename: 'batch_exporter.py — 비동기 배치 전송 튜닝',
+          lines: [
+            '# 오버헤드 최소화 — 배치 + 비동기 gRPC exporter',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.export import BatchSpanProcessor',
+            'from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (',
+            '    OTLPSpanExporter,',
+            ')',
+            '',
+            'provider = TracerProvider()',
+            'provider.add_span_processor(',
+            '    BatchSpanProcessor(',
+            '        OTLPSpanExporter(endpoint=\'otel-collector:4317\', insecure=True),',
+            '        max_queue_size=2048,         # 큐 상한 — 넘치면 drop(앱 보호)',
+            '        max_export_batch_size=512,   # 한 번에 보낼 span 수',
+            '        schedule_delay_millis=5000,  # 5초마다 flush',
+            '        export_timeout_millis=30000, # export 타임아웃',
+            '    )',
+            ')',
+            '',
+            '# 큐가 가득 차면 새 span은 버려진다 — 앱을 멈추지 않는 게 원칙',
+            '# schedule_delay를 늘리면 배치 효율↑ 대신 데이터 지연↑ (트레이드오프)',
+          ],
+          highlight: [10, 12, 13],
+        },
+      },
+      {
+        title: 'Step 3. 샘플링으로 볼륨·비용 절감',
+        desc: '비용은 결국 "저장·전송하는 데이터 양"에 비례한다. head 샘플링은 SDK에서 일부 trace만 기록해 CPU와 비용을 동시에 줄인다. ParentBased를 감싸는 이유는 부모가 sampled면 자식도 함께 sampled 되어 trace가 조각나지 않게 하기 위함이다. 함정은 "일단 100%로 켜두자"인데, 이는 저장·전송 비용을 그대로 다 문다. 에러나 느린 요청처럼 꼭 봐야 할 것은 Collector의 tail 샘플링에서 따로 100% 건지는 조합이 정석이다.',
+        focus: 'sampling',
+        metrics: { cpu: 2, latency: 0.3, cost: 900, series: 2000000, volume: 10 },
+        code: {
+          lang: 'python',
+          filename: 'sampling.py — head 샘플링 설정',
+          lines: [
+            '# 비용 절감 ① — head 샘플링으로 기록량 자체를 줄인다',
+            'from opentelemetry.sdk.trace import TracerProvider',
+            'from opentelemetry.sdk.trace.sampling import (',
+            '    ParentBased, TraceIdRatioBased,',
+            ')',
+            '',
+            '# 전체의 10%만 기록 — 나머지 90%는 span조차 만들지 않음',
+            'sampler = ParentBased(root=TraceIdRatioBased(0.10))',
+            'provider = TracerProvider(sampler=sampler)',
+            '',
+            '# ParentBased: 부모가 sampled면 자식도 sampled → trace 온전성 유지',
+            '# 주의 ①: 100% 샘플링은 저장·전송 비용을 100% 그대로 문다',
+            '# 주의 ②: 에러·느린 요청은 Collector tail 샘플링으로 별도 100% 보존',
+            '#   (head는 요청 시작 시점에 결정 → 결과를 못 봄)',
+          ],
+          highlight: [7, 8],
+        },
+      },
+      {
+        title: 'Step 4. 카디널리티 폭발을 막는다',
+        desc: '메트릭 비용을 조용히 폭발시키는 주범은 고카디널리티 라벨이다. 카디널리티는 라벨 값 조합의 수이고, 그 수만큼 시계열이 생겨 저장·인덱싱 비용이 곱해진다. user_id, request_id, 쿼리스트링이 붙은 http.url 같은 무한 값 라벨을 그대로 두면 시계열이 수백만 개로 터진다. Collector의 attributes 프로세서로 위험 라벨을 삭제하고, 경로는 http.route처럼 정규화된 값만 남긴다. 규칙은 단순하다 — 유일값이 수천을 넘는 라벨은 제거하거나 정규화한다.',
+        focus: 'cardinality',
+        metrics: { cpu: 2, latency: 0.3, cost: 380, series: 50000, volume: 10 },
+        code: {
+          lang: 'yaml',
+          filename: 'collector-cardinality.yaml — 라벨 폭발 차단',
+          lines: [
+            '# 비용 절감 ② — 고카디널리티 라벨을 Collector에서 제거',
+            'processors:',
+            '  # 카디널리티 = 라벨 값 조합 수 → 시계열 수 → 비용',
+            '  attributes/drop_high_card:',
+            '    actions:',
+            '      - key: user.id        # 사용자마다 새 시계열 → 제거',
+            '        action: delete',
+            '      - key: http.url       # 쿼리스트링까지 붙어 폭발 → 제거',
+            '        action: delete',
+            '      - key: http.route     # /users/{id} 로 정규화된 값만 유지',
+            '        action: extract',
+            '        pattern: ^(?P<route>/[^?]*)',
+            '  filter/drop_noise:',
+            '    metrics:',
+            '      metric:',
+            '        - \'name == "process.runtime.gc_count0"\'  # 저가치 제거',
+            '',
+            '# 규칙: 라벨의 유일값이 수천을 넘으면 반드시 제거/정규화',
+            '# → 시계열 2.0M → 50k 로 줄면 비용도 같은 비율로 감소',
+          ],
+          highlight: [3, 6, 8],
+        },
+      },
+      {
+        title: 'Step 5. 계측이 앱을 죽이지 않게 (안정성)',
+        desc: '마지막은 안정성이다. 계측 파이프라인이 오히려 장애를 유발하면 안 된다. Collector 맨 앞에 memory_limiter를 두어 메모리가 한계를 넘으면 데이터를 거부(백프레셔)해 OOM을 막는다. exporter에는 sending_queue로 백엔드 장애 시 버퍼를 두고, retry_on_failure로 재시도하되 max_elapsed_time으로 무한 재시도를 끊는다. 그리고 Collector 자체가 단일 장애점이 되지 않도록 2대 이상 + 로드밸런서로 이중화한다. 순서 규칙 하나만 기억하면 된다 — memory_limiter는 항상 파이프라인의 맨 앞.',
+        focus: 'stability',
+        metrics: { cpu: 2, latency: 0.3, cost: 380, series: 50000, volume: 10 },
+        code: {
+          lang: 'yaml',
+          filename: 'collector-stability.yaml — 죽지 않는 파이프라인',
+          lines: [
+            '# 안정성 — 계측이 앱·Collector를 죽이지 않게 하는 안전장치',
+            'processors:',
+            '  memory_limiter:           # ★ 항상 파이프라인 맨 앞',
+            '    check_interval: 1s',
+            '    limit_mib: 512          # 초과 시 데이터 거부(backpressure)',
+            '    spike_limit_mib: 128',
+            'exporters:',
+            '  otlp/backend:',
+            '    endpoint: tempo:4317',
+            '    sending_queue:',
+            '      enabled: true',
+            '      queue_size: 5000      # 백엔드 장애 시 버퍼',
+            '      num_consumers: 4',
+            '    retry_on_failure:',
+            '      enabled: true',
+            '      initial_interval: 5s',
+            '      max_elapsed_time: 300s  # 5분 초과 실패는 포기(무한 재시도 금지)',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      processors: [memory_limiter, batch]  # limiter가 항상 먼저',
+            '  # Collector는 2대 이상 + 로드밸런서로 단일 장애점 제거',
+          ],
+          highlight: [3, 10, 14, 21],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 숫자 포맷 헬퍼
+    // ─────────────────────────────────────────────────────────
+    function fmtCompact(n) {
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+      if (n >= 1000) return Math.round(n / 1000) + 'k';
+      return String(n);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 운영 관제 콘솔
+    // ─────────────────────────────────────────────────────────
+    function OpsConsoleLiveDataPane({ step, stepIdx }) {
+      const m = step.metrics;
+      const focus = step.focus;
+
+      const gauges = [
+        { key: 'cpu',     label: 'CPU 오버헤드',        value: m.cpu,     max: 15,      unit: '%',  good: m.cpu <= 3,       hot: focus === 'batch' },
+        { key: 'latency', label: '요청 지연 추가',       value: m.latency, max: 10,      unit: 'ms', good: m.latency <= 1,   hot: focus === 'batch' },
+        { key: 'cost',    label: '월 텔레메트리 비용',   value: m.cost,    max: 5000,    unit: '$',  good: m.cost <= 1000,   hot: focus === 'sampling' || focus === 'cardinality', money: true },
+        { key: 'series',  label: '활성 시계열 (카디널리티)', value: m.series, max: 2000000, unit: '',  good: m.series <= 100000, hot: focus === 'cardinality', compact: true },
+      ];
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">📉</span>
+              <span className="text-xs font-bold otel-text-dark">운영 관제 콘솔 — overhead / cost</span>
+            </div>
+            <span className="text-[10px] text-slate-500 font-mono">prod-seoul · otel-col</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={`step-${stepIdx}`}>
+
+            {/* 게이지 4종 */}
+            <div className="grid grid-cols-2 gap-2.5">
+              {gauges.map((g) => {
+                const pct = Math.min(100, (g.value / g.max) * 100);
+                const barColor = g.good ? 'bg-emerald-500' : 'bg-red-500';
+                const valColor = g.good ? 'text-emerald-600' : 'text-red-600';
+                const shown = g.compact ? fmtCompact(g.value)
+                  : g.money ? '$' + g.value.toLocaleString()
+                  : g.value + g.unit;
+                return (
+                  <div key={g.key}
+                    className={`rounded-lg border p-2.5 transition-all duration-500 fade-in ${g.hot ? 'otel-border border-2 otel-bg-light shadow' : 'border-slate-200 bg-slate-50'}`}>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-[10px] font-bold text-slate-600 leading-tight">{g.label}</span>
+                      {g.hot && <span className="text-[8px] otel-bg text-white px-1.5 py-0.5 rounded-full font-bold">FOCUS</span>}
+                    </div>
+                    <div className={`text-lg font-bold font-mono ${valColor}`}>{shown}</div>
+                    <div className="mt-1 h-1.5 rounded-full bg-slate-200 overflow-hidden">
+                      <div className={`h-full rounded-full transition-all duration-700 ${barColor}`} style={{ width: pct + '%' }}></div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 데이터 볼륨 배지 */}
+            <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+              <span className="text-[10px] font-bold text-slate-600">전송 데이터 볼륨</span>
+              <div className="flex-1 h-2 rounded-full bg-slate-200 overflow-hidden">
+                <div className={`h-full rounded-full transition-all duration-700 ${m.volume <= 30 ? 'otel-bg' : 'otel-bg-mid'}`} style={{ width: m.volume + '%' }}></div>
+              </div>
+              <span className="text-xs font-bold font-mono otel-text-dark">{m.volume}%</span>
+            </div>
+
+            {/* 신호별 비용 특성 */}
+            <div className="grid grid-cols-3 gap-1.5">
+              {[
+                { sig: 'traces',  note: '샘플링 지배', tone: 'text-sky-700 bg-sky-50 border-sky-200' },
+                { sig: 'metrics', note: '카디널리티', tone: 'text-violet-700 bg-violet-50 border-violet-200' },
+                { sig: 'logs',    note: '볼륨 지배',   tone: 'text-emerald-700 bg-emerald-50 border-emerald-200' },
+              ].map((s) => (
+                <div key={s.sig} className={`rounded border px-1.5 py-1 text-center ${s.tone}`}>
+                  <div className="text-[10px] font-bold font-mono">{s.sig}</div>
+                  <div className="text-[8px] opacity-80">{s.note}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* 안정성 패널 (stability 단계에서만) */}
+            {focus === 'stability' && (
+              <div className="otel-bg-light border-2 otel-border rounded-lg p-3 fade-in">
+                <div className="text-xs font-bold otel-text-dark mb-2">🛡️ 안정성 안전장치</div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {[
+                    { k: 'memory_limiter', v: 'OOM 차단' },
+                    { k: 'sending_queue',  v: '장애 버퍼' },
+                    { k: 'retry_on_failure', v: '재시도 상한' },
+                    { k: 'HA 2+ replicas', v: '단일점 제거' },
+                  ].map((it) => (
+                    <div key={it.k} className="bg-white rounded border border-slate-200 px-2 py-1">
+                      <div className="text-[10px] font-bold font-mono otel-text">{it.k}</div>
+                      <div className="text-[8px] text-slate-500">{it.v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 운영 체크리스트 (누적) */}
+            <div className="rounded-lg border border-slate-200 bg-white p-3">
+              <div className="text-[11px] font-bold text-slate-600 mb-2">운영 체크리스트</div>
+              <div className="space-y-1">
+                {CHECKLIST.map((c, i) => {
+                  const done = i <= stepIdx;
+                  const current = i === stepIdx;
+                  return (
+                    <div key={c.id}
+                      className={`flex items-center gap-2 text-[11px] rounded px-2 py-1 transition-all duration-500 ${current ? 'otel-bg-light font-bold otel-text-dark' : done ? 'text-slate-600' : 'text-slate-300'}`}>
+                      <span className={`w-4 h-4 rounded flex items-center justify-center text-[9px] font-bold shrink-0 ${done ? 'otel-bg text-white' : 'bg-slate-100 text-slate-300 border border-slate-200'}`}>
+                        {done ? '✓' : (i + 1)}
+                      </span>
+                      <span className="leading-tight">{c.label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-1-3</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 실전 운영 &gt; Chapter 1. 운영 &middot; V-1-3</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">운영 체크리스트 — overhead / cost</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                프로덕션 텔레메트리의 성능&middot;비용 관리 —
+                <strong> 측정 &rarr; 배치 &rarr; 샘플링 &rarr; 카디널리티 &rarr; 안정성</strong> 순서로 계측이 앱을 느리게 하지도, 지갑을 비우지도 않게 만든다.
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">BatchSpanProcessor</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">sampling</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">memory_limiter</code>
+              </p>
+              {/* 진행바 */}
+              <div className="mt-3 h-1.5 rounded-full bg-slate-100 overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: progress + '%' }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <OpsConsoleLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 배너 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(V-1-4)에서는 <strong>통합 패턴 — k8s &middot; Service Mesh &middot; FastAPI</strong>에서 계측을 실제 배포 환경에 붙이는 방법을 본다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./V-1-4.html" className="otel-text hover:otel-text-dark font-medium">V-1-4 통합 패턴 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — V-1-1. 분산 추적 디버깅 워크플로우</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔍</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-light: #D6DCEE; --otel-soft: #6E80C4; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-bg-soft { background-color: var(--otel-soft); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    V-1-1. 분산 추적 디버깅 워크플로우
+    학습 목표: 증상 → 트레이스 검색 → 타임라인 병목 span → 로그·속성 → 근본 원인 의 실전 흐름
+    핵심 예제: 느린 GET /api/orders 요청을 트레이스로 파고들어 N+1 쿼리를 찾아내 병렬화로 고친다
+    패턴: fastapi 표준 — 좌(트레이스 타임라인 워터폴 시각화) / 우(VSCode 코드)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 트레이스 워터폴 데이터 — GET /api/orders/{id}, 총 1240ms
+    // start/dur 단위 ms, depth = 들여쓰기 단계
+    const TRACE_TOTAL = 1240;
+    const SPANS = [
+      { id: 's0', name: 'GET /api/orders/{id}', svc: 'api-gateway',    start: 0,    dur: 1240, depth: 0, kind: 'server', status: 'ok' },
+      { id: 's1', name: 'orders.get_order',      svc: 'order-service',  start: 30,   dur: 1180, depth: 1, kind: 'internal', status: 'ok' },
+      { id: 's2', name: 'SELECT orders',         svc: 'postgres',       start: 60,   dur: 50,   depth: 2, kind: 'client', status: 'ok' },
+      { id: 's3', name: 'SELECT product x15 (N+1)', svc: 'postgres',    start: 150,  dur: 900,  depth: 2, kind: 'client', status: 'ok', bottleneck: true },
+      { id: 's4', name: 'GET /payment/verify',   svc: 'payment-service', start: 1060, dur: 145,  depth: 2, kind: 'client', status: 'error' },
+    ];
+
+    // 6 STEPS — 분산 추적 디버깅 실전 흐름
+    const STEPS = [
+      {
+        title: 'Step 1. 증상 포착 — 느린 요청·에러 알림',
+        desc: '디버깅은 항상 증상에서 출발한다. p95 지연 급등, 에러율 상승, 사용자 신고 같은 신호가 먼저 온다. 여기서 흔한 실수는 로그부터 grep 하는 것인데, 분산 시스템에서는 어느 서비스가 느린지조차 모른 채 로그 바다에 빠지기 쉽다. 대신 알림에 딸려 온 trace_id(또는 exemplar 링크)를 잡고 트레이스로 바로 들어가는 것이 정석이다. 메트릭은 "무엇이 나빠졌나", 트레이스는 "어디서 왜 나빠졌나"를 답한다.',
+        focus: 'symptom',
+        code: {
+          lang: 'python',
+          filename: 'alert_context.py — 알림에서 trace_id 확보',
+          lines: [
+            '# 증상: /api/orders p95 지연이 200ms에서 1.2s로 급등',
+            '# 알림 페이로드에 대표 trace_id 를 함께 실어 보낸다',
+            'from opentelemetry import trace',
+            '',
+            'def on_slow_request(request, duration_ms):',
+            '    # 임계치를 넘긴 요청에서 현재 스팬의 trace_id 추출',
+            '    if duration_ms < 800:',
+            '        return  # 정상 범위 — 무시',
+            '',
+            '    span = trace.get_current_span()',
+            '    ctx = span.get_span_context()',
+            '    trace_id = format(ctx.trace_id, "032x")',
+            '',
+            '    # 알림에 바로 열 수 있는 트레이스 링크를 포함',
+            '    link = f"https://tempo.internal/trace/{trace_id}"',
+            '    send_alert(',
+            '        title="slow /api/orders p95=1.2s",',
+            '        severity="warning",',
+            '        trace_url=link,          # 여기서 조사 시작',
+            '        service="api-gateway",',
+            '    )',
+            '    # 핵심: 로그 grep 대신 이 링크 하나로 트레이스 진입',
+          ],
+          highlight: [10, 11, 12, 15, 18],
+        },
+      },
+      {
+        title: 'Step 2. 트레이스 검색 — 느린 trace·error 태그로 좁히기',
+        desc: '대표 trace_id가 없으면 백엔드(Tempo/Jaeger)에서 조건 검색으로 문제 트레이스를 골라낸다. 핵심 필터는 두 가지다: 지연(duration이 임계치 초과)과 상태(error=true 또는 status.code=ERROR). service.name, http.route 같은 속성으로 범위를 좁히면 수천 개 중 후보 몇 개로 줄어든다. 평균이 아니라 느린 꼬리(tail)를 봐야 하므로 min-duration을 크게 잡는 게 요령이다. 잘 계측돼 있으면 검색 몇 번으로 재현 트레이스를 손에 넣는다.',
+        focus: 'search',
+        code: {
+          lang: 'sql',
+          filename: 'trace_search.traceql — 느린·에러 트레이스 필터',
+          lines: [
+            '-- TraceQL(Tempo) — 느린 주문 트레이스만 골라낸다',
+            '-- 1) 지연 꼬리: 전체 트레이스 duration 이 1초 초과',
+            '{ resource.service.name = "api-gateway"',
+            '  && name = "GET /api/orders/{id}"',
+            '  && duration > 1s }',
+            '',
+            '-- 2) 에러 태그가 붙은 스팬을 포함하는 트레이스',
+            '{ span.http.route = "/api/orders/{id}"',
+            '  && status = error }',
+            '',
+            '-- 3) 특정 다운스트림(결제)에서 실패한 케이스',
+            '{ resource.service.name = "payment-service"',
+            '  && span.http.status_code >= 500 }',
+            '',
+            '-- 검색 팁: 평균이 아니라 느린 꼬리를 봐야 하므로',
+            '--   min-duration 을 크게 잡아 후보를 압축한다.',
+            '-- 결과: trace 4c1f...a9  duration=1.24s  error=1',
+          ],
+          highlight: [3, 4, 5, 8, 9],
+        },
+      },
+      {
+        title: 'Step 3. 타임라인 병목 span — 가장 넓은 막대·gap 찾기',
+        desc: '트레이스를 열면 워터폴 타임라인이 뜬다. 규칙은 단순하다: 가장 넓은(오래 걸린) 막대가 병목이다. 여기서는 postgres의 "SELECT product x15"가 900ms로 전체의 대부분을 먹는다. 자식 span들의 합보다 부모가 훨씬 넓으면 그 gap은 계측 안 된 구간(직렬 대기, GC, 네트워크)을 뜻한다. 반대로 자식들이 순차로 촘촘히 이어지면 직렬 호출이라 병렬화 여지가 있다. 넓은 막대와 빈 gap, 이 두 가지가 눈으로 병목을 짚는 신호다.',
+        focus: 'timeline',
+        code: {
+          lang: 'python',
+          filename: 'find_bottleneck.py — 워터폴에서 병목 계산',
+          lines: [
+            '# 트레이스 스팬 목록에서 병목과 gap 을 자동으로 짚는다',
+            'def analyze(spans):',
+            '    root = max(spans, key=lambda s: s["dur"])  # 보통 루트',
+            '    # 1) 가장 오래 걸린 리프 스팬 = 병목 후보',
+            '    leaves = [s for s in spans if not s.get("children")]',
+            '    bottleneck = max(leaves, key=lambda s: s["dur"])',
+            '',
+            '    # 2) 부모 - 자식합 = 계측 안 된 gap(직렬 대기 의심)',
+            '    for s in spans:',
+            '        child_sum = sum(c["dur"] for c in s.get("children", []))',
+            '        gap = s["dur"] - child_sum',
+            '        if gap > 100:',
+            '            print(f"gap {gap}ms in {s[\'name\']} — 계측 공백?")',
+            '',
+            '    # 3) 형제 스팬이 시간축에서 겹치지 않으면 직렬 호출',
+            '    print("bottleneck:", bottleneck["name"], bottleneck["dur"], "ms")',
+            '    return bottleneck',
+            '',
+            '# 출력: bottleneck: SELECT product x15  900 ms',
+            '# → 900ms 한 덩어리가 전체 1240ms 를 지배한다',
+          ],
+          highlight: [5, 6, 10, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 4. 드릴다운 — 로그·속성·span 이벤트 확인',
+        desc: '병목 막대를 클릭해 속성(attributes)과 이벤트를 본다. db.statement에 동일 쿼리가 15번 반복되고 db.rows=1이면 전형적인 N+1이다. span 이벤트에 찍힌 타임스탬프로 각 쿼리가 직렬로 이어졌음을 확인한다. 같은 trace_id로 로그를 상관 조회하면 애플리케이션 관점의 정황(루프 카운트, 캐시 미스)까지 붙는다. 여기서 속성이 부실하면(문장·행수·peer 미기록) 원인이 안 보이므로, 이 순간이 곧 계측 개선 목록이 된다.',
+        focus: 'drilldown',
+        code: {
+          lang: 'python',
+          filename: 'span_attributes.py — 병목 span의 속성·이벤트',
+          lines: [
+            '# 병목 스팬을 열었을 때 보이는 속성/이벤트 (Tempo UI 재현)',
+            'bottleneck_span = {',
+            '    "name": "SELECT product x15",',
+            '    "attributes": {',
+            '        "db.system": "postgresql",',
+            '        "db.statement": "SELECT * FROM product WHERE id = $1",',
+            '        "db.rows": 1,            # 매 호출 1행 → N+1 신호',
+            '        "db.repeat_count": 15,   # 같은 쿼리 15회',
+            '        "net.peer.name": "postgres-primary",',
+            '    },',
+            '    "events": [                  # 각 쿼리 실행 시각(직렬)',
+            '        {"t": "150ms", "name": "query.start #1"},',
+            '        {"t": "210ms", "name": "query.start #2"},',
+            '        {"t": "990ms", "name": "query.start #15"},',
+            '    ],',
+            '}',
+            '',
+            '# 같은 trace_id 로 로그 상관 조회 → 애플리케이션 정황 확인',
+            '# LogQL: {service="order-service"} | trace_id="4c1f...a9"',
+            '# → "loading products in loop, cache_miss=15" 로그 발견',
+          ],
+          highlight: [6, 7, 8, 12, 13, 14],
+        },
+      },
+      {
+        title: 'Step 5. 근본 원인 & 수정 — 직렬 N+1을 병렬·일괄로',
+        desc: '근본 원인은 주문 항목마다 product를 개별 조회하는 직렬 N+1이었다. 수정은 두 갈래다: 15개 id를 IN 절 한 방에 묶는 일괄 쿼리, 또는 외부 호출이라면 asyncio.gather로 병렬화. 900ms 직렬이 60ms 일괄로 줄면 전체가 200ms대로 복귀한다. 동시에 실패했던 payment 호출은 span.record_exception과 set_status(ERROR)로 원인이 트레이스에 남게 계측을 보강한다. 고친 뒤에는 같은 검색 쿼리로 트레이스를 다시 떠서 병목이 사라졌는지 반드시 검증한다.',
+        focus: 'rootcause',
+        code: {
+          lang: 'sql',
+          filename: 'fix_n_plus_1.sql — 직렬 15회 → 일괄 1회',
+          lines: [
+            '-- Before: 항목마다 개별 조회 → 15회 직렬 왕복(900ms)',
+            'SELECT * FROM product WHERE id = $1;  -- x15 (루프)',
+            '',
+            '-- After: id 목록을 한 번에 묶는다 → 1회 왕복(60ms)',
+            'SELECT * FROM product',
+            'WHERE id = ANY($1::int[]);      -- $1 = {12,15,...,88}',
+            '',
+            '-- 외부 API 라면 SQL 대신 코드에서 병렬화:',
+            '--   rows = await asyncio.gather(*[fetch(i) for i in ids])',
+            '',
+            '-- 실패한 payment 호출은 트레이스에 원인을 남긴다:',
+            '--   span.record_exception(err)',
+            '--   span.set_status(Status(StatusCode.ERROR))',
+            '',
+            '-- 검증: 같은 TraceQL 로 재조회 → duration 1.24s → 0.21s',
+          ],
+          highlight: [4, 5, 6, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 6. 실무 함정 — 샘플링 유실·계측 공백·시간 동기화',
+        desc: '트레이스 디버깅이 막히는 대표 함정들이다. head 샘플링(1%)은 정작 느린·에러 트레이스를 버려서 "재현이 안 되는" 상황을 만든다 — tail sampling으로 error=true나 duration 초과 트레이스는 항상 보존해야 한다. 계측이 빠진 라이브러리 구간은 부모-자식 gap으로만 보이는 맹점이 되니 auto-instrumentation과 수동 span으로 메운다. 서버 간 시계가 어긋나면 자식이 부모보다 먼저 끝난 듯 보이므로 NTP 동기화가 전제다. 속성이 부실하면 병목을 봐도 원인을 못 짚으니 db.statement·행수·peer는 기본 계측 대상이다.',
+        focus: 'pitfall',
+        code: {
+          lang: 'python',
+          filename: 'tail_sampling.py — 문제 트레이스는 항상 보존',
+          lines: [
+            '# 함정 1: head 샘플링은 느린/에러 트레이스를 버린다',
+            '# → Collector tail_sampling 으로 조건부 100% 보존',
+            'tail_sampling_policies = [',
+            '    {"name": "keep-errors",',
+            '     "type": "status_code",',
+            '     "status_code": {"status_codes": ["ERROR"]}},',
+            '    {"name": "keep-slow",',
+            '     "type": "latency",',
+            '     "latency": {"threshold_ms": 800}},   # 느린 꼬리 보존',
+            '    {"name": "sample-rest",',
+            '     "type": "probabilistic",',
+            '     "probabilistic": {"sampling_percentage": 5}},',
+            ']',
+            '',
+            '# 함정 2: 계측 공백 → auto-instrument + 수동 span 으로 메움',
+            '# 함정 3: 서버 시계 어긋남 → NTP 동기화가 전제',
+            '# 함정 4: 속성 부족 → db.statement/rows/peer 는 필수 계측',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — 트레이스 타임라인 워터폴 디버깅 시각화
+    // ─────────────────────────────────────────────────────────
+    function TraceWaterfallLiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+      const svcColor = {
+        'api-gateway':    'bg-slate-400',
+        'order-service':  'bg-indigo-400',
+        'postgres':       'otel-bg-soft',
+        'payment-service': 'bg-rose-400',
+      };
+
+      // 증상 단계: 지연 급등 스파크라인 강조
+      const showSearch = focus === 'search';
+      const showTimeline = ['timeline', 'drilldown', 'rootcause', 'pitfall'].includes(focus);
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-300">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🔍</span>
+              <span className="text-xs font-bold otel-text-dark">Trace Explorer — GET /api/orders</span>
+            </div>
+            <span className="text-[10px] otel-text-dark font-mono">tempo · trace 4c1f...a9</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={animKey}>
+
+            {/* 증상 배너 (Step 1) */}
+            <div className={`rounded-lg border-2 px-3 py-2 transition-all duration-500 ${focus === 'symptom' ? 'border-rose-400 bg-rose-50 shadow-lg shadow-rose-200/40' : 'border-slate-200 bg-slate-50 opacity-60'}`}>
+              <div className="flex items-center gap-2">
+                <span className="text-base">🚨</span>
+                <span className="text-xs font-bold text-rose-700">증상: p95 지연 200ms → 1.2s</span>
+                {focus === 'symptom' && <span className="ml-auto text-[10px] bg-rose-500 text-white px-2 py-0.5 rounded-full font-bold">ALERT</span>}
+              </div>
+              <div className="mt-2 flex items-end gap-1 h-10">
+                {[180, 210, 195, 220, 205, 240, 620, 980, 1180, 1240].map((v, i) => (
+                  <div key={i} className={`flex-1 rounded-t transition-all duration-500 ${v > 800 ? 'bg-rose-400' : 'otel-bg-soft'}`}
+                       style={{ height: `${Math.round((v / 1240) * 100)}%` }} title={`${v}ms`}></div>
+                ))}
+              </div>
+              <div className="text-[9px] text-slate-500 mt-1 font-mono">p95 latency (10m) — 알림에 trace_id 동봉</div>
+            </div>
+
+            {/* 검색 필터 (Step 2) */}
+            <div className={`rounded-lg border transition-all duration-500 ${showSearch ? 'border-2 otel-border bg-white shadow-lg fade-in' : 'border-slate-200 bg-slate-50 opacity-60'}`}>
+              <div className="px-3 py-2 flex items-center gap-2 border-b border-slate-100">
+                <span className="text-sm">🧭</span>
+                <span className="text-[11px] font-bold otel-text-dark">TraceQL 검색 — 느린·에러 후보</span>
+                {showSearch && <span className="ml-auto text-[10px] otel-bg text-white px-2 py-0.5 rounded-full font-bold">FILTER</span>}
+              </div>
+              <div className="p-2 space-y-1">
+                {[
+                  { id: '4c1f...a9', dur: '1.24s', err: true, tag: 'duration 초과 · error' },
+                  { id: '77ab...02', dur: '0.31s', err: false, tag: 'duration 초과' },
+                  { id: 'd902...5c', dur: '1.05s', err: true, tag: 'error=true' },
+                ].map((t, i) => (
+                  <div key={t.id} className={`flex items-center gap-2 text-[10px] font-mono rounded px-2 py-1 border ${i === 0 && showSearch ? 'otel-bg-light otel-border border-2' : 'bg-white border-slate-200'}`}>
+                    <span className="font-bold otel-text-dark">{t.id}</span>
+                    <span className={t.err ? 'text-rose-600 font-bold' : 'text-slate-500'}>{t.dur}</span>
+                    {t.err && <span className="text-rose-500">●error</span>}
+                    <span className="ml-auto text-slate-400">{t.tag}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* 워터폴 타임라인 (Step 3~6) */}
+            <div className={`rounded-lg border transition-all duration-500 ${showTimeline ? 'border-2 otel-border bg-white shadow-lg fade-in' : 'border-slate-200 bg-slate-50 opacity-50'}`}>
+              <div className="px-3 py-2 flex items-center gap-2 border-b border-slate-100">
+                <span className="text-sm">📊</span>
+                <span className="text-[11px] font-bold otel-text-dark">Waterfall — 총 {TRACE_TOTAL}ms</span>
+                <span className="ml-auto text-[9px] text-slate-400 font-mono">span duration</span>
+              </div>
+              <div className="p-2 space-y-1.5">
+                {SPANS.map((s) => {
+                  const leftPct = (s.start / TRACE_TOTAL) * 100;
+                  const widthPct = Math.max((s.dur / TRACE_TOTAL) * 100, 2);
+                  const isBottleneck = s.bottleneck && ['timeline', 'drilldown', 'rootcause'].includes(focus);
+                  const isErr = s.status === 'error';
+                  return (
+                    <div key={s.id} className="flex items-center gap-2">
+                      <div className="w-28 shrink-0 text-right" style={{ paddingRight: 4 }}>
+                        <div className={`text-[9px] font-mono truncate ${isBottleneck ? 'font-bold otel-text-dark' : 'text-slate-600'}`} style={{ marginLeft: s.depth * 8 }}>{s.name}</div>
+                        <div className="text-[8px] text-slate-400 font-mono">{s.svc}</div>
+                      </div>
+                      <div className="flex-1 relative h-5 bg-slate-100 rounded">
+                        <div
+                          className={`absolute top-0 h-5 rounded flex items-center transition-all duration-500 ${svcColor[s.svc]} ${isBottleneck ? 'ring-2 ring-rose-500 shadow-lg shadow-rose-300/50 z-10' : ''} ${isErr ? 'ring-2 ring-rose-400' : ''}`}
+                          style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
+                          title={`${s.dur}ms`}
+                        >
+                          <span className="text-[8px] text-white font-bold px-1 truncate">{s.dur}ms</span>
+                        </div>
+                        {isBottleneck && (
+                          <span className="absolute -top-4 left-0 text-[8px] font-bold text-rose-600 whitespace-nowrap" style={{ left: `${leftPct}%` }}>▲ 가장 넓은 span = 병목</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* 드릴다운 속성 패널 (Step 4~5) */}
+              {['drilldown', 'rootcause'].includes(focus) && (
+                <div className="mx-2 mb-2 rounded-lg otel-bg-light border-2 otel-border p-2 fade-in">
+                  <div className="text-[10px] font-bold otel-text-dark mb-1">🔎 SELECT product x15 — 속성·이벤트</div>
+                  <div className="grid grid-cols-2 gap-1 text-[9px] font-mono">
+                    <div className="bg-white rounded px-1.5 py-0.5 border border-slate-200">db.rows: <span className="font-bold text-rose-600">1</span></div>
+                    <div className="bg-white rounded px-1.5 py-0.5 border border-slate-200">repeat: <span className="font-bold text-rose-600">15</span></div>
+                    <div className="bg-white rounded px-1.5 py-0.5 border border-slate-200 col-span-2 truncate">db.statement: SELECT * FROM product WHERE id=$1</div>
+                  </div>
+                  {focus === 'rootcause' && (
+                    <div className="mt-1.5 text-[9px] font-bold text-emerald-700 bg-emerald-50 rounded px-2 py-1 border border-emerald-300">
+                      ✔ 수정: IN 절 일괄 조회 → 900ms → 60ms · 전체 0.21s
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 실무 함정 패널 (Step 6) */}
+            {focus === 'pitfall' && (
+              <div className="rounded-lg border-2 border-amber-400 bg-amber-50 p-3 fade-in">
+                <div className="text-xs font-bold text-amber-700 mb-2">⚠️ 트레이스 디버깅 4대 함정</div>
+                <div className="space-y-1 text-[10px] text-amber-900">
+                  <div className="bg-white rounded px-2 py-1 border border-amber-200">1. head 샘플링이 문제 trace 유실 → <b>tail sampling</b>으로 error·느린 trace 보존</div>
+                  <div className="bg-white rounded px-2 py-1 border border-amber-200">2. 계측 공백(맹점) → auto-instrument + 수동 span 으로 gap 메움</div>
+                  <div className="bg-white rounded px-2 py-1 border border-amber-200">3. 서버 시계 어긋남 → NTP 동기화 전제(자식이 부모보다 먼저 끝난 착시)</div>
+                  <div className="bg-white rounded px-2 py-1 border border-amber-200">4. 속성 부족 → db.statement·rows·peer 는 기본 계측 대상</div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'symptom'   && '메트릭이 "무엇이 나빠졌나", 트레이스가 "어디서 왜"를 답한다 — trace_id 로 진입'}
+              {focus === 'search'    && 'duration 초과 + error 태그로 수천 trace 를 후보 몇 개로 압축'}
+              {focus === 'timeline'  && '가장 넓은 막대가 병목 · 부모-자식 gap 은 계측 공백/직렬 대기'}
+              {focus === 'drilldown' && '병목 span 속성·이벤트·상관 로그로 N+1 확증'}
+              {focus === 'rootcause' && '직렬 N+1 을 일괄/병렬로 → 재조회로 병목 소멸 검증'}
+              {focus === 'pitfall'   && '샘플링 유실·계측 공백·시계 오차·속성 부족을 미리 차단'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum V-1-1</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">V</div>
+                <div>
+                  <div className="text-xs text-slate-500 font-medium">Part V. 실전 운영 &gt; Chapter 1. 디버깅</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">분산 추적 디버깅 워크플로우</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                트레이스로 성능 문제와 에러를 추적하는 실전 흐름 — <strong>증상 → 검색 → 병목 span → 로그·속성 → 근본 원인</strong>.
+                느린 <code className="bg-slate-100 px-1 rounded text-xs">GET /api/orders</code> 요청을 파고들어
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">N+1 쿼리</code>를 찾아 병렬·일괄로 고친다.
+              </p>
+              {/* 진행바 */}
+              <div className="mt-3 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: `${progress}%` }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <TraceWaterfallLiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(V-1-2)에서는 <strong>서비스맵과 exemplar 상관 분석</strong> — 메트릭에서 트레이스로 점프하는 흐름을 자세히 본다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./V-1-2.html" className="otel-text hover:otel-text-dark font-medium">V-1-2 서비스맵·exemplar 상관 분석 &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

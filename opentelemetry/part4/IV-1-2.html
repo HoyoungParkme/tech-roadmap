@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenTelemetry 학습 — IV-1-2. Jaeger — Trace 백엔드</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔭</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <style>
+    :root { --otel: #4F62AD; --otel-dark: #3D4E8C; --otel-light: #D6DCEE; --otel-mid: #6E80C4; }
+    .otel-bg { background-color: var(--otel); }
+    .otel-bg-dark { background-color: var(--otel-dark); }
+    .otel-bg-light { background-color: var(--otel-light); }
+    .otel-bg-mid { background-color: var(--otel-mid); }
+    .otel-text { color: var(--otel); }
+    .otel-text-dark { color: var(--otel-dark); }
+    .otel-border { border-color: var(--otel); }
+    .otel-hover:hover { background-color: var(--otel-dark); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    IV-1-2. Jaeger — Trace 백엔드
+    학습 목표: OTLP로 전송된 span이 Jaeger에 저장되고 trace_id로 조회되어 타임라인·서비스맵으로 시각화되는 흐름 이해
+    핵심 비유: "블랙박스 기록장치" — 여러 서비스의 이동 궤적(span)을 한 항공편(trace_id)으로 묶어 저장하고 되감아 본다
+    패턴: fastapi 표준 — 좌(Jaeger 저장·조회·시각화) / 우(VSCode 코드: yaml/bash)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 데모용 span 목록 — 하나의 trace(checkout 요청)를 구성하는 span들
+    const TRACE = [
+      { svc: 'frontend', op: 'GET /checkout',   start: 0,   dur: 120, depth: 0, color: 'sky' },
+      { svc: 'api',      op: 'POST /order',      start: 12,  dur: 96,  depth: 1, color: 'violet' },
+      { svc: 'api',      op: 'db.query INSERT',  start: 20,  dur: 38,  depth: 2, color: 'emerald' },
+      { svc: 'api',      op: 'cache.get',        start: 60,  dur: 10,  depth: 2, color: 'amber' },
+      { svc: 'payment',  op: 'charge',           start: 74,  dur: 30,  depth: 2, color: 'rose' },
+    ];
+
+    // 5 STEPS — Jaeger 저장·조회·시각화
+    const STEPS = [
+      {
+        title: 'Step 1. Jaeger 아키텍처 — 저장·조회·시각화 백엔드',
+        desc: 'Jaeger는 분산 추적 데이터를 받아서 저장하고, trace_id로 조회하며, 타임라인·서비스맵으로 시각화하는 CNCF 백엔드다. 핵심 3요소는 collector(수집·검증·저장 쓰기), storage(실제 span 보관), query(조회 API + UI)다. 왜 나눠져 있냐면 수집량(쓰기)과 조회량(읽기)의 부하 특성이 완전히 달라 각자 독립적으로 스케일해야 하기 때문이다. all-in-one 바이너리는 이 셋을 한 프로세스로 묶어 로컬 개발용으로 쓰고, 프로덕션에서는 collector와 query를 분리 배포한다.',
+        focus: 'arch',
+        code: {
+          lang: 'yaml',
+          filename: 'docker-compose.yaml — Jaeger all-in-one (개발용)',
+          lines: [
+            '# 로컬 개발: collector + query + storage 를 한 컨테이너로',
+            '',
+            'services:',
+            '  jaeger:',
+            '    image: jaegertracing/all-in-one:1.60',
+            '    environment:',
+            '      # 네이티브 OTLP 수신 활성화 (1.35+ 기본 지원)',
+            '      COLLECTOR_OTLP_ENABLED: "true"',
+            '      # 개발용 인메모리 저장 (재시작 시 전부 소실)',
+            '      SPAN_STORAGE_TYPE: memory',
+            '    ports:',
+            '      - "16686:16686"   # Jaeger UI (query)',
+            '      - "4317:4317"     # OTLP gRPC 수신',
+            '      - "4318:4318"     # OTLP HTTP 수신',
+            '    healthcheck:',
+            '      test: ["CMD", "wget", "-qO-", "localhost:16686"]',
+            '      interval: 10s',
+            '',
+            '# all-in-one = 개발 전용. 프로덕션은 collector/query 분리 배포',
+          ],
+          highlight: [4, 8, 12, 13, 14],
+        },
+      },
+      {
+        title: 'Step 2. OTLP로 Jaeger에 전송 — 네이티브 수신',
+        desc: 'Jaeger 1.35부터는 OTLP를 네이티브로 받는다. 예전처럼 jaeger-thrift 전용 프로토콜을 쓸 필요 없이, 앱 SDK나 OTel Collector가 표준 OTLP(gRPC :4317, HTTP :4318)로 그대로 쏘면 된다. 실무에서는 앱이 Jaeger에 직접 쏘기보다 OTel Collector를 앞단에 두고, Collector의 otlp exporter가 Jaeger로 전달하는 구조를 권장한다. 그래야 배치·재시도·샘플링·백엔드 교체를 앱 재배포 없이 Collector 설정만으로 처리할 수 있다.',
+        focus: 'otlp',
+        code: {
+          lang: 'yaml',
+          filename: 'otel-collector.yaml — Jaeger로 export',
+          lines: [
+            '# OTel Collector 가 앱의 span 을 받아 Jaeger 로 전달',
+            '',
+            'receivers:',
+            '  otlp:',
+            '    protocols:',
+            '      grpc: { endpoint: 0.0.0.0:4317 }',
+            '      http: { endpoint: 0.0.0.0:4318 }',
+            '',
+            'exporters:',
+            '  # Jaeger 는 이제 OTLP 를 직접 받는다 (jaeger exporter 는 폐기됨)',
+            '  otlp/jaeger:',
+            '    endpoint: jaeger:4317',
+            '    tls:',
+            '      insecure: true          # 사내망 데모. 운영은 mTLS 권장',
+            '',
+            'processors:',
+            '  batch:',
+            '    timeout: 5s',
+            '',
+            'service:',
+            '  pipelines:',
+            '    traces:',
+            '      receivers:  [otlp]',
+            '      processors: [batch]',
+            '      exporters:  [otlp/jaeger]',
+            '',
+            '# 앱 -> Collector -> Jaeger : 백엔드 교체가 설정 한 줄',
+          ],
+          highlight: [11, 12, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 3. 저장 백엔드 — memory vs Cassandra vs Elasticsearch',
+        desc: 'Jaeger 자체는 span을 담아둘 저장소가 필요하다. memory는 프로세스 메모리에 담아 재시작하면 전부 사라지므로 데모 전용이다. 프로덕션은 대개 Elasticsearch(전문 검색·태그 필터가 강함)나 Cassandra(쓰기 처리량이 큼)를 쓴다. 왜 중요하냐면 span은 초당 수만 건씩 쌓여서 저장소가 병목이자 비용의 대부분이 되기 때문이다. 반드시 인덱스 보존 기간(ILM/TTL)을 설정해 오래된 trace를 자동 삭제해야 디스크가 터지지 않는다.',
+        focus: 'storage',
+        code: {
+          lang: 'yaml',
+          filename: 'jaeger-collector.yaml — Elasticsearch 백엔드',
+          lines: [
+            '# 프로덕션 collector: Elasticsearch 를 저장소로',
+            '',
+            'services:',
+            '  jaeger-collector:',
+            '    image: jaegertracing/jaeger-collector:1.60',
+            '    environment:',
+            '      SPAN_STORAGE_TYPE: elasticsearch',
+            '      ES_SERVER_URLS: http://es:9200',
+            '      # 인덱스 롤오버 + 보존 (미설정 시 디스크 폭발)',
+            '      ES_INDEX_ROLLOVER: "true"',
+            '      ES_NUM_SHARDS: "3"',
+            '      ES_NUM_REPLICAS: "1"',
+            '    ports:',
+            '      - "4317:4317"     # OTLP gRPC',
+            '',
+            '  jaeger-query:',
+            '    image: jaegertracing/jaeger-query:1.60',
+            '    environment:',
+            '      SPAN_STORAGE_TYPE: elasticsearch',
+            '      ES_SERVER_URLS: http://es:9200',
+            '    ports:',
+            '      - "16686:16686"   # UI 는 query 만 있으면 된다',
+            '',
+            '# collector(쓰기) 와 query(읽기) 를 따로 스케일한다',
+          ],
+          highlight: [7, 8, 10, 19],
+        },
+      },
+      {
+        title: 'Step 4. trace_id 조회 — 타임라인·span 상세·서비스맵',
+        desc: 'UI(포트 16686)에서 서비스·operation·태그·소요시간으로 trace를 검색하거나, 로그에 찍힌 trace_id를 직접 넣어 특정 요청 하나를 정확히 꺼낸다. trace를 열면 span들이 부모-자식 관계로 waterfall 타임라인으로 그려져 어느 구간이 오래 걸렸는지 한눈에 보인다. span을 클릭하면 태그·로그·에러가 나오고, 서비스맵/의존성 그래프는 서비스 간 호출 관계와 트래픽을 보여준다. 장애 대응의 핵심은 "로그의 trace_id -> Jaeger 조회 -> 느린 span 발견" 흐름이다.',
+        focus: 'query',
+        code: {
+          lang: 'bash',
+          filename: 'query.sh — trace_id 로 직접 조회',
+          lines: [
+            '# 1) 로그에서 trace_id 를 확보 (구조화 로그에 함께 남긴다)',
+            'kubectl logs deploy/api | grep ERROR',
+            '#  -> {\'level\':\'error\',\'trace_id\':\'4bf92f...a3ce9\', ...}',
+            '',
+            '# 2) Jaeger Query API 로 그 trace 하나만 조회',
+            'curl -s http://jaeger:16686/api/traces/4bf92f3577b34da6a3ce929d0e0e4736 \\',
+            '  | jq \'.data[0].spans[] | {op: .operationName, ms: (.duration/1000)}\'',
+            '',
+            '# 3) 서비스/조건으로 검색 (UI 검색과 동일한 API)',
+            'curl -s "http://jaeger:16686/api/traces?service=api&\\',
+            'operation=POST%20/order&minDuration=200ms&limit=20" | jq \'.data | length\'',
+            '',
+            '# 4) 브라우저로 UI 열기 — 타임라인·서비스맵 시각화',
+            'open http://jaeger:16686/trace/4bf92f3577b34da6a3ce929d0e0e4736',
+            '',
+            '# trace_id 는 모든 서비스가 공유 -> 요청 하나를 끝까지 추적',
+          ],
+          highlight: [1, 5, 6, 13],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — 샘플링·보존·카디널리티',
+        desc: '첫째, memory 스토리지를 프로덕션에 두면 재시작·OOM 때 trace가 통째로 사라진다 — 반드시 ES/Cassandra를 쓴다. 둘째, 샘플링을 안 하면 span 저장량과 비용이 트래픽에 비례해 폭발한다 — tail sampling으로 에러·느린 요청만 남기는 전략이 흔하다. 셋째, 보존 기간(ILM/TTL)을 안 걸면 인덱스가 무한히 커진다. 넷째, operation 이름이나 태그에 user_id·URL 같은 고유값을 넣으면 카디널리티가 폭발해 서비스맵과 검색이 느려진다 — 경로는 /users/{id}처럼 템플릿화한다.',
+        focus: 'pitfalls',
+        code: {
+          lang: 'yaml',
+          filename: 'tail-sampling.yaml — 비용을 잡는 샘플링',
+          lines: [
+            '# OTel Collector tail_sampling — 저장 전에 걸러 비용 절감',
+            '',
+            'processors:',
+            '  tail_sampling:',
+            '    decision_wait: 10s',
+            '    policies:',
+            '      # ① 에러 trace 는 무조건 보관',
+            '      - name: keep-errors',
+            '        type: status_code',
+            '        status_code: { status_codes: [ERROR] }',
+            '      # ② 느린 요청(500ms 초과) 은 보관',
+            '      - name: keep-slow',
+            '        type: latency',
+            '        latency: { threshold_ms: 500 }',
+            '      # ③ 나머지는 10% 만 확률 샘플링',
+            '      - name: sample-rest',
+            '        type: probabilistic',
+            '        probabilistic: { sampling_percentage: 10 }',
+            '',
+            '# 에러+느린요청은 다 남기고, 정상 트래픽만 솎아낸다',
+          ],
+          highlight: [4, 8, 12, 16, 17],
+        },
+      },
+    ];
+
+    // ─────────────────────────────────────────────────────────
+    // 좌측 LiveDataPane — Jaeger 저장·조회·시각화
+    // ─────────────────────────────────────────────────────────
+    function LiveDataPane({ step, stepIdx }) {
+      const focus = step.focus;
+      const animKey = `step-${stepIdx}`;
+      const TOTAL = 120; // trace 총 길이(ms) — 타임라인 스케일
+
+      const barCls = {
+        sky: 'bg-sky-400', violet: 'bg-violet-400', emerald: 'bg-emerald-400',
+        amber: 'bg-amber-400', rose: 'bg-rose-400',
+      };
+
+      return (
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          <div className="otel-bg-light px-4 py-2 flex items-center justify-between border-b border-slate-200">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🔭</span>
+              <span className="text-xs font-bold otel-text-dark">Jaeger — 분산 추적 블랙박스</span>
+            </div>
+            <span className="text-[10px] text-slate-600 font-mono">UI :16686 · CNCF</span>
+          </div>
+
+          <div className="p-4 space-y-3 min-h-[460px]" key={animKey}>
+
+            {/* 서비스 -> OTLP -> Jaeger 파이프라인 (항상 표시) */}
+            <div className="flex items-stretch gap-2">
+              {/* 서비스들 */}
+              <div className={`flex-1 rounded-lg border p-2 transition-all duration-500 ${focus === 'otlp' ? 'border-2 otel-border otel-bg-light' : 'border-slate-200 bg-slate-50'}`}>
+                <div className="text-[10px] font-bold text-slate-500 mb-1">서비스 (SDK)</div>
+                <div className="space-y-1">
+                  {['frontend', 'api', 'payment'].map((s) => (
+                    <div key={s} className="text-[10px] font-mono bg-white rounded border border-slate-200 px-1.5 py-0.5 flex items-center justify-between">
+                      <span className="text-slate-700">{s}</span>
+                      <span className="otel-text">span</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* OTLP 화살표 */}
+              <div className="flex flex-col items-center justify-center px-1">
+                <div className={`text-[9px] font-mono font-bold ${focus === 'otlp' ? 'otel-text-dark' : 'text-slate-400'}`}>OTLP</div>
+                <div className={`text-2xl leading-none ${focus === 'otlp' ? 'otel-text' : 'text-slate-300'}`}>&rarr;</div>
+                <div className={`text-[8px] font-mono ${focus === 'otlp' ? 'otel-text' : 'text-slate-400'}`}>:4317</div>
+              </div>
+
+              {/* Jaeger 3요소 */}
+              <div className="flex-1 rounded-lg border-2 otel-border otel-bg-light p-2">
+                <div className="text-[10px] font-bold otel-text-dark mb-1">Jaeger</div>
+                <div className="space-y-1">
+                  <JaegerBox label="collector" desc="수집·검증" on={['arch','otlp'].includes(focus)} />
+                  <JaegerBox label="storage" desc="span 보관" on={['arch','storage'].includes(focus)} />
+                  <JaegerBox label="query" desc="조회·UI" on={['arch','query','pitfalls'].includes(focus)} />
+                </div>
+              </div>
+            </div>
+
+            {/* 하단 동적 패널 */}
+            {focus === 'arch' && (
+              <div className="fade-in rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-bold otel-text-dark mb-2">배포 모드</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded border border-slate-300 bg-slate-50 p-2">
+                    <div className="text-[11px] font-bold text-slate-700">all-in-one</div>
+                    <div className="text-[9px] text-slate-500 mt-0.5">3요소 한 프로세스 · memory · 개발/데모</div>
+                  </div>
+                  <div className="rounded border-2 otel-border otel-bg-light p-2">
+                    <div className="text-[11px] font-bold otel-text-dark">production</div>
+                    <div className="text-[9px] text-slate-600 mt-0.5">collector/query 분리 · ES/Cassandra · 독립 스케일</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {focus === 'otlp' && (
+              <div className="fade-in rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-bold otel-text-dark mb-2">네이티브 OTLP 수신 (1.35+)</div>
+                <div className="space-y-1.5 text-[11px] font-mono">
+                  <div className="flex items-center gap-2"><span className="otel-bg text-white px-1.5 rounded">gRPC</span><span className="text-slate-600">:4317</span><span className="text-slate-400">— 고성능 push</span></div>
+                  <div className="flex items-center gap-2"><span className="otel-bg-mid text-white px-1.5 rounded">HTTP</span><span className="text-slate-600">:4318</span><span className="text-slate-400">— 방화벽 친화적</span></div>
+                </div>
+                <div className="text-[9px] text-slate-500 mt-2">권장: 앱 &rarr; OTel Collector &rarr; Jaeger (백엔드 교체가 쉬움)</div>
+              </div>
+            )}
+
+            {focus === 'storage' && (
+              <div className="fade-in rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-bold otel-text-dark mb-2">저장 백엔드 선택</div>
+                <div className="space-y-1.5">
+                  {[
+                    { name: 'memory', use: '개발/데모', note: '재시작 시 전부 소실', bad: true },
+                    { name: 'elasticsearch', use: '프로덕션', note: '태그 검색·필터 강함', bad: false },
+                    { name: 'cassandra', use: '프로덕션', note: '높은 쓰기 처리량', bad: false },
+                  ].map((b) => (
+                    <div key={b.name} className={`flex items-center justify-between rounded border px-2 py-1 ${b.bad ? 'border-rose-300 bg-rose-50' : 'border-emerald-300 bg-emerald-50'}`}>
+                      <span className="text-[11px] font-mono font-bold text-slate-700">{b.name}</span>
+                      <span className="text-[9px] text-slate-500">{b.use}</span>
+                      <span className={`text-[9px] font-bold ${b.bad ? 'text-rose-600' : 'text-emerald-700'}`}>{b.note}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {focus === 'query' && (
+              <div className="fade-in rounded-lg border border-slate-200 bg-white p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-xs font-bold otel-text-dark">trace_id: 4bf92f…4736 — 타임라인</div>
+                  <div className="text-[9px] font-mono text-slate-400">120ms</div>
+                </div>
+                <div className="space-y-1">
+                  {TRACE.map((sp, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <div className="w-24 shrink-0 text-[9px] font-mono text-slate-600 truncate" style={{ paddingLeft: sp.depth * 8 }}>{sp.op}</div>
+                      <div className="relative flex-1 h-3 bg-slate-100 rounded">
+                        <div className={`absolute h-3 rounded ${barCls[sp.color]}`}
+                          style={{ left: (sp.start / TOTAL * 100) + '%', width: (sp.dur / TOTAL * 100) + '%' }}
+                          title={sp.svc + ' ' + sp.dur + 'ms'}></div>
+                      </div>
+                      <div className="w-8 shrink-0 text-[8px] font-mono text-slate-400 text-right">{sp.dur}ms</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="text-[9px] text-slate-500 mt-2">db.query INSERT 가 38ms — 이 구간이 병목. span 클릭 &rarr; 태그·에러 확인</div>
+              </div>
+            )}
+
+            {focus === 'pitfalls' && (
+              <div className="fade-in space-y-1.5">
+                {[
+                  { t: 'memory 프로덕션', d: '재시작·OOM 시 trace 전소 → ES/Cassandra 필수' },
+                  { t: '샘플링 미설정', d: '저장량·비용 트래픽 비례 폭발 → tail sampling' },
+                  { t: '보존 미설정', d: 'ILM/TTL 없으면 인덱스 무한 증가 → 디스크 폭발' },
+                  { t: '카디널리티 폭발', d: 'op/태그에 user_id·URL → /users/{id} 로 템플릿화' },
+                ].map((p) => (
+                  <div key={p.t} className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-2">
+                    <span className="text-sm">⚠️</span>
+                    <div>
+                      <div className="text-[11px] font-bold text-rose-700">{p.t}</div>
+                      <div className="text-[10px] text-slate-600 leading-snug">{p.d}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="px-4 pb-3 pt-2 border-t border-slate-100 bg-slate-50">
+            <div className="text-[11px] text-slate-600 font-bold mb-1">{step.title.replace(/^Step \d+\. /, '')}</div>
+            <div className="text-[10px] text-slate-500 leading-snug">
+              {focus === 'arch'     && 'collector(쓰기) · storage(보관) · query(읽기·UI) 3요소'}
+              {focus === 'otlp'     && '표준 OTLP 를 네이티브 수신 — 전용 프로토콜 불필요'}
+              {focus === 'storage'  && '프로덕션은 ES/Cassandra — 보존 기간을 반드시 설정'}
+              {focus === 'query'    && 'trace_id 로 조회 → waterfall 타임라인 → 느린 span 발견'}
+              {focus === 'pitfalls' && '유실·비용·용량·카디널리티 — 4대 함정을 미리 막는다'}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function JaegerBox({ label, desc, on }) {
+      return (
+        <div className={`rounded border px-1.5 py-1 flex items-center justify-between transition-all duration-500 ${on ? 'border-2 otel-border bg-white shadow-sm scale-[1.02]' : 'border-slate-200 bg-white/60 opacity-60'}`}>
+          <span className="text-[10px] font-mono font-bold text-slate-700">{label}</span>
+          <span className="text-[8px] text-slate-500">{desc}</span>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 우측 VSCode CodeViewer
+    // ─────────────────────────────────────────────────────────
+    function CodeViewer({ code, stepIdx }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [stepIdx]);
+
+      return (
+        <div className="bg-[#282c34] rounded-xl overflow-hidden border border-slate-700 shadow-lg">
+          <div className="bg-[#21252b] px-4 py-2 flex items-center gap-2 border-b border-slate-700">
+            <div className="flex gap-1.5">
+              <span className="w-3 h-3 rounded-full bg-red-500"></span>
+              <span className="w-3 h-3 rounded-full bg-yellow-500"></span>
+              <span className="w-3 h-3 rounded-full bg-green-500"></span>
+            </div>
+            <span className="text-xs text-slate-400 ml-2 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-700/40 font-mono">{code.lang}</span>
+          </div>
+          <div className="overflow-auto max-h-[30rem] text-xs">
+            <pre className="p-0 m-0">
+              <code ref={codeRef} className={`language-${code.lang} block !bg-transparent !p-0`}>
+{code.lines.map((line, i) => {
+  const highlighted = code.highlight && code.highlight.includes(i + 1);
+  return (
+    <div key={i} className={`flex ${highlighted ? 'bg-yellow-500/10' : ''}`}>
+      <span className="select-none text-slate-500 text-right pr-3 pl-3 border-r border-slate-700 w-10 shrink-0">{i + 1}</span>
+      <span className="pl-3 pr-3 whitespace-pre">{line || ' '}</span>
+    </div>
+  );
+})}
+              </code>
+            </pre>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // App
+    // ─────────────────────────────────────────────────────────
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const intervalRef = useRef(null);
+
+      const handleNext = () => setStepIdx((i) => (i < STEPS.length - 1 ? i + 1 : i));
+      const handlePrev = () => setStepIdx((i) => Math.max(0, i - 1));
+      const handleNextRef = useRef(handleNext);
+      const handlePrevRef = useRef(handlePrev);
+      handleNextRef.current = handleNext;
+      handlePrevRef.current = handlePrev;
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) {
+              setIsPlaying(false);
+              return i;
+            }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [isPlaying]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') { e.preventDefault(); handleNextRef.current(); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); handlePrevRef.current(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      const togglePlay = () => {
+        if (stepIdx >= STEPS.length - 1) setStepIdx(0);
+        setIsPlaying((p) => !p);
+      };
+
+      const step = STEPS[stepIdx];
+      const progress = ((stepIdx + 1) / STEPS.length) * 100;
+
+      return (
+        <div className="min-h-screen bg-slate-50 font-sans p-4 md:p-6 text-slate-800">
+          <style>{`
+            @keyframes fadeIn {
+              from { opacity: 0; transform: translateY(4px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            .fade-in { animation: fadeIn 360ms ease-out; }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto space-y-5">
+
+            {/* 헤더 네비 */}
+            <nav className="flex items-center justify-between text-sm">
+              <a href="../index.html" className="otel-text hover:otel-text-dark font-medium">&larr; 챕터 목록</a>
+              <span className="font-mono bg-slate-100 px-2 py-1 rounded border border-slate-200 text-xs">curriculum IV-1-2</span>
+            </nav>
+
+            {/* 헤더 */}
+            <header className="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-9 h-9 otel-bg text-white flex items-center justify-center rounded-full font-bold text-sm">IV</div>
+                <div>
+                  <div className="text-xs otel-text-dark font-bold">Part IV. Exporter &amp; Backend &gt; Chapter 1 · IV-1-2</div>
+                  <h1 className="text-xl md:text-2xl font-bold text-slate-800">Jaeger — Trace 백엔드</h1>
+                </div>
+              </div>
+              <p className="text-slate-600 text-sm leading-relaxed">
+                분산 추적을 저장하고 시각화하는 백엔드 — 여러 서비스의 span이 <strong>OTLP</strong>로 Jaeger에 저장되고,
+                <code className="bg-slate-100 px-1 rounded text-xs mx-1">trace_id</code>로 조회하면
+                <strong>타임라인·서비스맵</strong>으로 그려진다.
+                <code className="bg-slate-100 px-1 rounded text-xs ml-1">collector</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">storage</code> /
+                <code className="bg-slate-100 px-1 rounded text-xs">query</code> 3요소를 다룬다.
+              </p>
+              {/* 진행바 */}
+              <div className="mt-3 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                <div className="h-full otel-bg transition-all duration-500" style={{ width: progress + '%' }}></div>
+              </div>
+            </header>
+
+            {/* 좌/우 2-pane */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} />
+            </div>
+
+            {/* 설명 */}
+            <div className="p-4 rounded-xl otel-bg-dark text-white shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-200">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <span className="text-xs text-indigo-200">키보드 &larr;/&rarr;</span>
+              </div>
+              <p className="text-sm leading-relaxed">{step.desc}</p>
+            </div>
+
+            {/* 마지막 단계: 다음 안내 */}
+            {stepIdx === STEPS.length - 1 && (
+              <div className="p-3 rounded-xl otel-bg-light border-2 otel-border otel-text-dark text-sm">
+                💡 다음(IV-1-3)에서는 <strong>Grafana Tempo</strong> — 오브젝트 스토리지 기반의 저비용 대용량 trace 백엔드를 본다.
+              </div>
+            )}
+
+            {/* 컨트롤 4 버튼 */}
+            <div className="flex items-center justify-center gap-3">
+              <button onClick={() => { setStepIdx(0); setIsPlaying(false); }} disabled={stepIdx === 0}
+                aria-label="처음으로"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                처음
+              </button>
+              <button onClick={handlePrev} disabled={stepIdx === 0}
+                aria-label="이전 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                &larr; 이전
+              </button>
+              <button onClick={togglePlay}
+                aria-label="자동 재생 시작/정지" aria-pressed={isPlaying}
+                className="px-4 py-1.5 rounded-lg text-sm font-bold otel-bg text-white otel-hover transition min-w-[96px]">
+                {isPlaying ? '⏸ 일시정지' : (stepIdx >= STEPS.length - 1 ? '↻ 다시보기' : '▶ 자동재생')}
+              </button>
+              <button onClick={handleNext} disabled={stepIdx >= STEPS.length - 1}
+                aria-label="다음 단계"
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-200 text-slate-700 hover:bg-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition">
+                다음 &rarr;
+              </button>
+            </div>
+
+            {/* 이전/다음 자료 네비 */}
+            <nav className="flex justify-between text-sm pt-2">
+              <a href="../index.html" className="text-slate-500 hover:text-slate-700">&larr; 챕터 목록</a>
+              <a href="./IV-1-3.html" className="otel-text hover:otel-text-dark font-medium">IV-1-3 Grafana Tempo &rarr;</a>
+            </nav>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
