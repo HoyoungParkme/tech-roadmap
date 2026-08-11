@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQLite 인터랙티브 학습 — Chapter I-1-2. ACID와 트랜잭션</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    SQLite Chapter I-1-2 — ACID와 트랜잭션 (rollback journal 흐름)
+    학습 목표: BEGIN → journal 생성 → 데이터 변경 → COMMIT (또는 CRASH/ROLLBACK) 5단계 추적
+    핵심 비유: "고치기 전에 원본을 복사해두는 안전 사본"
+    패턴: fastapi v1 — 좌(LiveDataPane: journal 상태 시뮬레이션) / 우(VSCode CodeViewer)
+    색상: SQLite navy (#003B57)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 정상 상태 — users.db 만 있다',
+        desc: '평상시 디스크에는 users.db 파일 하나만 있다. 아직 트랜잭션이 시작되지 않은 안정 상태. 모든 reader는 이 파일을 안전하게 읽을 수 있다. ACID 보장은 다음 단계, "변경이 시작되는 순간"부터 작동한다.',
+        files: [
+          { kind: 'db',      label: 'users.db',         value: '48 KB',    badge: 'main' },
+          { kind: 'empty',   label: '(no journal)',     value: '—',         badge: 'idle' },
+        ],
+        state: 'IDLE',
+        keyPoint: '정상 상태 = main DB 파일 하나. journal 파일은 아직 없다.',
+        code: {
+          lang: 'sql',
+          filename: 'idle-state.sql',
+          lines: [
+            '-- Step 1. 트랜잭션 시작 전의 안정 상태',
+            '',
+            '-- 디스크 상태',
+            '--   users.db          ← 메인 DB 파일',
+            '--   (journal 없음)    ← 트랜잭션 안 열림',
+            '',
+            "SELECT * FROM users WHERE id = 1;  -- 안전한 read",
+            '--   결과: 1 | Alice | alice@old.com',
+            '',
+            '-- 이 상태에서는:',
+            '--   • read 는 락 없이 가능 (SHARED lock 만)',
+            '--   • write 가 없으니 journal 도 없음',
+            '--   • 파일 한 개만 백업하면 끝',
+            '',
+            '-- → 다음 단계 (Step 2): "BEGIN 하면 무슨 일이 일어나는가"',
+          ],
+          highlight: [3, 4, 5, 7, 8, 10, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 2. BEGIN — 변경 전 원본 페이지를 journal 에 복사',
+        desc: 'BEGIN TRANSACTION을 만나면 SQLite는 변경하려는 페이지의 "변경 전 원본"을 users.db-journal 파일에 미리 복사한다. 아직 메인 파일은 손도 대지 않았다. journal은 "안전 사본"이다. 이게 SQLite의 ACID 비밀의 시작이다.',
+        files: [
+          { kind: 'db',      label: 'users.db',         value: '48 KB 그대로', badge: 'main' },
+          { kind: 'journal', label: 'users.db-journal', value: '원본 페이지 백업', badge: '🆕 생성' },
+        ],
+        state: 'JOURNAL_WRITE',
+        keyPoint: 'BEGIN = "변경 전 원본"을 journal 에 복사. 메인 파일은 아직 그대로.',
+        code: {
+          lang: 'sql',
+          filename: 'begin-trx.sql',
+          lines: [
+            '-- Step 2. BEGIN 직후 — journal 파일이 만들어진다',
+            '',
+            'BEGIN TRANSACTION;',
+            '',
+            '-- 이 시점의 디스크',
+            '--   users.db           ← 아직 변경 전 상태 그대로',
+            '--   users.db-journal   ← 신규! 변경될 페이지의 원본 사본',
+            '',
+            "UPDATE users SET email = 'alice@new.com' WHERE id = 1;",
+            '--   ↑ SQLite 내부 동작:',
+            '--     1) id=1 행이 들어있는 페이지를 식별 (예: page 7)',
+            '--     2) page 7 의 "변경 전 원본"을 users.db-journal 로 복사',
+            '--     3) 캐시상의 page 7 만 수정 (디스크 main 은 아직 안 건드림)',
+            '',
+            '-- journal 내용 (간단화)',
+            '--   header   : "SQLite rollback journal\\0"',
+            '--   page 7   : (변경 전 데이터 4096B 그대로)',
+            '',
+            '-- → 다음 단계 (Step 3): "변경된 페이지를 main 에 쓴다"',
+          ],
+          highlight: [3, 5, 6, 7, 9, 11, 12, 13, 15, 16, 17],
+        },
+      },
+      {
+        title: 'Step 3. 변경된 페이지를 users.db 에 기록',
+        desc: 'journal에 원본이 안전히 보관된 뒤, SQLite는 변경된 페이지를 메인 파일(users.db)에 실제로 쓴다. fsync로 디스크에 강제 동기화한다. 만약 이 시점에 정전이 나도 journal이 살아 있으므로 다음 부팅 시 원래대로 되돌릴 수 있다.',
+        files: [
+          { kind: 'db',      label: 'users.db',         value: '48 KB (page 7 변경됨)', badge: '✏️ 수정' },
+          { kind: 'journal', label: 'users.db-journal', value: '원본 보관 중',          badge: '🛡️ 안전' },
+        ],
+        state: 'MAIN_WRITE',
+        keyPoint: 'main 파일 수정 + fsync. journal 이 있으므로 중간에 죽어도 복구 가능.',
+        code: {
+          lang: 'sql',
+          filename: 'main-write.sql',
+          lines: [
+            '-- Step 3. 변경된 페이지를 main 파일에 쓰는 단계',
+            '',
+            '-- (Step 2 의 UPDATE 가 계속됨)',
+            '',
+            '-- SQLite 내부 동작:',
+            "--   1) journal 에 page 7 원본을 썼다 → fsync(users.db-journal)",
+            "--   2) main 파일 page 7 위치에 새 내용을 쓴다",
+            "--   3) fsync(users.db) 로 디스크에 강제 동기화",
+            '',
+            "-- 디스크 상태",
+            "--   users.db          ← page 7 가 'alice@new.com' 으로 변경됨",
+            "--   users.db-journal  ← 여전히 'alice@old.com' 원본 보관 중",
+            '',
+            '-- 만약 이 시점에 정전이 나면?',
+            '--   → 다음 부팅 시 sqlite3 가 journal 을 발견 →',
+            '--     "롤백 진행 중인 트랜잭션이 있다" 판단 →',
+            '--     journal 의 원본 page 7 을 main 으로 다시 복사 → 원래대로 복원',
+            '--   이것이 Atomicity 와 Durability 의 정체',
+            '',
+            '-- → 다음 단계 (Step 4): "COMMIT 으로 journal 을 지운다"',
+          ],
+          highlight: [5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 17, 18],
+        },
+      },
+      {
+        title: 'Step 4. COMMIT — journal 을 삭제하면 끝',
+        desc: 'COMMIT 명령은 사실상 "journal 파일을 지운다"는 한 줄 동작이다. journal이 사라진 순간 트랜잭션이 확정된 것으로 간주된다. 매우 단순하지만 atomic하다. journal이 있으면 미완료, 없으면 완료. 이 흑백 논리가 ACID를 보장한다.',
+        files: [
+          { kind: 'db',      label: 'users.db',         value: '48 KB (변경 확정)', badge: '✅ 커밋' },
+          { kind: 'empty',   label: '(journal 삭제됨)',  value: '—',                 badge: 'done' },
+        ],
+        state: 'COMMITTED',
+        keyPoint: 'COMMIT = journal 삭제. journal 있음=미완료, 없음=완료. 흑백 논리로 atomic.',
+        code: {
+          lang: 'sql',
+          filename: 'commit.sql',
+          lines: [
+            '-- Step 4. COMMIT — journal 파일 삭제 = 트랜잭션 확정',
+            '',
+            'COMMIT;',
+            '',
+            '-- SQLite 내부 동작:',
+            '--   1) main 파일이 모두 fsync 됐는지 확인',
+            '--   2) users.db-journal 파일을 삭제',
+            '--   3) (이 삭제 자체도 fsync 로 디렉터리 동기화)',
+            '',
+            '-- 이 시점의 디스크',
+            '--   users.db          ← 변경 확정 상태',
+            '--   (journal 없음)    ← 트랜잭션 종료',
+            '',
+            '-- "journal 의 존재 = 트랜잭션 진행 중" 이라는 흑백 논리',
+            '--   이 단순함이 SQLite ACID 의 핵심',
+            '',
+            "SELECT email FROM users WHERE id = 1;",
+            "--   결과: alice@new.com  ← 변경 반영 확인",
+            '',
+            '-- → 다음 단계 (Step 5): "만약 ROLLBACK 또는 CRASH 였다면?"',
+          ],
+          highlight: [3, 5, 6, 7, 8, 10, 11, 12, 14, 15, 17, 18],
+        },
+      },
+      {
+        title: 'Step 5. ROLLBACK 또는 CRASH — journal 로 복원',
+        desc: '명시적 ROLLBACK이거나 도중에 프로세스가 죽었다면 journal이 살아남아 있다. 다음 접속 시 SQLite는 journal을 발견하고 그 안의 원본 페이지로 main 파일을 되돌린다. 이 자동 복구가 "ACID 안의 Atomicity + Durability"를 단일 파일에서 실현하는 방법이다.',
+        files: [
+          { kind: 'db',      label: 'users.db',         value: '원상 복구됨',         badge: '↩️ 복원' },
+          { kind: 'journal', label: 'users.db-journal', value: '복구 후 삭제',         badge: 'cleanup' },
+        ],
+        state: 'ROLLED_BACK',
+        keyPoint: 'journal 존재 = 미완료 → 다음 접속 시 자동 복원. 정전에도 깨지지 않는 이유.',
+        code: {
+          lang: 'python',
+          filename: 'crash-recovery.py',
+          lines: [
+            '"""',
+            'Step 5. CRASH 시나리오 + 자동 복구 검증',
+            '',
+            '의존성: 표준 라이브러리 sqlite3',
+            '"""',
+            'import os',
+            'import sqlite3',
+            'from pathlib import Path',
+            '',
+            'DB_PATH = Path("users.db")',
+            'JOURNAL_PATH = Path("users.db-journal")',
+            '',
+            'def simulate_crash_during_update() -> None:',
+            '    """UPDATE 도중 프로세스가 죽는 상황을 흉내."""',
+            '    conn = sqlite3.connect(DB_PATH, isolation_level="DEFERRED")',
+            '    conn.execute("BEGIN")',
+            '    conn.execute("UPDATE users SET email = \'X\' WHERE id = 1")',
+            '    # COMMIT 직전 — 강제로 죽는다 (close 없음)',
+            '    os._exit(1)  # journal 파일이 디스크에 남음',
+            '',
+            'def reopen_and_check() -> str:',
+            '    """다음 접속 시 SQLite 가 journal 을 보고 자동 복구한다."""',
+            '    # connect 만 해도 SQLite 가 journal 을 발견 → 자동 롤백',
+            '    with sqlite3.connect(DB_PATH) as conn:',
+            '        row = conn.execute(',
+            '            "SELECT email FROM users WHERE id = 1"',
+            '        ).fetchone()',
+            '    return row[0]  # 변경 전 원본 값이 그대로 보존됨',
+            '',
+            '# 핵심:',
+            '#   • journal 이 남아있으면 "미완료 트랜잭션 있음" 판단',
+            '#   • SQLite 가 알아서 원본 페이지로 main 을 되돌림',
+            '#   • 사용자 코드는 별다른 처리 없이 다음 접속만 하면 됨',
+          ],
+          highlight: [6, 7, 8, 10, 11, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33],
+        },
+      },
+    ];
+
+    const KIND_STYLE = {
+      db:      { bg: 'bg-slate-100',    border: 'border-slate-300',   text: 'text-slate-800',   badge: 'bg-slate-200 text-slate-700' },
+      journal: { bg: 'bg-amber-50',     border: 'border-amber-400',   text: 'text-amber-900',   badge: 'bg-amber-200 text-amber-900' },
+      empty:   { bg: 'bg-slate-50',     border: 'border-dashed border-slate-300', text: 'text-slate-400', badge: 'bg-slate-200 text-slate-500' },
+    };
+
+    function DataCard({ item }) {
+      const s = KIND_STYLE[item.kind] || KIND_STYLE.db;
+      return (
+        <div className={`rounded-lg border ${s.bg} ${s.border} px-3 py-2 flex items-center justify-between`}>
+          <div className="flex items-center gap-2">
+            <span className={`text-xs font-bold ${s.text} w-32`}>{item.label}</span>
+            <span className={`text-sm font-mono ${s.text}`}>{item.value}</span>
+          </div>
+          <span className={`text-[10px] px-2 py-0.5 rounded ${s.badge}`}>{item.badge}</span>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      return (
+        <div className="rounded-xl border bg-white p-4 h-full flex flex-col" style={{ borderColor: '#B3C8D3' }}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{ color: '#003B57' }}>트랜잭션 상태: {state.state}</h3>
+            <span className="text-[10px] text-slate-500">디스크상 파일 목록</span>
+          </div>
+          <div className="space-y-2">
+            {state.files.map((it, i) => (
+              <DataCard key={i} item={it} />
+            ))}
+          </div>
+          <div className="mt-3 text-xs rounded p-2 border" style={{ color: '#003B57', backgroundColor: '#E6EEF3', borderColor: '#B3C8D3' }}>
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div
+                    key={i}
+                    className={`flex ${isHi ? 'bg-sky-500/15 border-l-2 border-sky-400 -ml-3 pl-2' : ''}`}
+                  >
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span
+                      className="flex-1"
+                      dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => {
+            if (i >= STEPS.length - 1) { setPlaying(false); return i; }
+            return i + 1;
+          });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen px-4 py-6" style={{ backgroundColor: '#E6EEF3' }}>
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: '#003B57' }}>I</span>
+              <div>
+                <h1 className="text-2xl font-bold" style={{ color: '#003B57' }}>Chapter I-1-2. ACID와 트랜잭션</h1>
+                <p className="text-sm text-slate-700">BEGIN → journal → main 쓰기 → COMMIT/CRASH 5단계</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs underline hover:no-underline" style={{ color: '#003B57' }}>← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ backgroundColor: i <= stepIdx ? '#003B57' : '#CBD5E1' }} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-white px-5 py-4 shadow" style={{ backgroundColor: '#003B57' }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm leading-relaxed" style={{ color: '#CFE0EA' }}>{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} className="px-3 py-1.5 text-xs rounded border bg-white" style={{ borderColor: '#B3C8D3', color: '#003B57' }}>처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} className="px-3 py-1.5 text-xs rounded border bg-white disabled:opacity-40" style={{ borderColor: '#B3C8D3', color: '#003B57' }}>← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: '#003B57' }}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} className="px-3 py-1.5 text-xs rounded border bg-white disabled:opacity-40" style={{ borderColor: '#B3C8D3', color: '#003B57' }}>다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-500 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm" style={{ borderColor: '#003B57', color: '#003B57' }}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                rollback journal = "변경 전 원본 사본". BEGIN → journal 작성 → main 변경 → COMMIT(journal 삭제). 정전 시 journal 발견하면 자동 복원. 다음 챕터(I-2-1)에서는 단일 쓰기 모델과 락을 본다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['ACID', 'BEGIN', 'COMMIT', 'ROLLBACK', 'rollback journal', 'fsync', '복구', 'durability'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full border" style={{ backgroundColor: '#E6EEF3', color: '#003B57', borderColor: '#B3C8D3' }}>#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs" style={{ color: '#003B57' }}>
+              <a href="./I-1-1.html" className="underline hover:no-underline">← 이전: I-1-1 파일 하나가 DB</a>
+              <a href="./I-2-1.html" className="underline hover:no-underline">다음: I-2-1 Single-writer 모델 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

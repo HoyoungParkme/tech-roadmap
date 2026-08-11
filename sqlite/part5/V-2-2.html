@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQLite 학습 — V-2-2. 종합: 프로덕션 SQLite 체크리스트</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    SQLite Chapter V-2-2 — 종합: 프로덕션 SQLite 체크리스트 (SQLite 완주)
+    학습 목표: 앞선 챕터(본질·SQL·인덱스·WAL·실전)를 프로덕션 배포 점검표로 종합
+    핵심: PRAGMA 세팅 → 스키마·인덱스 → 트랜잭션 → 백업·모니터링 → SQLite vs 서버 DB 판단
+    패턴: fastapi v1 — 좌(LiveDataPane: 배포 전 체크리스트) / 우(VSCode CodeViewer)
+    색상: slate (sqlite 도메인, #003B57)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. PRAGMA 세팅 — 배포 전 첫 문장부터 정한다',
+        desc: '프로덕션 SQLite는 연결을 열자마자 PRAGMA로 성격을 정한다. WAL 모드는 읽기와 쓰기가 서로를 막지 않게 하고, synchronous=NORMAL은 WAL과 짝을 이뤄 안전과 속도의 균형을 잡는다. foreign_keys=ON은 연결마다 꺼져 있는 기본값을 켜서 참조 무결성을 지키고, busy_timeout은 잠금 충돌 때 즉시 실패 대신 잠깐 기다리게 한다. cache_size는 페이지 캐시를 넉넉히 줘 디스크 왕복을 줄인다. 이 다섯 줄이 없으면 나머지 최적화가 모래 위에 쌓인다.',
+        chapter: 'IV. WAL',
+        viz: {
+          kind: 'pragma',
+          items: [
+            { pragma: 'journal_mode = WAL', why: '읽기/쓰기 동시성', src: 'IV WAL', ok: true },
+            { pragma: 'synchronous = NORMAL', why: 'WAL과 짝 · 안전/속도', src: 'IV WAL', ok: true },
+            { pragma: 'foreign_keys = ON', why: '참조 무결성 (연결마다 OFF 기본)', src: 'I 본질', ok: true },
+            { pragma: 'busy_timeout = 5000', why: '잠금 충돌 재시도', src: 'IV 동시성', ok: true },
+            { pragma: 'cache_size = -20000', why: '~20MB 페이지 캐시', src: 'III 성능', ok: true },
+          ],
+        },
+        verdict: '기반 세팅',
+        verdictTone: 'good',
+        keyPoint: 'WAL + synchronous=NORMAL + foreign_keys=ON + busy_timeout + cache_size. 연결마다 실행. 이게 프로덕션 SQLite의 첫 다섯 줄.',
+        code: {
+          lang: 'python',
+          filename: 'db_connect.py',
+          lines: [
+            '"""프로덕션 SQLite 연결 — 여는 순간 PRAGMA를 박는다."""',
+            'import sqlite3',
+            '',
+            'def connect(db_path: str) -> sqlite3.Connection:',
+            '    """PRAGMA를 적용한 연결을 반환한다. 연결마다 매번 실행해야 한다."""',
+            '    conn = sqlite3.connect(db_path, timeout=5.0)',
+            '',
+            '    # 1) WAL — 읽기와 쓰기가 서로를 막지 않는다 (IV장)',
+            '    conn.execute("PRAGMA journal_mode = WAL")',
+            '',
+            '    # 2) synchronous=NORMAL — WAL과 짝. FULL보다 빠르고 여전히 안전',
+            '    conn.execute("PRAGMA synchronous = NORMAL")',
+            '',
+            '    # 3) foreign_keys — 연결마다 OFF가 기본! 반드시 켠다 (I장)',
+            '    conn.execute("PRAGMA foreign_keys = ON")',
+            '',
+            '    # 4) busy_timeout — 잠금 충돌 시 즉시 실패 대신 5초 재시도',
+            '    conn.execute("PRAGMA busy_timeout = 5000")',
+            '',
+            '    # 5) cache_size — 음수는 KB 단위. -20000 = 약 20MB 캐시',
+            '    conn.execute("PRAGMA cache_size = -20000")',
+            '',
+            '    # (선택) mmap — 읽기 많은 워크로드에서 페이지 접근 가속',
+            '    conn.execute("PRAGMA mmap_size = 134217728")  # 128MB',
+            '',
+            '    conn.row_factory = sqlite3.Row',
+            '    return conn',
+            '',
+            '# 자가 점검: 설정이 실제로 먹었는지 확인',
+            'if __name__ == "__main__":',
+            '    c = connect("app.db")',
+            '    for key in ("journal_mode", "synchronous", "foreign_keys",',
+            '                "busy_timeout", "cache_size"):',
+            '        row = c.execute(f"PRAGMA {key}").fetchone()',
+            '        print(key, "=", row[0])',
+            '    # journal_mode = wal / foreign_keys = 1 이면 통과',
+          ],
+          highlight: [7, 8, 10, 11, 13, 14, 16, 17, 19, 20],
+        },
+      },
+      {
+        title: 'Step 2. 스키마·인덱스 설계 — 쿼리 패턴에서 거꾸로 그린다',
+        desc: '인덱스는 많이 만든다고 좋은 게 아니라, 실제 WHERE와 ORDER BY 패턴에서 거꾸로 설계한다. 복합 인덱스는 좌측 prefix 규칙을 따르므로 자주 함께 걸리는 컬럼 순서가 중요하다. SELECT 컬럼까지 인덱스에 담으면 covering 인덱스가 되어 테이블을 아예 안 읽는다. 전문 검색이 필요하면 LIKE 대신 FTS5 가상 테이블을 쓴다. 설계가 끝나면 ANALYZE로 통계를 채워 planner가 올바른 인덱스를 고르게 한다.',
+        chapter: 'III. 인덱스',
+        viz: {
+          kind: 'schema',
+          rows: [
+            { name: 'idx_orders_user_status', kind: '복합', detail: '(user_id, status) — 좌측 prefix', src: 'III-1', tone: 'good' },
+            { name: 'idx_orders_covering', kind: 'covering', detail: '(user_id, status, total) — 테이블 fetch X', src: 'III-1', tone: 'good' },
+            { name: 'docs_fts (FTS5)', kind: 'FTS', detail: '전문 검색 — LIKE %x% 대체', src: 'IV-2', tone: 'good' },
+            { name: 'idx_users_gender', kind: '역효과', detail: '카디널리티 2종 — SCAN이 더 빠름', src: 'III-1', tone: 'warn' },
+          ],
+        },
+        verdict: '쿼리 기반 설계',
+        verdictTone: 'good',
+        keyPoint: '복합 인덱스는 좌측 prefix, covering은 fetch 제거, 전문 검색은 FTS5. 낮은 카디널리티엔 만들지 마라. 마지막에 ANALYZE.',
+        code: {
+          lang: 'sql',
+          filename: 'schema.sql',
+          lines: [
+            '-- Step 2. 프로덕션 스키마 — 쿼리 패턴에서 인덱스를 역설계',
+            '',
+            'CREATE TABLE users (',
+            '    id         INTEGER PRIMARY KEY,   -- rowid 별칭 (자동 covering 포함)',
+            '    email      TEXT NOT NULL UNIQUE,  -- UNIQUE = 자동 인덱스',
+            '    created_at TEXT NOT NULL DEFAULT (datetime("now"))',
+            ');',
+            '',
+            'CREATE TABLE orders (',
+            '    id       INTEGER PRIMARY KEY,',
+            '    user_id  INTEGER NOT NULL REFERENCES users(id),  -- FK (PRAGMA로 강제됨)',
+            '    status   TEXT NOT NULL CHECK (status IN ("PENDING","PAID","CANCELED")),',
+            '    total    REAL NOT NULL,',
+            '    created_at TEXT NOT NULL DEFAULT (datetime("now"))',
+            ');',
+            '',
+            '-- 자주 쓰는 쿼리: WHERE user_id=? AND status=?',
+            '-- 복합 인덱스 — 좌측 prefix 규칙 (user_id 단독도 커버)',
+            'CREATE INDEX idx_orders_user_status ON orders(user_id, status);',
+            '',
+            '-- 대시보드 쿼리: SELECT total ... WHERE user_id=? AND status=?',
+            '-- covering 인덱스 — total까지 담아 테이블 fetch 제거',
+            'CREATE INDEX idx_orders_covering ON orders(user_id, status, total);',
+            '',
+            '-- 전문 검색이 필요하면 LIKE 대신 FTS5 (IV장)',
+            'CREATE VIRTUAL TABLE docs_fts USING fts5(title, body);',
+            '-- SELECT * FROM docs_fts WHERE docs_fts MATCH "sqlite";',
+            '',
+            '-- 함정: 낮은 카디널리티 컬럼엔 인덱스 만들지 마라',
+            '-- CREATE INDEX idx_gender ON users(gender);  -- M/F 2종 → SCAN이 빠름',
+            '',
+            '-- 설계 끝나면 통계를 채운다 → planner가 올바른 인덱스 선택',
+            'ANALYZE;',
+            '',
+            '-- 검증: 계획에 SEARCH ... USING INDEX / COVERING 이 보이는지',
+            'EXPLAIN QUERY PLAN',
+            'SELECT total FROM orders WHERE user_id = 42 AND status = "PAID";',
+            '-- SEARCH orders USING COVERING INDEX idx_orders_covering (user_id=? AND status=?)',
+          ],
+          highlight: [17, 18, 19, 21, 22, 23, 25, 26, 32, 33, 36, 37, 38, 39],
+        },
+      },
+      {
+        title: 'Step 3. 트랜잭션으로 쓰기를 묶는다 — 처리량이 수백 배 갈린다',
+        desc: 'SQLite에서 쓰기 한 건마다 트랜잭션이 열리고 닫히며 디스크 동기화가 일어난다. INSERT 1만 건을 자동 커밋으로 돌리면 1만 번 fsync가 발생해 처참하게 느리다. BEGIN...COMMIT으로 묶으면 동기화가 한 번으로 줄어 처리량이 수백 배 뛴다. 대신 트랜잭션을 너무 길게 쥐면 다른 쓰기가 막히므로, 수천~수만 건 단위로 끊어 커밋한다. 예외가 나면 반드시 ROLLBACK해 반쯤 쓰인 데이터를 남기지 않는다.',
+        chapter: 'II. 트랜잭션',
+        viz: {
+          kind: 'txn',
+          rows: [
+            { label: '자동 커밋 (1만 fsync)', bar: 3, ms: 9800, tone: 'danger' },
+            { label: '한 트랜잭션 묶기', bar: 98, ms: 95, tone: 'good' },
+            { label: '5천 배치 × 2', bar: 92, ms: 110, tone: 'good' },
+          ],
+        },
+        verdict: '~100배 향상',
+        verdictTone: 'good',
+        keyPoint: '쓰기는 BEGIN...COMMIT으로 묶어라. 자동 커밋은 건마다 fsync. 배치는 수천 단위, 예외 시 ROLLBACK.',
+        code: {
+          lang: 'python',
+          filename: 'bulk_write.py',
+          lines: [
+            '"""쓰기 묶기 — 트랜잭션 하나가 처리량을 수백 배 바꾼다."""',
+            'from db_connect import connect',
+            '',
+            'def insert_orders_batched(rows, batch_size: int = 5000) -> int:',
+            '    """orders를 배치 트랜잭션으로 적재한다. 커밋된 건수를 반환한다."""',
+            '    conn = connect("app.db")',
+            '    inserted = 0',
+            '    try:',
+            '        for start in range(0, len(rows), batch_size):',
+            '            chunk = rows[start:start + batch_size]',
+            '            # 배치 하나 = 트랜잭션 하나 = fsync 한 번',
+            '            conn.execute("BEGIN")',
+            '            conn.executemany(',
+            '                "INSERT INTO orders(user_id, status, total) VALUES (?, ?, ?)",',
+            '                chunk,',
+            '            )',
+            '            conn.commit()',
+            '            inserted += len(chunk)',
+            '    except Exception:',
+            '        conn.rollback()  # 반쯤 쓰인 데이터를 남기지 않는다',
+            '        raise',
+            '    finally:',
+            '        conn.close()',
+            '    return inserted',
+            '',
+            '# 안티패턴: 자동 커밋 — 건마다 트랜잭션+fsync (수백 배 느림)',
+            '# for r in rows:',
+            '#     conn.execute("INSERT INTO orders(...) VALUES (?, ?, ?)", r)',
+            '#     conn.commit()   # 1만 건 = 1만 fsync = 재앙',
+            '',
+            'if __name__ == "__main__":',
+            '    data = [(1, "PAID", 10.0)] * 10000',
+            '    print("inserted:", insert_orders_batched(data))',
+            '    # 자동 커밋 ~9.8s vs 배치 ~0.1s',
+          ],
+          highlight: [11, 12, 13, 14, 15, 16, 17, 19, 20, 25, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 4. 백업과 모니터링 — 실행 중에도 안전하게 뜬다',
+        desc: 'SQLite는 파일 하나가 곧 데이터 전부라, 실행 중 그냥 cp로 복사하면 WAL과 어긋나 손상된 스냅샷이 나온다. Online Backup API나 VACUUM INTO는 잠금과 일관성을 지키며 살아있는 DB를 안전하게 복제한다. VACUUM INTO는 조각 모음까지 겸해 파일이 작아지는 보너스가 있다. 운영에서는 PRAGMA integrity_check로 손상을 주기적으로 감시하고, page_count와 page_size로 파일 크기 증가를 추적한다. 백업은 복원 테스트로 검증해야 비로소 백업이다.',
+        chapter: 'V. 실전',
+        viz: {
+          kind: 'backup',
+          methods: [
+            { name: 'cp app.db bak.db', safe: false, note: '실행 중 복사 → WAL 어긋나 손상', src: '금지' },
+            { name: 'Online Backup API', safe: true, note: '살아있는 DB를 일관되게 복제', src: 'V 실전' },
+            { name: 'VACUUM INTO "bak.db"', safe: true, note: '복제 + 조각 모음 (파일 축소)', src: 'V 실전' },
+          ],
+          monitor: [
+            { check: 'PRAGMA integrity_check', expect: 'ok', src: '손상 감시' },
+            { check: 'page_count × page_size', expect: '파일 크기 추적', src: '용량 감시' },
+          ],
+        },
+        verdict: '안전 스냅샷',
+        verdictTone: 'good',
+        keyPoint: '실행 중 cp는 손상. Backup API·VACUUM INTO로 일관 스냅샷. integrity_check로 손상 감시, 크기 추적. 복원 테스트까지가 백업.',
+        code: {
+          lang: 'python',
+          filename: 'backup_monitor.py',
+          lines: [
+            '"""백업·모니터링 — 살아있는 DB를 안전하게 뜨고 상태를 감시한다."""',
+            'import sqlite3',
+            'from db_connect import connect',
+            '',
+            'def online_backup(src_path: str, dst_path: str) -> None:',
+            '    """Online Backup API로 실행 중 DB를 일관되게 복제한다."""',
+            '    src = connect(src_path)',
+            '    dst = sqlite3.connect(dst_path)',
+            '    with dst:',
+            '        src.backup(dst)          # 잠금·일관성 유지하며 페이지 복사',
+            '    dst.close()',
+            '    src.close()',
+            '',
+            'def vacuum_into(src_path: str, dst_path: str) -> None:',
+            '    """VACUUM INTO — 복제하며 조각 모음까지. 결과 파일이 작아진다."""',
+            '    conn = connect(src_path)',
+            '    conn.execute("VACUUM INTO ?", (dst_path,))',
+            '    conn.close()',
+            '',
+            'def health_check(db_path: str) -> dict:',
+            '    """무결성과 파일 크기를 점검해 딕셔너리로 반환한다."""',
+            '    conn = connect(db_path)',
+            '    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]',
+            '    page_count = conn.execute("PRAGMA page_count").fetchone()[0]',
+            '    page_size = conn.execute("PRAGMA page_size").fetchone()[0]',
+            '    conn.close()',
+            '    return {',
+            '        "integrity": integrity,            # "ok" 여야 정상',
+            '        "size_mb": page_count * page_size / 1_048_576,',
+            '    }',
+            '',
+            'if __name__ == "__main__":',
+            '    vacuum_into("app.db", "backup.db")',
+            '    print(health_check("app.db"))',
+            '    # 백업은 복원 테스트로 검증해야 진짜 백업이다',
+          ],
+          highlight: [4, 5, 9, 10, 13, 14, 16, 17, 22, 23, 24, 25, 28, 29],
+        },
+      },
+      {
+        title: 'Step 5. SQLite로 충분한가, 서버 DB로 가야 하나 (SQLite 완주)',
+        desc: 'SQLite는 단일 노드에서 읽기가 압도적이고 쓰기는 순간 한 명만 하는 워크로드에 최고의 선택이다. 내장·무설정·단일 파일이라 배포와 백업이 단순하고, 지연이 마이크로초 단위다. 그러나 SQLite의 쓰기는 데이터베이스 전체를 한 번에 한 연결만 잠그므로, 여러 서버가 동시에 고빈도로 쓰는 구조에는 맞지 않는다. 이때는 Postgres 같은 서버 DB로 넘어간다. 판단 기준은 화려한 규모가 아니라 "동시 쓰기 경합"이다. 여기까지가 본질·SQL·인덱스·WAL·실전을 하나로 꿴 SQLite 완주다.',
+        chapter: '종합',
+        viz: {
+          kind: 'decision',
+          enough: [
+            '읽기 위주 · 쓰기는 순간 1명',
+            '단일 서버 / 엣지 / 데스크톱 · 모바일',
+            '무설정 배포 · 단일 파일 백업이 이득',
+          ],
+          server: [
+            '여러 서버가 동시에 고빈도 쓰기',
+            '쓰기 경합으로 busy_timeout 자주 초과',
+            '수평 확장 · 복제 · 고가용성 필요',
+          ],
+        },
+        verdict: 'SQLite 완주',
+        verdictTone: 'good',
+        summary: {
+          title: 'V-2-2 프로덕션 SQLite 체크리스트 (전 챕터 종합)',
+          rows: [
+            { metric: 'PRAGMA', before: 'IV WAL', after: 'WAL·NORMAL·FK·busy·cache', delta: '연결마다' },
+            { metric: '스키마·인덱스', before: 'III 인덱스', after: '복합·covering·FTS5', delta: 'ANALYZE' },
+            { metric: '쓰기', before: 'II 트랜잭션', after: 'BEGIN…COMMIT 배치', delta: '~100배' },
+            { metric: '백업·감시', before: 'V 실전', after: 'Backup API·VACUUM INTO', delta: 'integrity' },
+            { metric: '한계 판단', before: '종합', after: '동시 쓰기면 서버 DB', delta: '경합 기준' },
+          ],
+        },
+        keyPoint: '판단 기준은 규모가 아니라 동시 쓰기 경합. SQLite로 충분한 곳이 대부분이다. 여기까지가 SQLite 완주.',
+        code: {
+          lang: 'python',
+          filename: 'production_checklist.py',
+          lines: [
+            '"""프로덕션 SQLite 최종 체크리스트 — 배포 전 한 번에 점검한다."""',
+            'from db_connect import connect',
+            '',
+            'CHECKLIST = [',
+            '    # (PRAGMA 키, 기대값) — IV장 WAL, I장 무결성',
+            '    ("journal_mode", "wal"),',
+            '    ("foreign_keys", 1),',
+            '    ("synchronous", 1),      # 1 == NORMAL',
+            ']',
+            '',
+            'def verify_production_ready(db_path: str) -> bool:',
+            '    """PRAGMA 세팅과 무결성을 점검한다. 모두 통과하면 True."""',
+            '    conn = connect(db_path)',
+            '    ok = True',
+            '    for key, expected in CHECKLIST:',
+            '        actual = conn.execute(f"PRAGMA {key}").fetchone()[0]',
+            '        passed = str(actual).lower() == str(expected).lower()',
+            '        print(("PASS" if passed else "WARN"), key, "=", actual)',
+            '        ok = ok and passed',
+            '',
+            '    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]',
+            '    print(("PASS" if integrity == "ok" else "WARN"), "integrity =", integrity)',
+            '    conn.close()',
+            '    return ok and integrity == "ok"',
+            '',
+            'def should_use_server_db(concurrent_writers: int, write_qps: int) -> bool:',
+            '    """동시 쓰기 경합이 크면 서버 DB로 이전할 신호를 준다."""',
+            '    # 규모가 아니라 "동시 쓰기 경합"이 판단 기준',
+            '    return concurrent_writers > 1 and write_qps > 200',
+            '',
+            'if __name__ == "__main__":',
+            '    print("ready:", verify_production_ready("app.db"))',
+            '    print("go server DB?:", should_use_server_db(4, 500))',
+            '    # SQLite 완주 — 본질·SQL·인덱스·WAL·실전을 하나로 꿰었다',
+          ],
+          highlight: [4, 5, 6, 7, 8, 11, 12, 20, 21, 25, 26, 27, 28],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function ChapterBadge({ label }) {
+      return <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-[#003B57] text-white whitespace-nowrap">{label}</span>;
+    }
+
+    function PragmaViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.items.map((it, i) => (
+            <div key={i} className="flex items-center gap-2 bg-white border border-emerald-300 rounded p-2">
+              <span className="text-emerald-600 text-sm">✓</span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[11px] font-mono font-bold text-slate-800 truncate">{it.pragma}</div>
+                <div className="text-[10px] text-slate-500 truncate">{it.why}</div>
+              </div>
+              <ChapterBadge label={it.src} />
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function SchemaViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.rows.map((r, i) => {
+            const t = TONE[r.tone] || TONE.good;
+            return (
+              <div key={i} className={`flex items-center gap-2 rounded p-2 border ${t.bg} ${t.border}`}>
+                <span className={`text-[9px] font-bold w-14 text-center px-1 py-0.5 rounded ${t.badge}`}>{r.kind}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[11px] font-mono font-bold text-slate-800 truncate">{r.name}</div>
+                  <div className="text-[10px] text-slate-600 truncate">{r.detail}</div>
+                </div>
+                <ChapterBadge label={r.src} />
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function TxnViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-2.5">
+          {viz.rows.map((r, i) => {
+            const t = TONE[r.tone] || TONE.good;
+            const barColor = r.tone === 'danger' ? 'bg-rose-500' : 'bg-emerald-500';
+            return (
+              <div key={i}>
+                <div className="flex justify-between text-[10px] mb-1">
+                  <span className={`font-bold ${t.text}`}>{r.label}</span>
+                  <span className="font-mono bg-slate-700 text-white px-1.5 py-0.5 rounded">{r.ms}ms</span>
+                </div>
+                <div className="h-3 bg-white rounded border border-slate-300 overflow-hidden">
+                  <div className={`h-full ${barColor}`} style={{ width: `${r.bar}%` }}></div>
+                </div>
+              </div>
+            );
+          })}
+          <div className="text-[10px] text-center text-slate-600">막대 = 처리량(길수록 좋음) · 자동 커밋은 건마다 fsync</div>
+        </div>
+      );
+    }
+
+    function BackupViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-3">
+          <div className="space-y-1.5">
+            {viz.methods.map((m, i) => (
+              <div key={i} className={`flex items-center gap-2 rounded p-2 border ${m.safe ? 'bg-emerald-50 border-emerald-300' : 'bg-rose-50 border-rose-300'}`}>
+                <span className={m.safe ? 'text-emerald-600' : 'text-rose-500'}>{m.safe ? '✓' : '✗'}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[11px] font-mono font-bold text-slate-800 truncate">{m.name}</div>
+                  <div className="text-[10px] text-slate-600 truncate">{m.note}</div>
+                </div>
+                <ChapterBadge label={m.src} />
+              </div>
+            ))}
+          </div>
+          <div className="border-t border-slate-200 pt-2 space-y-1.5">
+            <div className="text-[10px] font-bold text-slate-500">모니터링</div>
+            {viz.monitor.map((m, i) => (
+              <div key={i} className="flex items-center gap-2 bg-white border border-slate-300 rounded p-2">
+                <span className="text-slate-400 text-sm">📈</span>
+                <span className="flex-1 text-[11px] font-mono text-slate-800 truncate">{m.check}</span>
+                <span className="text-[10px] text-slate-600">{m.expect}</span>
+                <ChapterBadge label={m.src} />
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function DecisionViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="rounded-lg border border-emerald-300 bg-emerald-50 p-3">
+              <div className="text-xs font-bold text-emerald-800 mb-2">SQLite로 충분</div>
+              <ul className="space-y-1.5">
+                {viz.enough.map((s, i) => (
+                  <li key={i} className="text-[10px] text-emerald-900 flex gap-1.5"><span>✓</span><span>{s}</span></li>
+                ))}
+              </ul>
+            </div>
+            <div className="rounded-lg border border-amber-400 bg-amber-50 p-3">
+              <div className="text-xs font-bold text-amber-800 mb-2">서버 DB로</div>
+              <ul className="space-y-1.5">
+                {viz.server.map((s, i) => (
+                  <li key={i} className="text-[10px] text-amber-900 flex gap-1.5"><span>→</span><span>{s}</span></li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          <div className="mt-3 text-center text-[11px] bg-[#003B57] text-white px-2 py-1.5 rounded font-bold">
+            판단 기준 = 규모가 아니라 동시 쓰기 경합
+          </div>
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-slate-400 bg-white p-3">
+          <div className="text-sm font-bold text-slate-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-slate-200">
+                <th className="py-1 pr-2">항목</th><th className="py-1 pr-2">출처</th><th className="py-1 pr-2">핵심</th><th className="py-1">기준</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 pr-2 font-medium text-slate-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-slate-600 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-slate-800 text-[10px]">{r.after}</td>
+                  <td className="py-1 text-slate-900 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-slate-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-slate-800">배포 전 체크리스트</h3>
+            <div className="flex items-center gap-1.5">
+              <ChapterBadge label={state.chapter} />
+              <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+            </div>
+          </div>
+
+          {viz?.kind === 'pragma' && <PragmaViz viz={viz} />}
+          {viz?.kind === 'schema' && <SchemaViz viz={viz} />}
+          {viz?.kind === 'txn' && <TxnViz viz={viz} />}
+          {viz?.kind === 'backup' && <BackupViz viz={viz} />}
+          {viz?.kind === 'decision' && <DecisionViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-slate-800 bg-slate-100 border border-slate-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-slate-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#003B57] text-white font-bold">S</span>
+              <div>
+                <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded bg-[#003B57] text-white mb-1">Part V. 실전 활용 · V-2-2</span>
+                <h1 className="text-2xl font-bold text-slate-900">종합: 프로덕션 SQLite 체크리스트</h1>
+                <p className="text-sm text-slate-700/80">앞서 배운 것을 합친 프로덕션 배포 점검 (SQLite 완주)</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-[#003B57]' : 'bg-slate-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-[#003B57] text-slate-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-slate-900 text-white' : 'bg-[#003B57] text-white hover:bg-slate-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-slate-400 bg-white px-4 py-3 text-sm text-slate-900">
+                <div className="font-bold mb-1">✅ 핵심 정리 — SQLite 완주</div>
+                프로덕션 SQLite는 다섯 층으로 완성된다. ① 연결마다 WAL·synchronous=NORMAL·foreign_keys=ON·busy_timeout·cache_size PRAGMA. ② 쿼리 패턴에서 역설계한 복합·covering·FTS5 인덱스와 ANALYZE. ③ 쓰기는 BEGIN…COMMIT 배치로 묶어 처리량 수백 배. ④ Backup API·VACUUM INTO로 일관 스냅샷, integrity_check로 감시. ⑤ 동시 쓰기 경합이 크면 서버 DB로. 본질·SQL·인덱스·WAL·실전이 여기서 하나로 꿰였다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['PRAGMA', 'WAL', 'covering', 'FTS5', 'transaction', 'BackupAPI', 'integrity_check', 'checklist'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-800 border border-slate-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../index.html" className="underline hover:no-underline font-bold text-[#003B57]">🎓 SQLite 완주 · 챕터 목록으로 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQLite 학습 — V-2-1. 대용량 · 벌크 처리</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    SQLite Chapter V-2-1 — 대용량 · 벌크 처리
+    학습 목표: 벌크 INSERT 최적화(단일 트랜잭션), 초기 적재용 PRAGMA, 인덱스 적재 후 생성,
+              대용량 조회(keyset vs OFFSET), VACUUM, 실무 함정
+    패턴: fastapi v1 — 좌(LiveDataPane: 커밋 방식 속도 경주 애니메이션) / 우(VSCode CodeViewer)
+    색상: SQLite 도메인 강조색 #003B57
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 행마다 커밋 vs 한 트랜잭션 — 벌크의 핵심',
+        desc: 'SQLite는 COMMIT마다 디스크에 fsync를 호출해 데이터를 확실히 기록한다. 행마다 커밋하면 100만 번 fsync가 발생해 디스크 회전/플러시 대기가 병목이 된다. BEGIN~COMMIT로 100만 행을 한 트랜잭션에 묶으면 fsync는 사실상 1번, 수십에서 수백 배 빨라진다. 벌크 처리의 90퍼센트는 여기서 결정된다.',
+        viz: {
+          kind: 'race',
+          caption: '100만 행 INSERT — 커밋 방식별 처리 속도',
+          racers: [
+            { label: '행마다 커밋', speed: 0.34, ms: '약 48s', tone: 'danger', note: 'INSERT마다 COMMIT → fsync 100만 번' },
+            { label: '한 트랜잭션 벌크', speed: 3.0, ms: '약 0.9s', tone: 'good', note: 'BEGIN~COMMIT 1회 → fsync 사실상 1번' },
+          ],
+        },
+        verdict: '수십~수백 배',
+        verdictTone: 'good',
+        keyPoint: '벌크의 시작은 트랜잭션 묶기. 행마다 커밋은 fsync 폭탄이다.',
+        code: {
+          lang: 'python',
+          filename: 'bulk_insert.py',
+          lines: [
+            '# Step 1. 행마다 커밋 vs 한 트랜잭션 벌크 INSERT',
+            'import sqlite3',
+            'import time',
+            '',
+            'rows = [(f"user{n}@x.com", f"User{n}", 20 + n % 50) for n in range(1_000_000)]',
+            '',
+            'conn = sqlite3.connect("bulk.db")',
+            'conn.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT, name TEXT, age INT)")',
+            '',
+            '# 나쁜 예 — 행마다 커밋 (autocommit + 반복 commit)',
+            'def insert_slow(conn, rows):',
+            '    for email, name, age in rows:',
+            '        conn.execute("INSERT INTO users(email, name, age) VALUES(?, ?, ?)", (email, name, age))',
+            '        conn.commit()   # 매 행마다 fsync — 최악',
+            '',
+            '# 좋은 예 — 한 트랜잭션으로 묶고 executemany 재사용',
+            'def insert_fast(conn, rows):',
+            '    with conn:   # with 블록 = 하나의 트랜잭션(BEGIN~COMMIT)',
+            '        conn.executemany(',
+            '            "INSERT INTO users(email, name, age) VALUES(?, ?, ?)",',
+            '            rows,   # prepared statement 1개를 100만 번 재사용',
+            '        )',
+            '',
+            't0 = time.perf_counter()',
+            'insert_fast(conn, rows)',
+            'print(f"bulk insert: {time.perf_counter() - t0:.2f}s")',
+            '',
+            '# 요점',
+            '# 1) COMMIT = fsync. 횟수를 줄이는 것이 곧 속도.',
+            '# 2) executemany 는 SQL 파싱/바인딩을 한 번만 준비해 재사용.',
+            '# 3) 초대용량이면 5만~10만 행 단위로 나눠 커밋(메모리/락 균형).',
+            '',
+            '# 청크 커밋 예 — 메모리 폭발 방지',
+            'def insert_chunked(conn, rows, chunk=50_000):',
+            '    it = iter(rows)',
+            '    while True:',
+            '        batch = [r for _, r in zip(range(chunk), it)]',
+            '        if not batch:',
+            '            break',
+            '        with conn:',
+            '            conn.executemany("INSERT INTO users(email, name, age) VALUES(?, ?, ?)", batch)',
+          ],
+          highlight: [10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 26, 27, 28],
+        },
+      },
+      {
+        title: 'Step 2. 초기 적재용 PRAGMA — synchronous / journal_mode',
+        desc: 'PRAGMA synchronous=OFF와 journal_mode=MEMORY는 fsync와 롤백 저널 디스크 기록을 생략해 초기 적재를 크게 앞당긴다. 단, 적재 중 크래시가 나면 DB가 손상될 수 있으므로 오직 최초 벌크 적재 구간에서만 쓰고, 끝나면 다시 안전값(WAL/NORMAL)으로 되돌린다. 운영 서비스 DB에 상시로 켜두면 재앙이다.',
+        viz: {
+          kind: 'pragma',
+          caption: '초기 적재 구간 한정 — 켜고, 끝나면 되돌린다',
+          items: [
+            { pragma: 'PRAGMA synchronous = OFF', note: 'COMMIT마다 fsync 생략 (적재 중만)', tone: 'warn' },
+            { pragma: 'PRAGMA journal_mode = MEMORY', note: '롤백 저널을 메모리에 (디스크 기록 X)', tone: 'warn' },
+            { pragma: 'PRAGMA temp_store = MEMORY', note: '임시 테이블/정렬을 메모리로', tone: 'warn' },
+            { pragma: 'PRAGMA cache_size = -262144', note: '캐시 256MB로 확대 (음수=KB)', tone: 'good' },
+            { pragma: '-- 적재 후 되돌리기', note: 'synchronous=NORMAL, journal_mode=WAL', tone: 'good' },
+          ],
+        },
+        verdict: '적재 중만',
+        verdictTone: 'warn',
+        keyPoint: 'synchronous=OFF는 속도를 사지만 내구성을 판다. 초기 적재에만, 끝나면 원복.',
+        code: {
+          lang: 'sql',
+          filename: 'load_pragma.sql',
+          lines: [
+            '-- Step 2. 초기 벌크 적재용 PRAGMA (오직 적재 구간)',
+            '',
+            '-- 적재 시작 전 — 안전을 잠시 희생해 속도를 얻는다',
+            'PRAGMA synchronous = OFF;      -- COMMIT마다 fsync 생략',
+            'PRAGMA journal_mode = MEMORY;  -- 롤백 저널을 메모리에 (디스크 X)',
+            'PRAGMA temp_store = MEMORY;    -- 임시 정렬/테이블을 메모리로',
+            'PRAGMA cache_size = -262144;   -- 페이지 캐시 256MB (음수 = KB 단위)',
+            '',
+            'BEGIN;',
+            '-- ... 여기서 수백만 행 executemany INSERT ...',
+            'COMMIT;',
+            '',
+            '-- 적재가 끝나면 반드시 안전값으로 되돌린다',
+            'PRAGMA synchronous = NORMAL;   -- WAL에서 권장되는 균형값',
+            'PRAGMA journal_mode = WAL;     -- 동시 읽기/쓰기에 유리',
+            '',
+            '-- 경고: synchronous=OFF 상태에서 크래시/전원차단 시',
+            '--       DB 파일 손상 가능. 운영 DB 상시 사용 금지.',
+            '--       적재는 복원 가능한 원본이 따로 있을 때만 이 조합 사용.',
+            '',
+            '-- 확인용 — 현재 설정 조회',
+            'PRAGMA synchronous;   -- 0=OFF, 1=NORMAL, 2=FULL',
+            'PRAGMA journal_mode;  -- memory / wal / delete ...',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 17, 18, 19],
+        },
+      },
+      {
+        title: 'Step 3. 인덱스는 적재 후 — 그리고 ANALYZE',
+        desc: '인덱스가 있는 상태로 적재하면 매 INSERT마다 B-Tree를 재정렬해 쓰기가 느려지고 트리도 단편화된다. 인덱스 없이 순차로 다 넣은 뒤 CREATE INDEX를 한 번에 실행하면 정렬을 몰아서 하므로 훨씬 빠르고 트리도 조밀하다. 마지막에 ANALYZE로 통계를 갱신해야 planner가 새 인덱스를 제대로 활용한다.',
+        viz: {
+          kind: 'race',
+          caption: '인덱스 있는 테이블 vs 적재 후 인덱스 생성',
+          racers: [
+            { label: '적재 중 인덱스 유지', speed: 0.42, ms: '약 35s', tone: 'warn', note: '행마다 B-Tree 재정렬 + 단편화' },
+            { label: '적재 후 CREATE INDEX', speed: 2.6, ms: '약 6s', tone: 'good', note: '순차 적재 → 인덱스 한 번에 + ANALYZE' },
+          ],
+        },
+        verdict: '적재 후 생성',
+        verdictTone: 'good',
+        keyPoint: '넣을 땐 인덱스 없이. 다 넣고 CREATE INDEX + ANALYZE.',
+        code: {
+          lang: 'sql',
+          filename: 'index_after_load.sql',
+          lines: [
+            '-- Step 3. 인덱스는 적재 후에 만든다',
+            '',
+            '-- 1) 인덱스 없는 빈 테이블',
+            'CREATE TABLE users (',
+            '    id    INTEGER PRIMARY KEY,',
+            '    email TEXT,',
+            '    name  TEXT,',
+            '    age   INTEGER',
+            ');',
+            '',
+            '-- 2) 순차 벌크 적재 (인덱스 없으니 재정렬 비용 0)',
+            'BEGIN;',
+            '-- ... 수백만 행 executemany INSERT ...',
+            'COMMIT;',
+            '',
+            '-- 3) 적재가 끝난 뒤 인덱스를 한 번에 생성',
+            'CREATE INDEX idx_users_email ON users(email);',
+            'CREATE INDEX idx_users_age   ON users(age);',
+            '--   정렬을 몰아서 처리 → 빠르고 트리가 조밀함',
+            '',
+            '-- 4) 통계 갱신 — planner가 새 인덱스를 제대로 쓰게',
+            'ANALYZE;',
+            '--   sqlite_stat1 갱신. 안 하면 잘못된 실행계획 위험',
+            '',
+            '-- 5) 검증 — SCAN이 아니라 SEARCH인지 확인',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE email = "user500000@x.com";',
+            '--   SEARCH users USING INDEX idx_users_email (email=?)',
+            '',
+            '-- 요점',
+            '-- 인덱스 유지 적재: 매 INSERT마다 B-Tree N개 갱신 → 느림',
+            '-- 적재 후 생성:     쓰기는 순차, 정렬은 한 번 → 빠름 + 조밀',
+          ],
+          highlight: [10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22],
+        },
+      },
+      {
+        title: 'Step 4. 대용량 조회 — keyset vs OFFSET 페이지네이션',
+        desc: 'LIMIT/OFFSET은 뒤로 갈수록 앞의 행을 매번 세고 버리기 때문에 100만 번째 페이지에서 OFFSET 백만은 백만 행을 훑는다. keyset(seek) 방식은 마지막으로 본 id를 기억해 WHERE id > ?로 바로 다음 구간을 인덱스로 짚어 페이지가 깊어져도 일정하게 빠르다. 대용량 목록/무한 스크롤의 표준이다.',
+        viz: {
+          kind: 'paginate',
+          caption: '깊은 페이지에서의 비용 차이',
+          rows: [
+            { label: 'OFFSET 0', offset: 'LIMIT 20 OFFSET 0', off: 5, key: 5 },
+            { label: 'OFFSET 100k', offset: 'LIMIT 20 OFFSET 100000', off: 55, key: 5 },
+            { label: 'OFFSET 900k', offset: 'LIMIT 20 OFFSET 900000', off: 100, key: 5 },
+          ],
+        },
+        verdict: 'keyset 승',
+        verdictTone: 'good',
+        keyPoint: 'OFFSET은 깊을수록 느리다. keyset은 WHERE id > ? 로 항상 빠르다.',
+        code: {
+          lang: 'python',
+          filename: 'pagination.py',
+          lines: [
+            '# Step 4. keyset(seek) 페이지네이션 — 깊은 페이지도 일정 속도',
+            'import sqlite3',
+            '',
+            'conn = sqlite3.connect("bulk.db")',
+            'conn.row_factory = sqlite3.Row',
+            'PAGE = 20',
+            '',
+            '# 나쁜 예 — OFFSET: 깊어질수록 앞 행을 세고 버림 O(offset)',
+            'def page_by_offset(conn, page_no):',
+            '    off = page_no * PAGE',
+            '    return conn.execute(',
+            '        "SELECT id, email FROM users ORDER BY id LIMIT ? OFFSET ?",',
+            '        (PAGE, off),',
+            '    ).fetchall()',
+            '',
+            '# 좋은 예 — keyset: 마지막 id 이후만 인덱스로 바로 짚음 O(log N)',
+            'def page_by_keyset(conn, last_id=0):',
+            '    return conn.execute(',
+            '        "SELECT id, email FROM users WHERE id > ? ORDER BY id LIMIT ?",',
+            '        (last_id, PAGE),',
+            '    ).fetchall()',
+            '',
+            '# 전체 스트리밍 — fetchall 대신 커서 순회로 메모리 절약',
+            'def stream_all(conn):',
+            '    cur = conn.execute("SELECT id, email FROM users ORDER BY id")',
+            '    for row in cur:            # 한 행씩 — 메모리 폭발 방지',
+            '        yield row["id"], row["email"]',
+            '',
+            '# keyset 페이지 순회 예',
+            'last = 0',
+            'while True:',
+            '    batch = page_by_keyset(conn, last)',
+            '    if not batch:',
+            '        break',
+            '    last = batch[-1]["id"]     # 다음 페이지 커서 = 마지막 id',
+            '',
+            '# 요점',
+            '# 1) keyset은 정렬 컬럼에 인덱스가 있어야 효과(여기선 PK id).',
+            '# 2) 임의 페이지 점프가 필요 없으면 항상 keyset.',
+            '# 3) 대용량 조회는 fetchall 금지 — 커서 순회로 스트리밍.',
+          ],
+          highlight: [7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20],
+        },
+      },
+      {
+        title: 'Step 5. 함정 정리 · VACUUM 으로 공간 회수',
+        desc: '대량 DELETE 후에도 파일 크기는 줄지 않고 빈 페이지로 남는다. VACUUM은 DB를 통째로 다시 써서 단편화를 제거하고 공간을 회수하지만, 실행 중 DB 크기의 2배 여유 공간과 배타 락이 필요하니 트래픽 낮은 시간에 돌린다. 아래는 벌크 처리에서 반복되는 대표 함정들이다.',
+        viz: {
+          kind: 'pitfalls',
+          items: [
+            { icon: '⚠', label: '행마다 커밋', desc: 'fsync 100만 번 — 트랜잭션으로 묶어라' },
+            { icon: '⚠', label: '큰 OFFSET', desc: '깊은 페이지가 느림 — keyset으로 전환' },
+            { icon: '⚠', label: '적재 중 인덱스 유지', desc: 'B-Tree 재정렬 반복 — 적재 후 생성' },
+            { icon: '⚠', label: 'fetchall 메모리 폭발', desc: '수백만 행 한 번에 로드 — 커서 스트리밍' },
+            { icon: '⚠', label: 'synchronous=OFF 상시', desc: '크래시 시 손상 — 적재 구간만' },
+          ],
+        },
+        verdict: '함정 주의',
+        verdictTone: 'warn',
+        summary: {
+          title: 'V-2-1 대용량 · 벌크 처리 정리',
+          rows: [
+            { metric: '벌크 INSERT', before: '한 트랜잭션', after: 'fsync 1회 + executemany', delta: '수십~수백 배' },
+            { metric: '적재 PRAGMA', before: 'sync=OFF', after: '적재 구간만, 후 원복', delta: '초기만' },
+            { metric: '인덱스', before: '적재 후 생성', after: 'CREATE INDEX + ANALYZE', delta: '빠름+조밀' },
+            { metric: '조회', before: 'keyset', after: 'WHERE id > ? 인덱스 seek', delta: '일정 속도' },
+            { metric: '공간 회수', before: 'VACUUM', after: '단편화 제거, 2배 공간 필요', delta: '한산할 때' },
+          ],
+        },
+        keyPoint: '넣기는 트랜잭션+인덱스 후생성, 읽기는 keyset+스트리밍, 정리는 VACUUM. 다음(V-2-2)으로.',
+        code: {
+          lang: 'sql',
+          filename: 'vacuum_and_pitfalls.sql',
+          lines: [
+            '-- Step 5. VACUUM 으로 공간 회수 + 함정 점검',
+            '',
+            '-- 대량 삭제 후 — 파일은 그대로, 빈 페이지만 늘어남',
+            'DELETE FROM logs WHERE created_at < "2025-01-01";',
+            '-- 디스크 크기 변화 없음 (freelist 페이지로 재활용 대기)',
+            '',
+            '-- VACUUM — DB를 통째로 다시 써서 단편화 제거 + 공간 회수',
+            'VACUUM;',
+            '--   주의 1) 실행 중 DB 크기의 약 2배 여유 공간 필요',
+            '--   주의 2) 배타 락 — 다른 쓰기 차단. 한산한 시간에.',
+            '',
+            '-- 특정 DB로 압축 복사하며 회수 (백업 겸용)',
+            'VACUUM INTO "compacted.db";',
+            '',
+            '-- 자동 회수 옵션 — 대량 삭제가 잦다면',
+            'PRAGMA auto_vacuum = FULL;   -- 새 DB에서만 유효(재빌드 필요)',
+            'PRAGMA auto_vacuum = INCREMENTAL;',
+            'PRAGMA incremental_vacuum(1000);  -- 1000 페이지씩 점진 회수',
+            '',
+            '-- 유지보수 후 통계 갱신',
+            'ANALYZE;',
+            '',
+            '-- 함정 체크리스트',
+            '-- 1) 행마다 COMMIT?      → BEGIN~COMMIT로 묶기',
+            '-- 2) 큰 OFFSET?          → keyset(WHERE id > ?)',
+            '-- 3) 적재 중 인덱스?      → 적재 후 CREATE INDEX',
+            '-- 4) fetchall 남발?       → 커서 스트리밍',
+            '-- 5) sync=OFF 상시?       → 적재 구간만, 후 원복',
+            '',
+            '-- 다음 챕터: V-2-2',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 19, 20],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', bar: 'bg-emerald-500', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   bar: 'bg-amber-500',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    bar: 'bg-rose-500',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function RaceViz({ viz }) {
+      const [tick, setTick] = useState(0);
+      useEffect(() => {
+        setTick(0);
+        const id = setInterval(() => setTick((x) => (x >= 100 ? 100 : x + 2)), 60);
+        return () => clearInterval(id);
+      }, [viz]);
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">{viz.caption}</div>
+          <div className="space-y-3">
+            {viz.racers.map((r, i) => {
+              const t = TONE[r.tone] || TONE.warn;
+              const pct = Math.min(100, tick * r.speed);
+              const done = pct >= 100;
+              return (
+                <div key={i}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className={`text-xs font-bold ${t.text}`}>{r.label}</span>
+                    <span className="text-[10px] font-mono bg-slate-700 text-white px-2 py-0.5 rounded">{r.ms}</span>
+                  </div>
+                  <div className="h-4 bg-white rounded border border-slate-300 overflow-hidden">
+                    <div className={`h-full ${t.bar} transition-all duration-100 flex items-center justify-end pr-1`} style={{ width: `${pct}%` }}>
+                      {done && <span className="text-[9px] text-white font-bold">✓</span>}
+                    </div>
+                  </div>
+                  <div className="text-[10px] text-slate-600 mt-1">{r.note}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-3 text-[10px] text-center text-slate-600">
+            같은 100만 행 — 커밋/인덱스 전략만 바꿔도 처리 시간이 갈린다
+          </div>
+        </div>
+      );
+    }
+
+    function PragmaViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">{viz.caption}</div>
+          <div className="space-y-1.5">
+            {viz.items.map((it, i) => {
+              const t = TONE[it.tone] || TONE.warn;
+              return (
+                <div key={i} className={`flex items-center gap-2 rounded border p-2 ${t.bg} ${t.border}`}>
+                  <span className="flex-1 font-mono text-[11px] text-slate-800">{it.pragma}</span>
+                  <span className={`text-[10px] ${t.text} text-right`}>{it.note}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function PaginateViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">{viz.caption}</div>
+          <div className="space-y-3">
+            {viz.rows.map((r, i) => (
+              <div key={i} className="bg-white border border-slate-300 rounded p-2">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs font-bold text-slate-800">{r.label}</span>
+                  <span className="text-[10px] font-mono text-slate-500">{r.offset}</span>
+                </div>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-[10px] w-14 text-rose-700">OFFSET</span>
+                  <div className="flex-1 h-3 bg-slate-100 rounded overflow-hidden">
+                    <div className="h-full bg-rose-500" style={{ width: `${r.off}%` }}></div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] w-14 text-emerald-700">keyset</span>
+                  <div className="flex-1 h-3 bg-slate-100 rounded overflow-hidden">
+                    <div className="h-full bg-emerald-500" style={{ width: `${r.key}%` }}></div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 text-[10px] text-center text-slate-600">
+            OFFSET은 깊어질수록 늘어나고, keyset은 항상 짧다
+          </div>
+        </div>
+      );
+    }
+
+    function PitfallsViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.items.map((it, i) => (
+            <div key={i} className="flex items-start gap-2 bg-amber-50 border border-amber-300 rounded p-2">
+              <span className="text-amber-700">{it.icon}</span>
+              <div className="flex-1">
+                <div className="text-xs font-bold text-amber-900">{it.label}</div>
+                <div className="text-[10px] text-amber-800">{it.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-slate-400 bg-white p-3">
+          <div className="text-sm font-bold text-slate-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-slate-200">
+                <th className="py-1 pr-2">항목</th><th className="py-1 pr-2">방법</th><th className="py-1 pr-2">효과</th><th className="py-1">결과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 pr-2 font-medium text-slate-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-slate-600 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-slate-800 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-slate-900 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-slate-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-slate-800">대용량 · 벌크 시각화</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'race' && <RaceViz viz={viz} />}
+          {viz?.kind === 'pragma' && <PragmaViz viz={viz} />}
+          {viz?.kind === 'paginate' && <PaginateViz viz={viz} />}
+          {viz?.kind === 'pitfalls' && <PitfallsViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-slate-800 bg-slate-100 border border-slate-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-slate-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#003B57] text-white font-bold">S</span>
+              <div>
+                <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded bg-[#003B57] text-white mb-1">Part V. 실전 활용 · V-2-1</span>
+                <h1 className="text-2xl font-bold text-slate-900">대용량 · 벌크 처리</h1>
+                <p className="text-sm text-slate-700/80">수백만 행을 빠르게 넣고 다루는 실전 기법</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-[#003B57]' : 'bg-slate-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-[#003B57] text-slate-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-slate-900 text-white' : 'bg-[#003B57] text-white hover:bg-slate-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-slate-400 bg-white px-4 py-3 text-sm text-slate-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                벌크 INSERT는 한 트랜잭션으로 묶어 fsync를 줄이고 executemany로 statement를 재사용한다. 초기 적재에만 synchronous=OFF·journal_mode=MEMORY를 쓰고 끝나면 원복한다. 인덱스는 적재 후 CREATE INDEX + ANALYZE. 대용량 조회는 OFFSET 대신 keyset과 커서 스트리밍. 대량 삭제 후 공간은 한산할 때 VACUUM으로 회수한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['bulk_insert', 'executemany', 'transaction', 'PRAGMA', 'index_after_load', 'keyset', 'VACUUM'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-800 border border-slate-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-2-2.html" className="underline hover:no-underline">다음: V-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

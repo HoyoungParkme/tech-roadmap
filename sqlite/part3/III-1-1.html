@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQLite 학습 — III-1-1. 인덱스 기초</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    SQLite Chapter III-1-1 — 인덱스 기초
+    학습 목표: B-Tree 인덱스, CREATE INDEX, full table scan vs index scan, 카디널리티
+    인덱스 = 책의 색인. 데이터 정렬된 별도 구조로 빠른 lookup
+    패턴: fastapi v1 — 좌(LiveDataPane: B-Tree + 스캔 비교) / 우(VSCode CodeViewer)
+    색상: slate (sqlite 도메인, #003B57)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. Full Table Scan — 인덱스 없으면 전체를 뒤진다',
+        desc: 'WHERE email=? 쿼리, 100만 행이면 100만 번 비교. O(N) 선형 탐색. CPU와 디스크 I/O 모두 폭증. 결과 1건이라도 "찾을 때까지 모든 행 검사" 가 SQLite 기본.',
+        viz: {
+          kind: 'scan-compare',
+          method: 'SCAN TABLE users',
+          rowsScanned: 1000000,
+          rowsMatched: 1,
+          cost: 'O(N)',
+          ms: 850,
+        },
+        verdict: '느림',
+        verdictTone: 'danger',
+        keyPoint: '인덱스 없는 WHERE = SCAN TABLE. 100만 행 = 100만 비교. EXPLAIN QUERY PLAN으로 확인.',
+        code: {
+          lang: 'sql',
+          filename: 'full-scan.sql',
+          lines: [
+            '-- Step 1. 인덱스 없는 테이블의 비극',
+            '',
+            '-- 테스트 테이블',
+            'CREATE TABLE users (',
+            '    id     INTEGER PRIMARY KEY,',
+            '    email  TEXT NOT NULL,',
+            '    name   TEXT,',
+            '    age    INTEGER,',
+            '    created_at TEXT',
+            ');',
+            '',
+            '-- 100만 행 더미 데이터 (실무에선 INSERT 생략)',
+            'WITH RECURSIVE seq(n) AS (',
+            '    SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 1000000',
+            ')',
+            'INSERT INTO users(email, name, age, created_at)',
+            'SELECT ',
+            '    "user" || n || "@x.com",',
+            '    "User" || n,',
+            '    20 + (n % 50),',
+            '    datetime("2026-01-01", "+" || n || " seconds")',
+            'FROM seq;',
+            '',
+            '-- 쿼리 1) 이메일로 조회 — 인덱스 없음',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE email = "user500000@x.com";',
+            '',
+            '-- 결과:',
+            '-- SCAN users',
+            '--   ↑ 100만 행 전체 스캔. 1건만 찾아도 끝까지 본다.',
+            '--   ↑ 거의 850ms. 사용자는 "느리다" 체감.',
+            '',
+            '-- 쿼리 2) 정렬도 마찬가지',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users ORDER BY email LIMIT 10;',
+            '',
+            '-- SCAN users',
+            '-- USE TEMP B-TREE FOR ORDER BY  ← 임시 정렬 트리. 추가 비용.',
+            '',
+            '-- 쿼리 3) JOIN 도 동일',
+            'CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INT, total REAL);',
+            'EXPLAIN QUERY PLAN',
+            'SELECT u.name, o.total',
+            'FROM users u',
+            'JOIN orders o ON o.user_id = u.id',
+            'WHERE u.email = "user1@x.com";',
+            '',
+            '-- SCAN users',
+            '-- SEARCH orders USING INTEGER PRIMARY KEY  ← orders는 PK 인덱스 있음',
+            '-- users 에 인덱스 없으니 매번 100만 SCAN',
+            '',
+            '-- 진단 방법',
+            '-- 1) EXPLAIN QUERY PLAN 키워드 "SCAN" 발견 → 인덱스 부재 신호',
+            '-- 2) sqlite3 .timer ON 으로 실측',
+            '-- 3) sqlite_stat1 / sqlite_stat4 의 통계 확인',
+            '',
+            '-- 다음 Step: 인덱스 하나로 850ms → 0.1ms',
+          ],
+          highlight: [3, 4, 5, 6, 7, 8, 9, 23, 24, 25, 27, 28, 29, 30, 34, 35, 36, 38, 39],
+        },
+      },
+      {
+        title: 'Step 2. CREATE INDEX — B-Tree 색인을 만든다',
+        desc: 'CREATE INDEX idx_email ON users(email). 데이터를 정렬된 B-Tree로 별도 저장. lookup O(log N) → 100만 행 = 약 20번 비교. 0.1ms로 떨어진다. 단, 디스크 추가 + INSERT/UPDATE 비용 상승.',
+        viz: {
+          kind: 'btree',
+          root: 'M',
+          levels: [
+            ['M'],
+            ['G', 'T'],
+            ['B', 'J', 'P', 'X'],
+          ],
+          target: 'P',
+          steps: 3,
+        },
+        verdict: 'O(log N)',
+        verdictTone: 'good',
+        keyPoint: 'B-Tree 인덱스 = 정렬된 트리. 100만 행 lookup = 약 20번 점프. SCAN → SEARCH.',
+        code: {
+          lang: 'sql',
+          filename: 'create-index.sql',
+          lines: [
+            '-- Step 2. CREATE INDEX 의 위력',
+            '',
+            '-- 인덱스 생성',
+            'CREATE INDEX idx_users_email ON users(email);',
+            '',
+            '-- 다시 같은 쿼리',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE email = "user500000@x.com";',
+            '',
+            '-- 결과:',
+            '-- SEARCH users USING INDEX idx_users_email (email=?)',
+            '--   ↑ SCAN → SEARCH. 100만 → 약 20번 비교.',
+            '--   ↑ 850ms → 0.1ms (약 8500배 빠름)',
+            '',
+            '-- 동작 원리',
+            '-- B-Tree 구조 예시 (간략화):',
+            '--                  [ M ]',
+            '--                /       \\',
+            '--             [G]         [T]',
+            '--            /   \\       /   \\',
+            '--          [B]   [J]   [P]   [X]',
+            '--',
+            '-- "P" 찾기:',
+            '--   M 비교 → P>M, 오른쪽 → T 비교 → P<T, 왼쪽 → P ✓',
+            '--   3번 점프로 1백만 중 1개 발견',
+            '',
+            '-- 다중 컬럼 인덱스',
+            'CREATE INDEX idx_users_age_name ON users(age, name);',
+            '',
+            '-- 좌측 prefix 규칙 (composite index 핵심)',
+            '-- WHERE age=30 AND name="Alice"  ✓ 사용',
+            '-- WHERE age=30                    ✓ 사용 (age 만)',
+            '-- WHERE name="Alice"              ✗ 사용 X (age 없음)',
+            '',
+            '-- 유니크 인덱스 = UNIQUE 제약',
+            'CREATE UNIQUE INDEX idx_users_email_uniq ON users(email);',
+            '-- 중복 INSERT 시 SQLITE_CONSTRAINT 에러',
+            '',
+            '-- 부분 인덱스 (Partial Index) — 디스크 절약',
+            'CREATE INDEX idx_active_users ON users(email)',
+            'WHERE deleted_at IS NULL;',
+            '-- 활성 사용자만 색인 → 인덱스 크기 작음',
+            '',
+            '-- 표현식 인덱스',
+            'CREATE INDEX idx_lower_email ON users(lower(email));',
+            '-- WHERE lower(email)="x@y.com" 시에만 사용',
+            '',
+            '-- 인덱스 비용',
+            '-- 1) 디스크 추가 (원본의 10~30%)',
+            '-- 2) INSERT/UPDATE 마다 트리 재구성',
+            '-- 3) 쓰기 많은 테이블은 인덱스 최소화',
+            '',
+            '-- 인덱스 통계 업데이트',
+            'ANALYZE;',
+            '-- → sqlite_stat1 갱신, planner 가 더 정확한 선택',
+          ],
+          highlight: [2, 3, 4, 6, 7, 10, 11, 12, 13, 27, 28, 29, 30, 31, 32, 33, 36, 37, 39, 40, 41, 44, 45, 46],
+        },
+      },
+      {
+        title: 'Step 3. EXPLAIN QUERY PLAN — planner 의 결정을 읽는다',
+        desc: 'EXPLAIN QUERY PLAN 으로 SQLite planner 가 선택한 실행 계획 확인. SCAN(전체) vs SEARCH(인덱스), USING INDEX, USE TEMP B-TREE, COVERING INDEX 등 키워드. 인덱스 튜닝의 출발점.',
+        viz: {
+          kind: 'plan-compare',
+          plans: [
+            { label: '인덱스 없음', text: 'SCAN users', tone: 'danger', ms: 850 },
+            { label: '단일 인덱스', text: 'SEARCH users USING INDEX idx_email', tone: 'good', ms: 0.1 },
+            { label: 'COVERING', text: 'SEARCH users USING COVERING INDEX', tone: 'good', ms: 0.05 },
+            { label: 'ORDER BY (idx)', text: 'SEARCH USING INDEX FOR ORDER', tone: 'good', ms: 0.2 },
+            { label: 'ORDER BY (정렬)', text: 'USE TEMP B-TREE FOR ORDER BY', tone: 'warn', ms: 120 },
+          ],
+        },
+        verdict: 'plan 분석',
+        verdictTone: 'good',
+        keyPoint: 'SCAN = 전체 / SEARCH = 인덱스. COVERING = 테이블 안 봐도 됨. TEMP B-TREE = 임시 정렬.',
+        code: {
+          lang: 'sql',
+          filename: 'explain-query-plan.sql',
+          lines: [
+            '-- Step 3. EXPLAIN QUERY PLAN — planner 읽기',
+            '',
+            '-- 기본 사용법',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE email = ?;',
+            '-- → SEARCH users USING INDEX idx_users_email (email=?)',
+            '',
+            '-- 핵심 키워드 사전',
+            '',
+            '-- SCAN tableName',
+            '--   전체 테이블 스캔. O(N). 인덱스 부재.',
+            '',
+            '-- SEARCH tableName USING INDEX idxName (col=?)',
+            '--   인덱스 lookup. O(log N).',
+            '',
+            '-- SEARCH ... USING COVERING INDEX',
+            '--   인덱스만 읽어도 SELECT 컬럼 다 있음. 테이블 fetch 생략.',
+            '--   = 최고 성능',
+            '',
+            '-- USE TEMP B-TREE FOR ORDER BY',
+            '--   ORDER BY 처리에 임시 정렬 트리 생성. 메모리/CPU 부담.',
+            '--   → 인덱스가 정렬 순서와 일치하면 사라짐',
+            '',
+            '-- USE TEMP B-TREE FOR GROUP BY',
+            '--   GROUP BY 도 마찬가지. 인덱스 활용 가능.',
+            '',
+            '-- SCAN tableName USING INDEX (covering)',
+            '--   인덱스를 SCAN. WHERE 없거나 매우 광범위.',
+            '',
+            '-- 다양한 패턴',
+            '',
+            '-- (1) WHERE + ORDER BY 동시',
+            'CREATE INDEX idx_age_name ON users(age, name);',
+            'EXPLAIN QUERY PLAN',
+            'SELECT name FROM users WHERE age = 30 ORDER BY name;',
+            '-- → SEARCH ... USING COVERING INDEX idx_age_name (age=?)',
+            '--   age=30 후 name 정렬, 임시 트리 X (인덱스 자체가 정렬됨)',
+            '',
+            '-- (2) JOIN',
+            'EXPLAIN QUERY PLAN',
+            'SELECT u.name, o.total FROM users u',
+            'JOIN orders o ON o.user_id = u.id',
+            'WHERE u.id = 42;',
+            '-- → SEARCH u USING INTEGER PRIMARY KEY (rowid=?)',
+            '-- → SEARCH o USING INDEX idx_orders_user_id (user_id=?)',
+            '',
+            '-- (3) IN 절',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE id IN (1,2,3);',
+            '-- → SEARCH users USING INTEGER PRIMARY KEY (rowid=?)',
+            '--   IN 도 인덱스 활용',
+            '',
+            '-- (4) LIKE — prefix 만 인덱스',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE email LIKE "user1%";',
+            '-- → SEARCH users USING INDEX (email>? AND email<?)',
+            '--   "user1%" 처럼 prefix LIKE 만 인덱스 사용',
+            '--   "%@x.com" 처럼 leading wildcard 는 SCAN',
+            '',
+            '-- 실무 체크리스트',
+            '-- 1) 느린 쿼리는 항상 EXPLAIN QUERY PLAN 먼저',
+            '-- 2) SCAN 발견 → 인덱스 후보 검토',
+            '-- 3) USE TEMP B-TREE → 정렬 순서 인덱스 검토',
+            '-- 4) 변경 후 ANALYZE 로 통계 갱신',
+          ],
+          highlight: [2, 3, 4, 7, 8, 9, 11, 12, 14, 15, 16, 19, 20, 21, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 42, 43, 44, 45],
+        },
+      },
+      {
+        title: 'Step 4. Covering Index — 테이블을 아예 안 본다',
+        desc: 'SELECT 컬럼이 모두 인덱스에 포함되면 테이블 페이지를 안 읽음. SQLite는 "USING COVERING INDEX" 표기. 메모리 친화적이고 가장 빠른 패턴. composite index 설계 시 핵심.',
+        viz: {
+          kind: 'covering',
+          query: 'SELECT name FROM users WHERE age=30',
+          index: 'idx(age, name)',
+          tableHit: false,
+          improve: '추가 fetch 0회',
+        },
+        verdict: '최적',
+        verdictTone: 'good',
+        keyPoint: 'COVERING INDEX = 인덱스만 읽고 끝. WHERE+SELECT 컬럼이 모두 인덱스 안에 있어야 함.',
+        code: {
+          lang: 'sql',
+          filename: 'covering-index.sql',
+          lines: [
+            '-- Step 4. Covering Index — 테이블 안 봐도 됨',
+            '',
+            '-- 단순 인덱스 (covering 아님)',
+            'CREATE INDEX idx_age ON users(age);',
+            '',
+            'EXPLAIN QUERY PLAN',
+            'SELECT name FROM users WHERE age = 30;',
+            '-- → SEARCH users USING INDEX idx_age (age=?)',
+            '--   인덱스에서 rowid 찾고 → 테이블 가서 name fetch',
+            '--   I/O = 인덱스 1회 + 테이블 1회',
+            '',
+            '-- Covering Index (인덱스 안에 모든 컬럼)',
+            'DROP INDEX idx_age;',
+            'CREATE INDEX idx_age_name ON users(age, name);',
+            '',
+            'EXPLAIN QUERY PLAN',
+            'SELECT name FROM users WHERE age = 30;',
+            '-- → SEARCH users USING COVERING INDEX idx_age_name (age=?)',
+            '--   인덱스 1회 lookup → name 도 인덱스에 있음 → 끝',
+            '--   I/O = 인덱스 1회만',
+            '',
+            '-- 실측 비교 (10만 행 기준)',
+            '-- 일반 인덱스:   12 ms (인덱스 + 테이블 fetch)',
+            '-- COVERING:       3 ms (인덱스만)',
+            '',
+            '-- 활용 패턴 — 자주 같이 조회되는 컬럼들',
+            '',
+            '-- (1) 카운트',
+            'CREATE INDEX idx_status ON orders(status);',
+            'SELECT count(*) FROM orders WHERE status = "PAID";',
+            '-- → SEARCH USING COVERING INDEX idx_status',
+            '--   count(*) 는 컬럼 fetch 불필요 → 자연 covering',
+            '',
+            '-- (2) ID 만 필요',
+            'CREATE INDEX idx_user_status ON orders(user_id, status);',
+            'SELECT id FROM orders WHERE user_id = 1 AND status = "PAID";',
+            '-- ✗ id 가 인덱스에 없으면 covering 아님',
+            '',
+            '-- → 해결: rowid (PRIMARY KEY) 는 자동 포함됨',
+            '-- INTEGER PRIMARY KEY 는 rowid 별칭이라 항상 포함',
+            'SELECT id FROM orders WHERE user_id = 1 AND status = "PAID";',
+            '-- → COVERING (id = rowid 자동 포함)',
+            '',
+            '-- (3) 명시 포함 (SQLite 는 INCLUDE 키워드 없음 → 그냥 인덱스에 컬럼 추가)',
+            'CREATE INDEX idx_full ON orders(user_id, status, total, created_at);',
+            'SELECT total, created_at FROM orders WHERE user_id=1 AND status="PAID";',
+            '-- → COVERING (total, created_at 도 인덱스 안에)',
+            '',
+            '-- 트레이드오프',
+            '-- + 조회 매우 빠름',
+            '-- − 인덱스 크기 증가 (모든 컬럼 복사)',
+            '-- − INSERT/UPDATE 비용 증가',
+            '-- → 자주 호출되는 핵심 쿼리에만 적용',
+            '',
+            '-- 진단',
+            '-- EXPLAIN QUERY PLAN 결과에 "COVERING" 키워드 확인',
+          ],
+          highlight: [2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 27, 28, 29, 30, 31, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48],
+        },
+      },
+      {
+        title: 'Step 5. 인덱스 함정 — 만든다고 항상 빨라지지 않는다',
+        desc: '낮은 카디널리티(예: gender=2종), 매우 작은 테이블(<1000행), 쓰기 많은 테이블은 인덱스가 오히려 손해. ANALYZE 안 하면 planner 가 잘못 선택. 인덱스 = 양날의 검.',
+        viz: {
+          kind: 'pitfalls',
+          items: [
+            { icon: '⚠', label: '낮은 카디널리티', desc: 'gender 2종 → 50% 매칭, SCAN 이 더 빠름' },
+            { icon: '⚠', label: '작은 테이블', desc: '<1000 행은 SCAN 이 cache 친화적' },
+            { icon: '⚠', label: '쓰기 많음', desc: '쓰기마다 트리 재구성, INSERT 5~10배 느려짐' },
+            { icon: '⚠', label: 'leading %', desc: 'LIKE "%xx" 는 인덱스 못 씀' },
+            { icon: '⚠', label: 'ANALYZE 누락', desc: 'planner 통계 없으면 잘못 선택' },
+          ],
+        },
+        verdict: '함정 주의',
+        verdictTone: 'warn',
+        summary: {
+          title: 'III-1-1 인덱스 기초 정리',
+          rows: [
+            { metric: '없을 때', before: 'SCAN', after: 'O(N) 100만 비교', delta: '850ms' },
+            { metric: '단일 인덱스', before: 'SEARCH', after: 'O(log N) 20회', delta: '0.1ms' },
+            { metric: 'covering', before: '인덱스만', after: '테이블 fetch X', delta: '0.05ms' },
+            { metric: '카디널리티 낮음', before: 'SCAN 더 빠름', after: '인덱스 손해', delta: '역효과' },
+            { metric: '쓰기 부담', before: '인덱스 N개', after: '쓰기 N배 비용', delta: '균형' },
+          ],
+        },
+        keyPoint: '인덱스 = 도구. 카디널리티/쓰기 빈도/쿼리 패턴을 보고 신중히. 다음(III-1-2) WHERE 절 분석.',
+        code: {
+          lang: 'sql',
+          filename: 'index-pitfalls.sql',
+          lines: [
+            '-- Step 5. 인덱스 함정 5가지',
+            '',
+            '-- ① 낮은 카디널리티 — gender, is_active 같은 boolean',
+            'CREATE INDEX idx_gender ON users(gender);  -- M/F 2종',
+            'EXPLAIN QUERY PLAN',
+            'SELECT * FROM users WHERE gender = "M";',
+            '-- → SEARCH users USING INDEX idx_gender ...',
+            '-- 그러나 실제로는 50만 행 매칭 → 인덱스 lookup 50만 회',
+            '-- → SCAN 이 더 빠름 (순차 I/O)',
+            '-- 해결: 복합 인덱스 (gender, country) 처럼 카디널리티 보충',
+            '',
+            '-- ② 작은 테이블 — 200행 짜리에 인덱스?',
+            'CREATE TABLE config(k TEXT PRIMARY KEY, v TEXT);',
+            'CREATE INDEX idx_config_v ON config(v);',
+            '-- 200행은 page 한두장. SCAN이 cache hit 100%. 인덱스 손해.',
+            '',
+            '-- ③ 쓰기 많은 테이블',
+            '-- INSERT INTO logs(...) 가 초당 1만',
+            '-- 인덱스 5개 → 매 INSERT 마다 B-Tree 5개 갱신',
+            '-- → INSERT 5~10배 느려짐, WAL 폭증',
+            '-- 해결: 로그성 테이블은 인덱스 최소화. 분석은 별도 OLAP.',
+            '',
+            '-- ④ LIKE 의 leading wildcard',
+            'SELECT * FROM users WHERE email LIKE "%@gmail.com";',
+            '-- → SCAN. 인덱스 못 씀 (prefix 없음)',
+            '-- 해결책 1: 역순 컬럼 + 인덱스',
+            'ALTER TABLE users ADD COLUMN email_rev TEXT;',
+            'UPDATE users SET email_rev = reverse(email);',
+            'CREATE INDEX idx_email_rev ON users(email_rev);',
+            'SELECT * FROM users WHERE email_rev LIKE "moc.liamg@%";',
+            '-- 해결책 2: FTS5 (전문 검색, IV-3 권장)',
+            '',
+            '-- ⑤ ANALYZE 안 하면 planner 가 잘못 선택',
+            'CREATE INDEX idx_status ON orders(status);',
+            '-- ANALYZE 전: planner 는 모든 인덱스 동등하게 봄',
+            'ANALYZE;',
+            '-- sqlite_stat1, sqlite_stat4 갱신',
+            '-- → status="PAID" 가 90%, status="CANCELED" 1% 라는 분포 학습',
+            '-- → "WHERE status=CANCELED" 일 때 인덱스 적극 활용',
+            '',
+            '-- 운영 권장 흐름',
+            '-- 1) 새 인덱스 만들면 즉시 ANALYZE',
+            '-- 2) 데이터 분포 크게 변하면 주기적 ANALYZE',
+            '-- 3) sqlite3 ".analysis-limit 1000" 으로 빠르게',
+            '',
+            '-- 인덱스 진단 쿼리',
+            'SELECT name, sql FROM sqlite_master',
+            'WHERE type = "index" AND tbl_name = "users";',
+            '',
+            '-- 인덱스 통계 (ANALYZE 후)',
+            'SELECT * FROM sqlite_stat1 WHERE tbl = "users";',
+            '-- stat 컬럼: "rows distinct" — 카디널리티 추정',
+            '',
+            '-- 인덱스 제거',
+            'DROP INDEX IF EXISTS idx_gender;',
+            '',
+            '-- 다음 챕터: WHERE 절 작성 패턴 (III-1-2)',
+          ],
+          highlight: [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33, 34, 35, 36, 37],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function ScanCompareViz({ viz }) {
+      const pct = (viz.rowsMatched / viz.rowsScanned) * 100;
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs font-mono text-slate-800 mb-2">{viz.method}</div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-slate-500 w-20">스캔 행</span>
+              <div className="flex-1 h-3 bg-white rounded border border-slate-300 overflow-hidden">
+                <div className="h-full bg-rose-500" style={{ width: '100%' }}></div>
+              </div>
+              <span className="text-[10px] font-mono w-20 text-right">{viz.rowsScanned.toLocaleString()}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-slate-500 w-20">매칭</span>
+              <div className="flex-1 h-3 bg-white rounded border border-slate-300 overflow-hidden">
+                <div className="h-full bg-emerald-500" style={{ width: `${Math.max(0.1, pct)}%` }}></div>
+              </div>
+              <span className="text-[10px] font-mono w-20 text-right">{viz.rowsMatched}</span>
+            </div>
+          </div>
+          <div className="mt-3 flex justify-between text-xs">
+            <span className="font-mono bg-rose-100 text-rose-800 px-2 py-0.5 rounded">{viz.cost}</span>
+            <span className="font-mono bg-slate-700 text-white px-2 py-0.5 rounded">{viz.ms}ms</span>
+          </div>
+        </div>
+      );
+    }
+
+    function BTreeViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-2">B-Tree 색인 lookup ({viz.steps}단계)</div>
+          <div className="space-y-2">
+            {viz.levels.map((nodes, lvl) => (
+              <div key={lvl} className="flex justify-center gap-2">
+                {nodes.map((n) => (
+                  <span key={n} className={`text-xs font-mono px-3 py-1 rounded border ${
+                    n === viz.target ? 'bg-emerald-500 text-white border-emerald-700' :
+                    (lvl === 0 || (lvl === 1 && n === 'T') || (lvl === 2 && n === 'P')) ? 'bg-slate-700 text-white border-slate-800' :
+                    'bg-white border-slate-300 text-slate-700'
+                  }`}>{n}</span>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 text-[10px] text-center text-slate-600">
+            target=<span className="font-mono">{viz.target}</span> · 3 점프로 100만 중 1개 발견 · O(log N)
+          </div>
+        </div>
+      );
+    }
+
+    function PlanCompareViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.plans.map((p, i) => {
+            const t = TONE[p.tone] || TONE.warn;
+            return (
+              <div key={i} className={`flex items-center gap-2 p-2 rounded border ${t.bg} ${t.border}`}>
+                <span className={`text-[10px] w-20 ${t.text} font-bold`}>{p.label}</span>
+                <span className="flex-1 font-mono text-[10px] text-slate-800">{p.text}</span>
+                <span className="text-[10px] font-mono bg-slate-700 text-white px-2 py-0.5 rounded">{p.ms}ms</span>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function CoveringViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-3">
+          <div className="text-xs font-mono text-slate-800 bg-white border border-slate-300 rounded p-2">{viz.query}</div>
+          <div className="flex items-center justify-center gap-3">
+            <div className="bg-emerald-100 border border-emerald-400 rounded p-3 text-center min-w-[100px]">
+              <div className="text-[10px] text-emerald-700 mb-1">B-Tree 인덱스</div>
+              <div className="text-xs font-mono font-bold text-emerald-900">{viz.index}</div>
+              <div className="text-[10px] text-emerald-700 mt-1">SELECT 컬럼 ✓</div>
+            </div>
+            <span className={`text-2xl ${viz.tableHit ? 'text-rose-500' : 'text-slate-300'}`}>{viz.tableHit ? '→' : '↛'}</span>
+            <div className={`border rounded p-3 text-center min-w-[100px] ${
+              viz.tableHit ? 'bg-rose-50 border-rose-300' : 'bg-slate-100 border-slate-300 opacity-50 line-through'
+            }`}>
+              <div className="text-[10px] text-slate-500 mb-1">테이블 페이지</div>
+              <div className="text-xs font-mono font-bold text-slate-700">users 행</div>
+              <div className="text-[10px] text-slate-500 mt-1">{viz.tableHit ? 'fetch 필요' : '안 봄'}</div>
+            </div>
+          </div>
+          <div className="text-center text-xs bg-emerald-100 text-emerald-800 px-2 py-1 rounded border border-emerald-300 font-bold">
+            ✓ {viz.improve}
+          </div>
+        </div>
+      );
+    }
+
+    function PitfallsViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.items.map((it, i) => (
+            <div key={i} className="flex items-start gap-2 bg-amber-50 border border-amber-300 rounded p-2">
+              <span className="text-amber-700">{it.icon}</span>
+              <div className="flex-1">
+                <div className="text-xs font-bold text-amber-900">{it.label}</div>
+                <div className="text-[10px] text-amber-800">{it.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-slate-400 bg-white p-3">
+          <div className="text-sm font-bold text-slate-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-slate-200">
+                <th className="py-1 pr-2">분류</th><th className="py-1 pr-2">상태</th><th className="py-1 pr-2">설명</th><th className="py-1">결과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 pr-2 font-medium text-slate-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-slate-600 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-slate-800 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-slate-900 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-slate-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-slate-800">인덱스 시각화</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'scan-compare' && <ScanCompareViz viz={viz} />}
+          {viz?.kind === 'btree' && <BTreeViz viz={viz} />}
+          {viz?.kind === 'plan-compare' && <PlanCompareViz viz={viz} />}
+          {viz?.kind === 'covering' && <CoveringViz viz={viz} />}
+          {viz?.kind === 'pitfalls' && <PitfallsViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-slate-800 bg-slate-100 border border-slate-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-slate-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#003B57] text-white font-bold">S</span>
+              <div>
+                <h1 className="text-2xl font-bold text-slate-900">Chapter III-1-1. 인덱스 기초</h1>
+                <p className="text-sm text-slate-700/80">B-Tree / SCAN vs SEARCH / EXPLAIN QUERY PLAN / COVERING</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-[#003B57]' : 'bg-slate-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-[#003B57] text-slate-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-slate-900 text-white' : 'bg-[#003B57] text-white hover:bg-slate-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-slate-400 bg-white px-4 py-3 text-sm text-slate-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                인덱스는 B-Tree로 O(log N) lookup. SCAN→SEARCH 전환. EXPLAIN QUERY PLAN으로 검증. COVERING이 최적. 낮은 카디널리티/작은 테이블/쓰기 많음/leading wildcard는 함정.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['B-Tree', 'SCAN', 'SEARCH', 'COVERING', 'EXPLAIN', 'ANALYZE'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-800 border border-slate-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../part2/II-2-2.html" className="underline hover:no-underline">← II-2-2 트랜잭션</a>
+              <a href="./III-1-2.html" className="underline hover:no-underline">다음: III-1-2 WHERE 절 작성 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

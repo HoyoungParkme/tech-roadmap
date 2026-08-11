@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQLite 학습 — IV-1-2. busy_timeout · 락 · 체크포인트</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    SQLite Chapter IV-1-2 — busy_timeout · 락 · 체크포인트
+    학습 목표: SQLite 락 단계, single-writer, SQLITE_BUSY, busy_timeout, WAL 체크포인트
+    핵심: 쓰기는 한 번에 하나. 락 경합은 SQLITE_BUSY로 나타나고 busy_timeout으로 대기·재시도.
+    패턴: fastapi v1 — 좌(LiveDataPane: 연결 경합/체크포인트 애니메이션) / 우(VSCode CodeViewer)
+    색상: slate + SQLite 강조색 #003B57
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. SQLite 락 계층 — 쓰기는 한 번에 하나뿐',
+        desc: 'SQLite는 파일 하나를 여러 연결이 공유한다. 그래서 읽기는 여러 개가 동시에(SHARED) 가능하지만 쓰기는 오직 한 연결만 허용하는 single-writer 모델이다. 쓰기 연결은 SHARED → RESERVED → PENDING → EXCLUSIVE 순서로 락을 승격시키며, EXCLUSIVE를 잡는 순간 다른 모든 접근이 막힌다. 이 구조를 이해해야 왜 동시 쓰기에서 대기가 생기는지 설명할 수 있다.',
+        viz: {
+          kind: 'lock-hierarchy',
+          levels: [
+            { name: 'SHARED', desc: '읽기용. 여러 연결 동시 보유 가능', tone: 'good' },
+            { name: 'RESERVED', desc: '쓰기 예약. 읽기는 아직 허용, 쓰기 예약은 1개만', tone: 'warn' },
+            { name: 'PENDING', desc: '커밋 대기. 새 SHARED 획득 차단', tone: 'warn' },
+            { name: 'EXCLUSIVE', desc: '독점. 실제 파일 기록. 모든 접근 차단', tone: 'danger' },
+          ],
+        },
+        verdict: 'single-writer',
+        verdictTone: 'good',
+        keyPoint: '읽기 N개 동시 OK, 쓰기는 1개만. 락은 SHARED→RESERVED→PENDING→EXCLUSIVE로 승격.',
+        code: {
+          lang: 'sql',
+          filename: 'lock-levels.sql',
+          lines: [
+            '-- Step 1. SQLite 락 단계 확인',
+            '',
+            '-- WAL 모드 (읽기/쓰기 동시성 크게 개선)',
+            'PRAGMA journal_mode = WAL;',
+            '-- rollback journal: 읽기와 쓰기가 서로 막음',
+            '-- WAL: 읽기는 쓰기를 막지 않음. 단, 쓰기는 여전히 1개',
+            '',
+            '-- 읽기 트랜잭션 = SHARED 락',
+            'BEGIN;                       -- deferred: 첫 SELECT에서 SHARED',
+            'SELECT * FROM accounts WHERE id = 1;',
+            '-- 이 시점: SHARED 보유. 다른 연결도 SHARED 가능.',
+            'COMMIT;',
+            '',
+            '-- 쓰기 트랜잭션 = RESERVED → EXCLUSIVE 승격',
+            'BEGIN IMMEDIATE;             -- 즉시 RESERVED 락 획득',
+            'UPDATE accounts SET balance = balance - 100 WHERE id = 1;',
+            '-- RESERVED: 나만 쓰기 예약. 다른 쓰기 시도는 SQLITE_BUSY.',
+            'COMMIT;                      -- PENDING → EXCLUSIVE → 기록 → 해제',
+            '',
+            '-- 락 종류 요약',
+            '-- SHARED    : 읽기. 여러 연결 동시',
+            '-- RESERVED  : 쓰기 예약. 최대 1개',
+            '-- PENDING   : 커밋 진행. 신규 SHARED 차단',
+            '-- EXCLUSIVE : 파일 기록. 전면 차단',
+            '',
+            '-- 핵심: 트랜잭션 종류 선택이 락 타이밍을 결정',
+            '-- BEGIN          = DEFERRED (첫 쿼리에서 락)',
+            '-- BEGIN IMMEDIATE = 시작 즉시 RESERVED (쓰기 의도 명시)',
+            '-- 쓰기 트랜잭션은 IMMEDIATE 권장 → 데드락 위험 감소',
+          ],
+          highlight: [2, 3, 7, 8, 9, 13, 14, 15, 16],
+        },
+      },
+      {
+        title: 'Step 2. SQLITE_BUSY — 다른 연결이 쓰기 락을 쥐고 있다',
+        desc: '두 연결이 동시에 쓰기를 시도하면 먼저 RESERVED를 잡은 연결이 이기고, 나머지는 즉시 SQLITE_BUSY 에러를 받는다. 이건 버그가 아니라 single-writer 모델이 충돌을 알려주는 정상 신호다. 기본 설정에서는 대기 없이 곧바로 실패하기 때문에, 아무 대비가 없으면 트래픽이 조금만 몰려도 쓰기가 툭툭 끊긴다. 그래서 다음 단계의 busy_timeout이 필요하다.',
+        viz: {
+          kind: 'busy',
+          conns: [
+            { id: 'A', label: '연결 A' },
+            { id: 'B', label: '연결 B' },
+            { id: 'C', label: '연결 C' },
+          ],
+          winner: 'A',
+        },
+        verdict: 'SQLITE_BUSY',
+        verdictTone: 'danger',
+        keyPoint: '동시 쓰기 → 1개만 락 획득, 나머지는 SQLITE_BUSY. 기본값은 대기 없이 즉시 실패.',
+        code: {
+          lang: 'python',
+          filename: 'busy_error.py',
+          lines: [
+            '# Step 2. SQLITE_BUSY 재현 — 동시 쓰기 충돌',
+            'import sqlite3',
+            'import threading',
+            '',
+            '# busy_timeout=0 (기본) → 대기 없이 즉시 실패',
+            'def writer(name, hold_sec):',
+            '    conn = sqlite3.connect("bank.db", isolation_level=None)',
+            '    conn.execute("PRAGMA busy_timeout = 0")   # 즉시 실패 모드',
+            '    try:',
+            '        conn.execute("BEGIN IMMEDIATE")        # RESERVED 락 시도',
+            '        conn.execute("UPDATE accounts SET balance = balance - 1 WHERE id = 1")',
+            '        import time; time.sleep(hold_sec)      # 락을 잠시 붙잡음',
+            '        conn.execute("COMMIT")',
+            '        print(name, "커밋 성공")',
+            '    except sqlite3.OperationalError as e:',
+            '        # database is locked == SQLITE_BUSY',
+            '        print(name, "실패:", e)                # 다른 연결이 락 보유',
+            '    finally:',
+            '        conn.close()',
+            '',
+            '# A가 먼저 락을 잡고 0.5초 붙잡는 동안 B가 즉시 실패',
+            't1 = threading.Thread(target=writer, args=("A", 0.5))',
+            't2 = threading.Thread(target=writer, args=("B", 0.0))',
+            't1.start()',
+            't2.start()',
+            't1.join(); t2.join()',
+            '',
+            '# 출력 예:',
+            '#   B 실패: database is locked   ← SQLITE_BUSY',
+            '#   A 커밋 성공',
+            '#',
+            '# 왜? single-writer라서 A의 RESERVED가 살아있는 동안',
+            '# B의 BEGIN IMMEDIATE가 락을 못 얻고 곧바로 튕김.',
+          ],
+          highlight: [4, 7, 8, 9, 14, 15, 16, 30, 31, 32],
+        },
+      },
+      {
+        title: 'Step 3. busy_timeout — 실패 대신 잠깐 기다렸다 재시도',
+        desc: 'busy_timeout을 설정하면 SQLite는 락이 풀릴 때까지 지정한 밀리초 동안 내부에서 잠깐씩 자며 재시도한다. 그 사이 앞 트랜잭션이 커밋해 락이 풀리면 뒤 연결이 이어받아 성공한다. 즉 짧은 순간의 경합을 에러가 아니라 약간의 지연으로 흡수하는 것이다. 다만 이건 만능이 아니라서, 트랜잭션을 짧게 유지해 락을 오래 쥐지 않는 것이 함께 가야 한다.',
+        viz: {
+          kind: 'busy-timeout',
+          timeoutMs: 5000,
+          waited: 320,
+        },
+        verdict: '대기 후 성공',
+        verdictTone: 'good',
+        keyPoint: 'busy_timeout=5000이면 락 풀릴 때까지 최대 5초 재시도. 짧은 경합을 지연으로 흡수.',
+        code: {
+          lang: 'python',
+          filename: 'busy_timeout.py',
+          lines: [
+            '# Step 3. busy_timeout — 대기·재시도로 경합 흡수',
+            'import sqlite3',
+            '',
+            'def get_conn(path):',
+            '    conn = sqlite3.connect(path, isolation_level=None)',
+            '    conn.execute("PRAGMA journal_mode = WAL")',
+            '    # 락이 잡혀 있으면 최대 5초까지 내부 재시도 후 실패',
+            '    conn.execute("PRAGMA busy_timeout = 5000")',
+            '    return conn',
+            '',
+            '# 방법 A) PRAGMA busy_timeout (밀리초)',
+            'conn = get_conn("bank.db")',
+            '',
+            '# 방법 B) 파이썬 드라이버의 timeout(초) 인자 = 내부적으로 동일',
+            '# conn = sqlite3.connect("bank.db", timeout=5.0)',
+            '',
+            'def transfer(conn, src, dst, amount):',
+            '    # 쓰기 트랜잭션은 IMMEDIATE로 시작해 락 타이밍을 앞당김',
+            '    conn.execute("BEGIN IMMEDIATE")',
+            '    try:',
+            '        conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, src))',
+            '        conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, dst))',
+            '        conn.execute("COMMIT")   # 여기서 락 즉시 해제 → 대기 중 연결이 이어받음',
+            '    except Exception:',
+            '        conn.execute("ROLLBACK")',
+            '        raise',
+            '',
+            '# busy_timeout이 있으면 짧은 경합은 사용자에게 에러 대신',
+            '# 수백 ms의 지연으로만 보인다.',
+            'transfer(conn, 1, 2, 100)',
+            '',
+            '# 주의: busy_timeout은 "즉시 실패"만 막는다.',
+            '# 락을 5초 넘게 쥐는 긴 트랜잭션이 있으면 결국 SQLITE_BUSY.',
+            '# → 트랜잭션을 짧게 유지하는 것이 근본 대책.',
+          ],
+          highlight: [6, 7, 8, 17, 18, 22, 27, 28, 31, 32, 33],
+        },
+      },
+      {
+        title: 'Step 4. WAL 체크포인트 — 로그를 본체 DB에 반영한다',
+        desc: 'WAL 모드에서 쓰기는 본 DB 파일이 아니라 -wal 파일에 먼저 append된다. 이 WAL 프레임을 원본 데이터베이스로 옮겨 적는 작업이 체크포인트다. PASSIVE는 읽는 연결을 방해하지 않고 가능한 만큼만 옮기고, FULL/RESTART/TRUNCATE는 더 많이 반영하며 마지막엔 WAL 파일 크기를 줄이거나 0으로 자른다. 자동 체크포인트는 WAL이 약 1000페이지에 도달하면 돌지만, 긴 읽기 트랜잭션이 있으면 반영이 밀려 WAL이 계속 커진다.',
+        viz: {
+          kind: 'checkpoint',
+          walFrames: 6,
+          modes: [
+            { name: 'PASSIVE', desc: '읽기 방해 없이 가능한 만큼 반영. 기본 자동', tone: 'good' },
+            { name: 'FULL', desc: '모든 프레임 반영 시도. 읽기 끝날 때까지 대기', tone: 'warn' },
+            { name: 'RESTART', desc: 'FULL + WAL을 처음부터 다시 쓰게 리셋', tone: 'warn' },
+            { name: 'TRUNCATE', desc: 'FULL + WAL 파일 크기를 0으로 절단', tone: 'danger' },
+          ],
+        },
+        verdict: 'WAL → main',
+        verdictTone: 'good',
+        keyPoint: '체크포인트 = WAL 프레임을 본 DB에 반영. PASSIVE(자동)~TRUNCATE(WAL 절단) 4단계.',
+        code: {
+          lang: 'sql',
+          filename: 'checkpoint.sql',
+          lines: [
+            '-- Step 4. WAL 체크포인트 제어',
+            '',
+            '-- 자동 체크포인트 임계값 (프레임 수, 기본 1000)',
+            'PRAGMA wal_autocheckpoint = 1000;',
+            '-- WAL이 약 1000페이지 쌓이면 커밋 뒤 PASSIVE 체크포인트 자동 실행',
+            '',
+            '-- 수동 체크포인트 4가지 모드',
+            'PRAGMA wal_checkpoint(PASSIVE);   -- 읽기 방해 X, 되는 만큼',
+            'PRAGMA wal_checkpoint(FULL);      -- 모든 프레임 반영까지 시도',
+            'PRAGMA wal_checkpoint(RESTART);   -- FULL + WAL 시작점 리셋',
+            'PRAGMA wal_checkpoint(TRUNCATE);  -- FULL + WAL 파일 0으로 절단',
+            '',
+            '-- 반환값: (busy, log_frames, checkpointed_frames)',
+            '--   busy=1 이면 읽기 락에 막혀 일부만 반영됨',
+            '',
+            '-- WAL 현재 크기 확인',
+            'PRAGMA wal_checkpoint;            -- 인자 없으면 PASSIVE',
+            '',
+            '-- 자동 반영을 끄고 직접 제어 (배치 작업 등)',
+            'PRAGMA wal_autocheckpoint = 0;    -- 자동 끔',
+            '-- ... 대량 INSERT ...',
+            'PRAGMA wal_checkpoint(TRUNCATE);  -- 배치 끝나고 한 번에 반영 + 절단',
+            '',
+            '-- 왜 신경 써야 하나',
+            '-- 1) 긴 읽기 트랜잭션이 살아있으면 체크포인트가 프레임을',
+            '--    반영 못 하고 WAL 파일이 계속 커진다 (-wal 수 GB).',
+            '-- 2) 커진 WAL은 재시작 복구 시간과 디스크를 잡아먹는다.',
+            '-- 3) 주기적으로 TRUNCATE로 크기를 되돌리면 안정적.',
+            '',
+            '-- 진단: -wal 파일 크기를 모니터링',
+            'SELECT * FROM pragma_wal_checkpoint;',
+          ],
+          highlight: [2, 3, 6, 7, 8, 9, 10, 18, 19, 20, 21, 23, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — 락·타임아웃·체크포인트가 엉키는 지점',
+        desc: 'busy_timeout을 0으로 두면 아주 짧은 경합에도 쓰기가 즉시 실패한다. 반대로 긴 읽기 트랜잭션을 열어두면 체크포인트가 밀려 WAL이 무한정 커지고 디스크를 잡아먹는다. 여러 연결이 서로 다른 순서로 락을 승격하려다 데드락에 빠지기도 한다. 결국 답은 트랜잭션을 짧게, 쓰기는 BEGIN IMMEDIATE로, busy_timeout은 넉넉히, 체크포인트는 주기적으로다.',
+        viz: {
+          kind: 'pitfalls',
+          items: [
+            { icon: '⚠', label: 'busy_timeout=0', desc: '기본값. 짧은 경합에도 즉시 SQLITE_BUSY' },
+            { icon: '⚠', label: '긴 읽기 트랜잭션', desc: '체크포인트를 막아 WAL 파일이 무한 증가' },
+            { icon: '⚠', label: 'WAL 무한 증가', desc: '-wal 수 GB. 복구 느려지고 디스크 압박' },
+            { icon: '⚠', label: '락 데드락', desc: '서로 다른 순서로 승격 → 교착. IMMEDIATE로 예방' },
+            { icon: '⚠', label: '긴 쓰기 트랜잭션', desc: '락을 오래 쥐어 busy_timeout도 결국 초과' },
+          ],
+        },
+        verdict: '함정 주의',
+        verdictTone: 'warn',
+        summary: {
+          title: 'IV-1-2 락·busy_timeout·체크포인트 정리',
+          rows: [
+            { metric: '동시 쓰기', before: '1개만 락', after: '나머지 SQLITE_BUSY', delta: 'single-writer' },
+            { metric: 'busy_timeout', before: '0=즉시 실패', after: '5000=대기·재시도', delta: '넉넉히' },
+            { metric: '쓰기 시작', before: 'DEFERRED', after: 'BEGIN IMMEDIATE', delta: '데드락↓' },
+            { metric: '체크포인트', before: 'PASSIVE 자동', after: 'TRUNCATE 절단', delta: 'WAL 관리' },
+            { metric: '긴 트랜잭션', before: 'WAL 증가', after: '짧게 유지', delta: '근본 대책' },
+          ],
+        },
+        keyPoint: '짧은 트랜잭션 + IMMEDIATE + 넉넉한 busy_timeout + 주기적 체크포인트. 다음(IV-2-1)로.',
+        code: {
+          lang: 'python',
+          filename: 'concurrency_best_practice.py',
+          lines: [
+            '# Step 5. 동시성 실전 설정 — 함정 회피 템플릿',
+            'import sqlite3',
+            'from contextlib import contextmanager',
+            '',
+            'def open_db(path):',
+            '    conn = sqlite3.connect(path, isolation_level=None)',
+            '    conn.execute("PRAGMA journal_mode = WAL")     # 읽기/쓰기 동시성',
+            '    conn.execute("PRAGMA busy_timeout = 5000")    # 함정1: 0 금지',
+            '    conn.execute("PRAGMA synchronous = NORMAL")   # WAL에서 안전+빠름',
+            '    conn.execute("PRAGMA wal_autocheckpoint = 1000")',
+            '    return conn',
+            '',
+            '@contextmanager',
+            'def write_tx(conn):',
+            '    # 함정4: 쓰기는 IMMEDIATE로 시작해 승격 순서 통일 → 데드락 예방',
+            '    conn.execute("BEGIN IMMEDIATE")',
+            '    try:',
+            '        yield conn',
+            '        conn.execute("COMMIT")   # 함정2/5: 짧게 끝내 락을 빨리 놓기',
+            '    except Exception:',
+            '        conn.execute("ROLLBACK")',
+            '        raise',
+            '',
+            'conn = open_db("bank.db")',
+            '',
+            '# 쓰기: 트랜잭션 안에서 최소한의 작업만',
+            'with write_tx(conn) as c:',
+            '    c.execute("UPDATE accounts SET balance = balance - 100 WHERE id = 1")',
+            '    c.execute("UPDATE accounts SET balance = balance + 100 WHERE id = 2")',
+            '',
+            '# 읽기: 오래 붙잡지 말 것 (함정3: WAL 증가 방지)',
+            'rows = conn.execute("SELECT id, balance FROM accounts").fetchall()',
+            '',
+            '# 주기적 유지보수: WAL 파일 크기 되돌리기',
+            'conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")',
+            '',
+            '# 체크리스트',
+            '# 1) busy_timeout 넉넉히   2) 쓰기 IMMEDIATE',
+            '# 3) 트랜잭션 짧게         4) 읽기 오래 열지 말기',
+            '# 5) 주기적 TRUNCATE 체크포인트',
+          ],
+          highlight: [6, 7, 8, 9, 14, 15, 16, 19, 26, 27, 28, 34, 35, 38, 39, 40],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function LockHierarchyViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">쓰기 트랜잭션의 락 승격 순서</div>
+          <div className="space-y-2">
+            {viz.levels.map((lv, i) => {
+              const t = TONE[lv.tone] || TONE.warn;
+              return (
+                <div key={lv.name} className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono text-slate-400 w-4 text-right">{i + 1}</span>
+                  <div className={`flex-1 flex items-center gap-2 p-2 rounded border ${t.bg} ${t.border}`} style={{ marginLeft: i * 14 }}>
+                    <span className={`text-xs font-mono font-bold ${t.text} w-20`}>{lv.name}</span>
+                    <span className="text-[10px] text-slate-700 flex-1">{lv.desc}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-3 text-[10px] text-center text-slate-600">
+            읽기는 SHARED에서 멈추고, 쓰기만 EXCLUSIVE까지 올라간다
+          </div>
+        </div>
+      );
+    }
+
+    function BusyViz({ viz }) {
+      const [tick, setTick] = useState(0);
+      useEffect(() => {
+        const id = setInterval(() => setTick((x) => (x + 1) % 3), 900);
+        return () => clearInterval(id);
+      }, []);
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">동시 쓰기 요청 — RESERVED 락은 하나만</div>
+          <div className="flex flex-col gap-2">
+            {viz.conns.map((c) => {
+              const isWinner = c.id === viz.winner;
+              const active = tick >= 1;
+              const state = !active ? '대기' : isWinner ? '락 획득' : 'SQLITE_BUSY';
+              const t = !active ? TONE.warn : isWinner ? TONE.good : TONE.danger;
+              return (
+                <div key={c.id} className={`flex items-center gap-2 p-2 rounded border transition ${t.bg} ${t.border}`}>
+                  <span className="text-xs font-mono font-bold text-slate-700 w-16">{c.label}</span>
+                  <span className="text-[10px] font-mono text-slate-500 flex-1">BEGIN IMMEDIATE</span>
+                  <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded ${t.badge}`}>{state}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-3 flex items-center justify-center gap-2 text-[10px]">
+            <span className="font-mono bg-[#003B57] text-white px-2 py-0.5 rounded">accounts.db</span>
+            <span className="text-slate-500">RESERVED 락 = 연결 {viz.winner} 독점</span>
+          </div>
+        </div>
+      );
+    }
+
+    function BusyTimeoutViz({ viz }) {
+      const [elapsed, setElapsed] = useState(0);
+      useEffect(() => {
+        setElapsed(0);
+        const id = setInterval(() => {
+          setElapsed((x) => (x >= viz.waited ? viz.waited : x + 40));
+        }, 120);
+        return () => clearInterval(id);
+      }, [viz.waited]);
+      const done = elapsed >= viz.waited;
+      const pct = Math.min(100, (elapsed / viz.timeoutMs) * 100 * 6);
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-2">busy_timeout = {viz.timeoutMs}ms — 락 풀릴 때까지 재시도</div>
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-slate-500 w-16">재시도</span>
+              <div className="flex-1 h-3 bg-white rounded border border-slate-300 overflow-hidden">
+                <div className={`h-full ${done ? 'bg-emerald-500' : 'bg-amber-400'} transition-all`} style={{ width: `${pct}%` }}></div>
+              </div>
+              <span className="text-[10px] font-mono w-16 text-right">{elapsed}ms</span>
+            </div>
+            <div className="flex items-center justify-center gap-2 text-[10px]">
+              {done ? (
+                <span className="font-mono font-bold bg-emerald-200 text-emerald-800 px-2 py-0.5 rounded">락 해제 감지 → 쓰기 성공</span>
+              ) : (
+                <span className="font-mono bg-amber-200 text-amber-800 px-2 py-0.5 rounded">앞 트랜잭션 커밋 대기 중...</span>
+              )}
+            </div>
+          </div>
+          <div className="mt-3 text-[10px] text-center text-slate-600">
+            {viz.waited}ms 만에 락 해제 → {viz.timeoutMs}ms 한도 안이라 성공
+          </div>
+        </div>
+      );
+    }
+
+    function CheckpointViz({ viz }) {
+      const [moved, setMoved] = useState(0);
+      useEffect(() => {
+        setMoved(0);
+        const id = setInterval(() => {
+          setMoved((x) => (x >= viz.walFrames ? 0 : x + 1));
+        }, 700);
+        return () => clearInterval(id);
+      }, [viz.walFrames]);
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">WAL 프레임을 본 DB로 반영 (checkpoint)</div>
+          <div className="flex items-center gap-2 mb-3">
+            <div className="flex-1">
+              <div className="text-[10px] text-slate-500 mb-1 text-center">-wal 파일</div>
+              <div className="flex gap-1 justify-center flex-wrap">
+                {Array.from({ length: viz.walFrames }).map((_, i) => (
+                  <span key={i} className={`w-5 h-6 rounded text-[9px] flex items-center justify-center font-mono border ${
+                    i < moved ? 'bg-slate-200 border-slate-300 text-slate-300 line-through' : 'bg-amber-100 border-amber-400 text-amber-800'
+                  }`}>{i + 1}</span>
+                ))}
+              </div>
+            </div>
+            <span className="text-xl text-[#003B57]">→</span>
+            <div className="flex-1">
+              <div className="text-[10px] text-slate-500 mb-1 text-center">main DB</div>
+              <div className="flex gap-1 justify-center flex-wrap">
+                {Array.from({ length: viz.walFrames }).map((_, i) => (
+                  <span key={i} className={`w-5 h-6 rounded text-[9px] flex items-center justify-center font-mono border ${
+                    i < moved ? 'bg-emerald-200 border-emerald-400 text-emerald-800' : 'bg-white border-slate-300 text-slate-300'
+                  }`}>{i + 1}</span>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            {viz.modes.map((m) => {
+              const t = TONE[m.tone] || TONE.warn;
+              return (
+                <div key={m.name} className={`flex items-center gap-2 p-1.5 rounded border ${t.bg} ${t.border}`}>
+                  <span className={`text-[10px] font-mono font-bold ${t.text} w-16`}>{m.name}</span>
+                  <span className="text-[10px] text-slate-700 flex-1">{m.desc}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    function PitfallsViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.items.map((it, i) => (
+            <div key={i} className="flex items-start gap-2 bg-amber-50 border border-amber-300 rounded p-2">
+              <span className="text-amber-700">{it.icon}</span>
+              <div className="flex-1">
+                <div className="text-xs font-bold text-amber-900">{it.label}</div>
+                <div className="text-[10px] text-amber-800">{it.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-slate-400 bg-white p-3">
+          <div className="text-sm font-bold text-slate-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-slate-200">
+                <th className="py-1 pr-2">분류</th><th className="py-1 pr-2">전</th><th className="py-1 pr-2">후</th><th className="py-1">포인트</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 pr-2 font-medium text-slate-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-slate-600 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-slate-800 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-slate-900 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-slate-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-slate-800">동시성 시각화</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'lock-hierarchy' && <LockHierarchyViz viz={viz} />}
+          {viz?.kind === 'busy' && <BusyViz viz={viz} />}
+          {viz?.kind === 'busy-timeout' && <BusyTimeoutViz viz={viz} />}
+          {viz?.kind === 'checkpoint' && <CheckpointViz viz={viz} />}
+          {viz?.kind === 'pitfalls' && <PitfallsViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-slate-800 bg-slate-100 border border-slate-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-slate-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#003B57] text-white font-bold">S</span>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-[#003B57] text-white">Part IV. WAL과 동시성</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">IV-1-2</span>
+                </div>
+                <h1 className="text-2xl font-bold text-slate-900 mt-1">busy_timeout · 락 · 체크포인트</h1>
+                <p className="text-sm text-slate-700/80">동시 접근 시 락 경합과 대기 처리</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-[#003B57]' : 'bg-slate-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-[#003B57] text-slate-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-slate-900 text-white' : 'bg-[#003B57] text-white hover:bg-slate-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-slate-400 bg-white px-4 py-3 text-sm text-slate-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                SQLite는 single-writer라 동시 쓰기 중 하나만 락을 얻고 나머지는 SQLITE_BUSY. busy_timeout으로 짧은 경합을 대기·재시도로 흡수하고, 쓰기는 BEGIN IMMEDIATE, 트랜잭션은 짧게. WAL 체크포인트(PASSIVE~TRUNCATE)로 로그를 본 DB에 반영하며 WAL 무한 증가를 막는다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['single-writer', 'SQLITE_BUSY', 'busy_timeout', 'WAL', 'checkpoint', 'IMMEDIATE'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-800 border border-slate-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./IV-2-1.html" className="underline hover:no-underline">다음: IV-2-1 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

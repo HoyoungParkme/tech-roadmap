@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQLite 학습 — V-1-1. 앱 내장 / 백업 · restore</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>📚</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    SQLite Chapter V-1-1 — 앱 내장 / 백업 · restore
+    학습 목표: 앱 내장 사례, Online Backup API, VACUUM INTO, .backup, restore, integrity_check, 마이그레이션
+    핵심: 실행 중 DB를 단순 복사하면 손상 / 안전한 스냅샷 방법을 골라 쓴다
+    패턴: fastapi v1 — 좌(LiveDataPane: 위험한 복사 vs 안전한 백업 대비) / 우(VSCode CodeViewer)
+    색상: slate (sqlite 도메인, #003B57)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 앱 내장 — SQLite를 프로세스 안에 품는다',
+        desc: 'SQLite는 서버가 아니라 라이브러리다. 별도 프로세스·포트·네트워크 없이 앱과 같은 프로세스에서 파일 하나(.db)를 읽고 쓴다. 그래서 모바일·데스크톱·엣지·브라우저 WASM·테스트에 그대로 심는다. 배포는 바이너리에 링크되고, DB 파일만 함께 두면 끝이라 설치·운영 부담이 거의 없다. 대신 "파일 하나가 곧 데이터 전부"라 이 파일을 어떻게 백업·복원하느냐가 운영의 전부가 된다.',
+        viz: {
+          kind: 'embed-cases',
+          cases: [
+            { icon: '📱', label: '모바일', desc: 'iOS/Android 로컬 저장. 오프라인 우선.' },
+            { icon: '🖥', label: '데스크톱', desc: 'VSCode·브라우저 설정, 단일 파일 DB.' },
+            { icon: '📡', label: '엣지 / IoT', desc: '네트워크 불안정, 로컬에서 먼저 처리.' },
+            { icon: '🌐', label: '브라우저 WASM', desc: 'sql.js / wa-sqlite, 클라이언트 내장.' },
+            { icon: '🧪', label: '테스트', desc: ':memory: DB, CI에서 격리·초고속.' },
+          ],
+        },
+        verdict: '내장형',
+        verdictTone: 'good',
+        keyPoint: 'SQLite = 프로세스 내장 라이브러리. 데이터는 파일 하나에 전부. 그래서 백업·복원 전략이 곧 운영 전략.',
+        code: {
+          lang: 'python',
+          filename: 'embed_app.py',
+          lines: [
+            '# Step 1. 애플리케이션에 SQLite 품기 (파일 하나가 DB 전부)',
+            'import sqlite3',
+            'from pathlib import Path',
+            '',
+            '# 앱 데이터 폴더에 DB 파일 하나만 두면 끝 (서버·포트 없음)',
+            'DB_PATH = Path.home() / ".myapp" / "app.db"',
+            'DB_PATH.parent.mkdir(parents=True, exist_ok=True)',
+            '',
+            'def get_conn() -> sqlite3.Connection:',
+            '    # 앱 프로세스 안에서 직접 파일을 연다',
+            '    conn = sqlite3.connect(DB_PATH)',
+            '    # 내장 앱 권장 PRAGMA (실무 기본 세팅)',
+            '    conn.execute("PRAGMA journal_mode = WAL;")   # 동시 읽기+쓰기',
+            '    conn.execute("PRAGMA foreign_keys = ON;")     # 무결성 강제',
+            '    conn.execute("PRAGMA busy_timeout = 5000;")   # 잠금 5초 대기',
+            '    return conn',
+            '',
+            '# 최초 실행 시 스키마 생성 (앱에 스키마를 내장)',
+            'def init_schema(conn: sqlite3.Connection) -> None:',
+            '    conn.executescript(',
+            '        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT, created REAL)"',
+            '    )',
+            '',
+            '# 테스트는 파일 대신 메모리 DB — CI에서 격리·초고속',
+            'def get_test_conn() -> sqlite3.Connection:',
+            '    return sqlite3.connect(":memory:")',
+            '',
+            '# 배포: 실행 파일 + app.db 만 함께 두면 이동 가능',
+            '# 단, "실행 중인 app.db"를 그냥 복사하면 손상될 수 있다 (Step 2)',
+          ],
+          highlight: [5, 6, 9, 10, 12, 13, 14, 24, 25],
+        },
+      },
+      {
+        title: 'Step 2. 위험한 백업 — 실행 중 파일을 그냥 복사하면 손상된다',
+        desc: 'WAL 모드에서 최근 변경은 app.db가 아니라 app.db-wal에 쌓여 있다. 이때 cp app.db backup.db 만 하면 -wal을 빼먹어 "과거 시점의 반쪽 DB"가 복사된다. 더 나쁜 경우 복사 도중 다른 트랜잭션이 페이지를 갈아엎어 페이지가 서로 안 맞는 깨진 파일이 된다. 파일 3형제(.db, .db-wal, .db-shm)를 원자적으로 함께 떠야 하는데 OS 파일 복사로는 이 원자성을 보장할 수 없다. 그래서 "실행 중 단순 복사"는 백업이 아니라 시한폭탄이다.',
+        viz: {
+          kind: 'copy-contrast',
+          mode: 'unsafe',
+          title: 'cp app.db backup.db  (실행 중)',
+          files: [
+            { name: 'app.db', note: '커밋된 페이지', copied: true, tone: 'warn' },
+            { name: 'app.db-wal', note: '최근 변경 (미반영)', copied: false, tone: 'danger' },
+            { name: 'app.db-shm', note: 'WAL 인덱스', copied: false, tone: 'danger' },
+          ],
+          result: { text: 'backup.db = 반쪽·손상 위험', tone: 'danger' },
+        },
+        verdict: '손상 위험',
+        verdictTone: 'danger',
+        keyPoint: 'WAL 모드에서 cp app.db 는 -wal 을 놓친다. 실행 중 단순 복사 = 백업 아님. 페이지 불일치로 깨질 수 있다.',
+        code: {
+          lang: 'bash',
+          filename: 'unsafe-backup.sh',
+          lines: [
+            '# Step 2. 하지 말아야 할 백업 — 실행 중 단순 파일 복사',
+            '',
+            '# 앱이 WAL 모드로 켜져 있으면 파일이 3개다',
+            'ls -la ~/.myapp/',
+            '#  app.db        <- 커밋된 페이지 (과거 시점일 수 있음)',
+            '#  app.db-wal    <- 최근 변경분 (아직 app.db 에 병합 안 됨)',
+            '#  app.db-shm    <- WAL 공유 메모리 인덱스',
+            '',
+            '# 위험 1) -wal 을 빼먹은 복사 → 최근 데이터 통째로 유실',
+            'cp ~/.myapp/app.db  /backup/backup.db      # BAD',
+            '',
+            '# 위험 2) 복사 도중 앱이 체크포인트/쓰기 → 페이지 불일치 손상',
+            'cp ~/.myapp/app.db* /backup/               # 여전히 BAD (원자성 없음)',
+            '#  → 파일별 복사 시점이 어긋나 db 와 wal 버전이 안 맞음',
+            '',
+            '# 위험 3) rsync 도 마찬가지 — 스냅샷의 원자성을 보장하지 못함',
+            'rsync -a ~/.myapp/app.db /backup/          # BAD (실행 중이면)',
+            '',
+            '# 복원해보면 무결성 검사에서 바로 드러난다',
+            'sqlite3 /backup/backup.db "PRAGMA integrity_check;"',
+            '#  → "*** in database main ***" 또는 "database disk image is malformed"',
+            '',
+            '# 결론: 실행 중 DB 는 "파일"이 아니라 "살아있는 상태"다.',
+            '#       SQLite 가 아는 방식(Step 3)으로 떠야 안전하다.',
+          ],
+          highlight: [9, 10, 12, 13, 14, 22, 23, 24],
+        },
+      },
+      {
+        title: 'Step 3. 안전한 백업 — SQLite가 아는 방식으로 스냅샷을 뜬다',
+        desc: '방법은 세 가지다. Online Backup API는 앱이 켜진 채로도 잠금을 조율하며 페이지를 안전하게 복사한다(실시간 백업). VACUUM INTO는 조각 없는 단일 파일 스냅샷을 새로 써서 배포·아카이브에 좋다. .backup CLI는 내부적으로 Backup API를 쓰는 명령줄 도구라 운영 스크립트에 편하다. 공통점은 셋 다 트랜잭션 일관성을 지켜 "그 순간의 완전한 DB"를 만든다는 것이다. 파일 복사와 달리 -wal 누락이나 페이지 불일치가 원천적으로 없다.',
+        viz: {
+          kind: 'copy-contrast',
+          mode: 'safe',
+          title: 'Online Backup API / VACUUM INTO / .backup',
+          methods: [
+            { name: 'Online Backup API', note: '실행 중 안전 복사, 진행률 제어', tone: 'good' },
+            { name: 'VACUUM INTO', note: '단일 파일 스냅샷, 조각 제거', tone: 'good' },
+            { name: '.backup (CLI)', note: 'Backup API 래핑, 스크립트용', tone: 'good' },
+          ],
+          result: { text: 'snapshot.db = 일관된 완전본', tone: 'good' },
+        },
+        verdict: '안전',
+        verdictTone: 'good',
+        keyPoint: 'Online Backup API·VACUUM INTO·.backup 은 트랜잭션 일관성 보장. -wal 누락/페이지 불일치 없음.',
+        code: {
+          lang: 'python',
+          filename: 'safe_backup.py',
+          lines: [
+            '# Step 3. 안전한 백업 3종 (실행 중에도 OK)',
+            'import sqlite3',
+            '',
+            '# 방법 A) Online Backup API — 실행 중 안전 복사 + 진행률',
+            'def backup_online(src_path: str, dst_path: str) -> None:',
+            '    src = sqlite3.connect(src_path)',
+            '    dst = sqlite3.connect(dst_path)',
+            '    with dst:',
+            '        # pages=매 스텝 복사 페이지, 0 이하면 한 번에',
+            '        src.backup(dst, pages=100, progress=_report)',
+            '    dst.close()',
+            '    src.close()',
+            '',
+            'def _report(status: int, remaining: int, total: int) -> None:',
+            '    done = total - remaining',
+            '    print("backup", done, "/", total, "pages")',
+            '',
+            '# 방법 B) VACUUM INTO — 조각 없는 단일 파일 스냅샷',
+            'def backup_vacuum(src_path: str, dst_path: str) -> None:',
+            '    conn = sqlite3.connect(src_path)',
+            '    # 새 파일로 통째로 다시 쓰며 조각(fragmentation) 제거',
+            '    conn.execute("VACUUM INTO ?", (dst_path,))',
+            '    conn.close()',
+            '',
+            '# 방법 C) .backup (CLI) — 내부적으로 Backup API 사용',
+            '#   sqlite3 app.db ".backup /backup/snapshot.db"',
+            '#   → 운영 크론잡·셸 스크립트에서 가장 간편',
+            '',
+            '# 실무 팁: 백업 파일명에 타임스탬프 + 즉시 무결성 검사(Step 4)',
+            'if __name__ == "__main__":',
+            '    backup_online("app.db", "snapshot.db")',
+            '    backup_vacuum("app.db", "archive.db")',
+          ],
+          highlight: [3, 4, 5, 8, 9, 17, 18, 21, 24, 25, 26],
+        },
+      },
+      {
+        title: 'Step 4. restore + 무결성 검사 — 복원은 반드시 검증한다',
+        desc: '복원은 "앱을 멈추고 → 백업 파일을 원래 경로에 놓고 → 남은 -wal/-shm 을 정리하고 → 앱을 다시 켜는" 순서다. 순서를 어기면(앱이 켜진 채 파일 교체) 잠금·캐시가 꼬여 또 손상된다. 그리고 복원했다고 끝이 아니라 PRAGMA integrity_check 로 "정말 멀쩡한지"를 확인해야 한다. 백업을 뜰 때도, 복원한 뒤에도 이 검사를 돌려야 "검증 안 된 백업"이라는 최악의 함정을 피한다. ok 한 줄이 나와야 비로소 신뢰할 수 있는 백업이다.',
+        viz: {
+          kind: 'restore-flow',
+          steps: [
+            { n: 1, label: '앱 종료', desc: '쓰기 중지, 잠금 해제', tone: 'warn' },
+            { n: 2, label: '파일 교체', desc: 'snapshot.db → app.db', tone: 'good' },
+            { n: 3, label: '-wal/-shm 정리', desc: '옛 WAL 잔여물 제거', tone: 'good' },
+            { n: 4, label: 'integrity_check', desc: 'ok 확인 후 재기동', tone: 'good' },
+          ],
+          check: { pragma: 'PRAGMA integrity_check;', ok: 'ok' },
+        },
+        verdict: '검증 필수',
+        verdictTone: 'good',
+        keyPoint: '복원 순서: 종료→교체→WAL 정리→integrity_check. 검사 통과 전엔 "복원 완료" 아님.',
+        code: {
+          lang: 'bash',
+          filename: 'restore.sh',
+          lines: [
+            '# Step 4. 복원(restore) + 무결성 검사 — 순서를 지켜라',
+            'set -euo pipefail',
+            '',
+            'APP_DB=~/.myapp/app.db',
+            'BACKUP=/backup/snapshot.db',
+            '',
+            '# 1) 앱 종료 (파일을 쓰는 프로세스가 없어야 안전)',
+            'systemctl --user stop myapp   # 또는 앱 정상 종료',
+            '',
+            '# 2) 복원 전에 백업 파일부터 검증 (깨진 백업 복원 방지)',
+            'sqlite3 "$BACKUP" "PRAGMA integrity_check;"',
+            '#   → ok 가 아니면 여기서 중단 (다른 백업 사용)',
+            '',
+            '# 3) 기존 WAL 잔여물 정리 후 파일 교체',
+            'rm -f "${APP_DB}-wal" "${APP_DB}-shm"',
+            'cp "$BACKUP" "$APP_DB"',
+            '',
+            '# 4) 복원 결과 재검증 (복원 후에도 반드시)',
+            'sqlite3 "$APP_DB" "PRAGMA integrity_check;"',
+            'sqlite3 "$APP_DB" "PRAGMA foreign_key_check;"',
+            '#   → 둘 다 비어있거나 ok 여야 신뢰 가능',
+            '',
+            '# 5) 앱 재기동',
+            'systemctl --user start myapp',
+            '',
+            '# 참고: 빠른 확인만 필요하면 quick_check (가벼운 검사)',
+            'sqlite3 "$APP_DB" "PRAGMA quick_check;"',
+          ],
+          highlight: [6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19],
+        },
+      },
+      {
+        title: 'Step 5. 마이그레이션과 함정 — 백업 없는 배포는 없다',
+        desc: '스키마 변경은 user_version PRAGMA로 버전을 매기고, 마이그레이션 직전에 반드시 백업을 뜬 뒤 순서대로 올린다. 순서를 건너뛰거나 롤백 계획 없이 ALTER 하면 되돌릴 수 없다. 현장에서 데이터를 날리는 4대 함정은 (1) 실행 중 단순 복사, (2) -wal 누락, (3) 마이그레이션 순서 꼬임, (4) 백업 검증 생략이다. 넷 다 "검사 한 줄"과 "SQLite가 아는 백업 방식"으로 막을 수 있다. 백업은 뜨는 것보다 복원해서 검증하는 것이 진짜 백업이다.',
+        viz: {
+          kind: 'pitfalls',
+          items: [
+            { icon: '⚠', label: '실행 중 단순 복사', desc: 'cp app.db → 페이지 불일치 손상' },
+            { icon: '⚠', label: '-wal 누락 복사', desc: 'db 만 복사 → 최근 데이터 유실' },
+            { icon: '⚠', label: '마이그레이션 순서', desc: 'user_version 무시 → 되돌리기 불가' },
+            { icon: '⚠', label: '백업 검증 생략', desc: 'integrity_check 안 함 → 복원 때 발견' },
+          ],
+        },
+        verdict: '함정 주의',
+        verdictTone: 'warn',
+        summary: {
+          title: 'V-1-1 앱 내장 / 백업 · restore 정리',
+          rows: [
+            { metric: '단순 파일 복사', before: 'cp app.db', after: '-wal 누락/불일치', delta: '손상' },
+            { metric: 'Online Backup API', before: 'src.backup(dst)', after: '실행 중 안전', delta: '실시간' },
+            { metric: 'VACUUM INTO', before: '단일 파일', after: '조각 제거 스냅샷', delta: '아카이브' },
+            { metric: '.backup CLI', before: 'sqlite3 .backup', after: 'Backup API 래핑', delta: '스크립트' },
+            { metric: 'restore', before: '종료→교체→검사', after: 'integrity_check ok', delta: '검증' },
+          ],
+        },
+        keyPoint: '백업은 SQLite 방식으로 뜨고, 복원은 순서 지켜 검증까지. 다음(V-1-2)에서 실전 운영 패턴을 이어간다.',
+        code: {
+          lang: 'python',
+          filename: 'migrate.py',
+          lines: [
+            '# Step 5. 스키마 마이그레이션 — 백업 → 버전 순서대로',
+            'import sqlite3',
+            '',
+            'def current_version(conn: sqlite3.Connection) -> int:',
+            '    # user_version PRAGMA 로 스키마 버전을 관리 (0 이 초기값)',
+            '    return conn.execute("PRAGMA user_version;").fetchone()[0]',
+            '',
+            '# 버전별 마이그레이션 (순서가 곧 정답 — 건너뛰기 금지)',
+            'MIGRATIONS = {',
+            '    1: "ALTER TABLE notes ADD COLUMN pinned INTEGER DEFAULT 0;",',
+            '    2: "CREATE INDEX idx_notes_pinned ON notes(pinned);",',
+            '    3: "ALTER TABLE notes ADD COLUMN tag TEXT;",',
+            '}',
+            '',
+            'def migrate(conn: sqlite3.Connection) -> None:',
+            '    v = current_version(conn)',
+            '    for target in sorted(MIGRATIONS):',
+            '        if target <= v:',
+            '            continue                     # 이미 적용됨 → 건너뜀',
+            '        with conn:                       # 트랜잭션: 실패 시 롤백',
+            '            conn.executescript(MIGRATIONS[target])',
+            '            conn.execute("PRAGMA user_version = " + str(target))',
+            '        print("migrated to", target)',
+            '',
+            'if __name__ == "__main__":',
+            '    conn = sqlite3.connect("app.db")',
+            '    # 규칙 1) 마이그레이션 직전 반드시 백업',
+            '    conn.execute("VACUUM INTO ?", ("app.pre-migrate.db",))',
+            '    # 규칙 2) 순서대로 올리고',
+            '    migrate(conn)',
+            '    # 규칙 3) 끝나면 검증',
+            '    print(conn.execute("PRAGMA integrity_check;").fetchone()[0])',
+          ],
+          highlight: [4, 5, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 26, 27, 29, 31],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50',  border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',    border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',     border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function EmbedCasesViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">SQLite를 그대로 심는 5가지 현장</div>
+          <div className="grid grid-cols-1 gap-2">
+            {viz.cases.map((c, i) => (
+              <div key={i} className="flex items-center gap-3 bg-white border border-slate-300 rounded p-2">
+                <span className="text-xl">{c.icon}</span>
+                <div className="flex-1">
+                  <div className="text-xs font-bold text-slate-800">{c.label}</div>
+                  <div className="text-[10px] text-slate-600">{c.desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 text-[10px] text-center text-slate-600">
+            공통점: 데이터가 파일 하나(.db)에 전부 → 백업·복원이 곧 운영
+          </div>
+        </div>
+      );
+    }
+
+    function CopyContrastViz({ viz }) {
+      const isUnsafe = viz.mode === 'unsafe';
+      const res = TONE[viz.result.tone] || TONE.warn;
+      return (
+        <div className={`rounded-lg border p-4 ${isUnsafe ? 'bg-rose-50/40 border-rose-300' : 'bg-emerald-50/40 border-emerald-300'}`}>
+          <div className="text-xs font-mono text-slate-800 bg-white border border-slate-300 rounded px-2 py-1 mb-3">{viz.title}</div>
+
+          {isUnsafe ? (
+            <div className="space-y-2">
+              {viz.files.map((f, i) => {
+                const t = TONE[f.tone] || TONE.warn;
+                return (
+                  <div key={i} className={`flex items-center gap-2 rounded border p-2 ${t.bg} ${t.border}`}>
+                    <span className={`text-lg ${f.copied ? 'animate-pulse' : ''}`}>{f.copied ? '📄' : '❌'}</span>
+                    <div className="flex-1">
+                      <div className="text-xs font-mono font-bold text-slate-800">{f.name}</div>
+                      <div className="text-[10px] text-slate-600">{f.note}</div>
+                    </div>
+                    <span className={`text-[10px] font-bold ${t.text}`}>{f.copied ? '복사됨' : '누락!'}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {viz.methods.map((m, i) => {
+                const t = TONE[m.tone] || TONE.good;
+                return (
+                  <div key={i} className={`flex items-center gap-2 rounded border p-2 ${t.bg} ${t.border}`}>
+                    <span className="text-lg">✅</span>
+                    <div className="flex-1">
+                      <div className="text-xs font-mono font-bold text-slate-800">{m.name}</div>
+                      <div className="text-[10px] text-slate-600">{m.note}</div>
+                    </div>
+                    <span className={`text-[10px] font-bold ${t.text}`}>일관성 보장</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className={`mt-3 text-center text-xs font-bold px-2 py-1.5 rounded border ${res.bg} ${res.border} ${res.text}`}>
+            {isUnsafe ? '💥 ' : '🎯 '}{viz.result.text}
+          </div>
+        </div>
+      );
+    }
+
+    function RestoreFlowViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4">
+          <div className="text-xs text-slate-600 mb-3">복원 순서 (어기면 또 손상)</div>
+          <div className="space-y-2">
+            {viz.steps.map((s, i) => {
+              const t = TONE[s.tone] || TONE.good;
+              return (
+                <div key={i} className="flex items-center gap-2">
+                  <span className={`w-6 h-6 shrink-0 rounded-full flex items-center justify-center text-[11px] font-bold ${t.badge}`}>{s.n}</span>
+                  <div className={`flex-1 rounded border p-2 ${t.bg} ${t.border}`}>
+                    <div className="text-xs font-bold text-slate-800">{s.label}</div>
+                    <div className="text-[10px] text-slate-600">{s.desc}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="mt-3 flex items-center justify-between bg-white border border-emerald-300 rounded px-2 py-1.5">
+            <span className="text-[10px] font-mono text-slate-700">{viz.check.pragma}</span>
+            <span className="text-[10px] font-mono font-bold bg-emerald-200 text-emerald-800 px-2 py-0.5 rounded">{viz.check.ok}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function PitfallsViz({ viz }) {
+      return (
+        <div className="rounded-lg bg-slate-50 border border-slate-300 p-4 space-y-1.5">
+          {viz.items.map((it, i) => (
+            <div key={i} className="flex items-start gap-2 bg-amber-50 border border-amber-300 rounded p-2">
+              <span className="text-amber-700">{it.icon}</span>
+              <div className="flex-1">
+                <div className="text-xs font-bold text-amber-900">{it.label}</div>
+                <div className="text-[10px] text-amber-800">{it.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function SummaryTable({ summary }) {
+      if (!summary) return null;
+      return (
+        <div className="mt-3 rounded-xl border-2 border-slate-400 bg-white p-3">
+          <div className="text-sm font-bold text-slate-800 mb-2">📊 {summary.title}</div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-slate-200">
+                <th className="py-1 pr-2">항목</th><th className="py-1 pr-2">방법</th><th className="py-1 pr-2">효과</th><th className="py-1">결과</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((r, i) => (
+                <tr key={i} className="border-b border-slate-100">
+                  <td className="py-1 pr-2 font-medium text-slate-700">{r.metric}</td>
+                  <td className="py-1 pr-2 text-slate-600 font-mono text-[10px]">{r.before}</td>
+                  <td className="py-1 pr-2 text-slate-800 font-mono text-[10px]">{r.after}</td>
+                  <td className="py-1 text-slate-900 font-bold text-[10px]">{r.delta}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const viz = state.viz;
+      return (
+        <div className="rounded-xl border border-slate-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold text-slate-800">백업 · restore 시각화</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          {viz?.kind === 'embed-cases' && <EmbedCasesViz viz={viz} />}
+          {viz?.kind === 'copy-contrast' && <CopyContrastViz viz={viz} />}
+          {viz?.kind === 'restore-flow' && <RestoreFlowViz viz={viz} />}
+          {viz?.kind === 'pitfalls' && <PitfallsViz viz={viz} />}
+
+          <SummaryTable summary={state.summary} />
+
+          <div className="mt-3 text-xs text-slate-800 bg-slate-100 border border-slate-300 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-slate-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-[#003B57] text-white font-bold">S</span>
+              <div>
+                <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded bg-[#003B57] text-white mb-1">Part V. 실전 활용 · V-1-1</span>
+                <h1 className="text-2xl font-bold text-slate-900">앱 내장 / 백업 · restore</h1>
+                <p className="text-sm text-slate-700/80">애플리케이션에 SQLite를 품고 안전하게 백업한다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition ${i <= stepIdx ? 'bg-[#003B57]' : 'bg-slate-200'}`} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-[#003B57] text-slate-50 px-5 py-4 shadow">
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className={`px-4 py-1.5 text-xs rounded font-bold ${playing ? 'bg-slate-900 text-white' : 'bg-[#003B57] text-white hover:bg-slate-800'}`}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 border-slate-400 bg-white px-4 py-3 text-sm text-slate-900">
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                SQLite는 파일 하나에 데이터 전부 → 백업·복원이 곧 운영. 실행 중 단순 복사는 손상. Online Backup API·VACUUM INTO·.backup 으로 일관된 스냅샷을 뜬다. 복원은 종료→교체→WAL 정리→integrity_check 순서. 마이그레이션 전 백업, 백업은 검증까지가 백업.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Embedded', 'WAL', 'BackupAPI', 'VACUUM_INTO', 'restore', 'integrity_check', 'migration'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-800 border border-slate-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-1-2.html" className="underline hover:no-underline">다음: V-1-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
