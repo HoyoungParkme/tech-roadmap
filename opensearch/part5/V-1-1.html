@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenSearch 학습 — V-1-1. Cluster 노드·샤드·복제</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔭</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <style>
+    @keyframes pulseShard { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .shard-promoting { animation: pulseShard 1s ease-in-out infinite; }
+    @keyframes fadeNode { from { opacity: 1; } to { opacity: 0.25; } }
+    .node-down { animation: fadeNode 0.6s ease forwards; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    OpenSearch Chapter V-1-1 — Cluster 노드·샤드·복제
+    학습 목표: 인덱스가 여러 primary shard로 나뉘고 replica가 다른 노드에 배치되어,
+              한 노드가 죽어도 replica가 승격되어 데이터가 유지되는 클러스터 동작을 직관적으로 본다.
+    핵심 비유: 도서관 분관 — 같은 책(shard)의 사본(replica)을 다른 건물에 두어 한 건물이 불타도 열람 가능.
+    패턴: fastapi v1 — 좌(LiveDataPane: 노드/샤드 배치 + 장애→승격 애니메이션) / 우(VSCode CodeViewer)
+    색상: #005EB8 (OpenSearch 공식 블루), #003b75 (딥블루)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // 각 STEP의 좌측 시각화 상태: nodes(노드별 shard 배치) + health(클러스터 상태)
+    const STEPS = [
+      {
+        title: 'Step 1. 노드 역할 — master · data · coordinating · ingest',
+        desc: '클러스터는 여러 노드(서버 프로세스)로 이루어진다. 각 노드는 역할을 나눠 맡는다. master 노드는 클러스터 상태(어느 샤드가 어디 있는지)를 관리하고, data 노드는 실제 샤드를 저장·검색한다. coordinating 노드는 클라이언트 요청을 받아 data 노드에 분산하고 결과를 합치는 로드밸런서 역할이다. ingest 노드는 색인 전 전처리 파이프라인을 돌린다. 소규모는 한 노드가 모든 역할을 겸하지만, 규모가 커지면 master 전용 노드를 따로 두어야 검색 부하가 클러스터 관리까지 흔드는 사고를 막는다.',
+        health: 'green',
+        caption: '역할 분리 — master는 가볍게, data는 무겁게',
+        keyPoint: 'master 전용 노드를 안 두면, 무거운 검색 쿼리가 master를 멈춰 클러스터 전체가 흔들린다.',
+        nodes: [
+          { name: 'node-1', role: 'master', shards: [] },
+          { name: 'node-2', role: 'data', shards: [{ idx: 'logs', num: 0, type: 'P', status: 'active' }] },
+          { name: 'node-3', role: 'data', shards: [{ idx: 'logs', num: 1, type: 'P', status: 'active' }] },
+        ],
+        code: {
+          lang: 'bash',
+          filename: 'cat-nodes.sh',
+          lines: [
+            '# 클러스터에 붙은 노드와 역할 확인',
+            'curl -s "localhost:9200/_cat/nodes?v&h=name,node.role,master,heap.percent"',
+            '',
+            '# 출력 예시 (node.role 약자)',
+            '#   m = master 후보,  d = data,  i = ingest',
+            '#   r = remote_cluster_client,  * = 현재 master',
+            'name    node.role  master  heap.percent',
+            'node-1  m          *       18',
+            'node-2  dir        -       61',
+            'node-3  dir        -       57',
+            '',
+            '# opensearch.yml — 역할을 명시적으로 지정',
+            'node.name: node-1',
+            'node.roles: [ cluster_manager ]   # master 전용',
+            '# data 노드는  node.roles: [ data, ingest ]',
+          ],
+          highlight: [1, 6, 7, 8, 9, 12, 13],
+        },
+      },
+      {
+        title: 'Step 2. Primary shard · Replica shard — 인덱스 분산',
+        desc: '인덱스는 통째로 한 서버에 들어가지 않는다. number_of_shards만큼 primary shard로 쪼개져 여러 data 노드에 흩어진다. 각 primary는 number_of_replicas만큼 복제본(replica)을 갖는데, replica는 반드시 primary와 다른 노드에 배치된다. 같은 노드에 두면 그 노드가 죽을 때 원본과 사본이 함께 사라지기 때문이다. 여기서는 logs 인덱스가 primary 3개(P0·P1·P2), replica 각 1개로 총 6개 샤드가 3개 노드에 고르게 퍼진다. 읽기 요청은 primary와 replica 어느 쪽이든 처리하므로 replica는 가용성뿐 아니라 읽기 처리량 확장에도 쓰인다.',
+        health: 'green',
+        caption: 'primary(진한 칸) · replica(테두리 칸)는 서로 다른 노드에',
+        keyPoint: 'replica는 primary와 다른 노드에 강제 배치된다. 그래서 노드 1대 손실을 견딘다.',
+        nodes: [
+          { name: 'node-1', role: 'data', shards: [{ idx: 'logs', num: 0, type: 'P', status: 'active' }, { idx: 'logs', num: 2, type: 'R', status: 'active' }] },
+          { name: 'node-2', role: 'data', shards: [{ idx: 'logs', num: 1, type: 'P', status: 'active' }, { idx: 'logs', num: 0, type: 'R', status: 'active' }] },
+          { name: 'node-3', role: 'data', shards: [{ idx: 'logs', num: 2, type: 'P', status: 'active' }, { idx: 'logs', num: 1, type: 'R', status: 'active' }] },
+        ],
+        code: {
+          lang: 'json',
+          filename: 'create-index.json',
+          lines: [
+            'PUT /logs',
+            '{',
+            '  "settings": {',
+            '    "number_of_shards": 3,',
+            '    "number_of_replicas": 1',
+            '  }',
+            '}',
+            '',
+            '// 결과: primary 3개 + replica 3개 = 총 6 샤드',
+            '// number_of_shards 는 생성 후 변경 불가(재색인 필요)',
+            '// number_of_replicas 는 언제든 변경 가능:',
+            'PUT /logs/_settings',
+            '{ "index": { "number_of_replicas": 2 } }',
+          ],
+          highlight: [3, 4, 5, 9, 10, 11],
+        },
+      },
+      {
+        title: 'Step 3. 클러스터 상태 — green / yellow / red',
+        desc: '_cluster/health 한 방이면 클러스터 건강을 색으로 알 수 있다. green은 모든 primary와 모든 replica가 정상 배치된 상태다. yellow는 primary는 다 살아 있지만 일부 replica가 배치되지 못한 상태로, 데이터 손실은 없지만 이중화가 깨져 다음 장애에 취약하다. red는 primary 일부가 사라져 그 샤드의 데이터에 접근조차 못 하는 상태로, 즉시 대응해야 한다. 흔한 함정: 단일 노드 개발 환경에서 replica가 1이면 replica를 놓을 다른 노드가 없어 항상 yellow가 뜬다 — 정상이니 놀라지 말고 replica를 0으로 두거나 노드를 늘리면 된다.',
+        health: 'green',
+        caption: 'green = primary+replica 모두 정상 · unassigned 0',
+        keyPoint: 'yellow는 데이터는 안전하나 이중화가 깨진 경고. red는 primary 유실 = 즉시 장애.',
+        nodes: [
+          { name: 'node-1', role: 'data', shards: [{ idx: 'logs', num: 0, type: 'P', status: 'active' }, { idx: 'logs', num: 2, type: 'R', status: 'active' }] },
+          { name: 'node-2', role: 'data', shards: [{ idx: 'logs', num: 1, type: 'P', status: 'active' }, { idx: 'logs', num: 0, type: 'R', status: 'active' }] },
+          { name: 'node-3', role: 'data', shards: [{ idx: 'logs', num: 2, type: 'P', status: 'active' }, { idx: 'logs', num: 1, type: 'R', status: 'active' }] },
+        ],
+        code: {
+          lang: 'json',
+          filename: 'cluster-health.json',
+          lines: [
+            'GET /_cluster/health',
+            '{',
+            '  "status": "green",',
+            '  "number_of_nodes": 3,',
+            '  "active_primary_shards": 3,',
+            '  "active_shards": 6,',
+            '  "unassigned_shards": 0,',
+            '  "active_shards_percent_as_number": 100.0',
+            '}',
+            '',
+            '// status 판정 기준',
+            '//   green  : 모든 primary + 모든 replica 배치됨',
+            '//   yellow : primary 정상, replica 일부 unassigned',
+            '//   red    : primary 일부 unassigned (데이터 접근 불가)',
+          ],
+          highlight: [2, 6, 7, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 4. 노드 장애 → replica 승격 → 자동 복구',
+        desc: 'node-3가 갑자기 죽었다고 하자. node-3에 있던 P2(primary)와 R1(replica)이 함께 사라진다. master는 즉시 다른 노드에 살아 있던 P2의 replica(R2)를 primary로 승격시킨다 — 데이터 유실은 없다. 다만 승격 직후에는 replica가 부족해 클러스터가 yellow로 떨어진다. 노드가 돌아오거나 여유 노드가 있으면 master가 부족한 replica를 자동 재배치(리밸런싱)해 다시 green으로 복구한다. 바로 이 승격 메커니즘이 replica의 존재 이유다. 만약 number_of_replicas가 0이었다면 P2와 함께 데이터가 영영 사라지고 클러스터는 red가 된다.',
+        health: 'yellow',
+        caption: 'node-3 다운 → R2가 primary로 승격(점멸) → yellow',
+        keyPoint: 'replica 승격으로 데이터는 지킨다. 하지만 이중화가 깨져 yellow — 다음 장애 전에 복구 필수.',
+        downNode: 'node-3',
+        nodes: [
+          { name: 'node-1', role: 'data', shards: [{ idx: 'logs', num: 0, type: 'P', status: 'active' }, { idx: 'logs', num: 2, type: 'P', status: 'promoting' }] },
+          { name: 'node-2', role: 'data', shards: [{ idx: 'logs', num: 1, type: 'P', status: 'active' }, { idx: 'logs', num: 0, type: 'R', status: 'active' }] },
+          { name: 'node-3', role: 'data', down: true, shards: [{ idx: 'logs', num: 2, type: 'P', status: 'lost' }, { idx: 'logs', num: 1, type: 'R', status: 'lost' }] },
+        ],
+        code: {
+          lang: 'bash',
+          filename: 'failover.sh',
+          lines: [
+            '# node-3 다운 직후 샤드 상태 확인',
+            'curl -s "localhost:9200/_cat/shards/logs?v&h=index,shard,prirep,state,node"',
+            '',
+            'index  shard  prirep  state        node',
+            'logs   0      p       STARTED      node-1',
+            'logs   2      p       STARTED      node-1   # R2가 승격됨',
+            'logs   1      p       STARTED      node-2',
+            'logs   0      r       STARTED      node-2',
+            'logs   1      r       UNASSIGNED   -        # 재배치 대기',
+            'logs   2      r       UNASSIGNED   -        # 재배치 대기',
+            '',
+            '# 왜 배치가 안 되는지 진단',
+            'curl -s "localhost:9200/_cluster/allocation/explain"',
+            '# 노드 복귀 or 증설 시 master가 자동 리밸런싱 → green',
+          ],
+          highlight: [5, 8, 9, 12, 13],
+        },
+      },
+      {
+        title: 'Step 5. 실무 함정 — 샤드 수 · split brain · hot/warm',
+        desc: '실전에서 클러스터를 무너뜨리는 건 대부분 설계 실수다. (1) 샤드 과다: 작은 인덱스를 수백 샤드로 쪼개면 샤드마다 Lucene 세그먼트·힙·파일핸들 오버헤드가 쌓여 노드가 GC로 멈춘다 — 샤드 1개당 10~50GB를 권장한다. (2) replica 0: 비용 아끼려 replica를 끄면 노드 한 대 손실이 곧 데이터 유실이다. (3) split brain: 네트워크 단절로 master가 둘로 갈라져 서로 다른 데이터를 쓰는 사고. 정족수(과반) 기반 선출로 막으며, 후보 master는 홀수(3·5)로 둔다. (4) 힙: JVM 힙은 물리 메모리의 50% 이하이자 32GB 미만으로 잡아 compressed oops를 유지한다. (5) hot/warm 미설계: 오래된 로그를 비싼 SSD 노드에 방치하면 비용이 폭발한다 — hot(최신·SSD)/warm(과거·HDD) 계층을 나눠야 한다.',
+        health: 'green',
+        caption: 'master 후보 3(홀수) · 정족수 2 · replica≥1 · 샤드 크기 적정',
+        keyPoint: '샤드는 무조건 많다고 좋지 않다. 오버헤드가 힙을 먹는다. "적정 크기·홀수 master·replica≥1"이 3대 원칙.',
+        nodes: [
+          { name: 'node-1', role: 'master', vote: true, shards: [] },
+          { name: 'node-2', role: 'master', vote: true, shards: [] },
+          { name: 'node-3', role: 'master', vote: true, shards: [] },
+        ],
+        code: {
+          lang: 'yaml',
+          filename: 'opensearch.yml',
+          lines: [
+            '# 1) split brain 방지 — 후보 master는 홀수, 정족수 자동 계산',
+            'cluster.name: prod-logs',
+            'discovery.seed_hosts: [ node-1, node-2, node-3 ]',
+            'cluster.initial_cluster_manager_nodes: [ node-1, node-2, node-3 ]',
+            '',
+            '# 2) 힙 — 물리메모리 50% 이하 & 32GB 미만 (compressed oops)',
+            '# jvm.options:  -Xms16g / -Xmx16g',
+            '',
+            '# 3) hot/warm 계층 — 노드에 속성 부여',
+            'node.attr.temp: hot        # 최신 로그 (SSD)',
+            '# warm 노드는  node.attr.temp: warm  (HDD)',
+            '',
+            '# 4) 샤드 배치 정책 — 인덱스를 계층으로 라우팅',
+            '# PUT /logs-2026/_settings',
+            '# { "index.routing.allocation.require.temp": "hot" }',
+          ],
+          highlight: [1, 2, 3, 5, 6, 8, 9],
+        },
+      },
+    ];
+
+    const HEALTH = {
+      green:  { dot: '#22c55e', label: 'green',  ring: 'border-emerald-400', bg: 'bg-emerald-50', text: 'text-emerald-800', desc: '정상 — primary·replica 모두 배치' },
+      yellow: { dot: '#eab308', label: 'yellow', ring: 'border-amber-400',   bg: 'bg-amber-50',   text: 'text-amber-800',   desc: '경고 — replica 일부 미배치(데이터는 안전)' },
+      red:    { dot: '#ef4444', label: 'red',    ring: 'border-rose-400',    bg: 'bg-rose-50',    text: 'text-rose-800',    desc: '장애 — primary 유실(데이터 접근 불가)' },
+    };
+
+    function Shard({ s }) {
+      const isPrimary = s.type === 'P';
+      let cls = 'w-10 h-10 rounded-md flex flex-col items-center justify-center text-[10px] font-mono font-bold border-2 ';
+      let style = {};
+      if (s.status === 'lost') {
+        cls += 'border-slate-300 text-slate-300 line-through';
+        style = { borderStyle: 'dashed' };
+      } else if (s.status === 'promoting') {
+        cls += 'shard-promoting text-white border-amber-500';
+        style = { backgroundColor: '#eab308' };
+      } else if (isPrimary) {
+        cls += 'text-white';
+        style = { backgroundColor: '#005EB8', borderColor: '#003b75' };
+      } else {
+        cls += 'bg-white';
+        style = { color: '#005EB8', borderColor: '#005EB8' };
+      }
+      return (
+        <div className={cls} style={style} title={`${s.idx} ${s.type}${s.num}`}>
+          <span>{s.type}{s.num}</span>
+          <span className="text-[8px] font-normal">{isPrimary ? 'primary' : 'replica'}</span>
+        </div>
+      );
+    }
+
+    function NodeCard({ node }) {
+      const roleColor = node.role === 'master' ? '#003b75' : '#0369a1';
+      return (
+        <div className={`flex-1 rounded-lg border-2 bg-slate-50 p-2 flex flex-col ${node.down ? 'node-down border-rose-300' : 'border-slate-300'}`}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[11px] font-mono font-bold text-slate-700">{node.name}</span>
+            <span className="text-[9px] px-1.5 py-0.5 rounded text-white font-bold" style={{ backgroundColor: node.down ? '#94a3b8' : roleColor }}>
+              {node.down ? 'DOWN' : node.role}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1.5 min-h-[2.5rem] items-center">
+            {node.shards.length === 0
+              ? <span className="text-[9px] text-slate-400 italic">{node.vote ? '투표권(master 후보)' : '샤드 없음'}</span>
+              : node.shards.map((s, i) => <Shard key={i} s={s} />)}
+          </div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const h = HEALTH[state.health] || HEALTH.green;
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{ color: '#005EB8' }}>클러스터 토폴로지</h3>
+            <span className={`inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded border ${h.ring} ${h.bg} ${h.text} font-bold`}>
+              <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: h.dot }}></span>
+              {h.label}
+            </span>
+          </div>
+
+          <div className="flex gap-2 mb-3">
+            {state.nodes.map((n, i) => <NodeCard key={i} node={n} />)}
+          </div>
+
+          <div className={`rounded-lg border ${h.ring} ${h.bg} px-3 py-2 mb-2`}>
+            <div className="text-[11px] text-slate-600">클러스터 상태</div>
+            <div className={`text-sm font-bold ${h.text}`}>{h.desc}</div>
+          </div>
+
+          <div className="flex items-center gap-3 text-[10px] text-slate-600 mb-2">
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded-sm" style={{ backgroundColor: '#005EB8' }}></span>primary</span>
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded-sm border-2 bg-white" style={{ borderColor: '#005EB8' }}></span>replica</span>
+            <span className="inline-flex items-center gap-1"><span className="w-3 h-3 rounded-sm" style={{ backgroundColor: '#eab308' }}></span>승격 중</span>
+          </div>
+
+          <div className="text-xs text-slate-700 bg-sky-50 border border-sky-200 rounded p-2 mb-2">{state.caption}</div>
+          <div className="mt-auto text-xs text-slate-800 bg-sky-50 border border-sky-200 rounded p-2">💡 {state.keyPoint}</div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-sky-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: '#005EB8' }}>OS</span>
+              <div>
+                <div className="flex items-center gap-2 mb-0.5">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded text-white" style={{ backgroundColor: '#003b75' }}>Part V. 운영</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-100 text-sky-800 border border-sky-300">V-1-1</span>
+                </div>
+                <h1 className="text-2xl font-bold text-slate-900">Cluster — 노드·샤드·복제</h1>
+                <p className="text-sm text-slate-700/80">클러스터 구조와 데이터 분산·복제</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className="h-1.5 flex-1 rounded-full transition" style={{ backgroundColor: i <= stepIdx ? '#005EB8' : '#e2e8f0' }} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-slate-50 px-5 py-4 shadow" style={{ backgroundColor: '#003b75' }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: playing ? '#003b75' : '#005EB8' }}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm text-slate-900" style={{ borderColor: '#005EB8' }}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                노드는 역할(master·data·coordinating·ingest)을 나눠 맡고, 인덱스는 primary shard로 쪼개져 다른 노드의 replica와 함께 분산 배치된다. 노드 장애 시 replica가 primary로 승격되어 데이터를 지키되 이중화가 깨져 yellow가 된다. green/yellow/red로 상태를 읽고, 샤드 적정 크기·홀수 master·replica≥1·힙 32GB 미만·hot/warm 계층으로 사고를 예방한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['Cluster', 'Shard', 'Replica', 'Node Roles', 'Health', 'Failover', 'Split Brain', 'Hot/Warm'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 border border-sky-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-1-2.html" className="underline hover:no-underline">다음: V-1-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

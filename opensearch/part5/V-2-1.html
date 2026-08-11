@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenSearch 학습 — V-2-1. ISM — Index State Management</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔭</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    OpenSearch Chapter V-2-1 — ISM (Index State Management)
+    학습 목표: 로그성 인덱스의 생애주기를 정책으로 자동화해 비용과 성능을 함께 잡는 법을 본다.
+    핵심 비유: 창고 재고 관리 — 자주 쓰는 물건은 앞쪽(hot), 안 쓰는 건 뒤쪽(cold), 오래되면 폐기(delete)
+    패턴: fastapi v1 — 좌(LiveDataPane: hot→warm→cold→delete 생애주기 애니메이션) / 우(VSCode CodeViewer, ISM policy JSON)
+    색상: #005EB8 (OpenSearch 공식 블루)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. 왜 ISM인가 — 로그 인덱스는 방치하면 무한 증가한다',
+        desc: '애플리케이션 로그, Nginx 액세스 로그, 메트릭은 매일 수 GB씩 새 인덱스로 쌓인다. 아무 정책 없이 두면 디스크가 꽉 차서 클러스터가 read-only로 잠기고, 그 순간 색인이 전부 실패한다. 사람이 매일 오래된 인덱스를 손으로 지우는 방식은 반드시 빠뜨린다. ISM은 "나이·크기·문서 수" 조건이 충족되면 인덱스를 다음 상태로 자동 전이시켜, 사람 손을 떼도 생애주기가 굴러가게 만든다.',
+        phase: 'hot',
+        age: '0일',
+        size: '5 GB',
+        docs: '1,200만',
+        cost: '최고 (SSD)',
+        tone: 'good',
+        verdict: '정책 필요',
+        keyPoint: '디스크가 차서 클러스터가 잠기면 색인 전체가 멈춘다. 생애주기 자동화는 선택이 아니라 안전장치다.',
+        code: {
+          lang: 'json',
+          filename: 'problem-without-ism.json',
+          lines: [
+            '// ISM 없이 방치했을 때 벌어지는 일',
+            '{',
+            '  "indices_growth": {',
+            '    "logs-2026.08.01": "5 GB",',
+            '    "logs-2026.08.02": "5 GB",',
+            '    "...": "매일 새 인덱스, 무한 누적",',
+            '    "logs-2026.12.31": "누적 900 GB"',
+            '  },',
+            '  "disk_watermark": {',
+            '    "flood_stage": "95% 초과",',
+            '    "result": "index.blocks.read_only_allow_delete = true",',
+            '    "impact": "모든 색인 요청 실패 (쓰기 잠김)"',
+            '  },',
+            '  "manual_cleanup": {',
+            '    "method": "curl -XDELETE 매일 수동",',
+            '    "risk": "휴가/야간에 누락 → 장애",',
+            '    "verdict": "자동화 필수"',
+            '  }',
+            '}'
+          ],
+          highlight: [3, 4, 5, 7, 10, 11, 12, 16, 17, 18]
+        }
+      },
+      {
+        title: 'Step 2. ISM policy — 상태(state)와 전이(transition)를 선언한다',
+        desc: 'ISM policy는 인덱스가 거쳐 갈 상태 목록과, 각 상태에서 다음 상태로 넘어가는 조건을 JSON으로 선언한다. 여기서는 hot → warm → cold → delete 네 상태를 정의한다. 각 transition의 conditions에 min_index_age(인덱스 생성 후 경과 시간)를 넣으면, ISM 백그라운드 잡이 주기적으로 조건을 평가해 자동으로 상태를 넘긴다. 상태 이름과 전이만 잘 짜두면 이후 운영은 정책이 대신한다.',
+        phase: 'warm',
+        age: '3일',
+        size: '30 GB',
+        docs: '7,200만',
+        cost: '중간',
+        tone: 'good',
+        verdict: '상태 정의',
+        keyPoint: 'default_state가 시작점이다. 상태는 반드시 어딘가로 이어져야 하고, 마지막 상태(delete)만 transition이 없다.',
+        code: {
+          lang: 'json',
+          filename: 'ism-policy-states.json',
+          lines: [
+            '// PUT _plugins/_ism/policies/logs_lifecycle',
+            '{',
+            '  "policy": {',
+            '    "description": "로그 인덱스 hot-warm-cold 생애주기",',
+            '    "default_state": "hot",',
+            '    "states": [',
+            '      {',
+            '        "name": "hot",',
+            '        "actions": [],',
+            '        "transitions": [',
+            '          { "state_name": "warm", "conditions": { "min_index_age": "3d" } }',
+            '        ]',
+            '      },',
+            '      { "name": "warm", "transitions": [',
+            '          { "state_name": "cold", "conditions": { "min_index_age": "7d" } } ] },',
+            '      { "name": "cold", "transitions": [',
+            '          { "state_name": "delete", "conditions": { "min_index_age": "30d" } } ] },',
+            '      { "name": "delete", "actions": [] }',
+            '    ]',
+            '  }',
+            '}'
+          ],
+          highlight: [5, 6, 8, 10, 11, 14, 15, 16, 17, 18]
+        }
+      },
+      {
+        title: 'Step 3. rollover — 하나의 alias 뒤에서 새 인덱스로 갈아탄다',
+        desc: 'hot 상태의 인덱스가 무한히 커지면 안 되므로, 일정 크기·나이·문서 수에 도달하면 rollover로 새 인덱스를 만들고 쓰기를 그쪽으로 넘긴다. 애플리케이션은 항상 logs 라는 alias 하나에만 쓰기 때문에 인덱스가 바뀌어도 코드는 그대로다. rollover는 alias 설정이 전제 — is_write_index=true인 쓰기 대상 인덱스가 alias에 붙어 있어야 하고, 인덱스 이름은 logs-000001 처럼 숫자 패턴이어야 자동 증가한다.',
+        phase: 'hot',
+        age: '롤오버',
+        size: '50 GB → 새 인덱스',
+        docs: '1억 도달',
+        cost: '최고 (SSD)',
+        tone: 'warn',
+        verdict: 'alias 전환',
+        keyPoint: 'rollover_alias 미설정은 ISM 함정 1위. alias가 없으면 rollover 액션이 조용히 실패하고 인덱스만 계속 커진다.',
+        code: {
+          lang: 'json',
+          filename: 'ism-rollover.json',
+          lines: [
+            '// rollover 조건을 hot 상태의 action으로 넣는다',
+            '{',
+            '  "name": "hot",',
+            '  "actions": [',
+            '    {',
+            '      "rollover": {',
+            '        "min_size": "50gb",',
+            '        "min_index_age": "1d",',
+            '        "min_doc_count": 100000000',
+            '      }',
+            '    }',
+            '  ],',
+            '  "transitions": [',
+            '    { "state_name": "warm", "conditions": { "min_index_age": "3d" } }',
+            '  ]',
+            '}',
+            '',
+            '// 인덱스 템플릿에 rollover_alias 지정 (필수 전제)',
+            '// "index.plugins.index_state_management.rollover_alias": "logs"',
+            '// 최초 인덱스: PUT logs-000001  { aliases: { logs: { is_write_index: true } } }'
+          ],
+          highlight: [6, 7, 8, 9, 18, 19, 20]
+        }
+      },
+      {
+        title: 'Step 4. 상태별 action — 각 단계에서 리소스를 최적화한다',
+        desc: '상태를 나누는 이유는 각 단계에서 리소스 사용을 줄이기 위해서다. warm으로 넘어가면 더 이상 쓰지 않으므로 force_merge로 세그먼트를 하나로 합쳐 검색 속도를 높이고 디스크를 아낀다. cold에서는 복제본(replica)을 0으로 줄여 저장 비용을 절반으로 낮추고, read_only로 잠가 실수 쓰기를 막는다. delete 상태의 delete 액션이 인덱스를 완전히 제거해 디스크를 회수한다. 각 액션은 그 상태의 성격에 맞게 골라야 한다.',
+        phase: 'cold',
+        age: '7~30일',
+        size: '15 GB (압축)',
+        docs: '읽기 전용',
+        cost: '낮음',
+        tone: 'good',
+        verdict: '리소스 절감',
+        keyPoint: 'force_merge는 CPU·I/O를 크게 쓴다. 트래픽 피크 시간대에 warm 전이가 몰리면 클러스터가 느려지니 전이 시각을 분산하라.',
+        code: {
+          lang: 'json',
+          filename: 'ism-state-actions.json',
+          lines: [
+            '// 각 상태에 목적에 맞는 action을 배치',
+            '{ "name": "warm", "actions": [',
+            '    { "force_merge": { "max_num_segments": 1 } },',
+            '    { "replica_count": { "number_of_replicas": 1 } }',
+            '  ], "transitions": [ { "state_name": "cold",',
+            '    "conditions": { "min_index_age": "7d" } } ] }',
+            ',',
+            '{ "name": "cold", "actions": [',
+            '    { "replica_count": { "number_of_replicas": 0 } },',
+            '    { "read_only": {} }',
+            '  ], "transitions": [ { "state_name": "delete",',
+            '    "conditions": { "min_index_age": "30d" } } ] }',
+            ',',
+            '{ "name": "delete", "actions": [',
+            '    { "delete": {} }',
+            '  ] }'
+          ],
+          highlight: [3, 4, 9, 10, 14, 15]
+        }
+      },
+      {
+        title: 'Step 5. hot-warm 아키텍처와 실무 함정',
+        desc: 'hot 노드는 SSD·고사양으로 최신 데이터의 색인·검색을 받고, warm/cold 노드는 HDD·저사양으로 오래된 데이터를 값싸게 보관한다. ISM은 node attribute(box_type)와 allocation 액션으로 인덱스를 hot 노드에서 warm 노드로 물리적으로 이동시킨다. 실무 함정은 네 가지 — 정책 미적용으로 무한 증가, rollover_alias 누락, 전이 조건 단위 오류(3d를 3으로), 그리고 삭제 조건을 너무 짧게 잡아 필요한 로그가 사라지는 사고다. explain API로 각 인덱스의 현재 상태를 반드시 모니터링하라.',
+        phase: 'delete',
+        age: '30일+',
+        size: '0 (회수)',
+        docs: '삭제됨',
+        cost: '없음',
+        tone: 'danger',
+        verdict: '생애 완료',
+        keyPoint: 'GET _plugins/_ism/explain/logs-* 로 인덱스별 현재 state와 실패 이유를 확인한다. 정책은 붙이고 끝이 아니라 관측해야 한다.',
+        code: {
+          lang: 'json',
+          filename: 'ism-hot-warm-pitfalls.json',
+          lines: [
+            '// warm 노드로 물리 이동 (allocation 액션)',
+            '{ "name": "warm", "actions": [',
+            '    { "allocation": { "require": { "box_type": "warm" } } },',
+            '    { "force_merge": { "max_num_segments": 1 } }',
+            '  ] }',
+            '',
+            '// 실무 함정 체크리스트',
+            '{',
+            '  "pitfall_1": "정책 미적용 → 인덱스 무한 증가, 디스크 풀",',
+            '  "pitfall_2": "rollover_alias 누락 → rollover 조용히 실패",',
+            '  "pitfall_3": "조건 단위 오류: \'3d\' 대신 3 → 파싱 실패",',
+            '  "pitfall_4": "delete min_index_age 너무 짧음 → 로그 유실",',
+            '  "observe": "GET _plugins/_ism/explain/logs-*"',
+            '}'
+          ],
+          highlight: [3, 9, 10, 11, 12, 13]
+        }
+      }
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',    border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' }
+    };
+
+    const PHASES = [
+      { key: 'hot',    label: 'HOT',    hint: 'SSD · 색인+검색', color: '#dc2626' },
+      { key: 'warm',   label: 'WARM',   hint: 'force_merge',     color: '#ea580c' },
+      { key: 'cold',   label: 'COLD',   hint: 'replica 0 · RO',  color: '#0284c7' },
+      { key: 'delete', label: 'DELETE', hint: '디스크 회수',      color: '#475569' }
+    ];
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.tone] || TONE.warn;
+      const activeIdx = PHASES.findIndex((p) => p.key === state.phase);
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{color:'#005EB8'}}>인덱스 생애주기</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="flex items-stretch gap-1 mb-4">
+            {PHASES.map((p, i) => {
+              const isActive = i === activeIdx;
+              const isPast = i < activeIdx;
+              return (
+                <React.Fragment key={p.key}>
+                  <div className="flex-1 rounded-lg border px-1.5 py-2 text-center transition-all"
+                       style={{
+                         backgroundColor: isActive ? p.color : (isPast ? '#f1f5f9' : '#ffffff'),
+                         borderColor: isActive ? p.color : '#cbd5e1',
+                         color: isActive ? '#ffffff' : (isPast ? '#94a3b8' : '#334155'),
+                         transform: isActive ? 'scale(1.06)' : 'scale(1)',
+                         boxShadow: isActive ? '0 4px 12px rgba(0,0,0,0.18)' : 'none'
+                       }}>
+                    <div className="text-[11px] font-bold font-mono">{p.label}</div>
+                    <div className="text-[8px] mt-0.5 leading-tight">{p.hint}</div>
+                  </div>
+                  {i < PHASES.length - 1 && (
+                    <div className="flex items-center text-slate-300 text-xs" style={{color: i < activeIdx ? '#005EB8' : '#cbd5e1'}}>→</div>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+              <div className="text-xs text-slate-600">현재 상태</div>
+              <div className="text-lg font-mono font-bold" style={{color:'#005EB8'}}>{state.phase}</div>
+            </div>
+            <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+              <div className="text-xs text-slate-600">인덱스 나이</div>
+              <div className="text-base font-mono font-bold text-slate-800">{state.age}</div>
+            </div>
+            <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+              <div className="text-xs text-slate-600">크기</div>
+              <div className="text-base font-mono font-bold text-slate-800">{state.size}</div>
+            </div>
+            <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+              <div className="text-xs text-slate-600">저장 비용</div>
+              <div className="text-base font-mono font-bold text-slate-800">{state.cost}</div>
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-lg bg-sky-50 border border-sky-200 p-3 text-xs font-mono flex items-center justify-between">
+            <span className="text-slate-600">문서 수</span>
+            <span className="px-2 py-1 rounded text-white" style={{backgroundColor:'#005EB8'}}>{state.docs}</span>
+          </div>
+
+          <div className="mt-3 text-xs text-slate-800 bg-sky-50 border border-sky-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-sky-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{backgroundColor:'#005EB8'}}>OS</span>
+              <div>
+                <div className="flex items-center gap-2 mb-0.5">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded text-white" style={{backgroundColor:'#003b75'}}>Part V. 운영</span>
+                  <span className="text-[10px] font-mono text-slate-500">V-2-1</span>
+                </div>
+                <h1 className="text-2xl font-bold text-slate-900">ISM — Index State Management</h1>
+                <p className="text-sm text-slate-700/80">인덱스 생애주기를 자동으로 관리한다</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition`} style={{backgroundColor: i <= stepIdx ? '#005EB8' : '#e2e8f0'}} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-slate-50 px-5 py-4 shadow" style={{backgroundColor:'#003b75'}}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{backgroundColor: playing ? '#003b75' : '#005EB8'}}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm text-slate-900" style={{borderColor:'#005EB8'}}>
+                <div className="font-bold mb-1">✅ 핵심 정리</div>
+                ISM policy는 hot→warm→cold→delete 상태와 나이·크기·문서 수 전이 조건을 선언해 인덱스 생애주기를 자동화한다. hot에서 rollover로 새 인덱스에 갈아타고, 각 상태의 action(force_merge·replica 축소·read_only·delete)으로 리소스를 최적화한다. 함정은 정책 미적용·rollover_alias 누락·조건 단위 오류·삭제 조건 과소. explain API로 상태를 관측하라.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['ISM', 'Lifecycle', 'Rollover', 'HotWarm', 'ForceMerge', 'RetentionCost'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 border border-sky-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="./V-2-2.html" className="underline hover:no-underline">다음: V-2-2 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

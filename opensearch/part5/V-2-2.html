@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenSearch 학습 — V-2-2. Cross-Cluster Replication</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🔭</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js" data-presets="env,react"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!--
+    OpenSearch Chapter V-2-2 — Cross-Cluster Replication (CCR)
+    학습 목표: leader 인덱스의 변경을 follower 클러스터로 실시간 복제(pull 방식)하는 원리와,
+    재해 복구·지역 분산 운영에서 어떻게 활용하는지, 실무 함정까지 본다.
+    핵심 비유: 본사(leader)의 장부를 지사(follower)가 계속 베껴 적다가, 본사가 무너지면 지사가 본사가 된다.
+    패턴: fastapi v1 — 좌(LiveDataPane: DR 복제/승격 애니메이션) / 우(VSCode CodeViewer)
+    색상: #005EB8 (OpenSearch 공식 블루)
+  -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STEPS = [
+      {
+        title: 'Step 1. CCR란 — follower가 leader를 pull 방식으로 베낀다',
+        desc: 'Cross-Cluster Replication은 한 클러스터(leader)의 인덱스 변경을 다른 클러스터(follower)로 실시간 복제하는 기능이다. leader가 밀어주는(push) 게 아니라 follower가 leader의 translog를 주기적으로 당겨오는(pull) 구조라, follower 쪽에서 연결·속도를 통제할 수 있다. 그래서 지역이 다르고 네트워크가 불안정해도 follower가 자기 페이스로 따라잡는다. follower 인덱스는 읽기 전용이며 leader의 색인 순서를 그대로 재현한다.',
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.4s',
+        mode: 'replicating',
+        verdictTone: 'good',
+        verdict: '복제 중',
+        keyPoint: 'pull 방식이라 follower가 네트워크 상황에 맞춰 스스로 따라잡는다. leader는 follower를 신경 쓰지 않는다.',
+        code: {
+          lang: 'bash',
+          filename: 'ccr-setup.sh',
+          lines: [
+            '# follower 클러스터에서 실행 — leader를 원격 연결로 등록',
+            '# (leader 클러스터에 직접 명령하지 않는다: follower가 당겨온다)',
+            'curl -XPUT "https://follower:9200/_cluster/settings" \\',
+            '  -H "Content-Type: application/json" -u admin:pass -d \'{',
+            '  "persistent": {',
+            '    "cluster": {',
+            '      "remote": {',
+            '        "leader-dc": {',
+            '          "seeds": ["leader-node1:9300", "leader-node2:9300"]',
+            '        }',
+            '      }',
+            '    }',
+            '  }',
+            '}\'',
+          ],
+          highlight: [1, 2, 6, 7, 8, 9],
+        },
+      },
+      {
+        title: 'Step 2. follower 인덱스 생성 — 읽기 전용으로 leader를 따라간다',
+        desc: 'follower 클러스터에서 _plugins/_replication/{index}/_start를 호출하면 leader의 지정 인덱스를 복제하기 시작한다. 이때 follower 인덱스는 자동으로 읽기 전용이 된다 — 직접 색인(write)하면 복제 순서가 깨지므로 API가 막는다. 조회 트래픽은 follower가 받아 leader의 부하를 덜고, 지역 사용자에게는 가까운 follower가 낮은 지연으로 응답한다. 초기에는 leader의 기존 데이터를 통째로 복사(remote recovery)한 뒤, 이후 변경분만 따라잡는다.',
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '1.2s',
+        mode: 'replicating',
+        verdictTone: 'good',
+        verdict: '읽기 전용',
+        keyPoint: 'follower에 쓰기가 막히는 건 버그가 아니라 안전장치다. 읽기 부하 분산·지역 지연 감소가 핵심 이득.',
+        code: {
+          lang: 'json',
+          filename: 'start-follow.json',
+          lines: [
+            'POST follower:9200/_plugins/_replication/orders-follow/_start',
+            '{',
+            '  "leader_alias": "leader-dc",',
+            '  "leader_index": "orders",',
+            '  "use_roles": {',
+            '    "leader_cluster_role": "cross_cluster_replication_leader_full_access",',
+            '    "follower_cluster_role": "cross_cluster_replication_follower_full_access"',
+            '  }',
+            '}',
+            '',
+            '// 결과: orders-follow 인덱스가 읽기 전용으로 생성되고',
+            '// leader의 orders 변경을 계속 당겨온다(pull).',
+            '// 직접 색인 시도 → 403 cluster_block_exception (의도된 차단)',
+          ],
+          highlight: [1, 3, 4, 11, 12, 13],
+        },
+      },
+      {
+        title: 'Step 3. auto-follow — 새 인덱스를 패턴으로 자동 복제',
+        desc: '운영 중에는 logs-2026.08.11 처럼 날짜별 인덱스가 계속 생긴다. 하나씩 _start를 부르면 반드시 누락이 생긴다. auto-follow 규칙에 인덱스 패턴(logs-*)을 등록해두면, leader에 패턴과 일치하는 새 인덱스가 생기는 순간 follower가 자동으로 복제를 시작한다. ISM 롤오버로 새 인덱스가 열릴 때마다 사람이 개입하지 않아도 DR 커버리지가 유지된다. 단, 이미 존재하던 인덱스에는 소급 적용되지 않으니 규칙 등록 시점의 인덱스는 수동으로 붙여야 한다.',
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.8s',
+        mode: 'auto-follow',
+        verdictTone: 'good',
+        verdict: 'auto-follow',
+        keyPoint: '시계열·롤오버 인덱스는 auto-follow가 사실상 필수. 수동 _start는 반드시 누락 인덱스를 만든다.',
+        code: {
+          lang: 'json',
+          filename: 'auto-follow.json',
+          lines: [
+            'POST follower:9200/_plugins/_replication/_autofollow',
+            '{',
+            '  "leader_alias": "leader-dc",',
+            '  "name": "logs-dr-rule",',
+            '  "pattern": "logs-*",',
+            '  "use_roles": {',
+            '    "leader_cluster_role": "cross_cluster_replication_leader_full_access",',
+            '    "follower_cluster_role": "cross_cluster_replication_follower_full_access"',
+            '  }',
+            '}',
+            '',
+            '// leader에 logs-2026.08.12 가 새로 열리면',
+            '// follower가 자동으로 복제 시작 (사람 개입 0)',
+            '// 주의: 규칙 등록 이전의 logs-* 는 수동 _start 필요',
+          ],
+          highlight: [5, 12, 13, 14],
+        },
+      },
+      {
+        title: 'Step 4. CCR vs Cross-Cluster Search — 복제냐 원격 질의냐',
+        desc: 'CCR과 헷갈리기 쉬운 게 Cross-Cluster Search(CCS)다. CCS는 데이터를 복제하지 않고, 질의 시점에 원격 클러스터로 검색을 보내 결과를 합친다 — 저장 공간은 아끼지만 원격 클러스터가 죽으면 그 데이터는 못 본다. CCR은 데이터를 실제로 복사해 두므로 leader가 죽어도 follower가 데이터를 그대로 갖고 있다. 즉 "빠른 조회·저장 절약·항상 최신 원본 하나"면 CCS, "재해 복구·지역별 로컬 사본·leader 장애 대비"면 CCR이다. 둘을 섞어 쓰기도 한다.',
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.6s',
+        mode: 'compare',
+        verdictTone: 'warn',
+        verdict: '용도 구분',
+        keyPoint: 'CCS는 원본 하나를 원격 질의(장애 시 못 봄), CCR은 사본을 로컬 보관(장애 대비). 목적이 다르다.',
+        code: {
+          lang: 'json',
+          filename: 'ccr-vs-ccs.json',
+          lines: [
+            '// CCS — 복제 없이 원격 클러스터로 질의를 보낸다',
+            'GET local:9200/local-idx,leader-dc:orders/_search',
+            '{ "query": { "match": { "status": "PAID" } } }',
+            '// leader-dc 가 죽으면 orders 결과는 빠진다(사본 없음)',
+            '',
+            '// CCR — 데이터를 follower에 실제로 복사해 둔다',
+            'GET follower:9200/orders-follow/_search',
+            '{ "query": { "match": { "status": "PAID" } } }',
+            '// leader 가 죽어도 orders-follow 는 로컬에 그대로 존재',
+            '',
+            '// 정리: 저장 절약·항상 최신 → CCS',
+            '//       장애 대비·지역 사본 → CCR',
+          ],
+          highlight: [1, 2, 4, 6, 7, 9],
+        },
+      },
+      {
+        title: 'Step 5. 페일오버 — leader 장애 시 follower 승격',
+        desc: 'leader 클러스터(또는 지역 전체)가 죽으면 DR 계획이 발동한다. follower에서 _stop으로 복제를 끊으면 그 인덱스는 읽기 전용이 풀려 쓰기 가능한 정상 인덱스가 된다 — 이것이 승격(promotion)이다. 애플리케이션의 엔드포인트를 follower로 전환하면 서비스가 이어진다. 핵심 함정: 승격 시점까지 복제 지연(lag)만큼의 최신 데이터는 유실될 수 있다(비동기 복제라 RPO=0이 아니다). 또 원래 leader가 살아나면 데이터가 갈라지므로, 방향을 뒤집어 재복제(reverse replication)하는 절차를 미리 정해둬야 한다.',
+        leaderState: 'down',
+        followerState: 'promoted',
+        promoted: true,
+        lag: '유실 가능',
+        mode: 'failover',
+        verdictTone: 'danger',
+        verdict: '승격 완료',
+        keyPoint: '비동기라 RPO는 0이 아니다 — lag만큼 유실 가능. leader 복귀 시 split-brain 방지 위해 재복제 방향을 미리 설계.',
+        code: {
+          lang: 'bash',
+          filename: 'failover.sh',
+          lines: [
+            '# leader 지역 장애 감지 → follower 승격 절차',
+            '# 1) 복제 중단 = 읽기 전용 해제(쓰기 가능해짐) = 승격',
+            'curl -XPOST "https://follower:9200/_plugins/_replication/orders-follow/_stop" \\',
+            '  -H "Content-Type: application/json" -u admin:pass -d \'{}\'',
+            '',
+            '# 2) 앱 트래픽을 follower 엔드포인트로 전환',
+            '#    (DNS / 로드밸런서 스위치)',
+            '',
+            '# 3) 주의 — 승격 시점 기준 lag 만큼 최신 데이터 유실 가능',
+            '#    비동기 복제라 RPO=0 아님. 결제 등은 별도 재처리 큐 검토',
+            '',
+            '# 4) 원래 leader 복귀 시: split-brain 방지 위해',
+            '#    방향을 뒤집어(old-follower→old-leader) 재복제 후 재동기화',
+          ],
+          highlight: [2, 3, 6, 9, 12],
+        },
+      },
+      {
+        title: 'Step 6. 운영 종합 — 스냅샷·ISM·클러스터와 함께 쓰는 DR',
+        desc: 'CCR은 단독 기능이 아니라 앞서 배운 운영 요소와 맞물린다. 스냅샷(S3)은 시점 백업이라 복구에 시간이 걸리는 반면, CCR은 항상 준비된 뜨거운 사본(hot standby)이라 페일오버가 빠르다 — 둘은 대체가 아니라 상호 보완이다. ISM 롤오버로 만들어지는 시계열 인덱스는 auto-follow로 커버하고, 실무 함정으로 (1) leader와 follower의 버전 호환(follower ≥ leader 권장), (2) 대역폭·지연에 따른 lag 누적, (3) 원격 연결 보안(TLS·전용 role), (4) follower 승격 후 되돌리기 절차를 반드시 사전 점검한다. 이로써 OpenSearch 운영편을 완주한다.',
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.5s',
+        mode: 'operate',
+        verdictTone: 'good',
+        verdict: 'OpenSearch 완주',
+        keyPoint: '스냅샷=시점 백업(느린 복구), CCR=뜨거운 사본(빠른 페일오버). 버전·대역폭·보안·되돌리기 4대 함정을 사전 점검.',
+        code: {
+          lang: 'bash',
+          filename: 'dr-checklist.sh',
+          lines: [
+            '# CCR 운영 종합 점검 — 스냅샷/ISM/보안과 함께',
+            '',
+            '# (1) 복제 상태·지연 확인',
+            'curl "https://follower:9200/_plugins/_replication/orders-follow/_status?pretty" \\',
+            '  -u admin:pass   # syncing / bootstrapping / lag 확인',
+            '',
+            '# (2) 버전 호환 — follower 버전 >= leader 버전 권장',
+            'curl "https://follower:9200" -u admin:pass | grep number',
+            '',
+            '# (3) 스냅샷은 별도로 병행 (시점 복구용, CCR과 상호 보완)',
+            '#     스냅샷=느린 시점 복구 / CCR=빠른 hot standby',
+            '',
+            '# (4) 원격 연결 보안 — TLS + 최소 권한 role 로만 연결',
+            '#     대역폭 부족 시 lag 누적 → 알림 임계치 설정',
+            'echo "OpenSearch 운영편 완주 — DR 준비 완료"',
+          ],
+          highlight: [3, 4, 7, 10, 13, 15],
+        },
+      },
+    ];
+
+    const TONE = {
+      good:   { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-800', badge: 'bg-emerald-200 text-emerald-800' },
+      warn:   { bg: 'bg-amber-50',   border: 'border-amber-400',   text: 'text-amber-800',   badge: 'bg-amber-200 text-amber-800' },
+      danger: { bg: 'bg-rose-50',    border: 'border-rose-400',    text: 'text-rose-800',    badge: 'bg-rose-200 text-rose-800' },
+    };
+
+    function ClusterBox({ label, sub, state }) {
+      const map = {
+        active:   { bg: '#005EB8', ring: 'ring-sky-300', txt: 'text-white', tag: 'LEADER' },
+        down:     { bg: '#9f1239', ring: 'ring-rose-300', txt: 'text-white', tag: 'DOWN' },
+        syncing:  { bg: '#0e7490', ring: 'ring-cyan-300', txt: 'text-white', tag: 'FOLLOWER' },
+        promoted: { bg: '#065f46', ring: 'ring-emerald-300', txt: 'text-white', tag: 'PROMOTED' },
+      };
+      const s = map[state] || map.syncing;
+      return (
+        <div className={`flex-1 rounded-lg px-3 py-3 ring-2 ${s.ring} ${s.txt}`} style={{ backgroundColor: s.bg }}>
+          <div className="text-[10px] font-mono opacity-80">{s.tag}</div>
+          <div className="text-sm font-bold">{label}</div>
+          <div className="text-[11px] opacity-90 mt-0.5">{sub}</div>
+        </div>
+      );
+    }
+
+    function LiveDataPane({ state }) {
+      const t = TONE[state.verdictTone] || TONE.warn;
+      const leaderDown = state.leaderState === 'down';
+      const promoted = state.promoted;
+      // 복제 방향 화살표: 정상은 leader→follower, 장애 시 끊김
+      const arrow = leaderDown ? '✂' : '⇢ ⇢ ⇢';
+      return (
+        <div className="rounded-xl border border-sky-300 bg-white p-4 h-full flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold" style={{ color: '#005EB8' }}>DR 복제 흐름</h3>
+            <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
+          </div>
+
+          <div className="flex items-stretch gap-2">
+            <ClusterBox
+              label="Seoul DC (leader)"
+              sub={leaderDown ? '지역 장애' : '원본 쓰기 처리'}
+              state={state.leaderState}
+            />
+            <div className="flex flex-col items-center justify-center w-14">
+              <div className={`text-lg font-mono ${leaderDown ? 'text-rose-500' : 'text-sky-500'}`}>{arrow}</div>
+              <div className="text-[9px] text-slate-500 mt-1">{leaderDown ? '복제 중단' : 'pull 복제'}</div>
+            </div>
+            <ClusterBox
+              label="Tokyo DC (follower)"
+              sub={promoted ? '승격 → 쓰기 가능' : '읽기 전용 사본'}
+              state={state.followerState}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 mt-3">
+            <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+              <div className="text-xs text-slate-600">복제 지연(lag)</div>
+              <div className="text-base font-mono font-bold" style={{ color: '#005EB8' }}>{state.lag}</div>
+            </div>
+            <div className={`rounded-lg border ${t.bg} ${t.border} px-3 py-2`}>
+              <div className="text-xs text-slate-600">모드</div>
+              <div className="text-base font-mono font-bold text-slate-800">{state.mode}</div>
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-lg bg-sky-50 border border-sky-200 p-3">
+            <div className="text-[10px] text-slate-500 mb-1 font-mono">문서 복제 파이프라인</div>
+            <div className="flex items-center justify-between text-[11px] font-mono">
+              <span className="px-2 py-1 rounded bg-white border border-slate-300">write</span>
+              <span className="text-slate-400">→</span>
+              <span className="px-2 py-1 rounded bg-white border border-slate-300">translog</span>
+              <span className={leaderDown ? 'text-rose-500' : 'text-sky-500'}>→</span>
+              <span className={`px-2 py-1 rounded text-white`} style={{ backgroundColor: leaderDown ? '#9f1239' : '#005EB8' }}>
+                {leaderDown ? '끊김' : 'follower'}
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-3 text-xs text-slate-800 bg-sky-50 border border-sky-200 rounded p-2">
+            💡 {state.keyPoint}
+          </div>
+        </div>
+      );
+    }
+
+    function CodeViewer({ code, stepIdx, total }) {
+      const codeRef = useRef(null);
+      useEffect(() => {
+        if (codeRef.current && window.hljs) {
+          codeRef.current.removeAttribute('data-highlighted');
+          window.hljs.highlightElement(codeRef.current);
+        }
+      }, [code]);
+      const highlightSet = new Set(code.highlight || []);
+      const tokenLines = (() => {
+        if (!codeRef.current) return code.lines.map((l) => ({ html: l }));
+        const html = codeRef.current.innerHTML;
+        const split = html.split('\n');
+        return code.lines.map((l, i) => ({ html: split[i] !== undefined ? split[i] : l }));
+      })();
+      return (
+        <div className="rounded-xl overflow-hidden border border-slate-700 bg-[#282c34] h-full flex flex-col shadow-lg">
+          <div className="flex items-center gap-2 px-3 py-2 bg-slate-800 border-b border-slate-700">
+            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="ml-3 text-xs text-slate-300 font-mono">{code.filename}</span>
+            <span className="ml-auto text-[10px] text-slate-400">{code.lang}</span>
+          </div>
+          <div className="flex-1 overflow-auto p-3 text-xs font-mono leading-5">
+            <pre ref={codeRef} className={`hidden language-${code.lang}`}>{code.lines.join('\n')}</pre>
+            <div className="text-slate-200">
+              {code.lines.map((line, i) => {
+                const lineNo = i + 1;
+                const isHi = highlightSet.has(lineNo);
+                return (
+                  <div key={i} className={`flex ${isHi ? 'bg-slate-500/25 border-l-2 border-sky-300 -ml-3 pl-2' : ''}`}>
+                    <span className="text-slate-500 select-none w-8 text-right pr-2">{lineNo}</span>
+                    <span className="flex-1" dangerouslySetInnerHTML={{ __html: tokenLines[i] ? tokenLines[i].html : line }} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
+            <span>{code.lines.length} lines</span>
+            <span>Step {stepIdx + 1} / {total}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [stepIdx, setStepIdx] = useState(0);
+      const [playing, setPlaying] = useState(false);
+      const intervalRef = useRef(null);
+      const step = STEPS[stepIdx];
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.key === 'ArrowRight') setStepIdx((i) => Math.min(STEPS.length - 1, i + 1));
+          else if (e.key === 'ArrowLeft') setStepIdx((i) => Math.max(0, i - 1));
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
+
+      useEffect(() => {
+        if (!playing) return;
+        intervalRef.current = setInterval(() => {
+          setStepIdx((i) => { if (i >= STEPS.length - 1) { setPlaying(false); return i; } return i + 1; });
+        }, 3000);
+        return () => clearInterval(intervalRef.current);
+      }, [playing]);
+
+      const isLast = stepIdx === STEPS.length - 1;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-50 to-blue-100 px-4 py-6">
+          <div className="max-w-7xl mx-auto">
+            <header className="mb-5 flex items-end gap-3 flex-wrap">
+              <span className="inline-flex items-center justify-center w-10 h-10 rounded-lg text-white font-bold" style={{ backgroundColor: '#005EB8' }}>OS</span>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded text-white" style={{ backgroundColor: '#003b75' }}>Part V. 운영</span>
+                  <span className="text-[10px] font-mono text-slate-500">V-2-2</span>
+                </div>
+                <h1 className="text-2xl font-bold text-slate-900 mt-1">Cross-Cluster Replication</h1>
+                <p className="text-sm text-slate-700/80">여러 클러스터 간 실시간 복제로 재해 복구·지역 분산 (OpenSearch 완주)</p>
+              </div>
+              <a href="../index.html" className="ml-auto text-xs text-slate-700 underline hover:no-underline">← 챕터 목록</a>
+            </header>
+
+            <div className="mb-4 flex gap-1.5">
+              {STEPS.map((_, i) => (
+                <div key={i} className={`h-1.5 flex-1 rounded-full transition`} style={{ backgroundColor: i <= stepIdx ? '#005EB8' : '#e2e8f0' }} />
+              ))}
+            </div>
+
+            <div className="mb-4 rounded-xl text-slate-50 px-5 py-4 shadow" style={{ backgroundColor: '#003b75' }}>
+              <h2 className="text-lg font-bold mb-1">{step.title}</h2>
+              <p className="text-sm text-slate-200/90 leading-relaxed">{step.desc}</p>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <LiveDataPane state={step} />
+              <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
+            </div>
+
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <button onClick={() => setStepIdx(0)} aria-label="처음으로" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">처음</button>
+              <button onClick={() => setStepIdx((i) => Math.max(0, i - 1))} disabled={stepIdx === 0} aria-label="이전 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">← 이전</button>
+              <button onClick={() => { if (isLast) setStepIdx(0); setPlaying((p) => !p); }} aria-pressed={playing} aria-label={playing ? '자동 재생 정지' : '자동 재생 시작'} className="px-4 py-1.5 text-xs rounded font-bold text-white" style={{ backgroundColor: playing ? '#003b75' : '#005EB8' }}>{playing ? '⏸ 일시정지' : isLast ? '↻ 다시보기' : '▶ 자동재생'}</button>
+              <button onClick={() => setStepIdx((i) => Math.min(STEPS.length - 1, i + 1))} disabled={isLast} aria-label="다음 단계" className="px-3 py-1.5 text-xs rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40">다음 →</button>
+            </div>
+            <div className="text-center text-[10px] text-slate-600 mt-2">키보드 ←/→ · 자동재생 3초/단계</div>
+
+            {isLast && (
+              <div className="mt-5 rounded-lg border-2 bg-white px-4 py-3 text-sm text-slate-900" style={{ borderColor: '#005EB8' }}>
+                <div className="font-bold mb-1">✅ 핵심 정리 · OpenSearch 완주</div>
+                CCR은 leader의 변경을 follower가 pull 방식으로 실시간 복제하는 DR 기능이다. follower는 읽기 전용이라 조회 부하 분산·지역 지연 감소에도 쓰고, auto-follow로 시계열 인덱스를 자동 커버한다. CCS(원격 질의, 사본 없음)와 목적이 다르며, leader 장애 시 _stop으로 follower를 승격해 서비스를 잇는다. 비동기라 RPO는 0이 아니고(lag 유실), 버전·대역폭·보안·되돌리기 4대 함정을 사전 점검한다. 스냅샷(느린 시점 복구)과 CCR(빠른 hot standby)은 상호 보완. 이로써 OpenSearch 운영편을 완주한다.
+              </div>
+            )}
+
+            <div className="mt-4 flex flex-wrap gap-1.5 text-[10px]">
+              {['CCR', 'DR', 'Failover', 'auto-follow', 'RPO', 'CCS', 'hot-standby'].map((k) => (
+                <span key={k} className="px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 border border-sky-300">#{k}</span>
+              ))}
+            </div>
+
+            <nav className="mt-6 flex items-center justify-between text-xs text-slate-700">
+              <a href="../index.html" className="underline hover:no-underline">← 챕터 목록</a>
+              <a href="../index.html" className="underline hover:no-underline">OpenSearch 완주 — 챕터 목록으로 →</a>
+            </nav>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
