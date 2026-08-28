@@ -4,7 +4,7 @@
 
 ## 이 프로젝트는 뭔가요?
 
-D3.js 마인드맵 하나가 30개 학습 자료를 연결하는 허브 역할을 합니다. 각 학습 자료는 단계별 애니메이션 시각화(총 752개)로 구성되어 있습니다. 비유를 써서 설명하면, 도서관 안내판(마인드맵)을 보고 원하는 책(학습 자료)을 찾아가는 구조입니다.
+D3.js 마인드맵 하나가 52개 학습 자료를 연결하는 허브 역할을 합니다. 각 학습 자료는 단계별 애니메이션 시각화(총 1192개)로 구성되어 있습니다. 비유를 써서 설명하면, 도서관 안내판(마인드맵)을 보고 원하는 책(학습 자료)을 찾아가는 구조입니다.
 
 빌드 도구가 전혀 없습니다. HTML 파일을 브라우저로 열거나 정적 서버 하나를 띄우면 바로 동작합니다.
 
@@ -21,9 +21,9 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 
 루트(`/`)에 접속하면 마인드맵으로 자동 이동합니다.
 
-## 30개 학습 자료
+## 52개 학습 자료
 
-(2026-05-21 기준, Sprint 95+96)
+(2026-05-21 기준, Sprint 97)
 
 | 폴더 | 시각화 수 | 핵심 주제 |
 |:--|:--:|:--|
@@ -57,8 +57,30 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 | `linux/` | 20개 | 파일/프로세스/네트워크/자동화/운영 |
 | `typescript/` | 20개 | type/interface/generic, 고급 타입, React-Node 적용, 설계 패턴, strict 운영 |
 | `vue/` | 20개 | Composition API, 컴포넌트 패턴, Pinia/Router, 렌더링/성능, Vite/Nuxt |
+| `kotlin/` | 20개 | 기초 문법/OOP/함수형/코루틴/Spring Boot |
+| `go/` | 20개 | 기초/고루틴/채널/표준 라이브러리/마이크로서비스 |
+| `rust/` | 20개 | 소유권/빌림/라이프타임/비동기/시스템 프로그래밍 |
+| `svelte/` | 20개 | 반응형 선언/컴포넌트/스토어/SvelteKit/성능 |
+| `vite/` | 20개 | 개발 서버/HMR/번들링/플러그인/최적화 |
+| `webpack/` | 20개 | 엔트리/로더/플러그인/코드 스플리팅/최적화 |
+| `tailwind/` | 20개 | 유틸리티 클래스/반응형/다크모드/커스터마이징/JIT |
+| `storybook/` | 20개 | 스토리 작성/Addon/UI 테스트/디자인 시스템/배포 |
+| `helm/` | 20개 | 차트 구조/템플릿/값/릴리스/저장소 |
+| `argocd/` | 20개 | GitOps/Application/동기화/롤백/멀티 클러스터 |
+| `prometheus/` | 20개 | 메트릭/PromQL/Alerting/Exporter/연동 |
+| `grafana/` | 20개 | 대시보드/패널/데이터소스/알림/플러그인 |
+| `opentelemetry/` | 20개 | 트레이스/메트릭/로그/SDK/Collector |
+| `jaeger/` | 20개 | 분산 추적/샘플링/UI/백엔드/연동 |
+| `spring-cloud/` | 20개 | Config/Eureka/Gateway/Circuit Breaker/Sleuth |
+| `vault/` | 20개 | 시크릿 관리/정책/인증/동적 시크릿/HA |
+| `opensearch/` | 20개 | 인덱스/쿼리/Aggregation/보안/Dashboards |
+| `rabbitmq/` | 20개 | Exchange/Queue/바인딩/클러스터/메시지 패턴 |
+| `grpc/` | 20개 | Protobuf/단방향/스트리밍/인터셉터/부하분산 |
+| `pulumi/` | 20개 | IaC 코드/스택/상태/프로바이더/CI |
+| `webassembly/` | 20개 | WAT/Rust→WASM/JS 연동/WASI/성능 |
+| `sqlite/` | 20개 | SQL 기초/인덱스/트랜잭션/FTS/임베디드 패턴 |
 
-**총 시각화: 752개 + GCP SPA 52섹션** (2026-05-21 기준)
+**총 시각화: 1192개 + GCP SPA 52섹션** (2026-05-21 기준, Sprint 97)
 
 ## 마인드맵
 
@@ -71,7 +93,7 @@ D3.js로 구현한 마인드맵이 전체 학습 자료의 허브입니다.
 ## 주요 기능
 
 - **인터랙티브 시각화**: 단계별 애니메이션 + 키보드 ←/→ 탐색 + 자동 재생
-- **giscus 댓글**: 28개 허브 + 마인드맵에 GitHub Discussions 기반 댓글
+- **giscus 댓글**: 52개 허브 + 마인드맵에 GitHub Discussions 기반 댓글
 - **즉시 실행**: 빌드 없이 브라우저에서 바로 동작
 - **반응형**: 모바일/데스크톱 모두 지원 (Tailwind 반응형 클래스)
 
@@ -120,6 +142,30 @@ tech-roadmap/
 ├── graphql/          # GraphQL 스키마~보안
 ├── microservices/    # MSA 도메인~모니터링
 ├── linux/            # Linux 파일~운영
+├── typescript/       # TypeScript type~설계 패턴
+├── vue/              # Vue Composition API~Nuxt
+├── kotlin/           # Kotlin 기초~Spring Boot
+├── go/               # Go 기초~마이크로서비스
+├── rust/             # Rust 소유권~시스템 프로그래밍
+├── svelte/           # Svelte 반응형~SvelteKit
+├── vite/             # Vite 개발 서버~최적화
+├── webpack/          # Webpack 엔트리~최적화
+├── tailwind/         # Tailwind 유틸리티~JIT
+├── storybook/        # Storybook 스토리~디자인 시스템
+├── helm/             # Helm 차트~저장소
+├── argocd/           # ArgoCD GitOps~멀티 클러스터
+├── prometheus/       # Prometheus 메트릭~연동
+├── grafana/          # Grafana 대시보드~플러그인
+├── opentelemetry/    # OpenTelemetry 트레이스~Collector
+├── jaeger/           # Jaeger 분산 추적~연동
+├── spring-cloud/     # Spring Cloud Config~Sleuth
+├── vault/            # Vault 시크릿~HA
+├── opensearch/       # OpenSearch 인덱스~Dashboards
+├── rabbitmq/         # RabbitMQ Exchange~메시지 패턴
+├── grpc/             # gRPC Protobuf~부하분산
+├── pulumi/           # Pulumi IaC 코드~CI
+├── webassembly/      # WebAssembly WAT~성능
+├── sqlite/           # SQLite SQL~임베디드 패턴
 └── docs/             # 프로젝트 설계·운영 문서 (Claude 전용)
 ```
 
