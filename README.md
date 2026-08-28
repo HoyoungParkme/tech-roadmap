@@ -4,7 +4,7 @@
 
 ## 이 프로젝트는 뭔가요?
 
-D3.js 마인드맵 하나가 52개 학습 자료를 연결하는 허브 역할을 합니다. 각 학습 자료는 단계별 애니메이션 시각화(총 1192개)로 구성되어 있습니다. 비유를 써서 설명하면, 도서관 안내판(마인드맵)을 보고 원하는 책(학습 자료)을 찾아가는 구조입니다.
+루트 허브(개발자 학습 노트)가 65개 학습 자료를 목차로 연결합니다. D3.js 마인드맵도 별도 페이지로 볼 수 있습니다. 각 학습 자료는 단계별 애니메이션 시각화(총 1454개)로 구성되어 있습니다. 비유를 써서 설명하면, 도서관 안내판(허브 목차)을 보고 원하는 책(학습 자료)을 찾아가는 구조입니다.
 
 빌드 도구가 전혀 없습니다. HTML 파일을 브라우저로 열거나 정적 서버 하나를 띄우면 바로 동작합니다.
 
@@ -19,26 +19,26 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 # 그 후 http://127.0.0.1:8765/ 접속
 ```
 
-루트(`/`)에 접속하면 마인드맵으로 자동 이동합니다.
+루트(`/`)에 접속하면 65개 학습 자료를 모은 학습 노트 허브가 뜹니다. 상단 "☷ 마인드맵으로 보기" 버튼으로 D3.js 마인드맵으로도 이동할 수 있습니다.
 
-## 52개 학습 자료
+## 65개 학습 자료
 
-(2026-05-21 기준, Sprint 97)
+(2026-08-28 기준)
 
 | 폴더 | 시각화 수 | 핵심 주제 |
 |:--|:--:|:--|
 | `ai-agent/` | 26개 | Agent 아키텍처, ReAct 패턴, Function Calling |
-| `fastapi/` | 79개 | 비동기/Pydantic/CRUD/아키텍처/배포 — Part I~VII |
+| `fastapi/` | 78개 | 비동기/Pydantic/CRUD/아키텍처/배포 — Part I~VII |
 | `langchain/` | 29개 | LangChain + LangGraph 6 Parts |
-| `rag/` | 35개 | RAG 파이프라인 7 Parts |
+| `rag/` | 37개 | RAG 파이프라인 8 Parts |
 | `vector-db/` | 22개 | Vector DB 5 Parts |
 | `docker/` | 47개 | 컨테이너 + Compose + 배포 |
-| `springboot/` | 49개 | Spring Boot Part I~VII |
+| `springboot/` | 48개 | Spring Boot Part I~VII |
 | `postgres/` | 33개 | PostgreSQL SQL 파이프라인 |
 | `react/` | 39개 | React 함수형 컴포넌트 |
 | `github/` | 12개 | Git 흐름 9 Parts + 56 섹션 |
 | `gcp/` | 4 + SPA 52섹션 | GCP 서비스 (viewer SPA 별도) |
-| `graphrag/` | 21개 | GraphRAG + Neo4j — 5 Parts |
+| `graphrag/` | 23개 | GraphRAG + Neo4j — 6 Parts |
 | `kubernetes/` | 20개 | K8s 워크로드/서비스/스토리지/운영 |
 | `mlops/` | 20개 | 데이터/학습/배포/모니터링/운영 |
 | `observability/` | 20개 | 메트릭/로그/트레이스/SLO/사고대응 |
@@ -62,8 +62,7 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 | `rust/` | 20개 | 소유권/빌림/라이프타임/비동기/시스템 프로그래밍 |
 | `svelte/` | 20개 | 반응형 선언/컴포넌트/스토어/SvelteKit/성능 |
 | `vite/` | 20개 | 개발 서버/HMR/번들링/플러그인/최적화 |
-| `webpack/` | 20개 | 엔트리/로더/플러그인/코드 스플리팅/최적화 |
-| `tailwind/` | 20개 | 유틸리티 클래스/반응형/다크모드/커스터마이징/JIT |
+| `tailwindcss/` | 20개 | 유틸리티 클래스/반응형/다크모드/커스터마이징/JIT |
 | `storybook/` | 20개 | 스토리 작성/Addon/UI 테스트/디자인 시스템/배포 |
 | `helm/` | 20개 | 차트 구조/템플릿/값/릴리스/저장소 |
 | `argocd/` | 20개 | GitOps/Application/동기화/롤백/멀티 클러스터 |
@@ -77,10 +76,26 @@ python -m http.server 8765 --directory . --bind 127.0.0.1
 | `rabbitmq/` | 20개 | Exchange/Queue/바인딩/클러스터/메시지 패턴 |
 | `grpc/` | 20개 | Protobuf/단방향/스트리밍/인터셉터/부하분산 |
 | `pulumi/` | 20개 | IaC 코드/스택/상태/프로바이더/CI |
-| `webassembly/` | 20개 | WAT/Rust→WASM/JS 연동/WASI/성능 |
 | `sqlite/` | 20개 | SQL 기초/인덱스/트랜잭션/FTS/임베디드 패턴 |
+| `ml/` | 20개 | 지도/비지도/강화학습, SVM, XGBoost |
+| `dl/` | 20개 | ANN→CNN→RNN→Transformer |
+| `pytorch/` | 20개 | 텐서/autograd/학습 루프 |
+| `tensorflow/` | 20개 | Keras/GradientTape 두 방식 |
+| `python/` | 20개 | 문법/OOP/타입힌트/현장 활용 |
+| `java/` | 20개 | JVM/OOP/컬렉션/모던 자바 |
+| `c/` | 20개 | 포인터/메모리/자료구조 직접 구현 |
+| `csharp/` | 20개 | .NET/LINQ/async/ASP.NET |
+| `cpp/` | 20개 | RAII/STL/이동 시맨틱/멀티스레딩 |
+| `nodejs/` | 20개 | 이벤트 루프/비동기/Express |
+| `html/` | 20개 | 시맨틱/폼/접근성/성능 |
+| `css/` | 20개 | Flex/Grid/반응형/애니메이션 |
+| `js/` | 20개 | 비동기/DOM/이벤트/모던 문법 |
+| `search/` | 20개 | 역색인/BM25/HNSW/RRF |
+| `dw-pipeline/` | 20개 | ODS·DW·DM/dbt/Airflow |
 
-**총 시각화: 1192개 + GCP SPA 52섹션** (2026-05-21 기준, Sprint 97)
+**총 시각화: 1454개 + GCP SPA 52섹션** (2026-08-28 기준)
+
+> 참고: 위 개수는 루트 허브 `index.html`의 `CATS` 배열(등록된 65개 주제) 기준이며, 대표 주제(rag/graphrag/ai-agent/docker/postgres/react/github 등)를 실제 파일 수로 교차 검증했습니다. `webpack/`, `webassembly/`는 아직 `CATS` 배열에 등록되지 않은 별도 진행 중 폴더라 이 표에서 제외했습니다. fastapi의 `project-viewer.html`은 뷰어 페이지라 집계에서 제외했으며, 이에 맞춰 루트 `index.html`의 `CATS` 값도 정정했습니다(springboot도 과다 집계분을 함께 정정). 이제 `CATS` 선언값과 실제 파일 수가 전부 일치합니다.
 
 ## 마인드맵
 
@@ -93,7 +108,7 @@ D3.js로 구현한 마인드맵이 전체 학습 자료의 허브입니다.
 ## 주요 기능
 
 - **인터랙티브 시각화**: 단계별 애니메이션 + 키보드 ←/→ 탐색 + 자동 재생
-- **giscus 댓글**: 52개 허브 + 마인드맵에 GitHub Discussions 기반 댓글
+- **giscus 댓글**: 65개 허브 + 마인드맵에 GitHub Discussions 기반 댓글
 - **즉시 실행**: 빌드 없이 브라우저에서 바로 동작
 - **반응형**: 모바일/데스크톱 모두 지원 (Tailwind 반응형 클래스)
 
@@ -113,9 +128,9 @@ D3.js로 구현한 마인드맵이 전체 학습 자료의 허브입니다.
 
 ```
 tech-roadmap/
-├── mindmap/          # D3.js 마인드맵 허브 (전체 진입점)
+├── mindmap/          # D3.js 마인드맵 (루트 학습 노트 허브에서 링크)
 ├── ai-agent/         # AI Agent
-├── fastapi/          # FastAPI (79개 시각화)
+├── fastapi/          # FastAPI (78개 시각화)
 ├── langchain/        # LangChain + LangGraph
 ├── rag/              # RAG 파이프라인
 ├── vector-db/        # Vector DB
@@ -149,8 +164,7 @@ tech-roadmap/
 ├── rust/             # Rust 소유권~시스템 프로그래밍
 ├── svelte/           # Svelte 반응형~SvelteKit
 ├── vite/             # Vite 개발 서버~최적화
-├── webpack/          # Webpack 엔트리~최적화
-├── tailwind/         # Tailwind 유틸리티~JIT
+├── tailwindcss/      # Tailwind 유틸리티~JIT
 ├── storybook/        # Storybook 스토리~디자인 시스템
 ├── helm/             # Helm 차트~저장소
 ├── argocd/           # ArgoCD GitOps~멀티 클러스터
@@ -164,8 +178,22 @@ tech-roadmap/
 ├── rabbitmq/         # RabbitMQ Exchange~메시지 패턴
 ├── grpc/             # gRPC Protobuf~부하분산
 ├── pulumi/           # Pulumi IaC 코드~CI
-├── webassembly/      # WebAssembly WAT~성능
 ├── sqlite/           # SQLite SQL~임베디드 패턴
+├── ml/               # Machine Learning 지도~강화학습
+├── dl/               # Deep Learning ANN~Transformer
+├── pytorch/          # PyTorch 텐서~학습 루프
+├── tensorflow/       # TensorFlow Keras~GradientTape
+├── python/           # Python 문법~현장 활용
+├── java/             # Java JVM~모던 자바
+├── c/                # C 포인터~자료구조 직접 구현
+├── csharp/           # C# .NET~ASP.NET
+├── cpp/              # C++ RAII~멀티스레딩
+├── nodejs/           # Node.js 이벤트 루프~Express
+├── html/             # HTML 시맨틱~성능
+├── css/              # CSS Flex/Grid~애니메이션
+├── js/               # JavaScript 비동기~모던 문법
+├── search/           # Search 역색인~RRF
+├── dw-pipeline/      # DW Pipeline ODS~Airflow
 └── docs/             # 프로젝트 설계·운영 문서 (Claude 전용)
 ```
 
