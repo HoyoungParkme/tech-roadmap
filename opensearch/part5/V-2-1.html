@@ -268,9 +268,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
 
   <!--
     OpenSearch Chapter V-2-1 — ISM (Index State Management)
@@ -282,88 +286,396 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      problem: {lang:'json', filename:'problem-without-ism.json', lines:[
+        '// ISM 없이 방치했을 때 벌어지는 일',
+        '{',
+        '  "indices_growth": {',
+        '    "logs-2026.08.01": "5 GB",',
+        '    "logs-2026.08.02": "5 GB",',
+        '    "...": "매일 새 인덱스, 무한 누적",',
+        '    "logs-2026.12.31": "누적 900 GB"',
+        '  },',
+        '  "disk_watermark": {',
+        '    "flood_stage": "95% 초과",',
+        '    "result": "index.blocks.read_only_allow_delete = true",',
+        '    "impact": "모든 색인 요청 실패 (쓰기 잠김)"',
+        '  },',
+        '  "manual_cleanup": {',
+        '    "method": "curl -XDELETE 매일 수동",',
+        '    "risk": "휴가/야간에 누락 → 장애",',
+        '    "verdict": "자동화 필수"',
+        '  }',
+        '}'
+      ]},
+      states: {lang:'json', filename:'ism-policy-states.json', lines:[
+        '// PUT _plugins/_ism/policies/logs_lifecycle',
+        '{',
+        '  "policy": {',
+        '    "description": "로그 인덱스 hot-warm-cold 생애주기",',
+        '    "default_state": "hot",',
+        '    "states": [',
+        '      {',
+        '        "name": "hot",',
+        '        "actions": [],',
+        '        "transitions": [',
+        '          { "state_name": "warm", "conditions": { "min_index_age": "3d" } }',
+        '        ]',
+        '      },',
+        '      { "name": "warm", "transitions": [',
+        '          { "state_name": "cold", "conditions": { "min_index_age": "7d" } } ] },',
+        '      { "name": "cold", "transitions": [',
+        '          { "state_name": "delete", "conditions": { "min_index_age": "30d" } } ] },',
+        '      { "name": "delete", "actions": [] }',
+        '    ]',
+        '  }',
+        '}'
+      ]},
+      rollover: {lang:'json', filename:'ism-rollover.json', lines:[
+        '// rollover 조건을 hot 상태의 action으로 넣는다',
+        '{',
+        '  "name": "hot",',
+        '  "actions": [',
+        '    {',
+        '      "rollover": {',
+        '        "min_size": "50gb",',
+        '        "min_index_age": "1d",',
+        '        "min_doc_count": 100000000',
+        '      }',
+        '    }',
+        '  ],',
+        '  "transitions": [',
+        '    { "state_name": "warm", "conditions": { "min_index_age": "3d" } }',
+        '  ]',
+        '}',
+        '',
+        '// 인덱스 템플릿에 rollover_alias 지정 (필수 전제)',
+        '// "index.plugins.index_state_management.rollover_alias": "logs"',
+        '// 최초 인덱스: PUT logs-000001  { aliases: { logs: { is_write_index: true } } }'
+      ]},
+      actions: {lang:'json', filename:'ism-state-actions.json', lines:[
+        '// 각 상태에 목적에 맞는 action을 배치',
+        '{ "name": "warm", "actions": [',
+        '    { "force_merge": { "max_num_segments": 1 } },',
+        '    { "replica_count": { "number_of_replicas": 1 } }',
+        '  ], "transitions": [ { "state_name": "cold",',
+        '    "conditions": { "min_index_age": "7d" } } ] }',
+        ',',
+        '{ "name": "cold", "actions": [',
+        '    { "replica_count": { "number_of_replicas": 0 } },',
+        '    { "read_only": {} }',
+        '  ], "transitions": [ { "state_name": "delete",',
+        '    "conditions": { "min_index_age": "30d" } } ] }',
+        ',',
+        '{ "name": "delete", "actions": [',
+        '    { "delete": {} }',
+        '  ] }'
+      ]},
+      pitfalls: {lang:'json', filename:'ism-hot-warm-pitfalls.json', lines:[
+        '// warm 노드로 물리 이동 (allocation 액션)',
+        '{ "name": "warm", "actions": [',
+        '    { "allocation": { "require": { "box_type": "warm" } } },',
+        '    { "force_merge": { "max_num_segments": 1 } }',
+        '  ] }',
+        '',
+        '// 실무 함정 체크리스트',
+        '{',
+        '  "pitfall_1": "정책 미적용 → 인덱스 무한 증가, 디스크 풀",',
+        '  "pitfall_2": "rollover_alias 누락 → rollover 조용히 실패",',
+        '  "pitfall_3": "조건 단위 오류: \'3d\' 대신 3 → 파싱 실패",',
+        '  "pitfall_4": "delete min_index_age 너무 짧음 → 로그 유실",',
+        '  "observe": "GET _plugins/_ism/explain/logs-*"',
+        '}'
+      ]},
+    };
+
+    const S1 = {
+      title: 'Step 1. 왜 ISM인가 — 로그 인덱스는 방치하면 무한 증가한다',
+      desc: '애플리케이션 로그, Nginx 액세스 로그, 메트릭은 매일 수 GB씩 새 인덱스로 쌓인다. 아무 정책 없이 두면 디스크가 꽉 차서 클러스터가 read-only로 잠기고, 그 순간 색인이 전부 실패한다. 사람이 매일 오래된 인덱스를 손으로 지우는 방식은 반드시 빠뜨린다. ISM은 "나이·크기·문서 수" 조건이 충족되면 인덱스를 다음 상태로 자동 전이시켜, 사람 손을 떼도 생애주기가 굴러가게 만든다.',
+    };
+    const S2 = {
+      title: 'Step 2. ISM policy — 상태(state)와 전이(transition)를 선언한다',
+      desc: 'ISM policy는 인덱스가 거쳐 갈 상태 목록과, 각 상태에서 다음 상태로 넘어가는 조건을 JSON으로 선언한다. 여기서는 hot → warm → cold → delete 네 상태를 정의한다. 각 transition의 conditions에 min_index_age(인덱스 생성 후 경과 시간)를 넣으면, ISM 백그라운드 잡이 주기적으로 조건을 평가해 자동으로 상태를 넘긴다. 상태 이름과 전이만 잘 짜두면 이후 운영은 정책이 대신한다.',
+    };
+    const S3 = {
+      title: 'Step 3. rollover — 하나의 alias 뒤에서 새 인덱스로 갈아탄다',
+      desc: 'hot 상태의 인덱스가 무한히 커지면 안 되므로, 일정 크기·나이·문서 수에 도달하면 rollover로 새 인덱스를 만들고 쓰기를 그쪽으로 넘긴다. 애플리케이션은 항상 logs 라는 alias 하나에만 쓰기 때문에 인덱스가 바뀌어도 코드는 그대로다. rollover는 alias 설정이 전제 — is_write_index=true인 쓰기 대상 인덱스가 alias에 붙어 있어야 하고, 인덱스 이름은 logs-000001 처럼 숫자 패턴이어야 자동 증가한다.',
+    };
+    const S4 = {
+      title: 'Step 4. 상태별 action — 각 단계에서 리소스를 최적화한다',
+      desc: '상태를 나누는 이유는 각 단계에서 리소스 사용을 줄이기 위해서다. warm으로 넘어가면 더 이상 쓰지 않으므로 force_merge로 세그먼트를 하나로 합쳐 검색 속도를 높이고 디스크를 아낀다. cold에서는 복제본(replica)을 0으로 줄여 저장 비용을 절반으로 낮추고, read_only로 잠가 실수 쓰기를 막는다. delete 상태의 delete 액션이 인덱스를 완전히 제거해 디스크를 회수한다. 각 액션은 그 상태의 성격에 맞게 골라야 한다.',
+    };
+    const S5 = {
+      title: 'Step 5. hot-warm 아키텍처와 실무 함정',
+      desc: 'hot 노드는 SSD·고사양으로 최신 데이터의 색인·검색을 받고, warm/cold 노드는 HDD·저사양으로 오래된 데이터를 값싸게 보관한다. ISM은 node attribute(box_type)와 allocation 액션으로 인덱스를 hot 노드에서 warm 노드로 물리적으로 이동시킨다. 실무 함정은 네 가지 — 정책 미적용으로 무한 증가, rollover_alias 누락, 전이 조건 단위 오류(3d를 3으로), 그리고 삭제 조건을 너무 짧게 잡아 필요한 로그가 사라지는 사고다. explain API로 각 인덱스의 현재 상태를 반드시 모니터링하라.',
+    };
+
     const STEPS = [
-      {
-        title: 'Step 1. 왜 ISM인가 — 로그 인덱스는 방치하면 무한 증가한다',
-        desc: '애플리케이션 로그, Nginx 액세스 로그, 메트릭은 매일 수 GB씩 새 인덱스로 쌓인다. 아무 정책 없이 두면 디스크가 꽉 차서 클러스터가 read-only로 잠기고, 그 순간 색인이 전부 실패한다. 사람이 매일 오래된 인덱스를 손으로 지우는 방식은 반드시 빠뜨린다. ISM은 "나이·크기·문서 수" 조건이 충족되면 인덱스를 다음 상태로 자동 전이시켜, 사람 손을 떼도 생애주기가 굴러가게 만든다.',
+      // ── Step 1 ────────────────────────────────────────────────────────
+      { ...S1,
+        beat: {
+          label: '매일 새 인덱스가 열린다',
+          at: 'problem-without-ism.json L3–7',
+          caption: '날짜별로 인덱스를 하나씩 만들면 하루치는 5 GB로 가볍지만, 만드는 쪽에 멈출 장치가 없다.',
+          changes: [
+            {mark:'new',  text:'logs-2026.08.01 생성 (5 GB)'},
+            {mark:'read', text:'다음 날 logs-2026.08.02'},
+          ],
+        },
         phase: 'hot',
         age: '0일',
         size: '5 GB',
         docs: '1,200만',
         cost: '최고 (SSD)',
         tone: 'good',
+        verdict: '하루 5 GB',
+        keyPoint: '하루치만 보면 문제가 없어 보인다. 문제는 "언제 멈추는가"를 아무도 정하지 않았다는 점이다.',
+        code: {...CODE.problem, highlight: [3, 4, 5, 6, 7]},
+      },
+      { ...S1,
+        beat: {
+          label: '5개월이면 900 GB',
+          at: 'problem-without-ism.json L6–8',
+          caption: '하루 5 GB × 180일이 그대로 누적된다. 삭제 규칙이 없으니 총량은 시간에 정비례해 커진다.',
+          changes: [
+            {mark:'changed', text:'크기 5 GB → 누적 900 GB'},
+            {mark:'changed', text:'나이 0일 → 153일'},
+          ],
+        },
+        phase: 'hot',
+        age: '153일',
+        size: '누적 900 GB',
+        docs: '21억',
+        cost: '최고 (SSD)',
+        tone: 'warn',
+        verdict: '무한 누적',
+        keyPoint: '누적량은 보관 기간에 정비례한다. 보관 기간을 정하지 않으면 필요 디스크도 정할 수 없다.',
+        code: {...CODE.problem, highlight: [6, 7, 8]},
+      },
+      { ...S1,
+        beat: {
+          label: '디스크 95%에서 쓰기가 잠긴다',
+          at: 'problem-without-ism.json L9–13',
+          caption: 'flood_stage 워터마크를 넘으면 OpenSearch가 인덱스에 read_only_allow_delete 블록을 걸어 색인을 전부 막는다.',
+          changes: [
+            {mark:'new',  text:'index.blocks.read_only_allow_delete = true'},
+            {mark:'gone', text:'색인(write) 불가'},
+          ],
+        },
+        phase: 'hot',
+        age: '153일',
+        size: '900 GB (95% 초과)',
+        docs: '색인 중단',
+        cost: '최고 (SSD)',
+        tone: 'danger',
+        verdict: '쓰기 잠김',
+        keyPoint: '디스크가 차면 조용히 느려지는 게 아니라 색인이 즉시 실패한다. 로그 유입 전체가 끊긴다.',
+        code: {...CODE.problem, highlight: [9, 10, 11, 12, 13]},
+      },
+      { ...S1,
+        beat: {
+          label: '수동 삭제는 반드시 빠진다',
+          at: 'problem-without-ism.json L14–18',
+          caption: '매일 curl -XDELETE 를 사람이 치는 방식은 휴가·야간·장애 대응 중에 한 번만 빠져도 그대로 사고가 된다.',
+          changes: [
+            {mark:'gone', text:'사람 손 정리 → 신뢰 불가'},
+            {mark:'new',  text:'요구: 조건 기반 자동 전이'},
+          ],
+        },
+        phase: 'hot',
+        age: '153일',
+        size: '900 GB',
+        docs: '삭제 누락',
+        cost: '최고 (SSD)',
+        tone: 'danger',
         verdict: '정책 필요',
         keyPoint: '디스크가 차서 클러스터가 잠기면 색인 전체가 멈춘다. 생애주기 자동화는 선택이 아니라 안전장치다.',
-        code: {
-          lang: 'json',
-          filename: 'problem-without-ism.json',
-          lines: [
-            '// ISM 없이 방치했을 때 벌어지는 일',
-            '{',
-            '  "indices_growth": {',
-            '    "logs-2026.08.01": "5 GB",',
-            '    "logs-2026.08.02": "5 GB",',
-            '    "...": "매일 새 인덱스, 무한 누적",',
-            '    "logs-2026.12.31": "누적 900 GB"',
-            '  },',
-            '  "disk_watermark": {',
-            '    "flood_stage": "95% 초과",',
-            '    "result": "index.blocks.read_only_allow_delete = true",',
-            '    "impact": "모든 색인 요청 실패 (쓰기 잠김)"',
-            '  },',
-            '  "manual_cleanup": {',
-            '    "method": "curl -XDELETE 매일 수동",',
-            '    "risk": "휴가/야간에 누락 → 장애",',
-            '    "verdict": "자동화 필수"',
-            '  }',
-            '}'
-          ],
-          highlight: [3, 4, 5, 7, 10, 11, 12, 16, 17, 18]
-        }
+        code: {...CODE.problem, highlight: [14, 15, 16, 17, 18]},
       },
-      {
-        title: 'Step 2. ISM policy — 상태(state)와 전이(transition)를 선언한다',
-        desc: 'ISM policy는 인덱스가 거쳐 갈 상태 목록과, 각 상태에서 다음 상태로 넘어가는 조건을 JSON으로 선언한다. 여기서는 hot → warm → cold → delete 네 상태를 정의한다. 각 transition의 conditions에 min_index_age(인덱스 생성 후 경과 시간)를 넣으면, ISM 백그라운드 잡이 주기적으로 조건을 평가해 자동으로 상태를 넘긴다. 상태 이름과 전이만 잘 짜두면 이후 운영은 정책이 대신한다.',
+
+      // ── Step 2 ────────────────────────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: '정책을 등록하고 시작점을 정한다',
+          at: 'ism-policy-states.json L1, L5',
+          caption: 'PUT _plugins/_ism/policies/{이름} 으로 정책을 만들고, default_state 로 인덱스가 처음 놓일 상태를 지정한다.',
+          changes: [
+            {mark:'new',  text:'policy logs_lifecycle 등록'},
+            {mark:'read', text:'default_state = "hot"'},
+          ],
+        },
+        phase: 'hot',
+        age: '0일',
+        size: '5 GB',
+        docs: '1,200만',
+        cost: '최고 (SSD)',
+        tone: 'good',
+        verdict: '정책 등록',
+        keyPoint: 'default_state 가 없으면 정책이 붙어도 인덱스가 어디서 출발할지 모른다. 시작점이 첫 필수 항목이다.',
+        code: {...CODE.states, highlight: [1, 5]},
+      },
+      { ...S2,
+        beat: {
+          label: 'hot 상태를 선언한다',
+          at: 'ism-policy-states.json L6–9',
+          caption: 'states 배열의 첫 항목이 hot이다. 이 단계에서는 액션 없이 색인·검색을 그대로 받기만 한다.',
+          changes: [
+            {mark:'new',  text:'states[0] = hot'},
+            {mark:'read', text:'actions: [] (아무 것도 하지 않음)'},
+          ],
+        },
+        phase: 'hot',
+        age: '0~3일',
+        size: '5 GB',
+        docs: '1,200만',
+        cost: '최고 (SSD)',
+        tone: 'good',
+        verdict: 'hot 정의',
+        keyPoint: '액션이 비어 있어도 상태는 필요하다. 상태가 있어야 "여기서 저기로" 라는 전이를 걸 수 있다.',
+        code: {...CODE.states, highlight: [6, 7, 8, 9]},
+      },
+      { ...S2,
+        beat: {
+          label: 'hot → warm 전이 조건',
+          at: 'ism-policy-states.json L10–13',
+          caption: 'min_index_age 가 3d를 넘으면 ISM 백그라운드 잡이 인덱스를 warm 으로 넘긴다.',
+          changes: [
+            {mark:'new',     text:'transition: warm / min_index_age 3d'},
+            {mark:'changed', text:'상태 hot → warm'},
+          ],
+        },
         phase: 'warm',
         age: '3일',
         size: '30 GB',
         docs: '7,200만',
         cost: '중간',
         tone: 'good',
+        verdict: 'warm 전이',
+        keyPoint: '전이 평가는 즉시가 아니라 주기적(기본 30~48분 간격)이다. 조건 충족과 실제 전이 사이에 시차가 있다.',
+        code: {...CODE.states, highlight: [10, 11, 12, 13]},
+      },
+      { ...S2,
+        beat: {
+          label: 'warm → cold 는 7일',
+          at: 'ism-policy-states.json L14–15',
+          caption: '같은 방식으로 warm 상태에도 다음 목적지와 조건을 붙인다. 조건은 인덱스 생성 시각 기준 누적 나이다.',
+          changes: [
+            {mark:'new',     text:'transition: cold / min_index_age 7d'},
+            {mark:'changed', text:'상태 warm → cold'},
+          ],
+        },
+        phase: 'cold',
+        age: '7일',
+        size: '30 GB',
+        docs: '7,200만',
+        cost: '낮음',
+        tone: 'good',
+        verdict: 'cold 전이',
+        keyPoint: 'min_index_age 는 "이전 상태에 머문 시간"이 아니라 인덱스 생성 후 총 경과 시간이다. 조건 값이 누적으로 커져야 한다.',
+        code: {...CODE.states, highlight: [14, 15]},
+      },
+      { ...S2,
+        beat: {
+          label: 'delete 는 종착 상태',
+          at: 'ism-policy-states.json L16–18',
+          caption: 'cold 는 30일에서 delete 로 넘어가고, delete 에는 transitions 가 없다 — 여기서 생애주기가 끝난다.',
+          changes: [
+            {mark:'new',  text:'transition: delete / min_index_age 30d'},
+            {mark:'gone', text:'delete 이후 전이 없음'},
+          ],
+        },
+        phase: 'delete',
+        age: '30일',
+        size: '30 GB (회수 예정)',
+        docs: '7,200만',
+        cost: '없음',
+        tone: 'warn',
         verdict: '상태 정의',
         keyPoint: 'default_state가 시작점이다. 상태는 반드시 어딘가로 이어져야 하고, 마지막 상태(delete)만 transition이 없다.',
-        code: {
-          lang: 'json',
-          filename: 'ism-policy-states.json',
-          lines: [
-            '// PUT _plugins/_ism/policies/logs_lifecycle',
-            '{',
-            '  "policy": {',
-            '    "description": "로그 인덱스 hot-warm-cold 생애주기",',
-            '    "default_state": "hot",',
-            '    "states": [',
-            '      {',
-            '        "name": "hot",',
-            '        "actions": [],',
-            '        "transitions": [',
-            '          { "state_name": "warm", "conditions": { "min_index_age": "3d" } }',
-            '        ]',
-            '      },',
-            '      { "name": "warm", "transitions": [',
-            '          { "state_name": "cold", "conditions": { "min_index_age": "7d" } } ] },',
-            '      { "name": "cold", "transitions": [',
-            '          { "state_name": "delete", "conditions": { "min_index_age": "30d" } } ] },',
-            '      { "name": "delete", "actions": [] }',
-            '    ]',
-            '  }',
-            '}'
-          ],
-          highlight: [5, 6, 8, 10, 11, 14, 15, 16, 17, 18]
-        }
+        code: {...CODE.states, highlight: [16, 17, 18]},
       },
-      {
-        title: 'Step 3. rollover — 하나의 alias 뒤에서 새 인덱스로 갈아탄다',
-        desc: 'hot 상태의 인덱스가 무한히 커지면 안 되므로, 일정 크기·나이·문서 수에 도달하면 rollover로 새 인덱스를 만들고 쓰기를 그쪽으로 넘긴다. 애플리케이션은 항상 logs 라는 alias 하나에만 쓰기 때문에 인덱스가 바뀌어도 코드는 그대로다. rollover는 alias 설정이 전제 — is_write_index=true인 쓰기 대상 인덱스가 alias에 붙어 있어야 하고, 인덱스 이름은 logs-000001 처럼 숫자 패턴이어야 자동 증가한다.',
+
+      // ── Step 3 ────────────────────────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: 'hot 에 rollover 액션을 건다',
+          at: 'ism-rollover.json L3–6',
+          caption: 'hot 상태의 actions 안에 rollover 를 넣으면, 조건을 만족한 순간 새 인덱스를 만들고 쓰기를 옮긴다.',
+          changes: [
+            {mark:'new',  text:'hot.actions 에 rollover 추가'},
+            {mark:'read', text:'대상은 alias 의 write index'},
+          ],
+        },
+        phase: 'hot',
+        age: '0일',
+        size: '10 GB',
+        docs: '2,400만',
+        cost: '최고 (SSD)',
+        tone: 'good',
+        verdict: 'rollover 준비',
+        keyPoint: 'rollover 는 전이(transition)가 아니라 액션이다. 상태를 바꾸지 않고 "쓰는 인덱스"만 갈아 끼운다.',
+        code: {...CODE.rollover, highlight: [3, 4, 5, 6]},
+      },
+      { ...S3,
+        beat: {
+          label: '세 조건 중 하나만 넘으면 실행',
+          at: 'ism-rollover.json L7–9',
+          caption: 'min_size 50gb, min_index_age 1d, min_doc_count 1억 중 먼저 도달한 조건에서 롤오버가 일어난다.',
+          changes: [
+            {mark:'changed', text:'크기 10 GB → 50 GB 도달'},
+            {mark:'changed', text:'문서 수 1억 도달'},
+          ],
+        },
+        phase: 'hot',
+        age: '1일',
+        size: '50 GB (임계)',
+        docs: '1억 도달',
+        cost: '최고 (SSD)',
+        tone: 'warn',
+        verdict: '조건 충족',
+        keyPoint: '조건은 AND 가 아니라 OR 다. 크기 조건만 믿고 있으면 문서 수 조건에서 먼저 롤오버가 일어날 수 있다.',
+        code: {...CODE.rollover, highlight: [7, 8, 9]},
+      },
+      { ...S3,
+        beat: {
+          label: '롤오버해도 전이는 그대로',
+          at: 'ism-rollover.json L13–15',
+          caption: '새로 생긴 인덱스는 다시 hot 에서 출발하고, 3일이 지나면 원래대로 warm 으로 넘어간다.',
+          changes: [
+            {mark:'new',     text:'새 인덱스 logs-000002 (hot)'},
+            {mark:'changed', text:'이전 인덱스는 3일 후 warm'},
+          ],
+        },
+        phase: 'warm',
+        age: '3일',
+        size: '50 GB (고정)',
+        docs: '1억 (고정)',
+        cost: '중간',
+        tone: 'good',
+        verdict: 'warm 전이',
+        keyPoint: '롤오버된 옛 인덱스는 더 이상 커지지 않는다. 크기가 고정되므로 force_merge 같은 후처리를 안전하게 걸 수 있다.',
+        code: {...CODE.rollover, highlight: [13, 14, 15]},
+      },
+      { ...S3,
+        beat: {
+          label: 'alias 가 전제 조건이다',
+          at: 'ism-rollover.json L18–20',
+          caption: '인덱스 템플릿에 rollover_alias 를 넣고, 최초 인덱스를 logs-000001 + is_write_index=true 로 만들어 둬야 한다.',
+          changes: [
+            {mark:'new',  text:'index...rollover_alias = "logs"'},
+            {mark:'new',  text:'logs-000001 이 write index'},
+            {mark:'gone', text:'alias 없으면 rollover 무음 실패'},
+          ],
+        },
         phase: 'hot',
         age: '롤오버',
         size: '50 GB → 새 인덱스',
@@ -372,37 +684,60 @@
         tone: 'warn',
         verdict: 'alias 전환',
         keyPoint: 'rollover_alias 미설정은 ISM 함정 1위. alias가 없으면 rollover 액션이 조용히 실패하고 인덱스만 계속 커진다.',
-        code: {
-          lang: 'json',
-          filename: 'ism-rollover.json',
-          lines: [
-            '// rollover 조건을 hot 상태의 action으로 넣는다',
-            '{',
-            '  "name": "hot",',
-            '  "actions": [',
-            '    {',
-            '      "rollover": {',
-            '        "min_size": "50gb",',
-            '        "min_index_age": "1d",',
-            '        "min_doc_count": 100000000',
-            '      }',
-            '    }',
-            '  ],',
-            '  "transitions": [',
-            '    { "state_name": "warm", "conditions": { "min_index_age": "3d" } }',
-            '  ]',
-            '}',
-            '',
-            '// 인덱스 템플릿에 rollover_alias 지정 (필수 전제)',
-            '// "index.plugins.index_state_management.rollover_alias": "logs"',
-            '// 최초 인덱스: PUT logs-000001  { aliases: { logs: { is_write_index: true } } }'
-          ],
-          highlight: [6, 7, 8, 9, 18, 19, 20]
-        }
+        code: {...CODE.rollover, highlight: [18, 19, 20]},
       },
-      {
-        title: 'Step 4. 상태별 action — 각 단계에서 리소스를 최적화한다',
-        desc: '상태를 나누는 이유는 각 단계에서 리소스 사용을 줄이기 위해서다. warm으로 넘어가면 더 이상 쓰지 않으므로 force_merge로 세그먼트를 하나로 합쳐 검색 속도를 높이고 디스크를 아낀다. cold에서는 복제본(replica)을 0으로 줄여 저장 비용을 절반으로 낮추고, read_only로 잠가 실수 쓰기를 막는다. delete 상태의 delete 액션이 인덱스를 완전히 제거해 디스크를 회수한다. 각 액션은 그 상태의 성격에 맞게 골라야 한다.',
+
+      // ── Step 4 ────────────────────────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: 'warm — 세그먼트를 하나로 합친다',
+          at: 'ism-state-actions.json L2–4',
+          caption: '더 이상 쓰지 않는 인덱스라 force_merge 로 세그먼트를 1개로 줄이고, 복제본은 1로 유지해 가용성을 지킨다.',
+          changes: [
+            {mark:'changed', text:'세그먼트 다수 → 1개'},
+            {mark:'changed', text:'크기 30 GB → 22 GB'},
+          ],
+        },
+        phase: 'warm',
+        age: '3~7일',
+        size: '22 GB (병합)',
+        docs: '읽기 위주',
+        cost: '중간',
+        tone: 'good',
+        verdict: '세그먼트 병합',
+        keyPoint: 'force_merge 는 쓰기가 끝난 인덱스에만 건다. 계속 색인되는 인덱스에 걸면 병합이 곧바로 무의미해진다.',
+        code: {...CODE.actions, highlight: [2, 3, 4]},
+      },
+      { ...S4,
+        beat: {
+          label: 'warm → cold 전이 조건',
+          at: 'ism-state-actions.json L5–6',
+          caption: '액션이 모두 끝난 뒤에 transitions 가 평가된다. 7일이 지나면 cold 로 넘어간다.',
+          changes: [
+            {mark:'read',    text:'transitions: cold / 7d'},
+            {mark:'changed', text:'상태 warm → cold'},
+          ],
+        },
+        phase: 'cold',
+        age: '7일',
+        size: '22 GB',
+        docs: '읽기 위주',
+        cost: '중간',
+        tone: 'good',
+        verdict: 'cold 전이',
+        keyPoint: '한 상태의 액션이 실패하면 전이도 멈춘다. 인덱스는 그 상태에 갇힌 채 재시도만 반복한다.',
+        code: {...CODE.actions, highlight: [5, 6]},
+      },
+      { ...S4,
+        beat: {
+          label: 'cold — 복제본 0 + 읽기 전용',
+          at: 'ism-state-actions.json L8–10',
+          caption: 'replica_count 0 으로 사본을 없애 저장 비용을 절반으로 낮추고, read_only 로 실수 쓰기를 막는다.',
+          changes: [
+            {mark:'changed', text:'replica 1 → 0 (용량 절반)'},
+            {mark:'gone',    text:'쓰기 차단 (read_only)'},
+          ],
+        },
         phase: 'cold',
         age: '7~30일',
         size: '15 GB (압축)',
@@ -411,33 +746,100 @@
         tone: 'good',
         verdict: '리소스 절감',
         keyPoint: 'force_merge는 CPU·I/O를 크게 쓴다. 트래픽 피크 시간대에 warm 전이가 몰리면 클러스터가 느려지니 전이 시각을 분산하라.',
-        code: {
-          lang: 'json',
-          filename: 'ism-state-actions.json',
-          lines: [
-            '// 각 상태에 목적에 맞는 action을 배치',
-            '{ "name": "warm", "actions": [',
-            '    { "force_merge": { "max_num_segments": 1 } },',
-            '    { "replica_count": { "number_of_replicas": 1 } }',
-            '  ], "transitions": [ { "state_name": "cold",',
-            '    "conditions": { "min_index_age": "7d" } } ] }',
-            ',',
-            '{ "name": "cold", "actions": [',
-            '    { "replica_count": { "number_of_replicas": 0 } },',
-            '    { "read_only": {} }',
-            '  ], "transitions": [ { "state_name": "delete",',
-            '    "conditions": { "min_index_age": "30d" } } ] }',
-            ',',
-            '{ "name": "delete", "actions": [',
-            '    { "delete": {} }',
-            '  ] }'
-          ],
-          highlight: [3, 4, 9, 10, 14, 15]
-        }
+        code: {...CODE.actions, highlight: [8, 9, 10]},
       },
-      {
-        title: 'Step 5. hot-warm 아키텍처와 실무 함정',
-        desc: 'hot 노드는 SSD·고사양으로 최신 데이터의 색인·검색을 받고, warm/cold 노드는 HDD·저사양으로 오래된 데이터를 값싸게 보관한다. ISM은 node attribute(box_type)와 allocation 액션으로 인덱스를 hot 노드에서 warm 노드로 물리적으로 이동시킨다. 실무 함정은 네 가지 — 정책 미적용으로 무한 증가, rollover_alias 누락, 전이 조건 단위 오류(3d를 3으로), 그리고 삭제 조건을 너무 짧게 잡아 필요한 로그가 사라지는 사고다. explain API로 각 인덱스의 현재 상태를 반드시 모니터링하라.',
+      { ...S4,
+        beat: {
+          label: 'delete — 인덱스를 지운다',
+          at: 'ism-state-actions.json L11–12, L14–16',
+          caption: '30일이 지나면 delete 상태로 넘어가고, delete 액션이 인덱스를 제거해 디스크를 실제로 회수한다.',
+          changes: [
+            {mark:'read', text:'transitions: delete / 30d'},
+            {mark:'gone', text:'인덱스 삭제, 15 GB 회수'},
+          ],
+        },
+        phase: 'delete',
+        age: '30일+',
+        size: '0 (회수)',
+        docs: '삭제됨',
+        cost: '없음',
+        tone: 'danger',
+        verdict: '디스크 회수',
+        keyPoint: 'replica 0 인 cold 인덱스는 노드 한 대만 잃어도 복구할 수 없다. 지워도 되는 데이터에만 쓴다.',
+        code: {...CODE.actions, highlight: [11, 12, 14, 15, 16]},
+      },
+
+      // ── Step 5 ────────────────────────────────────────────────────────
+      { ...S5,
+        beat: {
+          label: 'allocation 으로 warm 노드에 옮긴다',
+          at: 'ism-hot-warm-pitfalls.json L2–5',
+          caption: 'box_type=warm 인 노드로만 샤드를 배치하게 해, 오래된 데이터를 값싼 HDD 노드로 물리 이동시킨다.',
+          changes: [
+            {mark:'changed', text:'샤드 위치 hot 노드 → warm 노드'},
+            {mark:'changed', text:'저장 매체 SSD → HDD'},
+          ],
+        },
+        phase: 'warm',
+        age: '3~7일',
+        size: '22 GB',
+        docs: '읽기 위주',
+        cost: '중간 (HDD)',
+        tone: 'good',
+        verdict: '노드 이동',
+        keyPoint: 'allocation 은 노드에 box_type attribute 가 미리 설정돼 있어야 동작한다. 없으면 샤드가 배치 불가 상태로 남는다.',
+        code: {...CODE.pitfalls, highlight: [2, 3, 4, 5]},
+      },
+      { ...S5,
+        beat: {
+          label: '함정 1·2 — 미적용과 alias 누락',
+          at: 'ism-hot-warm-pitfalls.json L9–10',
+          caption: '정책을 만들어 놓고 인덱스에 붙이지 않으면 아무 일도 안 일어나고, rollover_alias 가 없으면 롤오버가 조용히 실패한다.',
+          changes: [
+            {mark:'gone', text:'정책 미적용 → 자동화 0'},
+            {mark:'gone', text:'alias 누락 → rollover 무음 실패'},
+          ],
+        },
+        phase: 'cold',
+        age: '7일+',
+        size: '15 GB',
+        docs: '읽기 전용',
+        cost: '낮음',
+        tone: 'warn',
+        verdict: '함정 1·2',
+        keyPoint: '두 함정 모두 에러 메시지가 뜨지 않는다. 증상은 "그냥 아무 일도 안 일어남" 이라 늦게 발견된다.',
+        code: {...CODE.pitfalls, highlight: [9, 10]},
+      },
+      { ...S5,
+        beat: {
+          label: '함정 3·4 — 단위 오류와 과소 보관',
+          at: 'ism-hot-warm-pitfalls.json L11–12',
+          caption: "'3d' 를 3 으로 쓰면 파싱이 실패해 전이가 멈추고, delete 조건을 너무 짧게 잡으면 필요한 로그가 사라진다.",
+          changes: [
+            {mark:'gone', text:'조건 파싱 실패 → 전이 정지'},
+            {mark:'gone', text:'보관 기간 과소 → 로그 유실'},
+          ],
+        },
+        phase: 'cold',
+        age: '조건 오류',
+        size: '유실 위험',
+        docs: '복구 불가',
+        cost: '낮음',
+        tone: 'danger',
+        verdict: '함정 3·4',
+        keyPoint: '삭제는 되돌릴 수 없다. 보관 기간은 법·감사 요건을 확인한 뒤 넉넉하게 잡고 나중에 줄이는 편이 안전하다.',
+        code: {...CODE.pitfalls, highlight: [11, 12]},
+      },
+      { ...S5,
+        beat: {
+          label: 'explain 으로 상태를 관측한다',
+          at: 'ism-hot-warm-pitfalls.json L13',
+          caption: 'GET _plugins/_ism/explain/logs-* 이 인덱스별 현재 state 와 실패 원인을 그대로 돌려준다.',
+          changes: [
+            {mark:'read', text:'인덱스별 현재 state 확인'},
+            {mark:'read', text:'실패한 액션과 사유 확인'},
+          ],
+        },
         phase: 'delete',
         age: '30일+',
         size: '0 (회수)',
@@ -446,28 +848,8 @@
         tone: 'danger',
         verdict: '생애 완료',
         keyPoint: 'GET _plugins/_ism/explain/logs-* 로 인덱스별 현재 state와 실패 이유를 확인한다. 정책은 붙이고 끝이 아니라 관측해야 한다.',
-        code: {
-          lang: 'json',
-          filename: 'ism-hot-warm-pitfalls.json',
-          lines: [
-            '// warm 노드로 물리 이동 (allocation 액션)',
-            '{ "name": "warm", "actions": [',
-            '    { "allocation": { "require": { "box_type": "warm" } } },',
-            '    { "force_merge": { "max_num_segments": 1 } }',
-            '  ] }',
-            '',
-            '// 실무 함정 체크리스트',
-            '{',
-            '  "pitfall_1": "정책 미적용 → 인덱스 무한 증가, 디스크 풀",',
-            '  "pitfall_2": "rollover_alias 누락 → rollover 조용히 실패",',
-            '  "pitfall_3": "조건 단위 오류: \'3d\' 대신 3 → 파싱 실패",',
-            '  "pitfall_4": "delete min_index_age 너무 짧음 → 로그 유실",',
-            '  "observe": "GET _plugins/_ism/explain/logs-*"',
-            '}'
-          ],
-          highlight: [3, 9, 10, 11, 12, 13]
-        }
-      }
+        code: {...CODE.pitfalls, highlight: [13]},
+      },
     ];
 
     const TONE = {
@@ -492,6 +874,29 @@
             <h3 className="text-sm font-bold" style={{color:'#005EB8'}}>인덱스 생애주기</h3>
             <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
           </div>
+          {state.beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{state.beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {state.beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{state.beat.caption}</p>
+              {state.beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {state.beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
 
           <div className="flex items-stretch gap-1 mb-4">
             {PHASES.map((p, i) => {
@@ -590,7 +995,7 @@
           </div>
           <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
             <span>{code.lines.length} lines</span>
-            <span>Step {stepIdx + 1} / {total}</span>
+            <span>세부 {stepIdx + 1} / {total}</span>
           </div>
         </div>
       );

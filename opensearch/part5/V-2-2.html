@@ -268,9 +268,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
 
   <!--
     OpenSearch Chapter V-2-2 — Cross-Cluster Replication (CCR)
@@ -283,10 +287,209 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      setup: {lang:'bash', filename:'ccr-setup.sh', lines:[
+        '# follower 클러스터에서 실행 — leader를 원격 연결로 등록',
+        '# (leader 클러스터에 직접 명령하지 않는다: follower가 당겨온다)',
+        'curl -XPUT "https://follower:9200/_cluster/settings" \\',
+        '  -H "Content-Type: application/json" -u admin:pass -d \'{',
+        '  "persistent": {',
+        '    "cluster": {',
+        '      "remote": {',
+        '        "leader-dc": {',
+        '          "seeds": ["leader-node1:9300", "leader-node2:9300"]',
+        '        }',
+        '      }',
+        '    }',
+        '  }',
+        '}\'',
+      ]},
+      startFollow: {lang:'json', filename:'start-follow.json', lines:[
+        'POST follower:9200/_plugins/_replication/orders-follow/_start',
+        '{',
+        '  "leader_alias": "leader-dc",',
+        '  "leader_index": "orders",',
+        '  "use_roles": {',
+        '    "leader_cluster_role": "cross_cluster_replication_leader_full_access",',
+        '    "follower_cluster_role": "cross_cluster_replication_follower_full_access"',
+        '  }',
+        '}',
+        '',
+        '// 결과: orders-follow 인덱스가 읽기 전용으로 생성되고',
+        '// leader의 orders 변경을 계속 당겨온다(pull).',
+        '// 직접 색인 시도 → 403 cluster_block_exception (의도된 차단)',
+      ]},
+      autoFollow: {lang:'json', filename:'auto-follow.json', lines:[
+        'POST follower:9200/_plugins/_replication/_autofollow',
+        '{',
+        '  "leader_alias": "leader-dc",',
+        '  "name": "logs-dr-rule",',
+        '  "pattern": "logs-*",',
+        '  "use_roles": {',
+        '    "leader_cluster_role": "cross_cluster_replication_leader_full_access",',
+        '    "follower_cluster_role": "cross_cluster_replication_follower_full_access"',
+        '  }',
+        '}',
+        '',
+        '// leader에 logs-2026.08.12 가 새로 열리면',
+        '// follower가 자동으로 복제 시작 (사람 개입 0)',
+        '// 주의: 규칙 등록 이전의 logs-* 는 수동 _start 필요',
+      ]},
+      ccrVsCcs: {lang:'json', filename:'ccr-vs-ccs.json', lines:[
+        '// CCS — 복제 없이 원격 클러스터로 질의를 보낸다',
+        'GET local:9200/local-idx,leader-dc:orders/_search',
+        '{ "query": { "match": { "status": "PAID" } } }',
+        '// leader-dc 가 죽으면 orders 결과는 빠진다(사본 없음)',
+        '',
+        '// CCR — 데이터를 follower에 실제로 복사해 둔다',
+        'GET follower:9200/orders-follow/_search',
+        '{ "query": { "match": { "status": "PAID" } } }',
+        '// leader 가 죽어도 orders-follow 는 로컬에 그대로 존재',
+        '',
+        '// 정리: 저장 절약·항상 최신 → CCS',
+        '//       장애 대비·지역 사본 → CCR',
+      ]},
+      failover: {lang:'bash', filename:'failover.sh', lines:[
+        '# leader 지역 장애 감지 → follower 승격 절차',
+        '# 1) 복제 중단 = 읽기 전용 해제(쓰기 가능해짐) = 승격',
+        'curl -XPOST "https://follower:9200/_plugins/_replication/orders-follow/_stop" \\',
+        '  -H "Content-Type: application/json" -u admin:pass -d \'{}\'',
+        '',
+        '# 2) 앱 트래픽을 follower 엔드포인트로 전환',
+        '#    (DNS / 로드밸런서 스위치)',
+        '',
+        '# 3) 주의 — 승격 시점 기준 lag 만큼 최신 데이터 유실 가능',
+        '#    비동기 복제라 RPO=0 아님. 결제 등은 별도 재처리 큐 검토',
+        '',
+        '# 4) 원래 leader 복귀 시: split-brain 방지 위해',
+        '#    방향을 뒤집어(old-follower→old-leader) 재복제 후 재동기화',
+      ]},
+      checklist: {lang:'bash', filename:'dr-checklist.sh', lines:[
+        '# CCR 운영 종합 점검 — 스냅샷/ISM/보안과 함께',
+        '',
+        '# (1) 복제 상태·지연 확인',
+        'curl "https://follower:9200/_plugins/_replication/orders-follow/_status?pretty" \\',
+        '  -u admin:pass   # syncing / bootstrapping / lag 확인',
+        '',
+        '# (2) 버전 호환 — follower 버전 >= leader 버전 권장',
+        'curl "https://follower:9200" -u admin:pass | grep number',
+        '',
+        '# (3) 스냅샷은 별도로 병행 (시점 복구용, CCR과 상호 보완)',
+        '#     스냅샷=느린 시점 복구 / CCR=빠른 hot standby',
+        '',
+        '# (4) 원격 연결 보안 — TLS + 최소 권한 role 로만 연결',
+        '#     대역폭 부족 시 lag 누적 → 알림 임계치 설정',
+        'echo "OpenSearch 운영편 완주 — DR 준비 완료"',
+      ]},
+    };
+
+    const S1 = {
+      title: 'Step 1. CCR란 — follower가 leader를 pull 방식으로 베낀다',
+      desc: 'Cross-Cluster Replication은 한 클러스터(leader)의 인덱스 변경을 다른 클러스터(follower)로 실시간 복제하는 기능이다. leader가 밀어주는(push) 게 아니라 follower가 leader의 translog를 주기적으로 당겨오는(pull) 구조라, follower 쪽에서 연결·속도를 통제할 수 있다. 그래서 지역이 다르고 네트워크가 불안정해도 follower가 자기 페이스로 따라잡는다. follower 인덱스는 읽기 전용이며 leader의 색인 순서를 그대로 재현한다.',
+    };
+    const S2 = {
+      title: 'Step 2. follower 인덱스 생성 — 읽기 전용으로 leader를 따라간다',
+      desc: 'follower 클러스터에서 _plugins/_replication/{index}/_start를 호출하면 leader의 지정 인덱스를 복제하기 시작한다. 이때 follower 인덱스는 자동으로 읽기 전용이 된다 — 직접 색인(write)하면 복제 순서가 깨지므로 API가 막는다. 조회 트래픽은 follower가 받아 leader의 부하를 덜고, 지역 사용자에게는 가까운 follower가 낮은 지연으로 응답한다. 초기에는 leader의 기존 데이터를 통째로 복사(remote recovery)한 뒤, 이후 변경분만 따라잡는다.',
+    };
+    const S3 = {
+      title: 'Step 3. auto-follow — 새 인덱스를 패턴으로 자동 복제',
+      desc: '운영 중에는 logs-2026.08.11 처럼 날짜별 인덱스가 계속 생긴다. 하나씩 _start를 부르면 반드시 누락이 생긴다. auto-follow 규칙에 인덱스 패턴(logs-*)을 등록해두면, leader에 패턴과 일치하는 새 인덱스가 생기는 순간 follower가 자동으로 복제를 시작한다. ISM 롤오버로 새 인덱스가 열릴 때마다 사람이 개입하지 않아도 DR 커버리지가 유지된다. 단, 이미 존재하던 인덱스에는 소급 적용되지 않으니 규칙 등록 시점의 인덱스는 수동으로 붙여야 한다.',
+    };
+    const S4 = {
+      title: 'Step 4. CCR vs Cross-Cluster Search — 복제냐 원격 질의냐',
+      desc: 'CCR과 헷갈리기 쉬운 게 Cross-Cluster Search(CCS)다. CCS는 데이터를 복제하지 않고, 질의 시점에 원격 클러스터로 검색을 보내 결과를 합친다 — 저장 공간은 아끼지만 원격 클러스터가 죽으면 그 데이터는 못 본다. CCR은 데이터를 실제로 복사해 두므로 leader가 죽어도 follower가 데이터를 그대로 갖고 있다. 즉 "빠른 조회·저장 절약·항상 최신 원본 하나"면 CCS, "재해 복구·지역별 로컬 사본·leader 장애 대비"면 CCR이다. 둘을 섞어 쓰기도 한다.',
+    };
+    const S5 = {
+      title: 'Step 5. 페일오버 — leader 장애 시 follower 승격',
+      desc: 'leader 클러스터(또는 지역 전체)가 죽으면 DR 계획이 발동한다. follower에서 _stop으로 복제를 끊으면 그 인덱스는 읽기 전용이 풀려 쓰기 가능한 정상 인덱스가 된다 — 이것이 승격(promotion)이다. 애플리케이션의 엔드포인트를 follower로 전환하면 서비스가 이어진다. 핵심 함정: 승격 시점까지 복제 지연(lag)만큼의 최신 데이터는 유실될 수 있다(비동기 복제라 RPO=0이 아니다). 또 원래 leader가 살아나면 데이터가 갈라지므로, 방향을 뒤집어 재복제(reverse replication)하는 절차를 미리 정해둬야 한다.',
+    };
+    const S6 = {
+      title: 'Step 6. 운영 종합 — 스냅샷·ISM·클러스터와 함께 쓰는 DR',
+      desc: 'CCR은 단독 기능이 아니라 앞서 배운 운영 요소와 맞물린다. 스냅샷(S3)은 시점 백업이라 복구에 시간이 걸리는 반면, CCR은 항상 준비된 뜨거운 사본(hot standby)이라 페일오버가 빠르다 — 둘은 대체가 아니라 상호 보완이다. ISM 롤오버로 만들어지는 시계열 인덱스는 auto-follow로 커버하고, 실무 함정으로 (1) leader와 follower의 버전 호환(follower ≥ leader 권장), (2) 대역폭·지연에 따른 lag 누적, (3) 원격 연결 보안(TLS·전용 role), (4) follower 승격 후 되돌리기 절차를 반드시 사전 점검한다. 이로써 OpenSearch 운영편을 완주한다.',
+    };
+
     const STEPS = [
-      {
-        title: 'Step 1. CCR란 — follower가 leader를 pull 방식으로 베낀다',
-        desc: 'Cross-Cluster Replication은 한 클러스터(leader)의 인덱스 변경을 다른 클러스터(follower)로 실시간 복제하는 기능이다. leader가 밀어주는(push) 게 아니라 follower가 leader의 translog를 주기적으로 당겨오는(pull) 구조라, follower 쪽에서 연결·속도를 통제할 수 있다. 그래서 지역이 다르고 네트워크가 불안정해도 follower가 자기 페이스로 따라잡는다. follower 인덱스는 읽기 전용이며 leader의 색인 순서를 그대로 재현한다.',
+      // ── Step 1 ────────────────────────────────────────────────────────
+      { ...S1,
+        beat: {
+          label: '명령은 follower 쪽에서 친다',
+          at: 'ccr-setup.sh L1–2',
+          caption: 'leader 는 자기가 복제되는 줄 모른다. 연결을 맺고 당겨오는 주체는 언제나 follower 쪽이다.',
+          changes: [
+            {mark:'read', text:'실행 위치 = follower 클러스터'},
+            {mark:'gone', text:'leader 에 거는 명령 없음'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '미연결',
+        mode: 'setup',
+        verdictTone: 'warn',
+        verdict: '연결 전',
+        keyPoint: 'push 가 아니라 pull 이라 방향을 헷갈리면 안 된다. 설정도 복제도 전부 follower 가 시작한다.',
+        code: {...CODE.setup, highlight: [1, 2]},
+      },
+      { ...S1,
+        beat: {
+          label: 'follower 클러스터 설정에 쓴다',
+          at: 'ccr-setup.sh L3–5',
+          caption: '_cluster/settings 의 persistent 영역에 넣어야 노드를 재시작해도 원격 연결이 유지된다.',
+          changes: [
+            {mark:'new',  text:'PUT _cluster/settings 요청'},
+            {mark:'read', text:'persistent (재시작 후에도 유지)'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '미연결',
+        mode: 'setup',
+        verdictTone: 'warn',
+        verdict: '설정 요청',
+        keyPoint: 'transient 에 넣으면 재시작 때 사라져 복제가 조용히 끊긴다. 원격 연결은 반드시 persistent 로 둔다.',
+        code: {...CODE.setup, highlight: [3, 4, 5]},
+      },
+      { ...S1,
+        beat: {
+          label: 'cluster.remote 아래에 등록',
+          at: 'ccr-setup.sh L6–7',
+          caption: '원격 클러스터 목록은 cluster.remote 네임스페이스에 모인다. 여기에 여러 지역을 나란히 둘 수 있다.',
+          changes: [
+            {mark:'new',  text:'cluster.remote 네임스페이스'},
+            {mark:'read', text:'원격 클러스터 다중 등록 가능'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '연결 중',
+        mode: 'remote 등록',
+        verdictTone: 'warn',
+        verdict: 'remote 준비',
+        keyPoint: '원격 클러스터는 이름표를 붙여 여러 개 등록한다. CCR 도 CCS 도 이 이름표를 그대로 재사용한다.',
+        code: {...CODE.setup, highlight: [6, 7]},
+      },
+      { ...S1,
+        beat: {
+          label: 'leader-dc 이름과 seeds 지정',
+          at: 'ccr-setup.sh L8–9',
+          caption: 'leader-dc 라는 별칭에 leader 노드들의 전송 포트(9300)를 seeds 로 넣으면 원격 연결이 성립한다.',
+          changes: [
+            {mark:'new',  text:'원격 별칭 leader-dc 생성'},
+            {mark:'new',  text:'seeds = leader-node1/2:9300'},
+            {mark:'read', text:'복제 경로 열림'},
+          ],
+        },
         leaderState: 'active',
         followerState: 'syncing',
         promoted: false,
@@ -295,31 +498,81 @@
         verdictTone: 'good',
         verdict: '복제 중',
         keyPoint: 'pull 방식이라 follower가 네트워크 상황에 맞춰 스스로 따라잡는다. leader는 follower를 신경 쓰지 않는다.',
-        code: {
-          lang: 'bash',
-          filename: 'ccr-setup.sh',
-          lines: [
-            '# follower 클러스터에서 실행 — leader를 원격 연결로 등록',
-            '# (leader 클러스터에 직접 명령하지 않는다: follower가 당겨온다)',
-            'curl -XPUT "https://follower:9200/_cluster/settings" \\',
-            '  -H "Content-Type: application/json" -u admin:pass -d \'{',
-            '  "persistent": {',
-            '    "cluster": {',
-            '      "remote": {',
-            '        "leader-dc": {',
-            '          "seeds": ["leader-node1:9300", "leader-node2:9300"]',
-            '        }',
-            '      }',
-            '    }',
-            '  }',
-            '}\'',
-          ],
-          highlight: [1, 2, 6, 7, 8, 9],
-        },
+        code: {...CODE.setup, highlight: [8, 9]},
       },
-      {
-        title: 'Step 2. follower 인덱스 생성 — 읽기 전용으로 leader를 따라간다',
-        desc: 'follower 클러스터에서 _plugins/_replication/{index}/_start를 호출하면 leader의 지정 인덱스를 복제하기 시작한다. 이때 follower 인덱스는 자동으로 읽기 전용이 된다 — 직접 색인(write)하면 복제 순서가 깨지므로 API가 막는다. 조회 트래픽은 follower가 받아 leader의 부하를 덜고, 지역 사용자에게는 가까운 follower가 낮은 지연으로 응답한다. 초기에는 leader의 기존 데이터를 통째로 복사(remote recovery)한 뒤, 이후 변경분만 따라잡는다.',
+
+      // ── Step 2 ────────────────────────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: '_start 로 복제를 시작한다',
+          at: 'start-follow.json L1–2',
+          caption: 'follower 에 만들 인덱스 이름(orders-follow)을 URL 에 넣어 복제 시작을 요청한다.',
+          changes: [
+            {mark:'new',  text:'orders-follow 인덱스 생성'},
+            {mark:'read', text:'초기 전량 복사(remote recovery) 시작'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '초기 복사',
+        mode: 'bootstrapping',
+        verdictTone: 'warn',
+        verdict: '복제 시작',
+        keyPoint: '처음에는 lag 이 크게 잡힌다. 변경분이 아니라 leader 의 기존 데이터를 통째로 옮기는 구간이기 때문이다.',
+        code: {...CODE.startFollow, highlight: [1, 2]},
+      },
+      { ...S2,
+        beat: {
+          label: '어느 클러스터의 어느 인덱스인가',
+          at: 'start-follow.json L3–4',
+          caption: 'leader_alias 는 Step 1 에서 등록한 원격 이름표, leader_index 는 그쪽에서 베낄 인덱스다.',
+          changes: [
+            {mark:'read',    text:'leader_alias = leader-dc (Step 1 의 이름)'},
+            {mark:'read',    text:'leader_index = orders'},
+            {mark:'changed', text:'복사 대상 확정'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: 'remote recovery',
+        mode: 'bootstrapping',
+        verdictTone: 'warn',
+        verdict: '대상 지정',
+        keyPoint: 'leader 인덱스명과 follower 인덱스명은 달라도 된다. 같게 맞추면 운영 혼란이 줄어든다.',
+        code: {...CODE.startFollow, highlight: [3, 4]},
+      },
+      { ...S2,
+        beat: {
+          label: '양쪽 role 을 명시한다',
+          at: 'start-follow.json L5–9',
+          caption: 'leader 쪽에서 읽을 권한과 follower 쪽에서 쓸 권한을 각각 지정해야 복제 잡이 인증을 통과한다.',
+          changes: [
+            {mark:'new',  text:'leader_cluster_role 지정'},
+            {mark:'new',  text:'follower_cluster_role 지정'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '초기 복사 중',
+        mode: 'bootstrapping',
+        verdictTone: 'warn',
+        verdict: '권한 지정',
+        keyPoint: 'role 이 빠지면 연결은 되는데 복제만 실패한다. 보안 플러그인이 켜진 클러스터에서는 필수 항목이다.',
+        code: {...CODE.startFollow, highlight: [5, 6, 7, 8, 9]},
+      },
+      { ...S2,
+        beat: {
+          label: '결과 — 읽기 전용 사본',
+          at: 'start-follow.json L11–13',
+          caption: 'orders-follow 는 읽기 전용으로 열리고, 직접 색인하면 403 cluster_block_exception 이 돌아온다.',
+          changes: [
+            {mark:'new',  text:'orders-follow 읽기 전용 생성'},
+            {mark:'gone', text:'follower 직접 쓰기 → 403'},
+          ],
+        },
         leaderState: 'active',
         followerState: 'syncing',
         promoted: false,
@@ -328,30 +581,60 @@
         verdictTone: 'good',
         verdict: '읽기 전용',
         keyPoint: 'follower에 쓰기가 막히는 건 버그가 아니라 안전장치다. 읽기 부하 분산·지역 지연 감소가 핵심 이득.',
-        code: {
-          lang: 'json',
-          filename: 'start-follow.json',
-          lines: [
-            'POST follower:9200/_plugins/_replication/orders-follow/_start',
-            '{',
-            '  "leader_alias": "leader-dc",',
-            '  "leader_index": "orders",',
-            '  "use_roles": {',
-            '    "leader_cluster_role": "cross_cluster_replication_leader_full_access",',
-            '    "follower_cluster_role": "cross_cluster_replication_follower_full_access"',
-            '  }',
-            '}',
-            '',
-            '// 결과: orders-follow 인덱스가 읽기 전용으로 생성되고',
-            '// leader의 orders 변경을 계속 당겨온다(pull).',
-            '// 직접 색인 시도 → 403 cluster_block_exception (의도된 차단)',
-          ],
-          highlight: [1, 3, 4, 11, 12, 13],
-        },
+        code: {...CODE.startFollow, highlight: [11, 12, 13]},
       },
-      {
-        title: 'Step 3. auto-follow — 새 인덱스를 패턴으로 자동 복제',
-        desc: '운영 중에는 logs-2026.08.11 처럼 날짜별 인덱스가 계속 생긴다. 하나씩 _start를 부르면 반드시 누락이 생긴다. auto-follow 규칙에 인덱스 패턴(logs-*)을 등록해두면, leader에 패턴과 일치하는 새 인덱스가 생기는 순간 follower가 자동으로 복제를 시작한다. ISM 롤오버로 새 인덱스가 열릴 때마다 사람이 개입하지 않아도 DR 커버리지가 유지된다. 단, 이미 존재하던 인덱스에는 소급 적용되지 않으니 규칙 등록 시점의 인덱스는 수동으로 붙여야 한다.',
+
+      // ── Step 3 ────────────────────────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: '_autofollow 규칙을 등록한다',
+          at: 'auto-follow.json L1–4',
+          caption: '인덱스 하나가 아니라 규칙을 등록한다. 규칙에는 이름을 붙여 나중에 조회·삭제할 수 있게 한다.',
+          changes: [
+            {mark:'new',  text:'규칙 logs-dr-rule 생성'},
+            {mark:'read', text:'leader_alias = leader-dc 재사용'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.8s',
+        mode: 'auto-follow',
+        verdictTone: 'good',
+        verdict: '규칙 등록',
+        keyPoint: '_start 는 인덱스 단위, _autofollow 는 규칙 단위다. 운영에서는 규칙 개수만 관리하면 된다.',
+        code: {...CODE.autoFollow, highlight: [1, 2, 3, 4]},
+      },
+      { ...S3,
+        beat: {
+          label: '패턴이 복제 범위를 정한다',
+          at: 'auto-follow.json L5',
+          caption: 'logs-* 에 맞는 인덱스가 leader 에 생기면 전부 복제 대상이 된다. 범위를 넓힐수록 대역폭도 같이 는다.',
+          changes: [
+            {mark:'new',     text:'pattern = "logs-*"'},
+            {mark:'changed', text:'복제 범위: 인덱스 1개 → 패턴 전체'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.8s',
+        mode: 'auto-follow',
+        verdictTone: 'warn',
+        verdict: '패턴 지정',
+        keyPoint: '패턴을 * 로 넓게 잡으면 복제할 필요 없는 인덱스까지 끌어와 대역폭과 디스크를 태운다.',
+        code: {...CODE.autoFollow, highlight: [5]},
+      },
+      { ...S3,
+        beat: {
+          label: '새 인덱스가 열리면 자동 복제',
+          at: 'auto-follow.json L12–13',
+          caption: 'ISM 롤오버로 logs-2026.08.12 가 열리는 순간 follower 가 스스로 복제를 시작한다. 사람 개입이 0 이다.',
+          changes: [
+            {mark:'new',  text:'logs-2026.08.12 자동 복제 시작'},
+            {mark:'gone', text:'수동 _start 호출 불필요'},
+          ],
+        },
         leaderState: 'active',
         followerState: 'syncing',
         promoted: false,
@@ -360,31 +643,120 @@
         verdictTone: 'good',
         verdict: 'auto-follow',
         keyPoint: '시계열·롤오버 인덱스는 auto-follow가 사실상 필수. 수동 _start는 반드시 누락 인덱스를 만든다.',
-        code: {
-          lang: 'json',
-          filename: 'auto-follow.json',
-          lines: [
-            'POST follower:9200/_plugins/_replication/_autofollow',
-            '{',
-            '  "leader_alias": "leader-dc",',
-            '  "name": "logs-dr-rule",',
-            '  "pattern": "logs-*",',
-            '  "use_roles": {',
-            '    "leader_cluster_role": "cross_cluster_replication_leader_full_access",',
-            '    "follower_cluster_role": "cross_cluster_replication_follower_full_access"',
-            '  }',
-            '}',
-            '',
-            '// leader에 logs-2026.08.12 가 새로 열리면',
-            '// follower가 자동으로 복제 시작 (사람 개입 0)',
-            '// 주의: 규칙 등록 이전의 logs-* 는 수동 _start 필요',
-          ],
-          highlight: [5, 12, 13, 14],
-        },
+        code: {...CODE.autoFollow, highlight: [12, 13]},
       },
-      {
-        title: 'Step 4. CCR vs Cross-Cluster Search — 복제냐 원격 질의냐',
-        desc: 'CCR과 헷갈리기 쉬운 게 Cross-Cluster Search(CCS)다. CCS는 데이터를 복제하지 않고, 질의 시점에 원격 클러스터로 검색을 보내 결과를 합친다 — 저장 공간은 아끼지만 원격 클러스터가 죽으면 그 데이터는 못 본다. CCR은 데이터를 실제로 복사해 두므로 leader가 죽어도 follower가 데이터를 그대로 갖고 있다. 즉 "빠른 조회·저장 절약·항상 최신 원본 하나"면 CCS, "재해 복구·지역별 로컬 사본·leader 장애 대비"면 CCR이다. 둘을 섞어 쓰기도 한다.',
+      { ...S3,
+        beat: {
+          label: '소급 적용은 되지 않는다',
+          at: 'auto-follow.json L14',
+          caption: '규칙 등록 이전부터 있던 logs-* 인덱스는 대상이 아니다. 그 인덱스들은 _start 로 하나씩 붙여야 한다.',
+          changes: [
+            {mark:'gone', text:'기존 logs-* 는 규칙 밖'},
+            {mark:'read', text:'과거분은 수동 _start 필요'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.8s (기존분 미복제)',
+        mode: 'auto-follow',
+        verdictTone: 'warn',
+        verdict: '소급 안 됨',
+        keyPoint: '규칙을 걸었다고 DR 커버리지가 완성된 게 아니다. 등록 시점의 기존 인덱스 목록을 한 번은 훑어야 한다.',
+        code: {...CODE.autoFollow, highlight: [14]},
+      },
+
+      // ── Step 4 ────────────────────────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: 'CCS — 원격으로 질의만 보낸다',
+          at: 'ccr-vs-ccs.json L1–3',
+          caption: '인덱스 목록에 leader-dc:orders 처럼 원격 이름표를 적으면, 질의 시점에 원격으로 검색을 보내 결과를 합친다.',
+          changes: [
+            {mark:'read', text:'local-idx + leader-dc:orders 동시 질의'},
+            {mark:'gone', text:'사본 저장 없음 (디스크 0)'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '해당 없음',
+        mode: 'CCS 질의',
+        verdictTone: 'good',
+        verdict: '원격 질의',
+        keyPoint: 'CCS 는 저장 공간을 전혀 쓰지 않는다. 대신 매 질의마다 네트워크 왕복 비용을 낸다.',
+        code: {...CODE.ccrVsCcs, highlight: [1, 2, 3]},
+      },
+      { ...S4,
+        beat: {
+          label: 'CCS 의 한계 — 원격이 죽으면 끝',
+          at: 'ccr-vs-ccs.json L4',
+          caption: '원본이 하나뿐이라 leader-dc 가 내려가면 그 인덱스 결과는 그냥 빠진 채 응답이 돌아온다.',
+          changes: [
+            {mark:'changed', text:'leader-dc 장애'},
+            {mark:'gone',    text:'orders 결과 누락 (사본 없음)'},
+          ],
+        },
+        leaderState: 'down',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '결과 누락',
+        mode: 'CCS 장애',
+        verdictTone: 'danger',
+        verdict: '사본 없음',
+        keyPoint: '부분 실패가 예외가 아니라 "결과가 조용히 줄어든 성공"으로 보일 수 있어 더 위험하다.',
+        code: {...CODE.ccrVsCcs, highlight: [4]},
+      },
+      { ...S4,
+        beat: {
+          label: 'CCR — 로컬 사본에 질의한다',
+          at: 'ccr-vs-ccs.json L6–8',
+          caption: '같은 질의를 follower 의 orders-follow 에 보낸다. 데이터가 로컬에 있으므로 네트워크 왕복이 없다.',
+          changes: [
+            {mark:'new',     text:'orders-follow 로컬 사본 존재'},
+            {mark:'changed', text:'질의 대상 원격 → 로컬'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.6s',
+        mode: 'CCR 질의',
+        verdictTone: 'good',
+        verdict: '로컬 사본',
+        keyPoint: '사본이 로컬에 있으니 지역 사용자 응답이 빠르다. 대신 디스크를 그만큼 더 쓴다.',
+        code: {...CODE.ccrVsCcs, highlight: [6, 7, 8]},
+      },
+      { ...S4,
+        beat: {
+          label: 'leader 가 죽어도 데이터는 남는다',
+          at: 'ccr-vs-ccs.json L9',
+          caption: 'CCR 은 실제로 복사해 뒀기 때문에 leader 장애 시에도 follower 에서 그대로 조회된다.',
+          changes: [
+            {mark:'changed', text:'leader 장애'},
+            {mark:'new',     text:'orders-follow 는 로컬에 보존'},
+          ],
+        },
+        leaderState: 'down',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '사본 보존',
+        mode: 'CCR 장애',
+        verdictTone: 'warn',
+        verdict: '데이터 보존',
+        keyPoint: '장애 시 CCS 는 결과가 빠지고 CCR 은 결과가 남는다. 이 차이가 DR 도구로서의 갈림길이다.',
+        code: {...CODE.ccrVsCcs, highlight: [9]},
+      },
+      { ...S4,
+        beat: {
+          label: '선택 기준 정리',
+          at: 'ccr-vs-ccs.json L11–12',
+          caption: '저장 절약·항상 최신 원본 하나면 CCS, 장애 대비·지역 사본이 필요하면 CCR 이다.',
+          changes: [
+            {mark:'read', text:'CCS = 저장 절약 · 항상 최신'},
+            {mark:'read', text:'CCR = 장애 대비 · 지역 사본'},
+          ],
+        },
         leaderState: 'active',
         followerState: 'syncing',
         promoted: false,
@@ -393,29 +765,40 @@
         verdictTone: 'warn',
         verdict: '용도 구분',
         keyPoint: 'CCS는 원본 하나를 원격 질의(장애 시 못 봄), CCR은 사본을 로컬 보관(장애 대비). 목적이 다르다.',
-        code: {
-          lang: 'json',
-          filename: 'ccr-vs-ccs.json',
-          lines: [
-            '// CCS — 복제 없이 원격 클러스터로 질의를 보낸다',
-            'GET local:9200/local-idx,leader-dc:orders/_search',
-            '{ "query": { "match": { "status": "PAID" } } }',
-            '// leader-dc 가 죽으면 orders 결과는 빠진다(사본 없음)',
-            '',
-            '// CCR — 데이터를 follower에 실제로 복사해 둔다',
-            'GET follower:9200/orders-follow/_search',
-            '{ "query": { "match": { "status": "PAID" } } }',
-            '// leader 가 죽어도 orders-follow 는 로컬에 그대로 존재',
-            '',
-            '// 정리: 저장 절약·항상 최신 → CCS',
-            '//       장애 대비·지역 사본 → CCR',
-          ],
-          highlight: [1, 2, 4, 6, 7, 9],
-        },
+        code: {...CODE.ccrVsCcs, highlight: [11, 12]},
       },
-      {
-        title: 'Step 5. 페일오버 — leader 장애 시 follower 승격',
-        desc: 'leader 클러스터(또는 지역 전체)가 죽으면 DR 계획이 발동한다. follower에서 _stop으로 복제를 끊으면 그 인덱스는 읽기 전용이 풀려 쓰기 가능한 정상 인덱스가 된다 — 이것이 승격(promotion)이다. 애플리케이션의 엔드포인트를 follower로 전환하면 서비스가 이어진다. 핵심 함정: 승격 시점까지 복제 지연(lag)만큼의 최신 데이터는 유실될 수 있다(비동기 복제라 RPO=0이 아니다). 또 원래 leader가 살아나면 데이터가 갈라지므로, 방향을 뒤집어 재복제(reverse replication)하는 절차를 미리 정해둬야 한다.',
+
+      // ── Step 5 ────────────────────────────────────────────────────────
+      { ...S5,
+        beat: {
+          label: 'leader 지역 장애 감지',
+          at: 'failover.sh L1',
+          caption: 'leader 클러스터가 통째로 응답하지 않는다. 복제는 멈추고 DR 절차가 시작된다.',
+          changes: [
+            {mark:'changed', text:'leader 상태 active → down'},
+            {mark:'gone',    text:'translog pull 중단'},
+          ],
+        },
+        leaderState: 'down',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '복제 끊김',
+        mode: 'failover',
+        verdictTone: 'danger',
+        verdict: '지역 장애',
+        keyPoint: '이 시점의 follower 는 아직 읽기 전용이다. 조회는 되지만 주문을 받을 수는 없다.',
+        code: {...CODE.failover, highlight: [1]},
+      },
+      { ...S5,
+        beat: {
+          label: '_stop 이 곧 승격이다',
+          at: 'failover.sh L2–4',
+          caption: '복제를 끊으면 읽기 전용 블록이 풀리며 그냥 쓰기 가능한 인덱스가 된다. 별도 승격 API 가 따로 없다.',
+          changes: [
+            {mark:'changed', text:'follower syncing → promoted'},
+            {mark:'new',     text:'orders-follow 쓰기 가능'},
+          ],
+        },
         leaderState: 'down',
         followerState: 'promoted',
         promoted: true,
@@ -423,31 +806,162 @@
         mode: 'failover',
         verdictTone: 'danger',
         verdict: '승격 완료',
-        keyPoint: '비동기라 RPO는 0이 아니다 — lag만큼 유실 가능. leader 복귀 시 split-brain 방지 위해 재복제 방향을 미리 설계.',
-        code: {
-          lang: 'bash',
-          filename: 'failover.sh',
-          lines: [
-            '# leader 지역 장애 감지 → follower 승격 절차',
-            '# 1) 복제 중단 = 읽기 전용 해제(쓰기 가능해짐) = 승격',
-            'curl -XPOST "https://follower:9200/_plugins/_replication/orders-follow/_stop" \\',
-            '  -H "Content-Type: application/json" -u admin:pass -d \'{}\'',
-            '',
-            '# 2) 앱 트래픽을 follower 엔드포인트로 전환',
-            '#    (DNS / 로드밸런서 스위치)',
-            '',
-            '# 3) 주의 — 승격 시점 기준 lag 만큼 최신 데이터 유실 가능',
-            '#    비동기 복제라 RPO=0 아님. 결제 등은 별도 재처리 큐 검토',
-            '',
-            '# 4) 원래 leader 복귀 시: split-brain 방지 위해',
-            '#    방향을 뒤집어(old-follower→old-leader) 재복제 후 재동기화',
-          ],
-          highlight: [2, 3, 6, 9, 12],
-        },
+        keyPoint: '_stop 은 되돌릴 수 없는 결정이다. 한번 쓰기를 받기 시작하면 leader 와 데이터가 갈라진다.',
+        code: {...CODE.failover, highlight: [2, 3, 4]},
       },
-      {
-        title: 'Step 6. 운영 종합 — 스냅샷·ISM·클러스터와 함께 쓰는 DR',
-        desc: 'CCR은 단독 기능이 아니라 앞서 배운 운영 요소와 맞물린다. 스냅샷(S3)은 시점 백업이라 복구에 시간이 걸리는 반면, CCR은 항상 준비된 뜨거운 사본(hot standby)이라 페일오버가 빠르다 — 둘은 대체가 아니라 상호 보완이다. ISM 롤오버로 만들어지는 시계열 인덱스는 auto-follow로 커버하고, 실무 함정으로 (1) leader와 follower의 버전 호환(follower ≥ leader 권장), (2) 대역폭·지연에 따른 lag 누적, (3) 원격 연결 보안(TLS·전용 role), (4) follower 승격 후 되돌리기 절차를 반드시 사전 점검한다. 이로써 OpenSearch 운영편을 완주한다.',
+      { ...S5,
+        beat: {
+          label: '트래픽을 follower 로 돌린다',
+          at: 'failover.sh L6–7',
+          caption: 'DNS 나 로드밸런서에서 엔드포인트를 바꾸면 애플리케이션 코드 변경 없이 서비스가 이어진다.',
+          changes: [
+            {mark:'changed', text:'엔드포인트 leader → follower'},
+            {mark:'new',     text:'Tokyo DC 가 쓰기 처리'},
+          ],
+        },
+        leaderState: 'down',
+        followerState: 'promoted',
+        promoted: true,
+        lag: '유실 가능',
+        mode: 'failover',
+        verdictTone: 'warn',
+        verdict: '트래픽 전환',
+        keyPoint: '전환 시간을 줄이려면 엔드포인트를 처음부터 DNS·LB 뒤에 숨겨 둬야 한다. 앱에 호스트를 박아두면 배포가 필요해진다.',
+        code: {...CODE.failover, highlight: [6, 7]},
+      },
+      { ...S5,
+        beat: {
+          label: 'lag 만큼은 유실된다',
+          at: 'failover.sh L9–10',
+          caption: '비동기 복제라 아직 당겨오지 못한 변경은 leader 와 함께 사라진다. RPO 는 0 이 아니다.',
+          changes: [
+            {mark:'gone', text:'미복제 변경분 유실'},
+            {mark:'read', text:'결제 등은 재처리 큐 필요'},
+          ],
+        },
+        leaderState: 'down',
+        followerState: 'promoted',
+        promoted: true,
+        lag: '유실 가능',
+        mode: 'failover',
+        verdictTone: 'danger',
+        verdict: 'RPO 주의',
+        keyPoint: '평상시 lag 수치가 곧 예상 유실량이다. lag 을 모니터링하지 않으면 사고 때 손실 규모를 추정할 수 없다.',
+        code: {...CODE.failover, highlight: [9, 10]},
+      },
+      { ...S5,
+        beat: {
+          label: '되돌리기 방향을 미리 정한다',
+          at: 'failover.sh L12–13',
+          caption: '원래 leader 가 살아나면 양쪽에 서로 다른 데이터가 있다. 방향을 뒤집어 재복제하는 절차를 문서로 정해 둔다.',
+          changes: [
+            {mark:'new',     text:'reverse replication 계획'},
+            {mark:'changed', text:'복제 방향 old-follower → old-leader'},
+          ],
+        },
+        leaderState: 'down',
+        followerState: 'promoted',
+        promoted: true,
+        lag: '유실 가능',
+        mode: 'failover',
+        verdictTone: 'danger',
+        verdict: '재복제 설계',
+        keyPoint: '비동기라 RPO는 0이 아니다 — lag만큼 유실 가능. leader 복귀 시 split-brain 방지 위해 재복제 방향을 미리 설계.',
+        code: {...CODE.failover, highlight: [12, 13]},
+      },
+
+      // ── Step 6 ────────────────────────────────────────────────────────
+      { ...S6,
+        beat: {
+          label: '복제 상태와 지연을 본다',
+          at: 'dr-checklist.sh L3–5',
+          caption: '_status 는 현재 단계(syncing / bootstrapping)와 lag 을 돌려준다. 이 값이 DR 준비 상태의 기본 지표다.',
+          changes: [
+            {mark:'read', text:'단계: syncing / bootstrapping'},
+            {mark:'read', text:'현재 lag 0.5s'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.5s',
+        mode: 'operate',
+        verdictTone: 'good',
+        verdict: '상태 점검',
+        keyPoint: 'bootstrapping 이 오래 지속되면 초기 복사가 끝나지 않은 것이다. 이 상태에서는 페일오버해도 데이터가 부족하다.',
+        code: {...CODE.checklist, highlight: [3, 4, 5]},
+      },
+      { ...S6,
+        beat: {
+          label: '버전 호환을 확인한다',
+          at: 'dr-checklist.sh L7–8',
+          caption: 'follower 버전이 leader 보다 같거나 높아야 안전하다. 반대면 복제가 시작조차 되지 않을 수 있다.',
+          changes: [
+            {mark:'read',    text:'양쪽 버전 번호 비교'},
+            {mark:'changed', text:'업그레이드 순서: follower 먼저'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.5s',
+        mode: 'operate',
+        verdictTone: 'warn',
+        verdict: '버전 확인',
+        keyPoint: '클러스터를 업그레이드할 때는 follower 부터 올린다. 순서를 뒤집으면 복제가 멈춘다.',
+        code: {...CODE.checklist, highlight: [7, 8]},
+      },
+      { ...S6,
+        beat: {
+          label: '스냅샷과 함께 쓴다',
+          at: 'dr-checklist.sh L10–11',
+          caption: 'CCR 은 실수로 지운 문서까지 그대로 복제한다. 시점 복구는 스냅샷만 할 수 있으므로 둘 다 필요하다.',
+          changes: [
+            {mark:'new',  text:'스냅샷(S3) 병행 운영'},
+            {mark:'read', text:'스냅샷=시점 복구 / CCR=hot standby'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.5s',
+        mode: 'operate',
+        verdictTone: 'good',
+        verdict: '백업 병행',
+        keyPoint: 'CCR 은 백업이 아니다. 잘못된 삭제·손상도 그대로 따라가므로 시점 복구는 스냅샷이 담당한다.',
+        code: {...CODE.checklist, highlight: [10, 11]},
+      },
+      { ...S6,
+        beat: {
+          label: '보안과 대역폭을 챙긴다',
+          at: 'dr-checklist.sh L13–14',
+          caption: '지역 간 연결은 TLS 와 최소 권한 role 로만 열고, 대역폭이 모자라면 lag 이 계속 쌓이므로 알림을 건다.',
+          changes: [
+            {mark:'new',     text:'TLS + 최소 권한 role'},
+            {mark:'new',     text:'lag 임계치 알림'},
+            {mark:'changed', text:'대역폭 부족 시 lag 누적'},
+          ],
+        },
+        leaderState: 'active',
+        followerState: 'syncing',
+        promoted: false,
+        lag: '0.5s (누적 감시)',
+        mode: 'operate',
+        verdictTone: 'warn',
+        verdict: '보안·대역폭',
+        keyPoint: 'lag 은 한번 벌어지기 시작하면 스스로 줄지 않는다. 임계치 알림이 없으면 사고 직전에야 알게 된다.',
+        code: {...CODE.checklist, highlight: [13, 14]},
+      },
+      { ...S6,
+        beat: {
+          label: '운영편 완주',
+          at: 'dr-checklist.sh L15',
+          caption: '스냅샷·ISM·클러스터 운영에 CCR 까지 얹으면 OpenSearch 운영편의 DR 구성이 완성된다.',
+          changes: [
+            {mark:'new',  text:'DR 준비 완료'},
+            {mark:'read', text:'4대 함정 사전 점검 완료'},
+          ],
+        },
         leaderState: 'active',
         followerState: 'syncing',
         promoted: false,
@@ -456,28 +970,7 @@
         verdictTone: 'good',
         verdict: 'OpenSearch 완주',
         keyPoint: '스냅샷=시점 백업(느린 복구), CCR=뜨거운 사본(빠른 페일오버). 버전·대역폭·보안·되돌리기 4대 함정을 사전 점검.',
-        code: {
-          lang: 'bash',
-          filename: 'dr-checklist.sh',
-          lines: [
-            '# CCR 운영 종합 점검 — 스냅샷/ISM/보안과 함께',
-            '',
-            '# (1) 복제 상태·지연 확인',
-            'curl "https://follower:9200/_plugins/_replication/orders-follow/_status?pretty" \\',
-            '  -u admin:pass   # syncing / bootstrapping / lag 확인',
-            '',
-            '# (2) 버전 호환 — follower 버전 >= leader 버전 권장',
-            'curl "https://follower:9200" -u admin:pass | grep number',
-            '',
-            '# (3) 스냅샷은 별도로 병행 (시점 복구용, CCR과 상호 보완)',
-            '#     스냅샷=느린 시점 복구 / CCR=빠른 hot standby',
-            '',
-            '# (4) 원격 연결 보안 — TLS + 최소 권한 role 로만 연결',
-            '#     대역폭 부족 시 lag 누적 → 알림 임계치 설정',
-            'echo "OpenSearch 운영편 완주 — DR 준비 완료"',
-          ],
-          highlight: [3, 4, 7, 10, 13, 15],
-        },
+        code: {...CODE.checklist, highlight: [15]},
       },
     ];
 
@@ -516,6 +1009,29 @@
             <h3 className="text-sm font-bold" style={{ color: '#005EB8' }}>DR 복제 흐름</h3>
             <span className={`text-[10px] px-2 py-0.5 rounded ${t.badge}`}>{state.verdict}</span>
           </div>
+          {state.beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{state.beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {state.beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{state.beat.caption}</p>
+              {state.beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {state.beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
 
           <div className="flex items-stretch gap-2">
             <ClusterBox
@@ -606,7 +1122,7 @@
           </div>
           <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
             <span>{code.lines.length} lines</span>
-            <span>Step {stepIdx + 1} / {total}</span>
+            <span>세부 {stepIdx + 1} / {total}</span>
           </div>
         </div>
       );
