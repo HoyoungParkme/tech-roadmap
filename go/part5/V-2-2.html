@@ -268,9 +268,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
   <!--
     Go V-2-2 — 통합 테스트 : testcontainers
     mock 단위테스트의 한계 → 진짜 DB/큐를 컨테이너로 띄우는 통합테스트.
@@ -281,142 +285,532 @@
     const { useState, useEffect, useRef } = React;
     const BRAND = '#00ADD8';
 
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      why: { lang: 'go', filename: 'why_integration_test.go', lines: [
+        '// mock 은 이런 버그를 못 잡는다',
+        'type mockRepo struct{ users map[int]User }',
+        '',
+        'func (m *mockRepo) Save(u User) error {',
+        '    m.users[u.ID] = u   // 그냥 map 에 저장',
+        '    return nil          // => UNIQUE 위반? 모름',
+        '}',
+        '',
+        '// 실제 DB 라면 이런 게 걸린다:',
+        '//  - email UNIQUE 제약 위반',
+        '//  - NOT NULL 컬럼 누락',
+        '//  - 트랜잭션 롤백 동작',
+        '//  - "SELCT" 같은 SQL 오타',
+        '//  - 타임존 / JSONB 직렬화',
+        '',
+        '// => 핵심 경로는 진짜 DB 로 검증해야 안심',
+      ] },
+      setup: { lang: 'go', filename: 'container_setup.go', lines: [
+        'import (',
+        '    "context"',
+        '    "github.com/testcontainers/testcontainers-go"',
+        '    "github.com/testcontainers/testcontainers-go/modules/postgres"',
+        '    "github.com/testcontainers/testcontainers-go/wait"',
+        ')',
+        '',
+        '// 테스트용 Postgres 컨테이너를 띄운다',
+        'func startPostgres(ctx context.Context) (*postgres.PostgresContainer, error) {',
+        '    return postgres.Run(ctx,',
+        '        "postgres:16-alpine",',
+        '        postgres.WithDatabase("app_test"),',
+        '        postgres.WithUsername("test"),',
+        '        postgres.WithPassword("test"),',
+        '        testcontainers.WithWaitStrategy(',
+        '            wait.ForListeningPort("5432/tcp"),  // 준비될 때까지 대기',
+        '        ),',
+        '    )',
+        '}',
+        '// => 로컬에 Postgres 설치 불필요. Docker 만 있으면 됨',
+      ] },
+      lifecycle: { lang: 'go', filename: 'main_test.go', lines: [
+        'func TestMain(m *testing.M) {',
+        '    ctx := context.Background()',
+        '',
+        '    pg, err := startPostgres(ctx)   // 1) 기동',
+        '    if err != nil { log.Fatal(err) }',
+        '    defer pg.Terminate(ctx)         // 5) 정리 (반드시!)',
+        '',
+        '    dsn, _ := pg.ConnectionString(ctx, "sslmode=disable")',
+        '    db, err = sql.Open("pgx", dsn)  // 2) 연결',
+        '    if err != nil { log.Fatal(err) }',
+        '',
+        '    if err := migrate(db); err != nil {  // 3) 마이그레이션',
+        '        log.Fatal(err)',
+        '    }',
+        '',
+        '    code := m.Run()                 // 4) 테스트 실행',
+        '    os.Exit(code)',
+        '}',
+        '// => 기동 1회 → 여러 테스트 공유 → 종료 시 정리',
+      ] },
+      repoTest: { lang: 'go', filename: 'user_repo_test.go', lines: [
+        'func TestSaveUser_DuplicateEmail(t *testing.T) {',
+        '    repo := NewUserRepo(db)',
+        '    t.Cleanup(func() { db.Exec("TRUNCATE users") })',
+        '',
+        '    err := repo.Save(User{Email: "a@x.com"})',
+        '    if err != nil {',
+        '        t.Fatalf("first save failed: %v", err)  // => nil',
+        '    }',
+        '',
+        '    // 같은 email 재삽입 — 진짜 UNIQUE 제약이 막는다',
+        '    err = repo.Save(User{Email: "a@x.com"})',
+        '    if err == nil {',
+        '        t.Fatal("expected UNIQUE violation, got nil")',
+        '    }',
+        '    // => pq: duplicate key value violates unique constraint',
+        '}',
+      ] },
+      ci: { lang: 'yaml', filename: '.github/workflows/test.yml', lines: [
+        'jobs:',
+        '  test:',
+        '    runs-on: ubuntu-latest   # Docker 데몬 포함',
+        '    steps:',
+        '      - uses: actions/checkout@v4',
+        '      - uses: actions/setup-go@v5',
+        '        with: { go-version: "1.22" }',
+        '      # testcontainers 가 Docker 소켓을 자동 사용',
+        '      - run: go test ./... -race -parallel 4',
+        '',
+        '# 실무 체크리스트',
+        '#  [x] defer Terminate 로 정리 보장',
+        '#  [x] TestMain 1회 기동 + 병렬 실행',
+        '#  [x] 매핑 포트 사용 (고정 포트 금지)',
+        '#  [x] CI 러너에 Docker 필요',
+      ] },
+    };
+
+    const S1 = {
+      title: 'Step 1. 단위 테스트의 한계 — mock 은 진짜 DB 가 아니다',
+      desc: 'Repository 를 mock 으로 대체하면 테스트는 빠르지만, 실제 DB 가 하는 일을 흉내만 낸다. UNIQUE 제약, 트랜잭션 롤백, JSON 컬럼, 타임존, SQL 문법 오류는 mock 이 절대 못 잡는다. "테스트는 다 초록불인데 배포하니 터졌다" 의 단골 원인이다. 그래서 핵심 경로만이라도 진짜 Postgres 를 상대로 검증해야 신뢰가 생긴다.',
+    };
+    const S2 = {
+      title: 'Step 2. testcontainers-go — 코드로 진짜 컨테이너를 띄운다',
+      desc: 'testcontainers-go 는 테스트가 시작될 때 실제 Postgres 컨테이너를 코드로 띄우고, 끝나면 자동으로 정리한다. 개발자마다 로컬 DB 를 세팅할 필요도, 다른 테스트와 데이터가 섞일 걱정도 없다. 컨테이너는 매번 깨끗한 상태로 시작하므로 격리와 재현성이 보장된다. 필요한 건 Docker 데몬 하나뿐이다.',
+    };
+    const S3 = {
+      title: 'Step 3. 생명주기 — 기동 → 연결 → 마이그레이션 → 테스트 → 정리',
+      desc: 'TestMain 에서 컨테이너를 한 번 띄우고 연결 정보(host, port)를 받아 DB 에 붙는다. 그다음 스키마 마이그레이션을 적용해 테이블을 만들고, 실제 테스트들을 돌린 뒤, 마지막에 반드시 Terminate 로 컨테이너를 정리한다. 이 순서를 지켜야 매 테스트가 동일한 초기 상태에서 재현 가능하게 실행된다.',
+    };
+    const S4 = {
+      title: 'Step 4. 실제 테스트 — 진짜 쿼리가 제약까지 검증한다',
+      desc: '이제 테스트는 진짜 Postgres 를 상대로 INSERT/SELECT 를 실행한다. mock 이 못 잡던 UNIQUE 제약 위반이 여기서는 실제 에러로 돌아온다. 각 테스트는 t.Cleanup 으로 자기 데이터를 지워 서로 간섭하지 않게 한다. 이것이 앞 장의 Repository(V-1-1) 와 테스트 기초(IV-1-2) 가 실제 환경에서 검증되는 지점이다.',
+    };
+    const S5 = {
+      title: 'Step 5. 실무 함정 & CI — 느림·누수·포트 충돌을 잡는다',
+      desc: '통합테스트는 강력하지만 대가가 있다. 컨테이너 정리를 빠뜨리면 리소스가 새고, 매 테스트마다 새로 띄우면 느리다 — 그래서 기동은 재사용하고 테스트는 병렬로 돌린다. CI 러너에는 Docker 데몬이 있어야 하며, 고정 포트 대신 testcontainers 가 매핑한 랜덤 포트를 써야 충돌이 없다. 이 장으로 Go 백엔드의 테스트→서비스→운영이 하나로 검증된다.',
+    };
+
     const STEPS = [
-      {
-        title: 'Step 1. 단위 테스트의 한계 — mock 은 진짜 DB 가 아니다',
-        desc: 'Repository 를 mock 으로 대체하면 테스트는 빠르지만, 실제 DB 가 하는 일을 흉내만 낸다. UNIQUE 제약, 트랜잭션 롤백, JSON 컬럼, 타임존, SQL 문법 오류는 mock 이 절대 못 잡는다. "테스트는 다 초록불인데 배포하니 터졌다" 의 단골 원인이다. 그래서 핵심 경로만이라도 진짜 Postgres 를 상대로 검증해야 신뢰가 생긴다.',
+      // ── Step 1 ────────────────────────────────────────────────────────
+      { ...S1,
+        beat: {
+          label: 'mock 저장소를 만든다',
+          at: 'why_integration_test.go L2',
+          caption: 'User 를 map 에 담는 가짜 저장소. 빠르지만 이 안에는 SQL 도 제약도 없다.',
+          changes: [
+            { mark: 'new', text: 'mockRepo (map 기반)' },
+            { mark: 'gone', text: '스키마 · 제약' },
+          ],
+        },
         stage: 'contrast',
+        active: 0,
+        rows: [
+          { name: 'mock 단위테스트', detail: 'DB 인터페이스를 가짜 구현으로 치환', trust: 30, note: 'DB 를 map 으로 흉내', color: '#fee2e2' },
+        ],
+        pitfalls: null,
+        alert: { tone: 'info', text: 'mock 은 인터페이스만 맞추면 된다. 그래서 빠르고, 그래서 얕다.' },
+        code: { ...CODE.why, highlight: [2] },
+      },
+      { ...S1,
+        beat: {
+          label: 'Save 는 늘 nil 을 준다',
+          at: 'why_integration_test.go L4–7',
+          caption: '무엇을 넣든 map 에 들어가고 에러는 nil 이다. 중복 email 도 조용히 통과한다.',
+          changes: [
+            { mark: 'read', text: 'Save → 항상 nil' },
+            { mark: 'gone', text: 'UNIQUE 위반 감지' },
+          ],
+        },
+        stage: 'contrast',
+        active: 0,
+        rows: [
+          { name: 'mock 단위테스트', detail: 'DB 인터페이스를 가짜 구현으로 치환', trust: 30, note: 'UNIQUE 위반? 모름', color: '#fee2e2' },
+        ],
+        pitfalls: null,
+        alert: { tone: 'warn', text: '초록불은 "버그가 없다"가 아니라 "가짜가 통과했다"는 뜻일 수 있다.' },
+        code: { ...CODE.why, highlight: [4, 5, 6, 7] },
+      },
+      { ...S1,
+        beat: {
+          label: '진짜 DB 가 잡는 것들',
+          at: 'why_integration_test.go L9–14',
+          caption: 'UNIQUE · NOT NULL · 트랜잭션 롤백 · SQL 오타 · 타임존은 실제 DB 만 걸러낸다.',
+          changes: [
+            { mark: 'new', text: '통합테스트 = 실제 쿼리 검증' },
+            { mark: 'read', text: 'mock 이 못 잡는 5가지' },
+          ],
+        },
+        stage: 'contrast',
+        active: 0,
         rows: [
           { name: 'mock 단위테스트', detail: 'DB 인터페이스를 가짜 구현으로 치환', trust: 30, note: 'SQL·제약·트랜잭션 검증 불가', color: '#fee2e2' },
           { name: '통합테스트', detail: '진짜 Postgres 컨테이너 상대로 실행', trust: 95, note: '실제 쿼리·제약·마이그레이션 검증', color: '#dbf3e6' },
         ],
-        alert: { tone: 'warn', text: 'mock 은 "내가 상상한 DB" 를 테스트한다. 통합테스트는 "실제로 돌 DB" 를 테스트한다.' },
-        code: {
-          lang: 'go',
-          filename: 'why_integration_test.go',
-          lines: [
-            '// mock 은 이런 버그를 못 잡는다',
-            'type mockRepo struct{ users map[int]User }',
-            '',
-            'func (m *mockRepo) Save(u User) error {',
-            '    m.users[u.ID] = u   // 그냥 map 에 저장',
-            '    return nil          // => UNIQUE 위반? 모름',
-            '}',
-            '',
-            '// 실제 DB 라면 이런 게 걸린다:',
-            '//  - email UNIQUE 제약 위반',
-            '//  - NOT NULL 컬럼 누락',
-            '//  - 트랜잭션 롤백 동작',
-            '//  - "SELCT" 같은 SQL 오타',
-            '//  - 타임존 / JSONB 직렬화',
-            '',
-            '// => 핵심 경로는 진짜 DB 로 검증해야 안심',
-          ],
-          highlight: [3, 4, 5, 6, 8, 9, 10, 11, 12, 13],
-        },
+        pitfalls: null,
+        alert: { tone: 'danger', text: '"SELCT" 같은 오타는 mock 테스트를 100번 돌려도 안 나온다. 배포하면 나온다.' },
+        code: { ...CODE.why, highlight: [9, 10, 11, 12, 13, 14] },
       },
-      {
-        title: 'Step 2. testcontainers-go — 코드로 진짜 컨테이너를 띄운다',
-        desc: 'testcontainers-go 는 테스트가 시작될 때 실제 Postgres 컨테이너를 코드로 띄우고, 끝나면 자동으로 정리한다. 개발자마다 로컬 DB 를 세팅할 필요도, 다른 테스트와 데이터가 섞일 걱정도 없다. 컨테이너는 매번 깨끗한 상태로 시작하므로 격리와 재현성이 보장된다. 필요한 건 Docker 데몬 하나뿐이다.',
+      { ...S1,
+        beat: {
+          label: '핵심 경로는 진짜 DB 로',
+          at: 'why_integration_test.go L16',
+          caption: '전부를 통합테스트로 덮을 필요는 없다. 돈·계정 같은 핵심 경로만 진짜 DB 로 검증한다.',
+          changes: [
+            { mark: 'changed', text: '핵심 경로 → 통합테스트' },
+            { mark: 'read', text: '나머지는 mock 유지' },
+          ],
+        },
+        stage: 'contrast',
+        active: 0,
+        rows: [
+          { name: 'mock 단위테스트', detail: 'DB 인터페이스를 가짜 구현으로 치환', trust: 30, note: 'SQL·제약·트랜잭션 검증 불가', color: '#fee2e2' },
+          { name: '통합테스트', detail: '진짜 Postgres 컨테이너 상대로 실행', trust: 95, note: '실제 쿼리·제약·마이그레이션 검증', color: '#dbf3e6' },
+        ],
+        pitfalls: null,
+        alert: { tone: 'warn', text: 'mock 은 "내가 상상한 DB" 를 테스트한다. 통합테스트는 "실제로 돌 DB" 를 테스트한다.' },
+        code: { ...CODE.why, highlight: [16] },
+      },
+      // ── Step 2 ────────────────────────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: '모듈을 가져온다',
+          at: 'container_setup.go L1–6',
+          caption: 'testcontainers 본체 · postgres 모듈 · wait 전략 세 가지를 쓴다. 아직 뜬 것은 없다.',
+          changes: [
+            { mark: 'new', text: 'testcontainers-go · postgres 모듈' },
+            { mark: 'new', text: 'wait 전략 패키지' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: -1,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'info', text: 'postgres 모듈은 DSN 생성·기본 옵션까지 감싸 준다. 직접 GenericContainer 를 쓸 필요가 없다.' },
+        code: { ...CODE.setup, highlight: [1, 2, 3, 4, 5, 6] },
+      },
+      { ...S2,
+        beat: {
+          label: '이미지를 지정해 띄운다',
+          at: 'container_setup.go L8–11',
+          caption: 'postgres.Run 이 postgres:16-alpine 컨테이너를 실제로 기동한다. 여기서 생명주기가 시작된다.',
+          changes: [
+            { mark: 'new', text: 'postgres:16-alpine 컨테이너 기동' },
+            { mark: 'changed', text: '단계 → 1. 기동' },
+          ],
+        },
         stage: 'lifecycle',
         active: 0,
-        alert: { tone: 'info', text: 'testcontainers.GenericContainer 로 어떤 이미지든 띄운다. postgres 모듈은 마이그레이션·연결 헬퍼까지 제공한다.' },
-        code: {
-          lang: 'go',
-          filename: 'container_setup.go',
-          lines: [
-            'import (',
-            '    "context"',
-            '    "github.com/testcontainers/testcontainers-go"',
-            '    "github.com/testcontainers/testcontainers-go/modules/postgres"',
-            '    "github.com/testcontainers/testcontainers-go/wait"',
-            ')',
-            '',
-            '// 테스트용 Postgres 컨테이너를 띄운다',
-            'func startPostgres(ctx context.Context) (*postgres.PostgresContainer, error) {',
-            '    return postgres.Run(ctx,',
-            '        "postgres:16-alpine",',
-            '        postgres.WithDatabase("app_test"),',
-            '        postgres.WithUsername("test"),',
-            '        postgres.WithPassword("test"),',
-            '        testcontainers.WithWaitStrategy(',
-            '            wait.ForListeningPort("5432/tcp"),  // 준비될 때까지 대기',
-            '        ),',
-            '    )',
-            '}',
-            '// => 로컬에 Postgres 설치 불필요. Docker 만 있으면 됨',
-          ],
-          highlight: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        },
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'info', text: '이미지 태그를 고정하라. latest 를 쓰면 어느 날 CI 만 깨진다.' },
+        code: { ...CODE.setup, highlight: [8, 9, 10, 11] },
       },
-      {
-        title: 'Step 3. 생명주기 — 기동 → 연결 → 마이그레이션 → 테스트 → 정리',
-        desc: 'TestMain 에서 컨테이너를 한 번 띄우고 연결 정보(host, port)를 받아 DB 에 붙는다. 그다음 스키마 마이그레이션을 적용해 테이블을 만들고, 실제 테스트들을 돌린 뒤, 마지막에 반드시 Terminate 로 컨테이너를 정리한다. 이 순서를 지켜야 매 테스트가 동일한 초기 상태에서 재현 가능하게 실행된다.',
+      { ...S2,
+        beat: {
+          label: 'DB · 계정을 넘긴다',
+          at: 'container_setup.go L12–14',
+          caption: 'app_test 데이터베이스와 test/test 계정을 옵션으로 준다. 로컬 DB 세팅이 필요 없어진다.',
+          changes: [
+            { mark: 'new', text: 'DB app_test 생성' },
+            { mark: 'new', text: '계정 test / test' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 0,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'info', text: '테스트 DB 는 매번 새로 만들어진다. 개발자 로컬 데이터와 섞일 일이 없다.' },
+        code: { ...CODE.setup, highlight: [12, 13, 14] },
+      },
+      { ...S2,
+        beat: {
+          label: '준비될 때까지 기다린다',
+          at: 'container_setup.go L15–17',
+          caption: '컨테이너가 떠도 Postgres 가 곧바로 받지는 않는다. 5432 포트가 열릴 때까지 대기한다.',
+          changes: [
+            { mark: 'new', text: 'wait.ForListeningPort(5432)' },
+            { mark: 'gone', text: '기동 직후 연결 실패' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 0,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'warn', text: 'wait 전략을 빼면 CI 에서만 간헐적으로 깨지는 테스트가 된다.' },
+        code: { ...CODE.setup, highlight: [15, 16, 17] },
+      },
+      { ...S2,
+        beat: {
+          label: 'Docker 하나면 끝',
+          at: 'container_setup.go L19–20',
+          caption: '함수가 컨테이너 핸들을 돌려준다. 이제 연결 정보를 뽑아 DB 에 붙을 수 있다.',
+          changes: [
+            { mark: 'new', text: 'PostgresContainer 핸들 반환' },
+            { mark: 'changed', text: '단계 → 2. 연결 준비' },
+            { mark: 'gone', text: '로컬 Postgres 설치' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 1,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'info', text: 'testcontainers.GenericContainer 로 어떤 이미지든 띄운다. postgres 모듈은 마이그레이션·연결 헬퍼까지 제공한다.' },
+        code: { ...CODE.setup, highlight: [19, 20] },
+      },
+      // ── Step 3 ────────────────────────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: '기동하고 정리를 예약',
+          at: 'main_test.go L4–6',
+          caption: '컨테이너를 띄운 직후 defer Terminate 를 건다. 뒤에서 panic 이 나도 정리는 보장된다.',
+          changes: [
+            { mark: 'new', text: '컨테이너 기동' },
+            { mark: 'new', text: 'defer Terminate 예약' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 0,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'good', text: '정리 코드는 기동 바로 다음 줄에 쓴다. 나중에 쓰려다 빠뜨리면 컨테이너가 남는다.' },
+        code: { ...CODE.lifecycle, highlight: [4, 5, 6] },
+      },
+      { ...S3,
+        beat: {
+          label: 'DSN 을 받아 연결',
+          at: 'main_test.go L8–10',
+          caption: 'ConnectionString 이 매핑된 랜덤 포트를 포함한 DSN 을 준다. 그대로 sql.Open 에 넘긴다.',
+          changes: [
+            { mark: 'new', text: 'DSN (매핑 포트 포함)' },
+            { mark: 'changed', text: '단계 → 2. 연결' },
+            { mark: 'read', text: 'db 전역 핸들 확보' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 1,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'warn', text: '포트를 직접 5432 로 적지 마라. 매핑 포트는 실행마다 달라진다.' },
+        code: { ...CODE.lifecycle, highlight: [8, 9, 10] },
+      },
+      { ...S3,
+        beat: {
+          label: '스키마를 적용한다',
+          at: 'main_test.go L12–14',
+          caption: '빈 DB 에 마이그레이션을 돌려 테이블과 UNIQUE 제약을 만든다. 여기서 실패하면 테스트는 시작도 안 한다.',
+          changes: [
+            { mark: 'new', text: 'users 테이블 · UNIQUE 제약' },
+            { mark: 'changed', text: '단계 → 3. 마이그레이션' },
+          ],
+        },
         stage: 'lifecycle',
         active: 2,
-        alert: { tone: 'good', text: 'defer container.Terminate(ctx) 를 컨테이너 기동 직후에 걸어라. 테스트가 panic 해도 정리가 보장된다.' },
-        code: {
-          lang: 'go',
-          filename: 'main_test.go',
-          lines: [
-            'func TestMain(m *testing.M) {',
-            '    ctx := context.Background()',
-            '',
-            '    pg, err := startPostgres(ctx)   // 1) 기동',
-            '    if err != nil { log.Fatal(err) }',
-            '    defer pg.Terminate(ctx)         // 5) 정리 (반드시!)',
-            '',
-            '    dsn, _ := pg.ConnectionString(ctx, "sslmode=disable")',
-            '    db, err = sql.Open("pgx", dsn)  // 2) 연결',
-            '    if err != nil { log.Fatal(err) }',
-            '',
-            '    if err := migrate(db); err != nil {  // 3) 마이그레이션',
-            '        log.Fatal(err)',
-            '    }',
-            '',
-            '    code := m.Run()                 // 4) 테스트 실행',
-            '    os.Exit(code)',
-            '}',
-            '// => 기동 1회 → 여러 테스트 공유 → 종료 시 정리',
-          ],
-          highlight: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 15, 16],
-        },
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'good', text: '운영과 같은 마이그레이션을 돌리므로, 마이그레이션 자체도 테스트된다.' },
+        code: { ...CODE.lifecycle, highlight: [12, 13, 14] },
       },
-      {
-        title: 'Step 4. 실제 테스트 — 진짜 쿼리가 제약까지 검증한다',
-        desc: '이제 테스트는 진짜 Postgres 를 상대로 INSERT/SELECT 를 실행한다. mock 이 못 잡던 UNIQUE 제약 위반이 여기서는 실제 에러로 돌아온다. 각 테스트는 t.Cleanup 으로 자기 데이터를 지워 서로 간섭하지 않게 한다. 이것이 앞 장의 Repository(V-1-1) 와 테스트 기초(IV-1-2) 가 실제 환경에서 검증되는 지점이다.',
+      { ...S3,
+        beat: {
+          label: '테스트를 돌린다',
+          at: 'main_test.go L16–17',
+          caption: 'm.Run() 이 이 패키지의 모든 테스트를 실행하고, 그 결과 코드로 프로세스를 끝낸다.',
+          changes: [
+            { mark: 'changed', text: '단계 → 4. 테스트 실행' },
+            { mark: 'read', text: '컨테이너 1개를 전부가 공유' },
+          ],
+        },
         stage: 'lifecycle',
         active: 3,
-        alert: { tone: 'good', text: 'mock 이면 통과했을 중복 email 이 여기서는 진짜 제약 위반으로 잡힌다 — 이게 통합테스트의 값어치다.' },
-        code: {
-          lang: 'go',
-          filename: 'user_repo_test.go',
-          lines: [
-            'func TestSaveUser_DuplicateEmail(t *testing.T) {',
-            '    repo := NewUserRepo(db)',
-            '    t.Cleanup(func() { db.Exec("TRUNCATE users") })',
-            '',
-            '    err := repo.Save(User{Email: "a@x.com"})',
-            '    if err != nil {',
-            '        t.Fatalf("first save failed: %v", err)  // => nil',
-            '    }',
-            '',
-            '    // 같은 email 재삽입 — 진짜 UNIQUE 제약이 막는다',
-            '    err = repo.Save(User{Email: "a@x.com"})',
-            '    if err == nil {',
-            '        t.Fatal("expected UNIQUE violation, got nil")',
-            '    }',
-            '    // => pq: duplicate key value violates unique constraint',
-            '}',
-          ],
-          highlight: [1, 2, 3, 5, 6, 10, 11, 12, 13, 14, 15],
-        },
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'info', text: '기동은 1회, 테스트는 여러 개. 이 구조가 통합테스트 속도를 결정한다.' },
+        code: { ...CODE.lifecycle, highlight: [16, 17] },
       },
-      {
-        title: 'Step 5. 실무 함정 & CI — 느림·누수·포트 충돌을 잡는다',
-        desc: '통합테스트는 강력하지만 대가가 있다. 컨테이너 정리를 빠뜨리면 리소스가 새고, 매 테스트마다 새로 띄우면 느리다 — 그래서 기동은 재사용하고 테스트는 병렬로 돌린다. CI 러너에는 Docker 데몬이 있어야 하며, 고정 포트 대신 testcontainers 가 매핑한 랜덤 포트를 써야 충돌이 없다. 이 장으로 Go 백엔드의 테스트→서비스→운영이 하나로 검증된다.',
+      { ...S3,
+        beat: {
+          label: '마지막에 정리된다',
+          at: 'main_test.go L6',
+          caption: 'os.Exit 전에 예약해 둔 Terminate 가 돌며 컨테이너와 볼륨이 사라진다.',
+          changes: [
+            { mark: 'changed', text: '단계 → 5. 정리' },
+            { mark: 'gone', text: '컨테이너 · 볼륨' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 4,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'good', text: 'defer container.Terminate(ctx) 를 컨테이너 기동 직후에 걸어라. 테스트가 panic 해도 정리가 보장된다.' },
+        code: { ...CODE.lifecycle, highlight: [6] },
+      },
+      // ── Step 4 ────────────────────────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: '자기 뒤처리를 등록',
+          at: 'user_repo_test.go L1–3',
+          caption: 'Repository 를 진짜 db 핸들로 만들고, 끝나면 TRUNCATE 하도록 Cleanup 을 걸어 둔다.',
+          changes: [
+            { mark: 'new', text: 'repo = NewUserRepo(db)' },
+            { mark: 'new', text: 't.Cleanup → TRUNCATE users' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 3,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'info', text: '테스트끼리 데이터가 새지 않게 각자 자기 것만 지운다. 그래야 병렬 실행이 가능하다.' },
+        code: { ...CODE.repoTest, highlight: [1, 2, 3] },
+      },
+      { ...S4,
+        beat: {
+          label: '첫 저장은 성공한다',
+          at: 'user_repo_test.go L5–8',
+          caption: 'a@x.com 이 실제 INSERT 로 들어간다. 진짜 SQL 이 실행되므로 오타도 여기서 걸린다.',
+          changes: [
+            { mark: 'new', text: 'users 1행 INSERT' },
+            { mark: 'read', text: 'err == nil' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 3,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'good', text: 'mock 이라면 통과 여부가 같지만, 여기서는 SQL 문법과 컬럼 이름까지 검증된다.' },
+        code: { ...CODE.repoTest, highlight: [5, 6, 7, 8] },
+      },
+      { ...S4,
+        beat: {
+          label: '중복은 DB 가 막는다',
+          at: 'user_repo_test.go L10–14',
+          caption: '같은 email 을 다시 넣으면 Postgres 의 UNIQUE 제약이 에러를 돌려준다. err 가 nil 이면 테스트 실패다.',
+          changes: [
+            { mark: 'changed', text: '두 번째 Save → error' },
+            { mark: 'read', text: 'UNIQUE 제약 발동' },
+            { mark: 'gone', text: '조용한 통과' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 3,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'warn', text: '이 케이스가 mock 에서는 항상 nil 이었다. 그래서 배포 후에야 터졌다.' },
+        code: { ...CODE.repoTest, highlight: [10, 11, 12, 13, 14] },
+      },
+      { ...S4,
+        beat: {
+          label: '진짜 에러 문구를 본다',
+          at: 'user_repo_test.go L15',
+          caption: 'duplicate key value violates unique constraint — 운영에서 볼 그 문구가 테스트에서 먼저 나온다.',
+          changes: [
+            { mark: 'read', text: 'pq: duplicate key ... unique constraint' },
+          ],
+        },
+        stage: 'lifecycle',
+        active: 3,
+        rows: null,
+        pitfalls: null,
+        alert: { tone: 'good', text: 'mock 이면 통과했을 중복 email 이 여기서는 진짜 제약 위반으로 잡힌다 — 이게 통합테스트의 값어치다.' },
+        code: { ...CODE.repoTest, highlight: [15] },
+      },
+      // ── Step 5 ────────────────────────────────────────────────────────
+      { ...S5,
+        beat: {
+          label: 'Docker 있는 러너 선택',
+          at: '.github/workflows/test.yml L2–3',
+          caption: 'ubuntu-latest 러너에는 Docker 데몬이 이미 떠 있다. 이게 없으면 통합테스트는 전부 실패한다.',
+          changes: [
+            { mark: 'new', text: 'runs-on: ubuntu-latest' },
+            { mark: 'read', text: 'Docker 데몬 확보' },
+          ],
+        },
         stage: 'pitfall',
         active: 4,
+        rows: null,
+        pitfalls: [
+          { bad: 'CI 에 Docker 없음 → 전체 실패', good: 'CI 러너에 docker 서비스 / DinD 활성화' },
+        ],
+        alert: { tone: 'warn', text: 'Docker 없는 러너에서는 testcontainers 가 시작조차 못 한다. 러너 선택이 첫 조건이다.' },
+        code: { ...CODE.ci, highlight: [2, 3] },
+      },
+      { ...S5,
+        beat: {
+          label: '병렬로 돌려 시간을 줄인다',
+          at: '.github/workflows/test.yml L8–9',
+          caption: 'testcontainers 가 Docker 소켓을 알아서 잡고, -parallel 4 로 테스트를 동시에 돌린다.',
+          changes: [
+            { mark: 'new', text: 'go test -race -parallel 4' },
+            { mark: 'changed', text: '테스트 시간 단축' },
+          ],
+        },
+        stage: 'pitfall',
+        active: 4,
+        rows: null,
+        pitfalls: [
+          { bad: '테스트마다 새 컨테이너 → 매우 느림', good: 'TestMain 에서 1회 기동 후 공유 · t.Parallel()' },
+          { bad: 'CI 에 Docker 없음 → 전체 실패', good: 'CI 러너에 docker 서비스 / DinD 활성화' },
+        ],
+        alert: { tone: 'warn', text: '병렬로 돌리려면 테스트가 서로의 데이터를 건드리지 않아야 한다. t.Cleanup 이 전제다.' },
+        code: { ...CODE.ci, highlight: [8, 9] },
+      },
+      { ...S5,
+        beat: {
+          label: '정리와 재사용을 못박는다',
+          at: '.github/workflows/test.yml L11–13',
+          caption: 'Terminate 로 누수를 막고, TestMain 1회 기동으로 속도를 지킨다. 체크리스트 앞 두 줄이다.',
+          changes: [
+            { mark: 'new', text: 'defer Terminate 확인' },
+            { mark: 'new', text: 'TestMain 1회 기동 확인' },
+          ],
+        },
+        stage: 'pitfall',
+        active: 4,
+        rows: null,
+        pitfalls: [
+          { bad: 'Terminate 누락 → 컨테이너·볼륨 누수', good: 'defer pg.Terminate(ctx) 를 기동 직후 등록' },
+          { bad: '테스트마다 새 컨테이너 → 매우 느림', good: 'TestMain 에서 1회 기동 후 공유 · t.Parallel()' },
+          { bad: 'CI 에 Docker 없음 → 전체 실패', good: 'CI 러너에 docker 서비스 / DinD 활성화' },
+        ],
+        alert: { tone: 'danger', text: 'Terminate 를 빠뜨리면 CI 러너에 컨테이너와 볼륨이 쌓여 디스크가 찬다.' },
+        code: { ...CODE.ci, highlight: [11, 12, 13] },
+      },
+      { ...S5,
+        beat: {
+          label: '포트까지 확인하고 완주',
+          at: '.github/workflows/test.yml L14–15',
+          caption: '매핑 포트만 쓰고 CI 에 Docker 를 보장하면 4대 함정이 모두 닫힌다.',
+          changes: [
+            { mark: 'new', text: '매핑 포트 사용 확인' },
+            { mark: 'gone', text: '고정 포트 5432 충돌' },
+          ],
+        },
+        stage: 'pitfall',
+        active: 4,
+        rows: null,
         pitfalls: [
           { bad: 'Terminate 누락 → 컨테이너·볼륨 누수', good: 'defer pg.Terminate(ctx) 를 기동 직후 등록' },
           { bad: '테스트마다 새 컨테이너 → 매우 느림', good: 'TestMain 에서 1회 기동 후 공유 · t.Parallel()' },
@@ -424,28 +818,7 @@
           { bad: 'CI 에 Docker 없음 → 전체 실패', good: 'CI 러너에 docker 서비스 / DinD 활성화' },
         ],
         alert: { tone: 'good', text: 'Go 완주 — 언어 기초부터 동시성·서비스·운영·통합테스트까지, 이제 실무에 바로 투입할 수 있는 백엔드 개발자다. 🐹' },
-        code: {
-          lang: 'yaml',
-          filename: '.github/workflows/test.yml',
-          lines: [
-            'jobs:',
-            '  test:',
-            '    runs-on: ubuntu-latest   # Docker 데몬 포함',
-            '    steps:',
-            '      - uses: actions/checkout@v4',
-            '      - uses: actions/setup-go@v5',
-            '        with: { go-version: "1.22" }',
-            '      # testcontainers 가 Docker 소켓을 자동 사용',
-            '      - run: go test ./... -race -parallel 4',
-            '',
-            '# 실무 체크리스트',
-            '#  [x] defer Terminate 로 정리 보장',
-            '#  [x] TestMain 1회 기동 + 병렬 실행',
-            '#  [x] 매핑 포트 사용 (고정 포트 금지)',
-            '#  [x] CI 러너에 Docker 필요',
-          ],
-          highlight: [2, 3, 8, 9, 11, 12, 13, 14, 15],
-        },
+        code: { ...CODE.ci, highlight: [14, 15] },
       },
     ];
 
@@ -567,6 +940,29 @@
             <h3 className="text-sm font-bold" style={{color:'#0a5a6a'}}>통합 테스트 라이브</h3>
             <span className="text-[10px] text-slate-500">진짜 DB · 격리 · 재현성</span>
           </div>
+          {state.beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{state.beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {state.beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{state.beat.caption}</p>
+              {state.beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {state.beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           {state.stage === 'contrast' && <ContrastMock rows={state.rows} />}
           {state.stage === 'lifecycle' && <LifecycleMock active={state.active} />}
           {state.stage === 'pitfall' && <PitfallMock pitfalls={state.pitfalls} />}
@@ -616,7 +1012,7 @@
           </div>
           <div className="px-3 py-1.5 bg-slate-800 border-t border-slate-700 flex items-center justify-between text-[10px] text-slate-400">
             <span>{code.lines.length} lines</span>
-            <span>Step {stepIdx + 1} / {total}</span>
+            <span>세부 {stepIdx + 1} / {total}</span>
           </div>
         </div>
       );
