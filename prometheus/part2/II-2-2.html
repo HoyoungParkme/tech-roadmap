@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-trn-native-beats="1">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -268,9 +268,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
 
   <!--
     II-2-2. histogram_quantile — p95 지연
@@ -297,154 +301,476 @@
     const P95_RANK = 0.95 * TOTAL;   // 950
     const P95_EST = 0.9474;          // 0.5 + (950-780)/(970-780)*(1.0-0.5)
 
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      expose: {lang:'promql', filename:'/metrics — Histogram 노출 포맷', lines:[
+        '# Histogram 하나 = _bucket 여러 개 + _sum + _count',
+        '# _bucket{le="x"} = "x초 이하" 누적 건수 (단조 증가)',
+        '',
+        '# HELP http_request_duration_seconds Request latency',
+        '# TYPE http_request_duration_seconds histogram',
+        'http_request_duration_seconds_bucket{le="0.1"}   200',
+        'http_request_duration_seconds_bucket{le="0.25"}  550',
+        'http_request_duration_seconds_bucket{le="0.5"}   780',
+        'http_request_duration_seconds_bucket{le="1.0"}   970',
+        'http_request_duration_seconds_bucket{le="2.5"}   995',
+        'http_request_duration_seconds_bucket{le="+Inf"}  1000',
+        'http_request_duration_seconds_sum    420',
+        'http_request_duration_seconds_count  1000',
+        '',
+        '# 평균 지연 = _sum / _count = 0.42s',
+        '# 하지만 평균은 "꼬리 지연"을 숨긴다 → 백분위수가 필요',
+      ]},
+      aggregate: {lang:'promql', filename:'promql — instance 3대를 le 기준으로 합산', lines:[
+        '# 3대의 pod가 같은 histogram을 노출한다고 하자',
+        '# 목표: le 경계별로 rate를 더해 하나의 분포로 만든다',
+        '',
+        '# 1) 각 버킷을 초당 증가율로 변환 (Counter이므로 rate 필수)',
+        'rate(http_request_duration_seconds_bucket[5m])',
+        '',
+        '# 2) le는 남기고 pod/instance는 합산 → by(le)가 핵심',
+        'sum by (le) (',
+        '  rate(http_request_duration_seconds_bucket[5m])',
+        ')',
+        '',
+        '# le를 빼먹으면? → 분포 축이 사라져 quantile 계산 불가',
+        '# sum(rate(...))            # BAD: le 소실',
+        '# sum without (le) (...)    # BAD: le 제거',
+      ]},
+      quantile: {lang:'promql', filename:'promql — p95 지연 (서버 측 계산)', lines:[
+        '# p95 지연 = 상위 5%를 제외한 최악의 응답시간',
+        '# 0.95 분위 = 1000건 중 950번째 요청의 지연',
+        '',
+        'histogram_quantile(',
+        '  0.95,',
+        '  sum by (le) (',
+        '    rate(http_request_duration_seconds_bucket[5m])',
+        '  )',
+        ')',
+        '# → 약 0.95s  (누적 780@0.5s ~ 970@1.0s 사이)',
+        '',
+        '# 평균과 비교 (같은 데이터, 전혀 다른 그림)',
+        'rate(http_request_duration_seconds_sum[5m])',
+        '  / rate(http_request_duration_seconds_count[5m])',
+        '# → 0.42s  (평균은 꼬리를 감춘다)',
+      ]},
+      interp: {lang:'sql', filename:'sql — histogram_quantile 보간을 SQL로 재현', lines:[
+        '-- Prometheus 내부 보간 로직을 SQL로 풀어보면:',
+        '-- 목표 순위(rank) = quantile * total = 0.95 * 1000 = 950',
+        '',
+        'WITH b(le, cum) AS (',
+        '  VALUES (0.1,200),(0.25,550),(0.5,780),',
+        '         (1.0,970),(2.5,995)',
+        '),',
+        'bounds AS (            -- 950이 걸친 하한/상한 버킷',
+        '  SELECT 0.5 AS lower_le, 780 AS lower_cum,',
+        '         1.0 AS upper_le, 970 AS upper_cum,',
+        '         950 AS rank',
+        ')',
+        'SELECT lower_le',
+        '  + (rank - lower_cum) / (upper_cum - lower_cum)',
+        '    * (upper_le - lower_le)  AS p95_estimate',
+        'FROM bounds;',
+        '-- p95_estimate ≈ 0.947  (버킷 해상도에 묶인 근사치)',
+      ]},
+      slo: {lang:'promql', filename:'promql — SLO 위반 알림 규칙', lines:[
+        '# p99 지연이 1초를 넘으면 SLO 위반',
+        'histogram_quantile(',
+        '  0.99,',
+        '  sum by (le) (',
+        '    rate(http_request_duration_seconds_bucket[5m])',
+        '  )',
+        ') > 1.0',
+        '',
+        '# 경로별 p95를 한 번에 (le + path 유지)',
+        'histogram_quantile(',
+        '  0.95,',
+        '  sum by (le, path) (',
+        '    rate(http_request_duration_seconds_bucket[5m])',
+        '  )',
+        ')',
+        '',
+        '# 함정 요약',
+        '# 1) by(le) 누락 → 계산 불가',
+        '# 2) SLO 근처 버킷 부족 → 보간 오차',
+        '# 3) 집계 순서: rate → sum by(le) → quantile',
+        '# 4) 버킷 과다 → 카디널리티 폭증',
+      ]},
+    };
+
+    const S1 = { title:'Step 1. Histogram 3형제 — _bucket(le) · _sum · _count', desc:'Histogram은 하나의 관측을 세 가지로 노출한다. _bucket{le="x"}는 "x초 이하 응답이 누적 몇 건"이라 항상 단조 증가하고, +Inf 버킷은 전체 건수와 같다. _sum은 지연의 총합, _count는 전체 건수여서 둘을 나누면 평균이 나온다. p95는 이 누적 버킷에서 사후에 뽑아내므로, 애플리케이션은 버킷만 잘 쌓아두면 된다. 그래서 여러 인스턴스의 값을 더해도 의미가 깨지지 않는다(가산성).' };
+    const S2 = { title:'Step 2. sum by(le) — le 레이블을 유지한 채 집계', desc:'p95를 구하기 전에 여러 인스턴스·경로의 버킷을 하나로 합쳐야 한다. 이때 반드시 by(le)로 le 레이블을 남겨야 한다. le는 버킷 경계를 나타내는 축이므로, 이걸 날리면 histogram_quantile이 분포를 복원할 수 없다. rate(_bucket[5m])로 초당 증가율(=최근 관측 밀도)로 바꾼 뒤 sum by(le)로 합치는 것이 정석이다. le를 빼먹고 sum만 하는 것이 현업에서 가장 흔한 실수다.' };
+    const S3 = { title:'Step 3. histogram_quantile(0.95, ...) — 누적분포에서 p95', desc:'histogram_quantile(0.95, ...)는 "요청 1000건을 지연 오름차순으로 줄 세웠을 때 950번째가 어디냐"를 계산한다. 누적 버킷을 보고 950번째 순위가 걸치는 버킷을 찾는다. 여기서는 le=0.5(누적 780)와 le=1.0(누적 970) 사이에 950이 들어가므로 p95는 0.5초~1.0초 구간에 있다. 평균 0.42초와 비교하면 p95는 0.95초로, 꼬리 지연이 평균의 두 배가 넘는다는 사실이 드러난다. 이것이 평균 대신 백분위수를 보는 이유다.' };
+    const S4 = { title:'Step 4. 버킷 경계와 선형 보간 — p95는 "근사치"', desc:'Prometheus는 버킷 안의 분포를 모른다. 그래서 목표 순위가 걸친 버킷의 하한과 상한 사이를 직선으로 가정하고 보간한다. 950번째는 le=0.5(누적 780)와 le=1.0(누적 970) 사이에서 (950-780)/(970-780)=89.5% 지점이므로, 0.5 + 0.895*(1.0-0.5) ≈ 0.947초로 추정한다. 즉 실제 값이 아니라 버킷 해상도에 묶인 근사치다. 관심 구간(SLO 근처)에 버킷을 촘촘히 두지 않으면 p95 오차가 커진다. 이것이 버킷 설계가 중요한 이유다.' };
+    const S5 = { title:'Step 5. SLO 판정 · Summary와의 차이 · 실무 함정', desc:'SLO(예: "p99 지연 1초 이하")는 histogram_quantile(0.99, ...) 결과를 임계선과 비교해 판정한다. Summary도 quantile을 주지만 클라이언트가 미리 계산해 노출하므로 여러 인스턴스를 합칠 수 없다(비가산). 반면 Histogram은 버킷이 가산적이라 서버에서 전체 분포를 합쳐 정확히 집계된다. 실무 함정은 네 가지다: by(le) 누락, SLO 근처 버킷 부족으로 인한 보간 오차, rate 이전에 quantile을 계산하는 집계 순서 실수, 그리고 카디널리티 폭증(버킷을 너무 잘게 나눔). 새 코드는 특별한 이유가 없으면 Histogram을 쓴다.' };
+
     const STEPS = [
-      {
-        title: 'Step 1. Histogram 3형제 — _bucket(le) · _sum · _count',
-        desc: 'Histogram은 하나의 관측을 세 가지로 노출한다. _bucket{le="x"}는 "x초 이하 응답이 누적 몇 건"이라 항상 단조 증가하고, +Inf 버킷은 전체 건수와 같다. _sum은 지연의 총합, _count는 전체 건수여서 둘을 나누면 평균이 나온다. p95는 이 누적 버킷에서 사후에 뽑아내므로, 애플리케이션은 버킷만 잘 쌓아두면 된다. 그래서 여러 인스턴스의 값을 더해도 의미가 깨지지 않는다(가산성).',
+      // ── Step 1 ────────────────────────────────────────────────────────────
+      { ...S1,
+        beat:{
+          label:'3형제 구조',
+          at:'/metrics L1–2',
+          caption:'histogram 하나는 버킷 여러 개와 _sum, _count 로 노출된다.',
+          changes:[
+            {mark:'new', text:'_bucket / _sum / _count'},
+            {mark:'read', text:'le 라는 경계 레이블'},
+          ],
+        },
+        focus: 'structure',
+        legend: 'Histogram 하나 = _bucket 여러 개 + _sum + _count',
+        code:{...CODE.expose, highlight:[1,2]},
+      },
+      { ...S1,
+        beat:{
+          label:'메타 두 줄',
+          at:'/metrics L4–5',
+          caption:'TYPE 을 histogram 으로 선언해야 Prometheus 가 버킷 계열로 인식한다.',
+          changes:[
+            {mark:'new', text:'# TYPE histogram'},
+            {mark:'read', text:'메트릭 이름'},
+          ],
+        },
+        focus: 'structure',
+        legend: 'HELP·TYPE 으로 histogram 임을 선언한다',
+        code:{...CODE.expose, highlight:[4,5]},
+      },
+      { ...S1,
+        beat:{
+          label:'누적 버킷',
+          at:'/metrics L6–9',
+          caption:'le=0.1 에 200건, 0.25 에 550건. le 가 커질수록 값이 단조 증가한다.',
+          changes:[
+            {mark:'new', text:'버킷 4칸 채워짐'},
+            {mark:'changed', text:'누적 200 → 970'},
+          ],
+        },
+        focus: 'structure',
+        legend: 'le 가 커질수록 누적 건수가 늘어난다 (200 → 970)',
+        code:{...CODE.expose, highlight:[6,7,8,9]},
+      },
+      { ...S1,
+        beat:{
+          label:'+Inf 는 전체',
+          at:'/metrics L10–11',
+          caption:'마지막 +Inf 버킷은 모든 관측을 담아 _count 와 같은 1000 이 된다.',
+          changes:[
+            {mark:'new', text:'+Inf 버킷'},
+            {mark:'read', text:'전체 1000건'},
+          ],
+        },
+        focus: 'structure',
+        legend: '+Inf 버킷 = 전체 건수 1000 = _count',
+        code:{...CODE.expose, highlight:[10,11]},
+      },
+      { ...S1,
+        beat:{
+          label:'_sum 과 _count',
+          at:'/metrics L12–13',
+          caption:'_sum 은 지연 총합 420초, _count 는 1000건. 나누면 평균 0.42초.',
+          changes:[
+            {mark:'new', text:'_sum 420'},
+            {mark:'new', text:'_count 1000'},
+            {mark:'read', text:'평균 0.42s'},
+          ],
+        },
+        focus: 'structure',
+        legend: '_sum / _count = 평균 0.42s',
+        code:{...CODE.expose, highlight:[12,13]},
+      },
+      { ...S1,
+        beat:{
+          label:'평균의 한계',
+          at:'/metrics L15–16',
+          caption:'평균은 꼬리 지연을 감추므로 백분위수가 따로 필요하다.',
+          changes:[
+            {mark:'gone', text:'꼬리 지연 정보'},
+            {mark:'read', text:'백분위수의 필요성'},
+          ],
+        },
         focus: 'structure',
         legend: '_bucket은 누적(cumulative) — le가 커질수록 count 증가, +Inf = _count',
-        code: {
-          lang: 'promql',
-          filename: '/metrics — Histogram 노출 포맷',
-          lines: [
-            '# Histogram 하나 = _bucket 여러 개 + _sum + _count',
-            '# _bucket{le="x"} = "x초 이하" 누적 건수 (단조 증가)',
-            '',
-            '# HELP http_request_duration_seconds Request latency',
-            '# TYPE http_request_duration_seconds histogram',
-            'http_request_duration_seconds_bucket{le="0.1"}   200',
-            'http_request_duration_seconds_bucket{le="0.25"}  550',
-            'http_request_duration_seconds_bucket{le="0.5"}   780',
-            'http_request_duration_seconds_bucket{le="1.0"}   970',
-            'http_request_duration_seconds_bucket{le="2.5"}   995',
-            'http_request_duration_seconds_bucket{le="+Inf"}  1000',
-            'http_request_duration_seconds_sum    420',
-            'http_request_duration_seconds_count  1000',
-            '',
-            '# 평균 지연 = _sum / _count = 0.42s',
-            '# 하지만 평균은 "꼬리 지연"을 숨긴다 → 백분위수가 필요',
-          ],
-          highlight: [6, 7, 8, 9, 10, 11],
-        },
+        code:{...CODE.expose, highlight:[15,16]},
       },
-      {
-        title: 'Step 2. sum by(le) — le 레이블을 유지한 채 집계',
-        desc: 'p95를 구하기 전에 여러 인스턴스·경로의 버킷을 하나로 합쳐야 한다. 이때 반드시 by(le)로 le 레이블을 남겨야 한다. le는 버킷 경계를 나타내는 축이므로, 이걸 날리면 histogram_quantile이 분포를 복원할 수 없다. rate(_bucket[5m])로 초당 증가율(=최근 관측 밀도)로 바꾼 뒤 sum by(le)로 합치는 것이 정석이다. le를 빼먹고 sum만 하는 것이 현업에서 가장 흔한 실수다.',
+      // ── Step 2 ────────────────────────────────────────────────────────────
+      { ...S2,
+        beat:{
+          label:'3대의 pod',
+          at:'promql L1–2',
+          caption:'pod-a/b/c 가 각자 같은 histogram 을 노출한다. 이것을 le 축으로 합쳐야 한다.',
+          changes:[
+            {mark:'new', text:'pod 3대'},
+            {mark:'read', text:'각자의 버킷 분포'},
+          ],
+        },
+        focus: 'aggregate',
+        legend: 'pod 3대가 각자 같은 histogram 을 노출한다',
+        code:{...CODE.aggregate, highlight:[1,2]},
+      },
+      { ...S2,
+        beat:{
+          label:'버킷도 counter',
+          at:'promql L4–5',
+          caption:'버킷은 누적 counter 이므로 먼저 rate 로 초당 증가율로 바꾼다.',
+          changes:[
+            {mark:'new', text:'rate()'},
+            {mark:'changed', text:'누적 건수 → 초당 증가율'},
+          ],
+        },
+        focus: 'aggregate',
+        legend: 'rate(_bucket[5m]) — 버킷도 counter 라 rate 가 먼저다',
+        code:{...CODE.aggregate, highlight:[4,5]},
+      },
+      { ...S2,
+        beat:{
+          label:'by(le) 로 합산',
+          at:'promql L7–10',
+          caption:'by(le) 를 붙여 le 축만 남기고 pod 레이블은 합산한다.',
+          changes:[
+            {mark:'new', text:'sum by (le)'},
+            {mark:'gone', text:'pod 레이블'},
+            {mark:'changed', text:'분포 3개 → 1개'},
+          ],
+        },
+        focus: 'aggregate',
+        legend: 'sum by (le) — le 축은 유지, pod 는 합산',
+        code:{...CODE.aggregate, highlight:[7,8,9,10]},
+      },
+      { ...S2,
+        beat:{
+          label:'le 를 빼면 깨진다',
+          at:'promql L12–14',
+          caption:'sum(...) 이나 without(le) 를 쓰면 분포 축이 사라져 quantile 을 계산할 수 없다.',
+          changes:[
+            {mark:'gone', text:'le 축'},
+            {mark:'gone', text:'histogram_quantile 계산'},
+          ],
+        },
         focus: 'aggregate',
         legend: 'sum by(le) — le만 남기고 instance/path 등은 합산',
-        code: {
-          lang: 'promql',
-          filename: 'promql — instance 3대를 le 기준으로 합산',
-          lines: [
-            '# 3대의 pod가 같은 histogram을 노출한다고 하자',
-            '# 목표: le 경계별로 rate를 더해 하나의 분포로 만든다',
-            '',
-            '# 1) 각 버킷을 초당 증가율로 변환 (Counter이므로 rate 필수)',
-            'rate(http_request_duration_seconds_bucket[5m])',
-            '',
-            '# 2) le는 남기고 pod/instance는 합산 → by(le)가 핵심',
-            'sum by (le) (',
-            '  rate(http_request_duration_seconds_bucket[5m])',
-            ')',
-            '',
-            '# le를 빼먹으면? → 분포 축이 사라져 quantile 계산 불가',
-            '# sum(rate(...))            # BAD: le 소실',
-            '# sum without (le) (...)    # BAD: le 제거',
-          ],
-          highlight: [7, 8, 9, 10],
-        },
+        code:{...CODE.aggregate, highlight:[12,13,14]},
       },
-      {
-        title: 'Step 3. histogram_quantile(0.95, ...) — 누적분포에서 p95',
-        desc: 'histogram_quantile(0.95, ...)는 "요청 1000건을 지연 오름차순으로 줄 세웠을 때 950번째가 어디냐"를 계산한다. 누적 버킷을 보고 950번째 순위가 걸치는 버킷을 찾는다. 여기서는 le=0.5(누적 780)와 le=1.0(누적 970) 사이에 950이 들어가므로 p95는 0.5초~1.0초 구간에 있다. 평균 0.42초와 비교하면 p95는 0.95초로, 꼬리 지연이 평균의 두 배가 넘는다는 사실이 드러난다. 이것이 평균 대신 백분위수를 보는 이유다.',
+      // ── Step 3 ────────────────────────────────────────────────────────────
+      { ...S3,
+        beat:{
+          label:'p95 의 정의',
+          at:'promql L1–2',
+          caption:'지연 오름차순 1000건에서 950번째가 p95 다.',
+          changes:[
+            {mark:'new', text:'목표 순위 950'},
+            {mark:'read', text:'전체 1000건'},
+          ],
+        },
+        focus: 'quantile',
+        legend: 'p95 = 1000건 중 950번째 요청의 지연',
+        code:{...CODE.quantile, highlight:[1,2]},
+      },
+      { ...S3,
+        beat:{
+          label:'quantile 호출',
+          at:'promql L4–5',
+          caption:'histogram_quantile 에 분위 0.95 를 넘긴다.',
+          changes:[
+            {mark:'new', text:'histogram_quantile()'},
+            {mark:'read', text:'분위 0.95'},
+          ],
+        },
+        focus: 'quantile',
+        legend: 'histogram_quantile(0.95, ...) — 분위를 먼저 정한다',
+        code:{...CODE.quantile, highlight:[4,5]},
+      },
+      { ...S3,
+        beat:{
+          label:'입력은 버킷 분포',
+          at:'promql L6–9',
+          caption:'두 번째 인자로 앞 스텝에서 만든 sum by(le) 분포를 그대로 넣는다.',
+          changes:[
+            {mark:'read', text:'sum by (le) 결과'},
+            {mark:'new', text:'누적 분포(CDF) 곡선'},
+          ],
+        },
+        focus: 'quantile',
+        legend: '입력은 sum by(le) 로 합쳐진 버킷 분포',
+        code:{...CODE.quantile, highlight:[6,7,8,9]},
+      },
+      { ...S3,
+        beat:{
+          label:'걸치는 버킷',
+          at:'promql L10',
+          caption:'950 은 누적 780(le=0.5)과 970(le=1.0) 사이에 있어 p95 는 그 구간이다.',
+          changes:[
+            {mark:'new', text:'p95 마커 ≈ 0.95s'},
+            {mark:'read', text:'하한·상한 버킷'},
+          ],
+        },
+        focus: 'quantile',
+        legend: '950 은 780@0.5s 와 970@1.0s 사이 → p95 ≈ 0.95s',
+        code:{...CODE.quantile, highlight:[10]},
+      },
+      { ...S3,
+        beat:{
+          label:'평균과 비교',
+          at:'promql L12–15',
+          caption:'_sum/_count 평균은 0.42초. p95 는 그 두 배가 넘는다.',
+          changes:[
+            {mark:'new', text:'평균 0.42s'},
+            {mark:'read', text:'p95 0.95s'},
+            {mark:'changed', text:'평균 대비 2배 이상'},
+          ],
+        },
         focus: 'quantile',
         legend: '950번째(=95%) 순위가 걸치는 버킷 구간을 탐색',
-        code: {
-          lang: 'promql',
-          filename: 'promql — p95 지연 (서버 측 계산)',
-          lines: [
-            '# p95 지연 = 상위 5%를 제외한 최악의 응답시간',
-            '# 0.95 분위 = 1000건 중 950번째 요청의 지연',
-            '',
-            'histogram_quantile(',
-            '  0.95,',
-            '  sum by (le) (',
-            '    rate(http_request_duration_seconds_bucket[5m])',
-            '  )',
-            ')',
-            '# → 약 0.95s  (누적 780@0.5s ~ 970@1.0s 사이)',
-            '',
-            '# 평균과 비교 (같은 데이터, 전혀 다른 그림)',
-            'rate(http_request_duration_seconds_sum[5m])',
-            '  / rate(http_request_duration_seconds_count[5m])',
-            '# → 0.42s  (평균은 꼬리를 감춘다)',
-          ],
-          highlight: [4, 5, 6, 7, 8, 9],
-        },
+        code:{...CODE.quantile, highlight:[12,13,14,15]},
       },
-      {
-        title: 'Step 4. 버킷 경계와 선형 보간 — p95는 "근사치"',
-        desc: 'Prometheus는 버킷 안의 분포를 모른다. 그래서 목표 순위가 걸친 버킷의 하한과 상한 사이를 직선으로 가정하고 보간한다. 950번째는 le=0.5(누적 780)와 le=1.0(누적 970) 사이에서 (950-780)/(970-780)=89.5% 지점이므로, 0.5 + 0.895*(1.0-0.5) ≈ 0.947초로 추정한다. 즉 실제 값이 아니라 버킷 해상도에 묶인 근사치다. 관심 구간(SLO 근처)에 버킷을 촘촘히 두지 않으면 p95 오차가 커진다. 이것이 버킷 설계가 중요한 이유다.',
+      // ── Step 4 ────────────────────────────────────────────────────────────
+      { ...S4,
+        beat:{
+          label:'목표 순위 계산',
+          at:'sql L1–2',
+          caption:'분위 x 전체 건수로 목표 순위 950 을 먼저 정한다.',
+          changes:[
+            {mark:'new', text:'rank 950'},
+            {mark:'read', text:'quantile 0.95'},
+          ],
+        },
+        focus: 'interpolation',
+        legend: '목표 순위 rank = 0.95 x 1000 = 950',
+        code:{...CODE.interp, highlight:[1,2]},
+      },
+      { ...S4,
+        beat:{
+          label:'버킷 테이블',
+          at:'sql L4–7',
+          caption:'(le, 누적) 쌍을 늘어놓아 950 이 어디에 들어가는지 본다.',
+          changes:[
+            {mark:'new', text:'버킷 5행'},
+            {mark:'read', text:'누적값 200~995'},
+          ],
+        },
+        focus: 'interpolation',
+        legend: '버킷 경계와 누적값을 늘어놓는다',
+        code:{...CODE.interp, highlight:[4,5,6,7]},
+      },
+      { ...S4,
+        beat:{
+          label:'하한·상한 확정',
+          at:'sql L8–12',
+          caption:'950 을 감싸는 하한(0.5, 780)과 상한(1.0, 970)을 고른다.',
+          changes:[
+            {mark:'new', text:'lower 0.5@780'},
+            {mark:'new', text:'upper 1.0@970'},
+            {mark:'read', text:'rank 950'},
+          ],
+        },
+        focus: 'interpolation',
+        legend: '하한 0.5s@780 / 상한 1.0s@970 을 확정',
+        code:{...CODE.interp, highlight:[8,9,10,11,12]},
+      },
+      { ...S4,
+        beat:{
+          label:'직선 보간',
+          at:'sql L13–16',
+          caption:'(950-780)/(970-780)=0.895 지점을 버킷 폭에 곱해 하한에 더한다.',
+          changes:[
+            {mark:'new', text:'비율 0.895'},
+            {mark:'changed', text:'p95 ≈ 0.947s'},
+          ],
+        },
+        focus: 'interpolation',
+        legend: '비율 0.895 → 0.5 + 0.895 x (1.0-0.5)',
+        code:{...CODE.interp, highlight:[13,14,15,16]},
+      },
+      { ...S4,
+        beat:{
+          label:'근사치임을 인정',
+          at:'sql L17',
+          caption:'버킷 안 분포는 모르므로 결과는 버킷 해상도에 묶인 근사치다.',
+          changes:[
+            {mark:'read', text:'p95_estimate 0.947'},
+            {mark:'gone', text:'정확한 실제 값'},
+          ],
+        },
         focus: 'interpolation',
         legend: '보간: lower_le + 비율 * (upper_le - lower_le), 비율=(rank-lowerCum)/(upperCum-lowerCum)',
-        code: {
-          lang: 'sql',
-          filename: 'sql — histogram_quantile 보간을 SQL로 재현',
-          lines: [
-            '-- Prometheus 내부 보간 로직을 SQL로 풀어보면:',
-            '-- 목표 순위(rank) = quantile * total = 0.95 * 1000 = 950',
-            '',
-            'WITH b(le, cum) AS (',
-            '  VALUES (0.1,200),(0.25,550),(0.5,780),',
-            '         (1.0,970),(2.5,995)',
-            '),',
-            'bounds AS (            -- 950이 걸친 하한/상한 버킷',
-            '  SELECT 0.5 AS lower_le, 780 AS lower_cum,',
-            '         1.0 AS upper_le, 970 AS upper_cum,',
-            '         950 AS rank',
-            ')',
-            'SELECT lower_le',
-            '  + (rank - lower_cum) / (upper_cum - lower_cum)',
-            '    * (upper_le - lower_le)  AS p95_estimate',
-            'FROM bounds;',
-            '-- p95_estimate ≈ 0.947  (버킷 해상도에 묶인 근사치)',
-          ],
-          highlight: [13, 14, 15],
-        },
+        code:{...CODE.interp, highlight:[17]},
       },
-      {
-        title: 'Step 5. SLO 판정 · Summary와의 차이 · 실무 함정',
-        desc: 'SLO(예: "p99 지연 1초 이하")는 histogram_quantile(0.99, ...) 결과를 임계선과 비교해 판정한다. Summary도 quantile을 주지만 클라이언트가 미리 계산해 노출하므로 여러 인스턴스를 합칠 수 없다(비가산). 반면 Histogram은 버킷이 가산적이라 서버에서 전체 분포를 합쳐 정확히 집계된다. 실무 함정은 네 가지다: by(le) 누락, SLO 근처 버킷 부족으로 인한 보간 오차, rate 이전에 quantile을 계산하는 집계 순서 실수, 그리고 카디널리티 폭증(버킷을 너무 잘게 나눔). 새 코드는 특별한 이유가 없으면 Histogram을 쓴다.',
+      // ── Step 5 ────────────────────────────────────────────────────────────
+      { ...S5,
+        beat:{
+          label:'p99 로 올린다',
+          at:'promql L1–3',
+          caption:'분위를 0.99 로 올려 꼬리 중의 꼬리를 본다.',
+          changes:[
+            {mark:'changed', text:'분위 0.95 → 0.99'},
+            {mark:'new', text:'p99 막대 1.3s'},
+          ],
+        },
+        focus: 'slo',
+        legend: 'p99 = 0.99 분위 — SLO 판정에 쓰는 값',
+        code:{...CODE.slo, highlight:[1,2,3]},
+      },
+      { ...S5,
+        beat:{
+          label:'SLO 임계 비교',
+          at:'promql L4–7',
+          caption:'같은 sum by(le) 입력에 > 1.0 을 붙이면 위반 여부가 참/거짓으로 나온다.',
+          changes:[
+            {mark:'new', text:'> 1.0 임계'},
+            {mark:'changed', text:'판정 → 위반'},
+          ],
+        },
+        focus: 'slo',
+        legend: 'p99 1.3s > SLO 1.0s → 위반 판정',
+        code:{...CODE.slo, highlight:[4,5,6,7]},
+      },
+      { ...S5,
+        beat:{
+          label:'경로별 p95',
+          at:'promql L9–15',
+          caption:'by(le, path) 로 path 축을 남기면 경로마다 p95 가 따로 나온다.',
+          changes:[
+            {mark:'changed', text:'분위 0.99 → 0.95'},
+            {mark:'new', text:'path 축 유지'},
+          ],
+        },
+        focus: 'quantile',
+        legend: '경로별 p95 — by(le, path) 로 축을 하나 더 남긴다',
+        code:{...CODE.slo, highlight:[9,10,11,12,13,14,15]},
+      },
+      { ...S5,
+        beat:{
+          label:'함정 1·2',
+          at:'promql L17–19',
+          caption:'by(le) 를 빠뜨리면 계산 자체가 안 되고, SLO 근처 버킷이 성글면 보간 오차가 커진다.',
+          changes:[
+            {mark:'gone', text:'le 축(누락 시)'},
+            {mark:'changed', text:'보간 오차 증가'},
+          ],
+        },
+        focus: 'slo',
+        legend: '함정 — by(le) 누락, SLO 근처 버킷 부족',
+        code:{...CODE.slo, highlight:[17,18,19]},
+      },
+      { ...S5,
+        beat:{
+          label:'순서와 카디널리티',
+          at:'promql L20–21',
+          caption:'순서는 rate → sum by(le) → quantile. 버킷을 너무 잘게 나누면 카디널리티가 터진다.',
+          changes:[
+            {mark:'new', text:'집계 순서 규칙'},
+            {mark:'gone', text:'버킷 무한 세분화'},
+          ],
+        },
         focus: 'slo',
         legend: 'p99 vs SLO 임계선 비교로 위반 판정 — Histogram은 가산, Summary는 비가산',
-        code: {
-          lang: 'promql',
-          filename: 'promql — SLO 위반 알림 규칙',
-          lines: [
-            '# p99 지연이 1초를 넘으면 SLO 위반',
-            'histogram_quantile(',
-            '  0.99,',
-            '  sum by (le) (',
-            '    rate(http_request_duration_seconds_bucket[5m])',
-            '  )',
-            ') > 1.0',
-            '',
-            '# 경로별 p95를 한 번에 (le + path 유지)',
-            'histogram_quantile(',
-            '  0.95,',
-            '  sum by (le, path) (',
-            '    rate(http_request_duration_seconds_bucket[5m])',
-            '  )',
-            ')',
-            '',
-            '# 함정 요약',
-            '# 1) by(le) 누락 → 계산 불가',
-            '# 2) SLO 근처 버킷 부족 → 보간 오차',
-            '# 3) 집계 순서: rate → sum by(le) → quantile',
-            '# 4) 버킷 과다 → 카디널리티 폭증',
-          ],
-          highlight: [2, 3, 4, 5, 6, 7],
-        },
+        code:{...CODE.slo, highlight:[20,21]},
       },
     ];
 
@@ -459,7 +785,7 @@
     }
 
     // ── 좌측: bucket 누적 → 누적분포에서 p95 탐색 시각화
-    function LiveDataPane({ step, stepIdx }) {
+    function LiveDataPane({ beat, step, stepIdx }) {
       const [tick, setTick] = useState(0);
       useEffect(() => {
         setTick(0);
@@ -480,6 +806,29 @@
 
       return (
         <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+          {beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{beat.caption}</p>
+              {beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="bg-slate-50 px-4 py-2 flex items-center justify-between border-b border-slate-200">
             <div className="flex items-center gap-2">
               <span className="text-base">📊</span>
@@ -811,13 +1160,13 @@
             </header>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-              <LiveDataPane step={step} stepIdx={stepIdx} />
+              <LiveDataPane beat={step.beat} step={step} stepIdx={stepIdx} />
               <CodeViewer code={step.code} stepIdx={stepIdx} />
             </div>
 
             <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: '#B8421F' }}>
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider opacity-80">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <h3 className="text-xs font-bold uppercase tracking-wider opacity-80">세부 {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
                 <span className="text-xs opacity-80">키보드 &larr;/&rarr;</span>
               </div>
               <p className="text-sm leading-relaxed">{step.desc}</p>
