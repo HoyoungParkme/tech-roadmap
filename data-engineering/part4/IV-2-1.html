@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-trn-native-beats="1">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -268,9 +268,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
 
   <!--
     IV-2-1. Streaming SQL (ksqlDB / Flink SQL)
@@ -285,231 +289,761 @@
     // ─────────────────────────────────────────────────────
     // STEPS — 단계별 시뮬레이션 데이터
     // ─────────────────────────────────────────────────────
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      createStream: {lang: "yaml", filename: "create-stream.sql", lines: [
+        "-- ksqlDB: Kafka topic을 stream으로 선언",
+        "CREATE STREAM clicks (",
+        "  user_id   BIGINT,",
+        "  page      STRING,",
+        "  ts        TIMESTAMP",
+        ") WITH (",
+        "  KAFKA_TOPIC  = 'clicks',",
+        "  VALUE_FORMAT = 'JSON',",
+        "  TIMESTAMP    = 'ts'",
+        ");",
+        "",
+        "-- Flink SQL: 동일 개념, DDL 형식",
+        "CREATE TABLE clicks (",
+        "  user_id BIGINT,",
+        "  page    STRING,",
+        "  ts      TIMESTAMP(3),",
+        "  WATERMARK FOR ts AS ts - INTERVAL '5' SECOND",
+        ") WITH (",
+        "  'connector' = 'kafka',",
+        "  'topic'     = 'clicks',",
+        "  'format'    = 'json'",
+        ");",
+        "",
+        "-- 핵심 차이: 배치 vs 스트리밍",
+        "-- 배치: 끝있는 table, 1회 실행 → 결과 1개",
+        "-- 스트림: 끝없는 stream, 계속 실행 → 결과 stream",
+      ]},
+      windowQ: {lang: "yaml", filename: "window-queries.sql", lines: [
+        "-- 1) TUMBLE: 겹치지 않는 고정 구간 (가장 일반)",
+        "SELECT",
+        "  TUMBLE_START(ts, INTERVAL '1' MINUTE) AS win_start,",
+        "  page,",
+        "  COUNT(*) AS clicks",
+        "FROM clicks",
+        "GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), page;",
+        "-- [10:00-10:01) /home  142",
+        "-- [10:01-10:02) /home  158",
+        "",
+        "-- 2) HOP: 슬라이딩 window (겹침)",
+        "SELECT",
+        "  HOP_START(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) AS win_start,",
+        "  COUNT(*) AS clicks_5min",
+        "FROM clicks",
+        "GROUP BY HOP(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE);",
+        "-- 1분마다 \"지난 5분\" 합 → 부드러운 추세선",
+        "",
+        "-- 3) SESSION: 활동 간격으로 자동 그룹",
+        "SELECT user_id,",
+        "  SESSION_START(ts, INTERVAL '30' MINUTE) AS s_start,",
+        "  COUNT(*) AS page_views",
+        "FROM clicks",
+        "GROUP BY SESSION(ts, INTERVAL '30' MINUTE), user_id;",
+        "",
+        "-- 비유: 그물 모양",
+        "-- TUMBLE  = 1분짜리 그물 차례차례",
+        "-- HOP     = 5분짜리 그물 1분마다 겹쳐서",
+        "-- SESSION = 무리 지나갈 때까지 기다렸다 닫기",
+      ]},
+      watermark: {lang: "yaml", filename: "watermark.sql", lines: [
+        "-- Flink SQL: WATERMARK 선언 (DDL 안에)",
+        "CREATE TABLE clicks (",
+        "  user_id BIGINT,",
+        "  page    STRING,",
+        "  ts      TIMESTAMP(3),",
+        "  WATERMARK FOR ts AS ts - INTERVAL '5' SECOND",
+        ") WITH ( 'connector' = 'kafka', ... );",
+        "",
+        "-- 의미",
+        "-- \"ts보다 5초 늦게까지는 도착할 수 있다\"",
+        "-- watermark = max(ts) - 5s",
+        "-- watermark가 window 끝을 지나면 → window 닫고 emit",
+        "",
+        "-- 동작 예시: TUMBLE 1분 [10:00~10:01)",
+        "-- 도착시각    이벤트 ts   watermark   상태",
+        "-- 10:00:55    10:00:50    10:00:45    채우는 중",
+        "-- 10:01:04    10:00:59    10:00:54    아직 미마감",
+        "-- 10:01:10    10:01:05    10:01:00    → window 닫고 emit",
+        "-- 10:01:12    10:00:58    (late!)     이미 닫힘",
+        "",
+        "-- late event 처리",
+        "-- 1) 버림 (기본)",
+        "-- 2) side output 으로 별도 처리",
+        "-- 3) ALLOWED LATENESS — window 더 오래 열어둠",
+        "",
+        "-- 트레이드오프",
+        "-- watermark 짧게 → 빠름, late 많아짐",
+        "-- watermark 길게 → 늦음, 정확도 ↑",
+      ]},
+      matchRecognize: {lang: "yaml", filename: "match-recognize.sql", lines: [
+        "-- Flink SQL: MATCH_RECOGNIZE",
+        "-- 시나리오: 결제 → 환불 시퀀스 패턴 탐지",
+        "",
+        "SELECT *",
+        "FROM payments",
+        "MATCH_RECOGNIZE (",
+        "  PARTITION BY user_id",
+        "  ORDER BY ts",
+        "  MEASURES",
+        "    PAY.ts        AS pay_ts,",
+        "    REFUND.ts     AS refund_ts,",
+        "    PAY.amount    AS pay_amt,",
+        "    REFUND.amount AS refund_amt",
+        "  ONE ROW PER MATCH",
+        "  AFTER MATCH SKIP PAST LAST ROW",
+        "  PATTERN (PAY REFUND)",
+        "  WITHIN INTERVAL '30' MINUTE",
+        "  DEFINE",
+        "    PAY    AS PAY.kind = 'payment',",
+        "    REFUND AS REFUND.kind = 'refund'",
+        "         AND REFUND.amount = PAY.amount",
+        ");",
+        "-- user_id=42, pay_ts=10:01:00 amt=1.2M",
+        "--            refund_ts=10:03:30 amt=1.2M",
+        "-- → 의심 거래 alert",
+        "",
+        "-- 패턴 문법 (정규식 유사)",
+        "-- A B          A 다음 B",
+        "-- A B+         A 다음 B 1번 이상",
+        "-- A B* C       A 다음 B 0번 이상, C",
+        "",
+        "-- 활용 예",
+        "-- 사기:  login_fail{3,} → success → transfer",
+        "-- 퍼널:  view → cart → checkout → purchase",
+        "-- IoT:   normal → high → critical",
+        "",
+        "-- ksqlDB는 MATCH_RECOGNIZE 없음 — JOIN 으로 흉내",
+      ]},
+    };
+
+    const S1 = { title: "Step 1. Unbounded — 끝이 없는 stream", desc: "배치 SQL은 \"끝이 있는 테이블\"을 한 번에 읽지만, Streaming SQL은 끝이 없는 stream 위에서 동작한다. Kafka topic을 CREATE STREAM 으로 선언하면 이후 INSERT 되는 모든 메시지가 자동으로 들어온다. event time 축은 무한히 흐른다." };
+    const S2 = { title: "Step 2. Window — Tumble / Hop / Session", desc: "끝이 없는 stream을 시간으로 잘라야 집계가 가능. TUMBLE은 겹치지 않는 고정 구간(1분/1분/1분), HOP은 겹치는 슬라이딩(5분 window 1분마다), SESSION은 활동 간격으로 자동 묶음. \"그물의 모양\"이 다르다." };
+    const S3 = { title: "Step 3. Watermark — late event 처리", desc: "네트워크 지연으로 ts=58초 이벤트가 t=70초에 도착할 수 있다. Watermark는 \"이 시각 이전 이벤트는 더 안 올 거다\"라는 약속. 5초 grace 후 window를 닫고 결과 emit. 이후 도착하는 이벤트는 late event 처리 (버림 또는 side output)." };
+    const S4 = { title: "Step 4. CEP — MATCH_RECOGNIZE 패턴 매칭", desc: "Complex Event Processing — stream 안에서 \"결제 → 환불\" 같은 시퀀스 패턴을 정규식처럼 찾는다. Flink SQL의 MATCH_RECOGNIZE 는 PARTITION BY user_id 로 묶고 ORDER BY ts 로 정렬한 뒤 PATTERN (PAY REFUND) 매칭. 사기 탐지 / 클릭 퍼널 / 이탈 분석에 쓴다." };
+
     const STEPS = [
-      {
-        title: 'Step 1. Unbounded — 끝이 없는 stream',
-        desc: '배치 SQL은 "끝이 있는 테이블"을 한 번에 읽지만, Streaming SQL은 끝이 없는 stream 위에서 동작한다. Kafka topic을 CREATE STREAM 으로 선언하면 이후 INSERT 되는 모든 메시지가 자동으로 들어온다. event time 축은 무한히 흐른다.',
-        focus: 'unbounded',
-        // unbounded: kafka topic → stream 흐름 + event time 축
+      // ── Step 1 ────────────────────────────────────────────────────────────
+      { ...S1,
+        beat: {
+          label: "CREATE STREAM 선언",
+          at: "create-stream.sql L1–2",
+          caption: "ksqlDB 에서 clicks 라는 stream 을 만든다. 아직 축 위에는 아무 이벤트도 없다.",
+          changes: [{mark: "new", text: "stream clicks"}, {mark: "read", text: "초점 → Unbounded"}],
+        },
+        focus: "unbounded",
+        events: [],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.createStream, highlight: [1, 2]},
+      },
+      { ...S1,
+        beat: {
+          label: "컬럼 3개 정의",
+          at: "create-stream.sql L3–5",
+          caption: "user_id / page / ts 세 컬럼으로 메시지 모양을 정한다. 이 모양의 첫 이벤트가 t=5s 에 들어온다.",
+          changes: [{mark: "new", text: "스키마 user_id·page·ts"}, {mark: "new", text: "이벤트 1건 도착"}],
+        },
+        focus: "unbounded",
         events: [
-          { id: 'e1', t: 5,  page: '/home', late: false },
-          { id: 'e2', t: 18, page: '/cart', late: false },
-          { id: 'e3', t: 32, page: '/home', late: false },
-          { id: 'e4', t: 47, page: '/buy',  late: false },
-          { id: 'e5', t: 62, page: '/home', late: false },
-          { id: 'e6', t: 78, page: '/cart', late: false },
+          {id: "e1", t: 5, page: "/home", late: false}
         ],
         windows: [],
         watermark: null,
         latePoint: null,
         cepMatch: null,
-        code: {
-          lang: 'yaml',
-          filename: 'create-stream.sql',
-          lines: [
-            '-- ksqlDB: Kafka topic을 stream으로 선언',
-            'CREATE STREAM clicks (',
-            '  user_id   BIGINT,',
-            '  page      STRING,',
-            '  ts        TIMESTAMP',
-            ') WITH (',
-            '  KAFKA_TOPIC  = \'clicks\',',
-            '  VALUE_FORMAT = \'JSON\',',
-            '  TIMESTAMP    = \'ts\'',
-            ');',
-            '',
-            '-- Flink SQL: 동일 개념, DDL 형식',
-            'CREATE TABLE clicks (',
-            '  user_id BIGINT,',
-            '  page    STRING,',
-            '  ts      TIMESTAMP(3),',
-            '  WATERMARK FOR ts AS ts - INTERVAL \'5\' SECOND',
-            ') WITH (',
-            '  \'connector\' = \'kafka\',',
-            '  \'topic\'     = \'clicks\',',
-            '  \'format\'    = \'json\'',
-            ');',
-            '',
-            '-- 핵심 차이: 배치 vs 스트리밍',
-            '-- 배치: 끝있는 table, 1회 실행 → 결과 1개',
-            '-- 스트림: 끝없는 stream, 계속 실행 → 결과 stream',
-          ],
-          highlight: [2, 13, 17],
-        },
+        code: {...CODE.createStream, highlight: [3, 4, 5]},
       },
-      {
-        title: 'Step 2. Window — Tumble / Hop / Session',
-        desc: '끝이 없는 stream을 시간으로 잘라야 집계가 가능. TUMBLE은 겹치지 않는 고정 구간(1분/1분/1분), HOP은 겹치는 슬라이딩(5분 window 1분마다), SESSION은 활동 간격으로 자동 묶음. "그물의 모양"이 다르다.',
-        focus: 'window',
-        events: [
-          { id: 'e1', t: 5,  page: '/home', late: false },
-          { id: 'e2', t: 18, page: '/cart', late: false },
-          { id: 'e3', t: 32, page: '/home', late: false },
-          { id: 'e4', t: 47, page: '/buy',  late: false },
-          { id: 'e5', t: 62, page: '/home', late: false },
-          { id: 'e6', t: 78, page: '/cart', late: false },
-        ],
-        // 3가지 window 비교 — 1분(60s) tumble 기준
-        windows: [
-          { kind: 'tumble',  start: 0,  end: 60, count: 4, label: '[0~1분) count=4' },
-          { kind: 'tumble',  start: 60, end: 90, count: 2, label: '[1~1.5분) count=2' },
-          { kind: 'hop',     start: 0,  end: 60, count: 4, label: 'HOP 5min slide 1min' },
-          { kind: 'session', start: 5,  end: 78, count: 6, label: 'SESSION (idle 30s)' },
-        ],
-        watermark: null,
-        latePoint: null,
-        cepMatch: null,
-        code: {
-          lang: 'yaml',
-          filename: 'window-queries.sql',
-          lines: [
-            '-- 1) TUMBLE: 겹치지 않는 고정 구간 (가장 일반)',
-            'SELECT',
-            '  TUMBLE_START(ts, INTERVAL \'1\' MINUTE) AS win_start,',
-            '  page,',
-            '  COUNT(*) AS clicks',
-            'FROM clicks',
-            'GROUP BY TUMBLE(ts, INTERVAL \'1\' MINUTE), page;',
-            '-- [10:00-10:01) /home  142',
-            '-- [10:01-10:02) /home  158',
-            '',
-            '-- 2) HOP: 슬라이딩 window (겹침)',
-            'SELECT',
-            '  HOP_START(ts, INTERVAL \'1\' MINUTE, INTERVAL \'5\' MINUTE) AS win_start,',
-            '  COUNT(*) AS clicks_5min',
-            'FROM clicks',
-            'GROUP BY HOP(ts, INTERVAL \'1\' MINUTE, INTERVAL \'5\' MINUTE);',
-            '-- 1분마다 "지난 5분" 합 → 부드러운 추세선',
-            '',
-            '-- 3) SESSION: 활동 간격으로 자동 그룹',
-            'SELECT user_id,',
-            '  SESSION_START(ts, INTERVAL \'30\' MINUTE) AS s_start,',
-            '  COUNT(*) AS page_views',
-            'FROM clicks',
-            'GROUP BY SESSION(ts, INTERVAL \'30\' MINUTE), user_id;',
-            '',
-            '-- 비유: 그물 모양',
-            '-- TUMBLE  = 1분짜리 그물 차례차례',
-            '-- HOP     = 5분짜리 그물 1분마다 겹쳐서',
-            '-- SESSION = 무리 지나갈 때까지 기다렸다 닫기',
-          ],
-          highlight: [1, 11, 19],
+      { ...S1,
+        beat: {
+          label: "Kafka topic 연결",
+          at: "create-stream.sql L6–10",
+          caption: "KAFKA_TOPIC 으로 원본을 연결하고 TIMESTAMP=ts 로 시간 축을 ts 로 못박는다. 도착 순서가 아니라 event time 이 기준이다.",
+          changes: [{mark: "read", text: "KAFKA_TOPIC = 'clicks'"}, {mark: "changed", text: "시간 축 = ts (event time)"}],
         },
-      },
-      {
-        title: 'Step 3. Watermark — late event 처리',
-        desc: '네트워크 지연으로 ts=58초 이벤트가 t=70초에 도착할 수 있다. Watermark는 "이 시각 이전 이벤트는 더 안 올 거다"라는 약속. 5초 grace 후 window를 닫고 결과 emit. 이후 도착하는 이벤트는 late event 처리 (버림 또는 side output).',
-        focus: 'watermark',
+        focus: "unbounded",
         events: [
-          { id: 'e1', t: 5,  page: '/home', late: false },
-          { id: 'e2', t: 18, page: '/cart', late: false },
-          { id: 'e3', t: 32, page: '/home', late: false },
-          { id: 'e4', t: 47, page: '/buy',  late: false },
-          { id: 'e5', t: 58, page: '/home', late: false },
-          { id: 'e6', t: 78, page: '/cart', late: false },
-        ],
-        windows: [
-          { kind: 'tumble', start: 0,  end: 60, count: 5, label: '[0~60s) closed', closed: true },
-        ],
-        watermark: 65,   // watermark line at t=65 (= max event 60 - 5s grace ... 시각화 단순화)
-        latePoint: 55,   // ts=55, 도착시간이 watermark 이후 → late
-        cepMatch: null,
-        code: {
-          lang: 'yaml',
-          filename: 'watermark.sql',
-          lines: [
-            '-- Flink SQL: WATERMARK 선언 (DDL 안에)',
-            'CREATE TABLE clicks (',
-            '  user_id BIGINT,',
-            '  page    STRING,',
-            '  ts      TIMESTAMP(3),',
-            '  WATERMARK FOR ts AS ts - INTERVAL \'5\' SECOND',
-            ') WITH ( \'connector\' = \'kafka\', ... );',
-            '',
-            '-- 의미',
-            '-- "ts보다 5초 늦게까지는 도착할 수 있다"',
-            '-- watermark = max(ts) - 5s',
-            '-- watermark가 window 끝을 지나면 → window 닫고 emit',
-            '',
-            '-- 동작 예시: TUMBLE 1분 [10:00~10:01)',
-            '-- 도착시각    이벤트 ts   watermark   상태',
-            '-- 10:00:55    10:00:50    10:00:45    채우는 중',
-            '-- 10:01:04    10:00:59    10:00:54    아직 미마감',
-            '-- 10:01:10    10:01:05    10:01:00    → window 닫고 emit',
-            '-- 10:01:12    10:00:58    (late!)     이미 닫힘',
-            '',
-            '-- late event 처리',
-            '-- 1) 버림 (기본)',
-            '-- 2) side output 으로 별도 처리',
-            '-- 3) ALLOWED LATENESS — window 더 오래 열어둠',
-            '',
-            '-- 트레이드오프',
-            '-- watermark 짧게 → 빠름, late 많아짐',
-            '-- watermark 길게 → 늦음, 정확도 ↑',
-          ],
-          highlight: [6, 18, 19],
-        },
-      },
-      {
-        title: 'Step 4. CEP — MATCH_RECOGNIZE 패턴 매칭',
-        desc: 'Complex Event Processing — stream 안에서 "결제 → 환불" 같은 시퀀스 패턴을 정규식처럼 찾는다. Flink SQL의 MATCH_RECOGNIZE 는 PARTITION BY user_id 로 묶고 ORDER BY ts 로 정렬한 뒤 PATTERN (PAY REFUND) 매칭. 사기 탐지 / 클릭 퍼널 / 이탈 분석에 쓴다.',
-        focus: 'cep',
-        events: [
-          { id: 'e1', t: 5,  page: 'PAY:1.2M',    late: false, kind: 'pay' },
-          { id: 'e2', t: 18, page: '/cart',       late: false },
-          { id: 'e3', t: 32, page: 'REFUND:1.2M', late: false, kind: 'refund' },
-          { id: 'e4', t: 47, page: '/buy',        late: false },
-          { id: 'e5', t: 62, page: '/home',       late: false },
-          { id: 'e6', t: 78, page: '/cart',       late: false },
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false}
         ],
         windows: [],
         watermark: null,
         latePoint: null,
-        cepMatch: { fromId: 'e1', toId: 'e3', label: 'PAY → REFUND 매칭!' },
-        code: {
-          lang: 'yaml',
-          filename: 'match-recognize.sql',
-          lines: [
-            '-- Flink SQL: MATCH_RECOGNIZE',
-            '-- 시나리오: 결제 → 환불 시퀀스 패턴 탐지',
-            '',
-            'SELECT *',
-            'FROM payments',
-            'MATCH_RECOGNIZE (',
-            '  PARTITION BY user_id',
-            '  ORDER BY ts',
-            '  MEASURES',
-            '    PAY.ts        AS pay_ts,',
-            '    REFUND.ts     AS refund_ts,',
-            '    PAY.amount    AS pay_amt,',
-            '    REFUND.amount AS refund_amt',
-            '  ONE ROW PER MATCH',
-            '  AFTER MATCH SKIP PAST LAST ROW',
-            '  PATTERN (PAY REFUND)',
-            '  WITHIN INTERVAL \'30\' MINUTE',
-            '  DEFINE',
-            '    PAY    AS PAY.kind = \'payment\',',
-            '    REFUND AS REFUND.kind = \'refund\'',
-            '         AND REFUND.amount = PAY.amount',
-            ');',
-            '-- user_id=42, pay_ts=10:01:00 amt=1.2M',
-            '--            refund_ts=10:03:30 amt=1.2M',
-            '-- → 의심 거래 alert',
-            '',
-            '-- 패턴 문법 (정규식 유사)',
-            '-- A B          A 다음 B',
-            '-- A B+         A 다음 B 1번 이상',
-            '-- A B* C       A 다음 B 0번 이상, C',
-            '',
-            '-- 활용 예',
-            '-- 사기:  login_fail{3,} → success → transfer',
-            '-- 퍼널:  view → cart → checkout → purchase',
-            '-- IoT:   normal → high → critical',
-            '',
-            '-- ksqlDB는 MATCH_RECOGNIZE 없음 — JOIN 으로 흉내',
-          ],
-          highlight: [6, 16, 19, 20],
+        cepMatch: null,
+        code: {...CODE.createStream, highlight: [6, 7, 8, 9, 10]},
+      },
+      { ...S1,
+        beat: {
+          label: "Flink 쪽 DDL",
+          at: "create-stream.sql L12–17",
+          caption: "Flink SQL 도 같은 개념을 CREATE TABLE 로 쓴다. WATERMARK 선언까지 DDL 안에 들어간다.",
+          changes: [{mark: "new", text: "Flink TABLE clicks"}, {mark: "new", text: "이벤트 계속 유입"}],
         },
+        focus: "unbounded",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.createStream, highlight: [12, 13, 14, 15, 16, 17]},
+      },
+      { ...S1,
+        beat: {
+          label: "connector 설정",
+          at: "create-stream.sql L18–22",
+          caption: "connector=kafka, topic=clicks, format=json — 어디서 어떤 형식으로 읽을지 지정한다.",
+          changes: [{mark: "read", text: "connector = 'kafka'"}, {mark: "changed", text: "이벤트 5건 누적"}],
+        },
+        focus: "unbounded",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.createStream, highlight: [18, 19, 20, 21, 22]},
+      },
+      { ...S1,
+        beat: {
+          label: "배치와의 차이",
+          at: "create-stream.sql L24–26",
+          caption: "배치는 한 번 돌고 결과 하나를 낸다. 스트림은 끝이 없어 계속 돌고 결과도 계속 나온다.",
+          changes: [{mark: "gone", text: "끝나는 지점"}, {mark: "changed", text: "이벤트 6건 (계속 유입)"}],
+        },
+        focus: "unbounded",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.createStream, highlight: [24, 25, 26]},
+      },
+      // ── Step 2 ────────────────────────────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: "집계 컬럼 고르기",
+          at: "window-queries.sql L2–5",
+          caption: "window 시작 시각과 page 로 묶어 건수를 센다. 아직 자를 구간이 없어 그물은 비어 있다.",
+          changes: [{mark: "changed", text: "초점 → Window"}, {mark: "read", text: "COUNT(*) AS clicks"}],
+        },
+        focus: "window",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.windowQ, highlight: [2, 3, 4, 5]},
+      },
+      { ...S2,
+        beat: {
+          label: "TUMBLE 1분",
+          at: "window-queries.sql L6–7",
+          caption: "GROUP BY TUMBLE(ts, 1분) — 겹치지 않는 1분 그물이 생기고 그 안의 이벤트가 모인다.",
+          changes: [{mark: "new", text: "TUMBLE [0~60s) 그물"}, {mark: "read", text: "구간 안 이벤트 4건"}],
+        },
+        focus: "window",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 4, label: "[0~1분) 집계 중"}
+        ],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.windowQ, highlight: [6, 7]},
+      },
+      { ...S2,
+        beat: {
+          label: "구간별 결과",
+          at: "window-queries.sql L8–9",
+          caption: "1분이 지나면 그 구간의 결과가 확정되고 다음 그물이 이어 열린다. 결과가 계속 흘러나온다.",
+          changes: [{mark: "changed", text: "[0~1분) count=4 확정"}, {mark: "new", text: "[1~1.5분) 그물 count=2"}],
+        },
+        focus: "window",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 4, label: "[0~1분) count=4"},
+          {kind: "tumble", start: 60, end: 90, count: 2, label: "[1~1.5분) count=2"}
+        ],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.windowQ, highlight: [8, 9]},
+      },
+      { ...S2,
+        beat: {
+          label: "HOP 슬라이딩",
+          at: "window-queries.sql L11–16",
+          caption: "HOP 은 5분 그물을 1분마다 겹쳐 던진다. 같은 이벤트가 여러 window 에 들어가 추세선이 부드러워진다.",
+          changes: [{mark: "new", text: "HOP 그물 (겹침)"}, {mark: "changed", text: "이벤트 1건이 여러 window 에 포함"}],
+        },
+        focus: "window",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 4, label: "[0~1분) count=4"},
+          {kind: "tumble", start: 60, end: 90, count: 2, label: "[1~1.5분) count=2"},
+          {kind: "hop", start: 0, end: 60, count: 4, label: "HOP 5min slide 1min"}
+        ],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.windowQ, highlight: [11, 12, 13, 14, 15, 16]},
+      },
+      { ...S2,
+        beat: {
+          label: "SESSION 자동 묶음",
+          at: "window-queries.sql L19–24",
+          caption: "SESSION 은 길이를 정하지 않고 활동이 끊길 때까지 이어 붙인다. user 단위 방문 한 묶음이 된다.",
+          changes: [{mark: "new", text: "SESSION 그물 (5~78s)"}, {mark: "read", text: "user_id 별 page_views"}],
+        },
+        focus: "window",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 4, label: "[0~1분) count=4"},
+          {kind: "tumble", start: 60, end: 90, count: 2, label: "[1~1.5분) count=2"},
+          {kind: "hop", start: 0, end: 60, count: 4, label: "HOP 5min slide 1min"},
+          {kind: "session", start: 5, end: 78, count: 6, label: "SESSION 집계 중"}
+        ],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.windowQ, highlight: [19, 20, 21, 22, 23, 24]},
+      },
+      { ...S2,
+        beat: {
+          label: "그물 모양 정리",
+          at: "window-queries.sql L26–29",
+          caption: "TUMBLE 은 차례차례, HOP 은 겹쳐서, SESSION 은 무리가 지나갈 때까지. 30초 idle 이 지나 세션이 닫힌다.",
+          changes: [{mark: "changed", text: "SESSION (idle 30s) 확정"}, {mark: "read", text: "세 가지 그물 비교"}],
+        },
+        focus: "window",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 4, label: "[0~1분) count=4"},
+          {kind: "tumble", start: 60, end: 90, count: 2, label: "[1~1.5분) count=2"},
+          {kind: "hop", start: 0, end: 60, count: 4, label: "HOP 5min slide 1min"},
+          {kind: "session", start: 5, end: 78, count: 6, label: "SESSION (idle 30s)"}
+        ],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.windowQ, highlight: [26, 27, 28, 29]},
+      },
+      // ── Step 3 ────────────────────────────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: "테이블 다시 선언",
+          at: "watermark.sql L1–5",
+          caption: "같은 clicks 를 Flink DDL 로 다시 본다. 아직 watermark 선이 없어 window 를 언제 닫을지 알 수 없다.",
+          changes: [{mark: "changed", text: "초점 → Watermark"}, {mark: "gone", text: "window 마감 기준"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [1, 2, 3, 4, 5]},
+      },
+      { ...S3,
+        beat: {
+          label: "WATERMARK 선언",
+          at: "watermark.sql L6–7",
+          caption: "ts 에서 5초를 뺀 값이 watermark 다. 축 왼쪽 끝에 빨간 선이 생기고 첫 그물이 열린다.",
+          changes: [{mark: "new", text: "watermark 선 등장"}, {mark: "new", text: "[0~60s) window 열림"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 0, label: "[0~60s) 열림"}
+        ],
+        watermark: 0,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [6, 7]},
+      },
+      { ...S3,
+        beat: {
+          label: "watermark = max(ts)-5s",
+          at: "watermark.sql L9–12",
+          caption: "가장 큰 ts 에서 5초 뒤로 물러난 지점이 watermark 다. 이벤트가 쌓일수록 선이 오른쪽으로 밀린다.",
+          changes: [{mark: "changed", text: "watermark 0 → 45s"}, {mark: "changed", text: "window 안 4건 집계 중"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 4, label: "[0~60s) 채우는 중"}
+        ],
+        watermark: 45,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [9, 10, 11, 12]},
+      },
+      { ...S3,
+        beat: {
+          label: "지연 도착 예시",
+          at: "watermark.sql L14–17",
+          caption: "ts=59초 이벤트가 10:01:04 에 도착해도 watermark 는 아직 54초라 window 는 열려 있다. e5 가 58초 자리로 들어온다.",
+          changes: [{mark: "changed", text: "e5 ts 62s → 58s"}, {mark: "changed", text: "watermark 45 → 54s"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 58, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 5, label: "[0~60s) 채우는 중"}
+        ],
+        watermark: 54,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [14, 15, 16, 17]},
+      },
+      { ...S3,
+        beat: {
+          label: "window 닫고 emit",
+          at: "watermark.sql L18",
+          caption: "watermark 가 60초를 넘어서면 그 구간은 더 안 온다고 보고 닫는다. count=5 로 결과가 나간다.",
+          changes: [{mark: "changed", text: "window closed (count=5)"}, {mark: "new", text: "결과 emit"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 58, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 5, label: "[0~60s) closed", closed: true}
+        ],
+        watermark: 60,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [18]},
+      },
+      { ...S3,
+        beat: {
+          label: "late event 처리",
+          at: "watermark.sql L19–24",
+          caption: "닫힌 뒤 도착한 ts=55초 이벤트는 late 다. 기본은 버리고, 필요하면 side output 이나 ALLOWED LATENESS 로 살린다.",
+          changes: [{mark: "new", text: "late 이벤트 ts=55s"}, {mark: "gone", text: "닫힌 window 재집계"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 58, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 5, label: "[0~60s) closed", closed: true}
+        ],
+        watermark: 60,
+        latePoint: 55,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [19, 20, 21, 22, 23, 24]},
+      },
+      { ...S3,
+        beat: {
+          label: "짧게 vs 길게",
+          at: "watermark.sql L26–28",
+          caption: "watermark 를 길게 잡으면 선이 더 오른쪽에서 멈춘다. 결과는 늦어지지만 late 로 버려지는 건수가 준다.",
+          changes: [{mark: "changed", text: "watermark 60 → 65s"}, {mark: "read", text: "정확도 ↑ / 지연 ↑"}],
+        },
+        focus: "watermark",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 58, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [
+          {kind: "tumble", start: 0, end: 60, count: 5, label: "[0~60s) closed", closed: true}
+        ],
+        watermark: 65,
+        latePoint: 55,
+        cepMatch: null,
+        code: {...CODE.watermark, highlight: [26, 27, 28]},
+      },
+      // ── Step 4 ────────────────────────────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: "payments 를 읽는다",
+          at: "match-recognize.sql L1–5",
+          caption: "clicks 대신 payments stream 을 본다. window 도 watermark 도 없이 이벤트 순서만 남는다.",
+          changes: [{mark: "changed", text: "초점 → CEP"}, {mark: "gone", text: "window / watermark"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "/home", late: false},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.matchRecognize, highlight: [1, 2, 3, 4, 5]},
+      },
+      { ...S4,
+        beat: {
+          label: "user 별 시간순 정렬",
+          at: "match-recognize.sql L6–8",
+          caption: "PARTITION BY user_id 로 사람별로 나누고 ORDER BY ts 로 줄 세운다. 그 줄에서 결제 이벤트가 드러난다.",
+          changes: [{mark: "new", text: "MATCH_RECOGNIZE 블록"}, {mark: "changed", text: "e1 → PAY:1.2M"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "/home", late: false},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.matchRecognize, highlight: [6, 7, 8]},
+      },
+      { ...S4,
+        beat: {
+          label: "MEASURES 로 꺼낼 값",
+          at: "match-recognize.sql L9–13",
+          caption: "매칭되면 무엇을 뽑을지 정한다. PAY 와 REFUND 의 시각·금액을 꺼내 쓰겠다는 선언이다.",
+          changes: [{mark: "read", text: "PAY.ts / REFUND.amount"}, {mark: "changed", text: "e3 → REFUND:1.2M"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "REFUND:1.2M", late: false, kind: "refund"},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: null,
+        code: {...CODE.matchRecognize, highlight: [9, 10, 11, 12, 13]},
+      },
+      { ...S4,
+        beat: {
+          label: "PATTERN (PAY REFUND)",
+          at: "match-recognize.sql L14–17",
+          caption: "PAY 다음 REFUND 가 오는 순서를 30분 안에서 찾는다. 두 이벤트를 잇는 화살표가 그려진다.",
+          changes: [{mark: "new", text: "PAY → REFUND 화살표"}, {mark: "read", text: "WITHIN INTERVAL '30' MINUTE"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "REFUND:1.2M", late: false, kind: "refund"},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: {fromId: "e1", toId: "e3", label: "PATTERN (PAY REFUND)"},
+        code: {...CODE.matchRecognize, highlight: [14, 15, 16, 17]},
+      },
+      { ...S4,
+        beat: {
+          label: "DEFINE 조건",
+          at: "match-recognize.sql L18–21",
+          caption: "kind 로 결제와 환불을 구분하고, 금액까지 같아야 매칭으로 친다. 아무 환불이나 걸리지 않는다.",
+          changes: [{mark: "changed", text: "금액 일치 조건 추가"}, {mark: "gone", text: "금액 다른 환불 매칭"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "REFUND:1.2M", late: false, kind: "refund"},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: {fromId: "e1", toId: "e3", label: "금액 일치 조건 확인"},
+        code: {...CODE.matchRecognize, highlight: [18, 19, 20, 21]},
+      },
+      { ...S4,
+        beat: {
+          label: "매칭 결과",
+          at: "match-recognize.sql L23–25",
+          caption: "user_id=42 가 1.2M 을 결제하고 2분 30초 뒤 같은 금액을 환불했다. 의심 거래로 alert 가 나간다.",
+          changes: [{mark: "new", text: "의심 거래 alert"}, {mark: "read", text: "pay_ts / refund_ts"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "REFUND:1.2M", late: false, kind: "refund"},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: {fromId: "e1", toId: "e3", label: "의심 거래 alert"},
+        code: {...CODE.matchRecognize, highlight: [23, 24, 25]},
+      },
+      { ...S4,
+        beat: {
+          label: "패턴 문법",
+          at: "match-recognize.sql L27–30",
+          caption: "PATTERN 은 정규식처럼 쓴다. A B 는 연속, A B+ 는 1번 이상 반복, A B* C 는 0번 이상이다.",
+          changes: [{mark: "read", text: "A B / A B+ / A B* C"}, {mark: "changed", text: "패턴 표기법 확장"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "REFUND:1.2M", late: false, kind: "refund"},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: {fromId: "e1", toId: "e3", label: "A B = A 다음 B"},
+        code: {...CODE.matchRecognize, highlight: [27, 28, 29, 30]},
+      },
+      { ...S4,
+        beat: {
+          label: "활용과 한계",
+          at: "match-recognize.sql L32–37",
+          caption: "사기 탐지·퍼널·IoT 경보가 같은 문법으로 풀린다. 다만 ksqlDB 에는 MATCH_RECOGNIZE 가 없어 JOIN 으로 흉내내야 한다.",
+          changes: [{mark: "changed", text: "PAY → REFUND 매칭 확정"}, {mark: "gone", text: "ksqlDB 의 MATCH_RECOGNIZE"}],
+        },
+        focus: "cep",
+        events: [
+          {id: "e1", t: 5, page: "PAY:1.2M", late: false, kind: "pay"},
+          {id: "e2", t: 18, page: "/cart", late: false},
+          {id: "e3", t: 32, page: "REFUND:1.2M", late: false, kind: "refund"},
+          {id: "e4", t: 47, page: "/buy", late: false},
+          {id: "e5", t: 62, page: "/home", late: false},
+          {id: "e6", t: 78, page: "/cart", late: false}
+        ],
+        windows: [],
+        watermark: null,
+        latePoint: null,
+        cepMatch: {fromId: "e1", toId: "e3", label: "PAY → REFUND 매칭!"},
+        code: {...CODE.matchRecognize, highlight: [32, 33, 34, 35, 36, 37]},
       },
     ];
 
@@ -527,13 +1061,36 @@
     // ─────────────────────────────────────────────────────
     // LiveDataPane — Streaming 시각화 (event time 축)
     // ─────────────────────────────────────────────────────
-    function LiveDataPane({ step }) {
+    function LiveDataPane({ beat, step }) {
       const { focus, events, windows, watermark, latePoint, cepMatch } = step;
       const T_MAX = 90; // event time 축 0~90s
       const tToPct = (t) => (t / T_MAX) * 100;
 
       return (
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+          {beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{beat.caption}</p>
+              {beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-bold text-slate-700">🌊 흐르는 강 (Streaming)</h2>
             <span className="text-[10px] text-slate-400 font-mono">event time · live</span>
@@ -776,7 +1333,7 @@
           {/* 푸터 */}
           <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
             <span>{code.lines.length} lines</span>
-            <span>Step {stepIdx + 1} / {total}</span>
+            <span>세부 {stepIdx + 1} / {total}</span>
           </div>
         </div>
       );
@@ -856,7 +1413,7 @@
 
             {/* 좌/우 2-pane */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-              <LiveDataPane step={step} />
+              <LiveDataPane beat={step.beat} step={step} />
               <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
@@ -871,7 +1428,7 @@
             <div className="p-4 rounded-xl bg-teal-700 text-white shadow-sm">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-teal-200">
-                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                  세부 {stepIdx + 1} / {STEPS.length} · {step.title}
                 </h3>
                 <span className="text-xs text-teal-200">키보드 &larr;/&rarr;</span>
               </div>
