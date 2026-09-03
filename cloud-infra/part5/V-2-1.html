@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-trn-native-beats="1">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -268,9 +268,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
 
   <!--
     V-2-1. 운영 자동화 — Runbook → Playbook → SSM → Chaos
@@ -294,258 +298,768 @@
     // ─────────────────────────────────────────────────────
     // 단계별 데이터 정의 (자동화 진화 + 우측 코드)
     // ─────────────────────────────────────────────────────
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      runbook: {lang:'shell', filename:'alert-with-runbook.yaml', lines:[
+        '# Alertmanager — runbook URL을 annotation으로 link',
+        '- alert: HighErrorRate',
+        '  expr: rate(http_requests_total{code=~"5.."}[5m])',
+        '         / rate(http_requests_total[5m]) > 0.05',
+        '  for: 5m',
+        '  labels:',
+        '    severity: critical',
+        '    team: ops',
+        '  annotations:',
+        '    summary: "5xx 에러율 > 5% (5분 지속)"',
+        '    runbook: "https://wiki/runbook/HighErrorRate"',
+        '    dashboard: "https://grafana/d/api-errors"',
+        '',
+        '# 절대 규칙',
+        '#  - alert PR에 runbook URL 없으면 reject',
+        '#  - 분기마다 runbook 리뷰 (오래된 명령 방지)',
+        '#  - oncall 신입은 runbook drill로 입사 첫 주 훈련',
+      ]},
+      playbook: {lang:'yaml', filename:'ansible/playbooks/restart-api.yml', lines:[
+        '# 사용: $ ansible-playbook restart-api.yml -e "env=prod"',
+        '---',
+        '- name: Restart API after high error rate',
+        '  hosts: "tag_Service_api:&tag_Env_{{ env }}"',
+        '  serial: "30%"           # 한 번에 30%씩 (rolling)',
+        '  max_fail_percentage: 10 # 10% 실패 시 중단',
+        '  become: true',
+        '',
+        '  pre_tasks:',
+        '    - name: drain instance from ALB',
+        '      community.aws.elb_target_group:',
+        '        target_group_arn: "{{ tg_arn }}"',
+        '        targets: [{ Id: "{{ ansible_ec2_instance_id }}" }]',
+        '        state: absent',
+        '      delegate_to: localhost',
+        '',
+        '  tasks:',
+        '    - name: restart api container',
+        '      community.docker.docker_container:',
+        '        name: api',
+        '        image: "{{ image_repo }}:{{ image_tag }}"',
+        '        state: started',
+        '        recreate: yes',
+        '',
+        '    - name: health check',
+        '      ansible.builtin.uri:',
+        '        url: "http://localhost:8080/healthz"',
+        '        status_code: 200',
+        '      retries: 10',
+        '      delay: 3',
+        '',
+        '  post_tasks:',
+        '    - name: re-register to ALB',
+        '      community.aws.elb_target_group:',
+        '        targets: [{ Id: "{{ ansible_ec2_instance_id }}" }]',
+        '        state: present',
+        '      delegate_to: localhost',
+        '',
+        '# 핵심: drain → restart → health → rejoin = zero-downtime',
+        '# 멱등(idempotent) — 여러 번 실행해도 결과 같음',
+      ]},
+      ssm: {lang:'yaml', filename:'ssm-automation-restart-unhealthy.yaml', lines:[
+        '# CloudWatch Alarm → EventBridge → SSM Document 자동 실행',
+        'schemaVersion: "0.3"',
+        'description: "Restart unhealthy EC2 when CPU > 95% for 5min"',
+        'assumeRole: "arn:aws:iam::123:role/SSMAutomationRole"',
+        '',
+        'parameters:',
+        '  InstanceId: { type: String }',
+        '',
+        'mainSteps:',
+        '  - name: tagBeforeRestart',
+        '    action: "aws:createTags"',
+        '    inputs:',
+        '      ResourceType: EC2',
+        '      ResourceIds: ["{{ InstanceId }}"]',
+        '      Tags:',
+        '        - { Key: AutoRestart, Value: "{{ global:DATE_TIME }}" }',
+        '',
+        '  - name: stopInstance',
+        '    action: "aws:changeInstanceState"',
+        '    inputs:',
+        '      InstanceIds: ["{{ InstanceId }}"]',
+        '      DesiredState: stopped',
+        '',
+        '  - name: startInstance',
+        '    action: "aws:changeInstanceState"',
+        '    inputs:',
+        '      InstanceIds: ["{{ InstanceId }}"]',
+        '      DesiredState: running',
+        '',
+        '  - name: notifySlack',
+        '    action: "aws:invokeLambdaFunction"',
+        '    inputs:',
+        '      FunctionName: "slack-incident-notifier"',
+        '      Payload: |',
+        '        { "text": "🔄 Auto-restarted {{ InstanceId }} (CPU>95%)" }',
+        '',
+        '# EventBridge Rule (Terraform 발췌)',
+        '#   event_pattern = { source: ["aws.cloudwatch"],',
+        '#     detail: { state: { value: ["ALARM"] } } }',
+        '#   target arn = ssm automation-definition/Restart-Unhealthy',
+        '',
+        '# 운영 규칙',
+        '#  - 자동 복구는 1회만 (loop 방지)',
+        '#  - 2회 연속 발생 시 PagerDuty (사람 호출)',
+        '#  - 모든 자동 작업은 CloudTrail audit',
+      ]},
+      fis: {lang:'yaml', filename:'fis-experiment-az-failure.yaml', lines:[
+        '# AWS Fault Injection Simulator — AZ 장애 시뮬레이션',
+        'description: "Simulate AZ failure in ap-northeast-2a"',
+        'roleArn: "arn:aws:iam::123:role/FISRole"',
+        '',
+        'stopConditions:',
+        '  - source: "aws:cloudwatch:alarm"',
+        '    value: "arn:aws:cloudwatch:...:alarm/p99-latency-breach"',
+        '  # SLO 깨지면 즉시 실험 중단 (안전장치)',
+        '',
+        'targets:',
+        '  apiServers:',
+        '    resourceType: "aws:ec2:instance"',
+        '    resourceTags:',
+        '      Service: "api"',
+        '      Env: "staging"             # ⚠️ prod 직접 X',
+        '    selectionMode: "PERCENT(50)"',
+        '    filters:',
+        '      - path: "Placement.AvailabilityZone"',
+        '        values: ["ap-northeast-2a"]',
+        '',
+        'actions:',
+        '  terminateApi:',
+        '    actionId: "aws:ec2:terminate-instances"',
+        '    targets: { Instances: "apiServers" }',
+        '',
+        '  injectNetworkLatency:',
+        '    actionId: "aws:ssm:send-command"',
+        '    parameters:',
+        '      documentArn: "arn:aws:ssm:::document/AWSFIS-Run-Network-Latency"',
+        '      duration: "PT5M"',
+        '      latencyMilliseconds: "500"',
+        '    targets: { Instances: "apiServers" }',
+        '',
+        '# Game Day 합격 기준',
+        '#  - SLO 위반 0건 (또는 stopCondition 자동 중단)',
+        '#  - MTTA < 5분, MTTR < 30분',
+        '#  - 모든 oncall 멤버가 runbook으로 자력 대응',
+        '',
+        '# 안티패턴',
+        '#  ✗ 시나리오 없이 prod에 즉흥 실험',
+        '#  ✗ stopCondition 없는 실험 (무한 장애)',
+        '#  ✗ 회고 없는 game day (학습 0)',
+      ]},
+    };
+
+    const S1 = { title:'Step 1. Runbook — "사람이 읽는 비상 매뉴얼"', desc:'5xx 급증 같은 incident 발생 시 새벽에 깨어난 oncall이 5분 안에 첫 조치를 할 수 있어야 한다. Markdown 절차서 — 증상/영향/즉시 조치/진단/에스컬레이션 5단계로 구조화. 모든 alert에는 runbook URL을 annotation으로 링크. 분기마다 리뷰 필수.' };
+    const S2 = { title:'Step 2. Playbook — "Ansible로 코드화한 복구 절차"', desc:'Runbook의 수동 단계를 코드로 옮긴 것이 Playbook. Ansible / SaltStack 등 IaC 도구로 멱등성(idempotent) 있게 작성. 사람이 명령어 외울 필요 없이 ansible-playbook 한 줄. 단, 아직 사람이 트리거 — 다음 단계는 완전 자동화.' };
+    const S3 = { title:'Step 3. SSM Automation — "AWS가 알아서 복구한다"', desc:'AWS Systems Manager Automation document를 EventBridge 알람과 연결해 사람 없이 자동 트리거. CPU 95% 5분 → 자동 재시작, EBS 90% → 자동 확장. CloudWatch Alarm → EventBridge → SSM Run Document 체인. 사람은 결과만 Slack으로 받는다.' };
+    const S4 = { title:'Step 4. Chaos Engineering — "의도적으로 장애를 일으켜 본다"', desc:'실제 장애 전에 평소 업무 시간에 일부러 깨뜨려 본다. AWS FIS / Gremlin / Chaos Monkey로 EC2 종료, 네트워크 지연, DB 페일오버 등 주입. 분기 1회 game day로 팀 전체 대응 훈련. Runbook/Playbook이 실제로 동작하는지 검증.' };
+
+    // 좌측 패널에서 반복 쓰이는 조각 (원본 값 그대로)
+    const MD_FILE = 'wiki/runbook/HighErrorRate.md';
+    const FM_TITLE    = { k: 'title',         v: 'HighErrorRate (5xx > 5%)' };
+    const FM_SEVERITY = { k: 'severity',      v: 'critical' };
+    const FM_OWNER    = { k: 'owner',         v: 'ops-team' };
+    const FM_REVIEWED = { k: 'last_reviewed', v: '2026-04-15' };
+    const SEC1 = { num: '1', name: '증상 (Symptom)',         items: ['5xx 에러율 5% 초과 5분 지속', 'Grafana: /d/api-errors'], tone: 'info' };
+    const SEC2 = { num: '2', name: '영향 (Impact)',          items: ['결제 실패 / 주문 누락', '매출 시간당 ~500만원'],         tone: 'warn' };
+    const SEC3 = { num: '3', name: '즉시 조치 (5분 내) ⚠️', items: ['Slack #incident /ack', '최근 30분 배포 → rollback', 'No deploy → Step 4'], tone: 'crit' };
+    const SEC4 = { num: '4', name: '진단 (10~30분)',         items: ['CloudWatch Logs ERROR', 'X-Ray slow endpoint', 'RDS conn pool 포화?'], tone: 'info' };
+    const SEC5 = { num: '5', name: '에스컬레이션 (30분+)',   items: ['@backend-lead 호출', 'PM 통보', '1시간 → IC 지명'],          tone: 'warn' };
+
+    const PS_DRAIN   = { name: 'drain',   emoji: '🚪', desc: 'ALB target group에서 제외',    status: 'done' };
+    const PS_RESTART = { name: 'restart', emoji: '🔄', desc: 'docker pull + recreate',         status: 'done' };
+    const PS_VERIFY  = { name: 'verify',  emoji: '🩺', desc: '/healthz 200 (10회 retry · 3s)', status: 'done' };
+    const PS_REJOIN  = { name: 'rejoin',  emoji: '✅', desc: 'ALB target group 재등록',       status: 'done' };
+
+    const FN_ALARM = { emoji: '📊', name: 'CloudWatch Alarm', detail: 'CPU > 95% (5min)', tone: 'warn' };
+    const FN_BUS   = { emoji: '🚦', name: 'EventBridge Rule', detail: 'detail-type 매칭',  tone: 'info' };
+    const FN_SLACK = { emoji: '💬', name: 'Slack 통보',        detail: '"Auto-restarted i-xx"', tone: 'good' };
+    const ssmNode = (detail) => ({ emoji: '🛠️', name: 'SSM Document', detail, tone: 'crit' });
+
+    const TL_T0   = { t: 'T 0',   event: '실험 시작',    detail: 'EC2 50% terminate',  tone: 'crit' };
+    const TL_T15  = { t: 'T+15s', event: 'ALB 감지',     detail: '5xx 일시 spike',     tone: 'warn' };
+    const TL_T45  = { t: 'T+45s', event: 'AutoScaling',  detail: '신규 instance 기동', tone: 'info' };
+    const TL_T90  = { t: 'T+90s', event: 'SSM 자동복구', detail: 'Step 3 자동화 작동', tone: 'info' };
+    const TL_T3M  = { t: 'T+3m',  event: 'p99 회복',     detail: 'SLO 위반 0건',       tone: 'good' };
+    const G_MTTA = { name: 'MTTA',    value: '2m',  ok: true, goal: '< 5m' };
+    const G_MTTR = { name: 'MTTR',    value: '3m',  ok: true, goal: '< 30m' };
+    const G_SLO  = { name: 'SLO 위반', value: '0건', ok: true, goal: '0건' };
+
     const STEPS = [
-      {
-        title: 'Step 1. Runbook — "사람이 읽는 비상 매뉴얼"',
-        desc: '5xx 급증 같은 incident 발생 시 새벽에 깨어난 oncall이 5분 안에 첫 조치를 할 수 있어야 한다. Markdown 절차서 — 증상/영향/즉시 조치/진단/에스컬레이션 5단계로 구조화. 모든 alert에는 runbook URL을 annotation으로 링크. 분기마다 리뷰 필수.',
+      // ── Step 1. Runbook ───────────────────────────────────────────────
+      { ...S1,
+        beat: {
+          label: 'alert 조건을 건다',
+          at: 'alert-with-runbook.yaml L2–4',
+          caption: '5xx 비율이 전체 요청의 5%를 넘는지 계산하는 식이 alert의 몸통이다.',
+          changes: [
+            { mark: 'new',  text: 'alert HighErrorRate' },
+            { mark: 'read', text: 'http_requests_total' },
+          ],
+        },
         focus: 'runbook',
         viewMode: 'markdown',
         markdown: {
-          title: 'wiki/runbook/HighErrorRate.md',
-          frontmatter: [
-            { k: 'title',         v: 'HighErrorRate (5xx > 5%)' },
-            { k: 'severity',      v: 'critical' },
-            { k: 'owner',         v: 'ops-team' },
-            { k: 'last_reviewed', v: '2026-04-15' },
-          ],
-          sections: [
-            { num: '1', name: '증상 (Symptom)',         items: ['5xx 에러율 5% 초과 5분 지속', 'Grafana: /d/api-errors'], tone: 'info' },
-            { num: '2', name: '영향 (Impact)',          items: ['결제 실패 / 주문 누락', '매출 시간당 ~500만원'],         tone: 'warn' },
-            { num: '3', name: '즉시 조치 (5분 내) ⚠️', items: ['Slack #incident /ack', '최근 30분 배포 → rollback', 'No deploy → Step 4'], tone: 'crit' },
-            { num: '4', name: '진단 (10~30분)',         items: ['CloudWatch Logs ERROR', 'X-Ray slow endpoint', 'RDS conn pool 포화?'], tone: 'info' },
-            { num: '5', name: '에스컬레이션 (30분+)',   items: ['@backend-lead 호출', 'PM 통보', '1시간 → IC 지명'],          tone: 'warn' },
-          ],
+          title: MD_FILE,
+          frontmatter: [FM_TITLE],
+          sections: [SEC1],
         },
-        code: {
-          lang: 'shell',
-          filename: 'alert-with-runbook.yaml',
-          lines: [
-            '# Alertmanager — runbook URL을 annotation으로 link',
-            '- alert: HighErrorRate',
-            '  expr: rate(http_requests_total{code=~"5.."}[5m])',
-            '         / rate(http_requests_total[5m]) > 0.05',
-            '  for: 5m',
-            '  labels:',
-            '    severity: critical',
-            '    team: ops',
-            '  annotations:',
-            '    summary: "5xx 에러율 > 5% (5분 지속)"',
-            '    runbook: "https://wiki/runbook/HighErrorRate"',
-            '    dashboard: "https://grafana/d/api-errors"',
-            '',
-            '# 절대 규칙',
-            '#  - alert PR에 runbook URL 없으면 reject',
-            '#  - 분기마다 runbook 리뷰 (오래된 명령 방지)',
-            '#  - oncall 신입은 runbook drill로 입사 첫 주 훈련',
-          ],
-          highlight: [10, 11, 14, 15, 16],
-        },
+        code: { ...CODE.runbook, highlight: [2, 3, 4] },
       },
-      {
-        title: 'Step 2. Playbook — "Ansible로 코드화한 복구 절차"',
-        desc: 'Runbook의 수동 단계를 코드로 옮긴 것이 Playbook. Ansible / SaltStack 등 IaC 도구로 멱등성(idempotent) 있게 작성. 사람이 명령어 외울 필요 없이 ansible-playbook 한 줄. 단, 아직 사람이 트리거 — 다음 단계는 완전 자동화.',
+      { ...S1,
+        beat: {
+          label: '지속 시간과 라벨',
+          at: 'alert-with-runbook.yaml L5–8',
+          caption: '5분 지속돼야 발화하고, severity/team 라벨로 누구에게 갈지가 정해진다.',
+          changes: [
+            { mark: 'new',     text: 'for: 5m (5분 지속)' },
+            { mark: 'new',     text: 'severity=critical, team=ops' },
+            { mark: 'changed', text: '영향 범위 문서화' },
+          ],
+        },
+        focus: 'runbook',
+        viewMode: 'markdown',
+        markdown: {
+          title: MD_FILE,
+          frontmatter: [FM_TITLE, FM_SEVERITY],
+          sections: [SEC1, SEC2],
+        },
+        code: { ...CODE.runbook, highlight: [5, 6, 7, 8] },
+      },
+      { ...S1,
+        beat: {
+          label: 'summary 한 줄',
+          at: 'alert-with-runbook.yaml L9–10',
+          caption: 'annotations의 summary는 새벽에 깨어난 oncall이 가장 먼저 읽는 한 줄이다.',
+          changes: [
+            { mark: 'new',  text: 'annotations 블록' },
+            { mark: 'read', text: 'summary → 즉시 조치 진입점' },
+          ],
+        },
+        focus: 'runbook',
+        viewMode: 'markdown',
+        markdown: {
+          title: MD_FILE,
+          frontmatter: [FM_TITLE, FM_SEVERITY, FM_OWNER],
+          sections: [SEC1, SEC2, SEC3],
+        },
+        code: { ...CODE.runbook, highlight: [9, 10] },
+      },
+      { ...S1,
+        beat: {
+          label: 'runbook URL을 붙인다',
+          at: 'alert-with-runbook.yaml L11–12',
+          caption: 'alert에서 절차서와 대시보드로 바로 점프한다 — 이 두 줄이 이 페이지의 핵심이다.',
+          changes: [
+            { mark: 'new',  text: 'runbook URL 링크' },
+            { mark: 'new',  text: 'dashboard URL 링크' },
+            { mark: 'read', text: '진단 절차 열림' },
+          ],
+        },
+        focus: 'runbook',
+        viewMode: 'markdown',
+        markdown: {
+          title: MD_FILE,
+          frontmatter: [FM_TITLE, FM_SEVERITY, FM_OWNER],
+          sections: [SEC1, SEC2, SEC3, SEC4],
+        },
+        code: { ...CODE.runbook, highlight: [11, 12] },
+      },
+      { ...S1,
+        beat: {
+          label: 'URL 없으면 reject',
+          at: 'alert-with-runbook.yaml L14–15',
+          caption: 'runbook URL이 없는 alert PR은 리뷰에서 거절한다 — 링크 없는 alert는 만들지 않는다.',
+          changes: [
+            { mark: 'new',  text: '절대 규칙 1: PR reject' },
+            { mark: 'gone', text: '"일단 alert만" 불가' },
+          ],
+        },
+        focus: 'runbook',
+        viewMode: 'markdown',
+        markdown: {
+          title: MD_FILE,
+          frontmatter: [FM_TITLE, FM_SEVERITY, FM_OWNER],
+          sections: [SEC1, SEC2, SEC3, SEC4, SEC5],
+        },
+        code: { ...CODE.runbook, highlight: [14, 15] },
+      },
+      { ...S1,
+        beat: {
+          label: '분기 리뷰와 drill',
+          at: 'alert-with-runbook.yaml L16–17',
+          caption: '분기마다 리뷰해 오래된 명령을 걷어내고, 신입은 drill로 절차를 몸에 익힌다.',
+          changes: [
+            { mark: 'changed', text: 'last_reviewed 갱신' },
+            { mark: 'new',     text: 'oncall drill 훈련' },
+          ],
+        },
+        focus: 'runbook',
+        viewMode: 'markdown',
+        markdown: {
+          title: MD_FILE,
+          frontmatter: [FM_TITLE, FM_SEVERITY, FM_OWNER, FM_REVIEWED],
+          sections: [SEC1, SEC2, SEC3, SEC4, SEC5],
+        },
+        code: { ...CODE.runbook, highlight: [16, 17] },
+      },
+
+      // ── Step 2. Playbook ──────────────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: '대상과 rolling 정책',
+          at: 'ansible/playbooks/restart-api.yml L3–7',
+          caption: 'env 태그로 대상을 고르고, 한 번에 30%씩만 건드리도록 안전장치를 건다.',
+          changes: [
+            { mark: 'new',  text: 'serial 30% rolling' },
+            { mark: 'new',  text: 'max_fail_percentage 10' },
+            { mark: 'gone', text: '전체 동시 재시작 불가' },
+          ],
+        },
+        focus: 'playbook',
+        viewMode: 'pipeline',
+        pipeline: {
+          title: 'ansible-playbook restart-api.yml',
+          subtitle: 'hosts=tag_Service_api · serial 30% · max_fail 10% (실행 전)',
+          stages: [],
+          metric: { label: '사람 개입', before: '명령어 8개 외움', after: '대상만 지정' },
+        },
+        code: { ...CODE.playbook, highlight: [3, 4, 5, 6, 7] },
+      },
+      { ...S2,
+        beat: {
+          label: 'ALB에서 먼저 뺀다',
+          at: 'ansible/playbooks/restart-api.yml L9–15',
+          caption: 'pre_tasks에서 target group을 absent로 만들어 트래픽을 끊고 나서 손을 댄다.',
+          changes: [
+            { mark: 'new',  text: 'drain 단계' },
+            { mark: 'gone', text: '재시작 중 요청 유입 차단' },
+          ],
+        },
+        focus: 'playbook',
+        viewMode: 'pipeline',
+        pipeline: {
+          title: 'ansible-playbook restart-api.yml',
+          subtitle: 'drain 진행 — state: absent',
+          stages: [PS_DRAIN],
+          metric: { label: '사람 개입', before: '수동 deregister', after: 'pre_tasks 자동' },
+        },
+        code: { ...CODE.playbook, highlight: [9, 10, 11, 12, 13, 14, 15] },
+      },
+      { ...S2,
+        beat: {
+          label: '컨테이너 recreate',
+          at: 'ansible/playbooks/restart-api.yml L17–23',
+          caption: 'image 태그로 pull 받고 recreate — 같은 태그로 여러 번 돌려도 결과가 같다.',
+          changes: [
+            { mark: 'new',     text: 'restart 단계' },
+            { mark: 'changed', text: 'api 컨테이너 → 새 image' },
+          ],
+        },
+        focus: 'playbook',
+        viewMode: 'pipeline',
+        pipeline: {
+          title: 'ansible-playbook restart-api.yml',
+          subtitle: 'restart 진행 — recreate: yes',
+          stages: [PS_DRAIN, PS_RESTART],
+          metric: { label: '사람 개입', before: 'docker 명령 3개', after: 'task 1개' },
+        },
+        code: { ...CODE.playbook, highlight: [17, 18, 19, 20, 21, 22, 23] },
+      },
+      { ...S2,
+        beat: {
+          label: '살아났는지 확인',
+          at: 'ansible/playbooks/restart-api.yml L25–30',
+          caption: '/healthz가 200을 줄 때까지 3초 간격으로 10번 확인한다. 실패하면 여기서 멈춘다.',
+          changes: [
+            { mark: 'new',  text: 'verify 단계 (10회 retry)' },
+            { mark: 'read', text: 'status_code 200 확인' },
+          ],
+        },
+        focus: 'playbook',
+        viewMode: 'pipeline',
+        pipeline: {
+          title: 'ansible-playbook restart-api.yml',
+          subtitle: 'verify 진행 — retries 10 · delay 3s',
+          stages: [PS_DRAIN, PS_RESTART, PS_VERIFY],
+          metric: { label: '사람 개입', before: 'curl 눈으로 확인', after: 'uri 모듈 자동 판정' },
+        },
+        code: { ...CODE.playbook, highlight: [25, 26, 27, 28, 29, 30] },
+      },
+      { ...S2,
+        beat: {
+          label: 'ALB로 돌려보낸다',
+          at: 'ansible/playbooks/restart-api.yml L32–37',
+          caption: 'health가 통과한 인스턴스만 post_tasks에서 present로 재등록된다.',
+          changes: [
+            { mark: 'new',     text: 'rejoin 단계' },
+            { mark: 'changed', text: 'target state absent → present' },
+          ],
+        },
+        focus: 'playbook',
+        viewMode: 'pipeline',
+        pipeline: {
+          title: 'ansible-playbook restart-api.yml',
+          subtitle: 'rejoin 완료 — state: present',
+          stages: [PS_DRAIN, PS_RESTART, PS_VERIFY, PS_REJOIN],
+          metric: { label: '사람 개입', before: '수동 재등록', after: 'post_tasks 자동' },
+        },
+        code: { ...CODE.playbook, highlight: [32, 33, 34, 35, 36, 37] },
+      },
+      { ...S2,
+        beat: {
+          label: '멱등성으로 마무리',
+          at: 'ansible/playbooks/restart-api.yml L39–40',
+          caption: '네 단계가 이어져 무중단이 되고, 몇 번을 실행해도 결과가 같아진다.',
+          changes: [
+            { mark: 'new',     text: 'zero-downtime 성립' },
+            { mark: 'changed', text: '사람 개입 → 1줄' },
+          ],
+        },
         focus: 'playbook',
         viewMode: 'pipeline',
         pipeline: {
           title: 'ansible-playbook restart-api.yml',
           subtitle: 'serial 30% rolling · idempotent · zero-downtime',
-          stages: [
-            { name: 'drain',    emoji: '🚪', desc: 'ALB target group에서 제외',    status: 'done' },
-            { name: 'restart',  emoji: '🔄', desc: 'docker pull + recreate',         status: 'done' },
-            { name: 'verify',   emoji: '🩺', desc: '/healthz 200 (10회 retry · 3s)', status: 'done' },
-            { name: 'rejoin',   emoji: '✅', desc: 'ALB target group 재등록',       status: 'done' },
-          ],
+          stages: [PS_DRAIN, PS_RESTART, PS_VERIFY, PS_REJOIN],
           metric: { label: '사람 개입', before: '명령어 8개 외움', after: 'ansible-playbook 1줄' },
         },
-        code: {
-          lang: 'yaml',
-          filename: 'ansible/playbooks/restart-api.yml',
-          lines: [
-            '# 사용: $ ansible-playbook restart-api.yml -e "env=prod"',
-            '---',
-            '- name: Restart API after high error rate',
-            '  hosts: "tag_Service_api:&tag_Env_{{ env }}"',
-            '  serial: "30%"           # 한 번에 30%씩 (rolling)',
-            '  max_fail_percentage: 10 # 10% 실패 시 중단',
-            '  become: true',
-            '',
-            '  pre_tasks:',
-            '    - name: drain instance from ALB',
-            '      community.aws.elb_target_group:',
-            '        target_group_arn: "{{ tg_arn }}"',
-            '        targets: [{ Id: "{{ ansible_ec2_instance_id }}" }]',
-            '        state: absent',
-            '      delegate_to: localhost',
-            '',
-            '  tasks:',
-            '    - name: restart api container',
-            '      community.docker.docker_container:',
-            '        name: api',
-            '        image: "{{ image_repo }}:{{ image_tag }}"',
-            '        state: started',
-            '        recreate: yes',
-            '',
-            '    - name: health check',
-            '      ansible.builtin.uri:',
-            '        url: "http://localhost:8080/healthz"',
-            '        status_code: 200',
-            '      retries: 10',
-            '      delay: 3',
-            '',
-            '  post_tasks:',
-            '    - name: re-register to ALB',
-            '      community.aws.elb_target_group:',
-            '        targets: [{ Id: "{{ ansible_ec2_instance_id }}" }]',
-            '        state: present',
-            '      delegate_to: localhost',
-            '',
-            '# 핵심: drain → restart → health → rejoin = zero-downtime',
-            '# 멱등(idempotent) — 여러 번 실행해도 결과 같음',
-          ],
-          highlight: [5, 6, 11, 27, 28, 29, 30, 36],
-        },
+        code: { ...CODE.playbook, highlight: [39, 40] },
       },
-      {
-        title: 'Step 3. SSM Automation — "AWS가 알아서 복구한다"',
-        desc: 'AWS Systems Manager Automation document를 EventBridge 알람과 연결해 사람 없이 자동 트리거. CPU 95% 5분 → 자동 재시작, EBS 90% → 자동 확장. CloudWatch Alarm → EventBridge → SSM Run Document 체인. 사람은 결과만 Slack으로 받는다.',
+
+      // ── Step 3. SSM Automation ────────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: '자동 실행 체인 선언',
+          at: 'ssm-automation-restart-unhealthy.yaml L1–4',
+          caption: 'CPU 95%가 5분 지속되면 시작되는 document다. 실행 권한은 assumeRole이 갖는다.',
+          changes: [
+            { mark: 'new',  text: 'CloudWatch Alarm 트리거' },
+            { mark: 'new',  text: 'SSMAutomationRole' },
+          ],
+        },
         focus: 'ssm_automation',
         viewMode: 'flow',
         flow: {
-          title: '자동 복구 flow — 사람 개입 없음',
-          nodes: [
-            { emoji: '📊', name: 'CloudWatch Alarm',  detail: 'CPU > 95% (5min)',     tone: 'warn' },
-            { emoji: '🚦', name: 'EventBridge Rule',  detail: 'detail-type 매칭',     tone: 'info' },
-            { emoji: '🛠️', name: 'SSM Document',     detail: 'Restart-Unhealthy',    tone: 'crit' },
-            { emoji: '💬', name: 'Slack 통보',         detail: '"Auto-restarted i-xx"', tone: 'good' },
+          title: '트리거 정의 — 알람이 시작점',
+          nodes: [FN_ALARM],
+          stats: [],
+        },
+        code: { ...CODE.ssm, highlight: [1, 2, 3, 4] },
+      },
+      { ...S3,
+        beat: {
+          label: 'InstanceId를 받는다',
+          at: 'ssm-automation-restart-unhealthy.yaml L6–7',
+          caption: '어떤 인스턴스를 손볼지는 EventBridge가 알람에서 꺼내 파라미터로 넘겨준다.',
+          changes: [
+            { mark: 'new',  text: 'parameters.InstanceId' },
+            { mark: 'read', text: 'EventBridge → document 전달' },
           ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '파라미터 전달 — 대상 인스턴스',
+          nodes: [FN_ALARM, FN_BUS],
+          stats: [],
+        },
+        code: { ...CODE.ssm, highlight: [6, 7] },
+      },
+      { ...S3,
+        beat: {
+          label: '먼저 태그를 남긴다',
+          at: 'ssm-automation-restart-unhealthy.yaml L9–16',
+          caption: '건드리기 전에 AutoRestart 태그로 시각을 기록한다 — 나중에 감사할 때 근거가 된다.',
+          changes: [
+            { mark: 'new',     text: 'mainSteps 시작' },
+            { mark: 'new',     text: 'AutoRestart 태그' },
+          ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '자동 복구 flow — 1) 태그 기록',
+          nodes: [FN_ALARM, FN_BUS, ssmNode('tagBeforeRestart')],
+          stats: [],
+        },
+        code: { ...CODE.ssm, highlight: [9, 10, 11, 12, 13, 14, 15, 16] },
+      },
+      { ...S3,
+        beat: {
+          label: '인스턴스를 멈춘다',
+          at: 'ssm-automation-restart-unhealthy.yaml L18–22',
+          caption: 'changeInstanceState로 stopped까지 기다린다. 사람은 아직 아무것도 하지 않았다.',
+          changes: [
+            { mark: 'changed', text: '인스턴스 running → stopped' },
+          ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '자동 복구 flow — 2) 정지',
+          nodes: [FN_ALARM, FN_BUS, ssmNode('stopInstance')],
+          stats: [],
+        },
+        code: { ...CODE.ssm, highlight: [18, 19, 20, 21, 22] },
+      },
+      { ...S3,
+        beat: {
+          label: '다시 켠다',
+          at: 'ssm-automation-restart-unhealthy.yaml L24–28',
+          caption: '같은 액션으로 running까지 올린다. 여기까지가 무인 복구의 실체다.',
+          changes: [
+            { mark: 'changed', text: '인스턴스 stopped → running' },
+          ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '자동 복구 flow — 3) 기동',
+          nodes: [FN_ALARM, FN_BUS, ssmNode('startInstance')],
+          stats: [],
+        },
+        code: { ...CODE.ssm, highlight: [24, 25, 26, 27, 28] },
+      },
+      { ...S3,
+        beat: {
+          label: '결과만 사람에게',
+          at: 'ssm-automation-restart-unhealthy.yaml L30–35',
+          caption: 'Lambda를 불러 Slack에 결과를 던진다 — 사람은 호출받는 대신 통보만 받는다.',
+          changes: [
+            { mark: 'new',  text: 'Slack 통보 노드' },
+            { mark: 'gone', text: '새벽 oncall 호출' },
+          ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '자동 복구 flow — 4) 통보',
+          nodes: [FN_ALARM, FN_BUS, ssmNode('Restart-Unhealthy'), FN_SLACK],
+          stats: [{ k: '새벽 호출', before: '주 2회', after: '0회' }],
+        },
+        code: { ...CODE.ssm, highlight: [30, 31, 32, 33, 34, 35] },
+      },
+      { ...S3,
+        beat: {
+          label: 'EventBridge로 잇는다',
+          at: 'ssm-automation-restart-unhealthy.yaml L37–40',
+          caption: 'ALARM 상태 이벤트를 이 document로 보내는 규칙 — 체인이 여기서 닫힌다.',
+          changes: [
+            { mark: 'new',  text: 'event_pattern ALARM 매칭' },
+            { mark: 'read', text: 'target = Restart-Unhealthy' },
+          ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '자동 복구 flow — 체인 연결 완료',
+          nodes: [FN_ALARM, FN_BUS, ssmNode('Restart-Unhealthy'), FN_SLACK],
           stats: [
             { k: '평균 복구 시간', before: '15분 (oncall 호출)', after: '90초 (무인)' },
             { k: '새벽 호출',     before: '주 2회',            after: '0회' },
           ],
         },
-        code: {
-          lang: 'yaml',
-          filename: 'ssm-automation-restart-unhealthy.yaml',
-          lines: [
-            '# CloudWatch Alarm → EventBridge → SSM Document 자동 실행',
-            'schemaVersion: "0.3"',
-            'description: "Restart unhealthy EC2 when CPU > 95% for 5min"',
-            'assumeRole: "arn:aws:iam::123:role/SSMAutomationRole"',
-            '',
-            'parameters:',
-            '  InstanceId: { type: String }',
-            '',
-            'mainSteps:',
-            '  - name: tagBeforeRestart',
-            '    action: "aws:createTags"',
-            '    inputs:',
-            '      ResourceType: EC2',
-            '      ResourceIds: ["{{ InstanceId }}"]',
-            '      Tags:',
-            '        - { Key: AutoRestart, Value: "{{ global:DATE_TIME }}" }',
-            '',
-            '  - name: stopInstance',
-            '    action: "aws:changeInstanceState"',
-            '    inputs:',
-            '      InstanceIds: ["{{ InstanceId }}"]',
-            '      DesiredState: stopped',
-            '',
-            '  - name: startInstance',
-            '    action: "aws:changeInstanceState"',
-            '    inputs:',
-            '      InstanceIds: ["{{ InstanceId }}"]',
-            '      DesiredState: running',
-            '',
-            '  - name: notifySlack',
-            '    action: "aws:invokeLambdaFunction"',
-            '    inputs:',
-            '      FunctionName: "slack-incident-notifier"',
-            '      Payload: |',
-            '        { "text": "🔄 Auto-restarted {{ InstanceId }} (CPU>95%)" }',
-            '',
-            '# EventBridge Rule (Terraform 발췌)',
-            '#   event_pattern = { source: ["aws.cloudwatch"],',
-            '#     detail: { state: { value: ["ALARM"] } } }',
-            '#   target arn = ssm automation-definition/Restart-Unhealthy',
-            '',
-            '# 운영 규칙',
-            '#  - 자동 복구는 1회만 (loop 방지)',
-            '#  - 2회 연속 발생 시 PagerDuty (사람 호출)',
-            '#  - 모든 자동 작업은 CloudTrail audit',
-          ],
-          highlight: [9, 18, 24, 30, 31, 41, 42, 43],
-        },
+        code: { ...CODE.ssm, highlight: [37, 38, 39, 40] },
       },
-      {
-        title: 'Step 4. Chaos Engineering — "의도적으로 장애를 일으켜 본다"',
-        desc: '실제 장애 전에 평소 업무 시간에 일부러 깨뜨려 본다. AWS FIS / Gremlin / Chaos Monkey로 EC2 종료, 네트워크 지연, DB 페일오버 등 주입. 분기 1회 game day로 팀 전체 대응 훈련. Runbook/Playbook이 실제로 동작하는지 검증.',
+      { ...S3,
+        beat: {
+          label: '1회만, 그다음은 사람',
+          at: 'ssm-automation-restart-unhealthy.yaml L42–45',
+          caption: '자동 복구는 한 번만 시도하고, 두 번 연속이면 PagerDuty로 사람을 부른다.',
+          changes: [
+            { mark: 'new',  text: '2회 연속 → PagerDuty' },
+            { mark: 'gone', text: '무한 재시작 loop' },
+            { mark: 'read', text: 'CloudTrail audit' },
+          ],
+        },
+        focus: 'ssm_automation',
+        viewMode: 'flow',
+        flow: {
+          title: '자동 복구 flow — 사람 개입 없음',
+          nodes: [FN_ALARM, FN_BUS, { emoji: '🛠️', name: 'SSM Document', detail: 'Restart-Unhealthy', tone: 'crit' }, FN_SLACK],
+          stats: [
+            { k: '평균 복구 시간', before: '15분 (oncall 호출)', after: '90초 (무인)' },
+            { k: '새벽 호출',     before: '주 2회',            after: '0회' },
+          ],
+        },
+        code: { ...CODE.ssm, highlight: [42, 43, 44, 45] },
+      },
+
+      // ── Step 4. Chaos Engineering ─────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: '실험을 정의한다',
+          at: 'fis-experiment-az-failure.yaml L1–3',
+          caption: 'AZ 하나가 통째로 죽는 상황을 흉내 내는 FIS 실험 템플릿을 연다.',
+          changes: [
+            { mark: 'new',  text: 'AZ 장애 시뮬레이션 정의' },
+            { mark: 'new',  text: 'FISRole 권한' },
+          ],
+        },
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: '정의만 작성 · 아직 대상 미지정',
+          timeline: [],
+          gauges: [],
+        },
+        code: { ...CODE.fis, highlight: [1, 2, 3] },
+      },
+      { ...S4,
+        beat: {
+          label: '안전장치를 먼저',
+          at: 'fis-experiment-az-failure.yaml L5–8',
+          caption: 'p99 지연 알람이 울리면 실험이 스스로 멈춘다. stopCondition 없는 실험은 만들지 않는다.',
+          changes: [
+            { mark: 'new',  text: 'stopConditions (p99 알람)' },
+            { mark: 'gone', text: '무한 장애 가능성 제거' },
+          ],
+        },
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: 'stopCondition = p99-latency-breach',
+          timeline: [],
+          gauges: [],
+        },
+        code: { ...CODE.fis, highlight: [5, 6, 7, 8] },
+      },
+      { ...S4,
+        beat: {
+          label: 'staging의 절반만',
+          at: 'fis-experiment-az-failure.yaml L10–16',
+          caption: '태그로 대상을 좁힌다 — Env=staging, 그중 50%만. prod에 직접 걸지 않는다.',
+          changes: [
+            { mark: 'new',     text: 'targets.apiServers' },
+            { mark: 'changed', text: '대상 = staging 50%' },
+            { mark: 'gone',    text: 'prod 직접 실험 금지' },
+          ],
+        },
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: 'staging · Service=api · 50% 선택',
+          timeline: [],
+          gauges: [],
+        },
+        code: { ...CODE.fis, highlight: [10, 11, 12, 13, 14, 15, 16] },
+      },
+      { ...S4,
+        beat: {
+          label: 'AZ 하나로 좁힌다',
+          at: 'fis-experiment-az-failure.yaml L17–19',
+          caption: 'filters로 ap-northeast-2a에 있는 인스턴스만 남긴다 — 이게 "AZ 장애"의 정체다.',
+          changes: [
+            { mark: 'changed', text: '대상 AZ = ap-northeast-2a' },
+          ],
+        },
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: 'staging · ap-northeast-2a · 50% 선택',
+          timeline: [],
+          gauges: [],
+        },
+        code: { ...CODE.fis, highlight: [17, 18, 19] },
+      },
+      { ...S4,
+        beat: {
+          label: '실제로 종료시킨다',
+          at: 'fis-experiment-az-failure.yaml L21–24',
+          caption: 'terminate-instances 액션이 대상 절반을 죽인다. 여기서 실험 시계가 시작된다.',
+          changes: [
+            { mark: 'new',     text: 'terminateApi 액션' },
+            { mark: 'changed', text: 'T 0 — EC2 50% 종료' },
+          ],
+        },
         focus: 'chaos',
         viewMode: 'experiment',
         experiment: {
           title: 'AWS FIS — AZ 장애 시뮬레이션',
           subtitle: 'staging · ap-northeast-2a · 50% terminate',
-          timeline: [
-            { t: 'T 0',     event: '실험 시작', detail: 'EC2 50% terminate', tone: 'crit' },
-            { t: 'T+15s',   event: 'ALB 감지', detail: '5xx 일시 spike',     tone: 'warn' },
-            { t: 'T+45s',   event: 'AutoScaling', detail: '신규 instance 기동', tone: 'info' },
-            { t: 'T+90s',   event: 'SSM 자동복구', detail: 'Step 3 자동화 작동', tone: 'info' },
-            { t: 'T+3m',    event: 'p99 회복',  detail: 'SLO 위반 0건',       tone: 'good' },
-          ],
-          gauges: [
-            { name: 'MTTA',    value: '2m',  ok: true,  goal: '< 5m' },
-            { name: 'MTTR',    value: '3m',  ok: true,  goal: '< 30m' },
-            { name: 'SLO 위반', value: '0건', ok: true, goal: '0건' },
+          timeline: [TL_T0],
+          gauges: [],
+        },
+        code: { ...CODE.fis, highlight: [21, 22, 23, 24] },
+      },
+      { ...S4,
+        beat: {
+          label: '지연도 주입한다',
+          at: 'fis-experiment-az-failure.yaml L26–32',
+          caption: '죽이는 것만이 장애가 아니다. SSM으로 500ms 지연을 5분간 넣어 느린 장애도 본다.',
+          changes: [
+            { mark: 'new',     text: 'injectNetworkLatency 500ms' },
+            { mark: 'changed', text: 'ALB가 5xx spike 감지' },
           ],
         },
-        code: {
-          lang: 'yaml',
-          filename: 'fis-experiment-az-failure.yaml',
-          lines: [
-            '# AWS Fault Injection Simulator — AZ 장애 시뮬레이션',
-            'description: "Simulate AZ failure in ap-northeast-2a"',
-            'roleArn: "arn:aws:iam::123:role/FISRole"',
-            '',
-            'stopConditions:',
-            '  - source: "aws:cloudwatch:alarm"',
-            '    value: "arn:aws:cloudwatch:...:alarm/p99-latency-breach"',
-            '  # SLO 깨지면 즉시 실험 중단 (안전장치)',
-            '',
-            'targets:',
-            '  apiServers:',
-            '    resourceType: "aws:ec2:instance"',
-            '    resourceTags:',
-            '      Service: "api"',
-            '      Env: "staging"             # ⚠️ prod 직접 X',
-            '    selectionMode: "PERCENT(50)"',
-            '    filters:',
-            '      - path: "Placement.AvailabilityZone"',
-            '        values: ["ap-northeast-2a"]',
-            '',
-            'actions:',
-            '  terminateApi:',
-            '    actionId: "aws:ec2:terminate-instances"',
-            '    targets: { Instances: "apiServers" }',
-            '',
-            '  injectNetworkLatency:',
-            '    actionId: "aws:ssm:send-command"',
-            '    parameters:',
-            '      documentArn: "arn:aws:ssm:::document/AWSFIS-Run-Network-Latency"',
-            '      duration: "PT5M"',
-            '      latencyMilliseconds: "500"',
-            '    targets: { Instances: "apiServers" }',
-            '',
-            '# Game Day 합격 기준',
-            '#  - SLO 위반 0건 (또는 stopCondition 자동 중단)',
-            '#  - MTTA < 5분, MTTR < 30분',
-            '#  - 모든 oncall 멤버가 runbook으로 자력 대응',
-            '',
-            '# 안티패턴',
-            '#  ✗ 시나리오 없이 prod에 즉흥 실험',
-            '#  ✗ stopCondition 없는 실험 (무한 장애)',
-            '#  ✗ 회고 없는 game day (학습 0)',
-          ],
-          highlight: [5, 6, 7, 8, 15, 22, 23, 34, 35, 36, 37],
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: 'staging · ap-northeast-2a · 50% terminate + 500ms',
+          timeline: [TL_T0, TL_T15],
+          gauges: [],
         },
+        code: { ...CODE.fis, highlight: [26, 27, 28, 29, 30, 31, 32] },
+      },
+      { ...S4,
+        beat: {
+          label: '합격 기준을 잰다',
+          at: 'fis-experiment-az-failure.yaml L34–37',
+          caption: 'MTTA 5분, MTTR 30분 안에 들어와야 game day 합격이다. 숫자로 판정한다.',
+          changes: [
+            { mark: 'new',  text: 'MTTA / MTTR 게이지' },
+            { mark: 'read', text: 'AutoScaling + SSM 자동복구 관측' },
+          ],
+        },
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: 'staging · ap-northeast-2a · 50% terminate · 판정 중',
+          timeline: [TL_T0, TL_T15, TL_T45, TL_T90],
+          gauges: [G_MTTA, G_MTTR],
+        },
+        code: { ...CODE.fis, highlight: [34, 35, 36, 37] },
+      },
+      { ...S4,
+        beat: {
+          label: '회고 없으면 학습 0',
+          at: 'fis-experiment-az-failure.yaml L39–42',
+          caption: '즉흥 실험·안전장치 없는 실험·회고 없는 game day 세 가지는 금지한다.',
+          changes: [
+            { mark: 'new',     text: 'SLO 위반 0건 확정' },
+            { mark: 'changed', text: 'p99 회복 — 실험 종료' },
+            { mark: 'gone',    text: '회고 없는 game day' },
+          ],
+        },
+        focus: 'chaos',
+        viewMode: 'experiment',
+        experiment: {
+          title: 'AWS FIS — AZ 장애 시뮬레이션',
+          subtitle: 'staging · ap-northeast-2a · 50% terminate',
+          timeline: [TL_T0, TL_T15, TL_T45, TL_T90, TL_T3M],
+          gauges: [G_MTTA, G_MTTR, G_SLO],
+        },
+        code: { ...CODE.fis, highlight: [39, 40, 41, 42] },
       },
     ];
 
@@ -560,7 +1074,7 @@
     // ─────────────────────────────────────────────────────
     // LiveDataPane — 자동화 진화 시각화 (focus별 다른 뷰)
     // ─────────────────────────────────────────────────────
-    function LiveDataPane({ step }) {
+    function LiveDataPane({ beat, step }) {
       return (
         <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-4">
           {/* 자동화 진화 4단계 카드 */}
@@ -569,6 +1083,29 @@
               <h2 className="text-sm font-bold text-slate-700">📖 자동화의 진화</h2>
               <span className="text-[10px] text-slate-400 font-mono">runbook → chaos</span>
             </div>
+          {beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{beat.caption}</p>
+              {beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
             <div className="grid grid-cols-4 gap-2">
               {AUTOMATION_STAGES.map((s, idx) => {
                 const isActive = step.focus === s.key;
@@ -833,7 +1370,7 @@
 
           <div className="bg-[#21252b] px-4 py-1.5 text-[10px] text-slate-500 font-mono flex justify-between border-t border-slate-700">
             <span>{code.lines.length} lines</span>
-            <span>Step {stepIdx + 1} / {total}</span>
+            <span>세부 {stepIdx + 1} / {total}</span>
           </div>
         </div>
       );
@@ -913,7 +1450,7 @@
 
             {/* 좌/우 2-pane */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-              <LiveDataPane step={step} />
+              <LiveDataPane beat={step.beat} step={step} />
               <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
             </div>
 
@@ -928,7 +1465,7 @@
             <div className="p-4 rounded-xl bg-blue-700 text-white shadow-sm">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-blue-200">
-                  Step {stepIdx + 1} / {STEPS.length} · {step.title}
+                  세부 {stepIdx + 1} / {STEPS.length} · {step.title}
                 </h3>
                 <span className="text-xs text-blue-200">키보드 &larr;/&rarr;</span>
               </div>
