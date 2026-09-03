@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-trn-native-beats="1">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -269,9 +269,13 @@
     });
   })();
   </script>
+  <style id="trn-mark-css">
+    @keyframes trn-pop { from { transform: translateY(3px); opacity: 0; } to { transform: none; opacity: 1; } }
+    .trn-mark { animation: trn-pop .2s ease-out both; }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root" data-trn-native-beats="1"></div>
   <!--
     III-1-2. Adaptive / Tail-based 샘플링
     학습 목표: head-based의 한계를 넘어, 트래픽에 맞춰 비율을 자동 조정하거나(adaptive)
@@ -284,215 +288,603 @@
     const BRAND = '#67CFE9';
     const DEEP = '#0E7B91';
 
+    // beat 마다 무엇이 바뀌었는지 표시한다
+    const MARK = {
+      new:     { sign: '＋', color: '#16a34a', bg: '#f0fdf4', bd: '#86efac' },
+      changed: { sign: '↻', color: '#d97706', bg: '#fffbeb', bd: '#fcd34d' },
+      read:    { sign: '→', color: '#2563eb', bg: '#eff6ff', bd: '#93c5fd' },
+      gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
+    };
+
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      limit: { lang: 'yaml', filename: 'problem-recap.yaml — 고정 비율의 두 맹점', lines: [
+        '# III-1-1 복습: probabilistic 1% 고정의 문제점',
+        'default_strategy:',
+        '  type: probabilistic',
+        '  param: 0.01                 # 모든 서비스에 일괄 1%',
+        '',
+        '# 맹점 1) 저트래픽 서비스 과소 샘플 ─────────',
+        '#  checkout-api : 5,000 rps × 1% = 50 trace/s  (충분)',
+        '#  admin-api    :     3 rps × 1% = 0.03 trace/s',
+        '#                 → 하루에 겨우 2,592건, 사실상 안 보임',
+        '',
+        '# 맹점 2) 결과를 모른 채 앞(head)에서 결정 ──',
+        '#  요청 도착 시점엔 아직 아무것도 실행 안 됨',
+        '#  → 이 요청이 500ms 걸릴지, 500 에러 날지 모름',
+        '#  → 정작 중요한 희소 에러가 1% 확률로만 잡힘',
+        '',
+        '# 두 갈래의 해법',
+        '#  A. Adaptive  : collector가 서비스별 비율을 자동 조정',
+        '#                 (저트래픽엔 비율↑, 고트래픽엔 비율↓)',
+        '#  B. Tail-based: trace 완료까지 버퍼링 후 결정',
+        '#                 (에러·느린 것만 골라 100% 보존)',
+      ] },
+      adaptive: { lang: 'yaml', filename: 'jaeger-adaptive.yaml — collector 자동 조정', lines: [
+        '# Adaptive: collector가 목표 처리량에 맞춰 비율 자동 계산',
+        'apiVersion: jaegertracing.io/v1',
+        'kind: Jaeger',
+        'metadata:',
+        '  name: jaeger-adaptive',
+        'spec:',
+        '  strategy: production',
+        '  collector:',
+        '    options:',
+        '      sampling:',
+        '        strategies:',
+        '          # adaptive 모드 활성화',
+        '          type: adaptive',
+        '      # 서비스·operation별 목표 trace/s',
+        '      sampling.target-samples-per-second: 1',
+        '      # 비율 재계산 주기',
+        '      sampling.calculation-interval: 1m',
+        '      # 초기 비율 (관측 전 부트스트랩)',
+        '      sampling.initial-sampling-probability: 0.001',
+        '      # 최소 비율 (저트래픽도 최소한 보장)',
+        '      sampling.min-sampling-probability: 0.00001',
+        '  storage:',
+        '    type: elasticsearch          # 전략 저장소로도 사용',
+        '',
+        '# collector의 자동 조정 루프 ─────────────',
+        '#  매 1분:',
+        '#   1) 서비스별 최근 처리량(qps) 집계',
+        '#   2) target(1/s) 대비 필요한 확률 재계산',
+        '#      p = target / observed_qps  (상·하한 clamp)',
+        '#   3) 새 확률을 각 client에 원격 전파',
+        '#  → admin-api(3qps): p≈0.33  (거의 다 잡음)',
+        '#  → checkout-api(5000qps): p≈0.0002 (과금 방지)',
+      ] },
+      tail: { lang: 'yaml', filename: 'otel-collector.yaml — tail_sampling processor', lines: [
+        '# OpenTelemetry Collector: 완료된 trace를 보고 결정',
+        'processors:',
+        '  tail_sampling:',
+        '    # trace 완성을 기다리는 시간 (첫 span 이후)',
+        '    decision_wait: 10s',
+        '    # 동시에 추적 중인 최대 trace 수 (메모리 상한)',
+        '    num_traces: 100000',
+        '    # 초당 신규 trace 유입 상한',
+        '    expected_new_traces_per_sec: 2000',
+        '    policies:',
+        '      # 1) 에러는 무조건 100% 보존',
+        '      - name: keep-errors',
+        '        type: status_code',
+        '        status_code:',
+        '          status_codes: [ERROR]',
+        '      # 2) 느린 trace(500ms 초과)도 100% 보존',
+        '      - name: keep-slow',
+        '        type: latency',
+        '        latency:',
+        '          threshold_ms: 500',
+        '      # 3) 나머지 정상 trace는 1%만',
+        '      - name: sample-normal',
+        '        type: probabilistic',
+        '        probabilistic:',
+        '          sampling_percentage: 1',
+        '',
+        '# 흐름 ──────────────────────────────────',
+        '#  span 도착 → trace_id별 버퍼에 누적',
+        '#  decision_wait 경과 → 정책을 위→아래로 평가',
+        '#  하나라도 keep이면 보존, 아니면 drop',
+      ] },
+      policy: { lang: 'yaml', filename: 'tail-policies-advanced.yaml — 조합 정책', lines: [
+        '# 정교한 정책: and_policy로 조건 결합',
+        'tail_sampling:',
+        '  decision_wait: 10s',
+        '  policies:',
+        '    # A) VIP 고객의 결제 실패는 전량 보존',
+        '    - name: vip-payment-error',
+        '      type: and',
+        '      and:',
+        '        and_sub_policy:',
+        '          - name: is-error',
+        '            type: status_code',
+        '            status_code:',
+        '              status_codes: [ERROR]',
+        '          - name: is-vip',
+        '            type: string_attribute',
+        '            string_attribute:',
+        '              key: customer.tier',
+        '              values: [vip, enterprise]',
+        '    # B) 그 외 모든 에러도 보존',
+        '    - name: all-errors',
+        '      type: status_code',
+        '      status_code:',
+        '        status_codes: [ERROR]',
+        '    # C) 정상 trace는 0.5%만',
+        '    - name: baseline',
+        '      type: probabilistic',
+        '      probabilistic:',
+        '        sampling_percentage: 0.5',
+        '',
+        '# 평가 규칙 ─────────────────────────────',
+        '#  policies는 OR — 하나라도 keep이면 보존',
+        '#  and 내부의 and_sub_policy는 AND — 모두 참이어야',
+        '#  함정: decision_wait 후 도착한 span은 누락',
+      ] },
+      compare: { lang: 'yaml', filename: 'decision-guide.yaml — 선택 기준 요약', lines: [
+        '# 세 전략 비교표 ─────────────────────────',
+        '#                    head      adaptive   tail',
+        '#  결정 시점         시작       시작        완료 후',
+        '#  에러 100% 보존    ✕          ✕           ◎',
+        '#  저트래픽 보정     ✕          ◎           △',
+        '#  비용(메모리)      낮음       낮음        높음',
+        '#  구현/운영 난이도  ◎ 단순     △           ✕ 복잡',
+        '#  서비스간 일관성   ◎          ◎           ◎(완성 대기)',
+        '',
+        '# 선택 플로우 ───────────────────────────',
+        '#  1) 일단 head probabilistic로 시작 (III-1-1)',
+        '#  2) 서비스별 트래픽 편차 큼 → adaptive 승격',
+        '#  3) 에러/지연 절대 놓치면 안 됨 → tail 추가',
+        '',
+        '# 실무 2단 구성 (권장) ──────────────────',
+        'pipeline:',
+        '  edge-agent:',
+        '    sampling: head-probabilistic   # 1차 부하 차단',
+        '    param: 0.1',
+        '  tail-collector:',
+        '    sampling: tail_sampling        # 2차 정밀 선별',
+        '    keep: [errors, slow>500ms]',
+        '    loadbalancing: by-trace-id     # 같은 trace는 한 곳으로',
+        '',
+        '# 흔한 함정 ─────────────────────────────',
+        '#  ✗ adaptive 파라미터가 많아 초기 튜닝이 까다로움',
+        '#  ✗ tail decision_wait만큼 결과가 지연 노출',
+        '#  ✗ tail은 메모리·LB 비용 → 전 구간 적용 금물',
+        '#  ✗ 저트래픽 서비스는 여전히 min-probability로 방어',
+      ] },
+    };
+
+    const S1 = {
+      key: 'limit',
+      title: 'Step 1. head-based의 한계 — 저트래픽 서비스는 굶고, 희소 에러는 놓친다',
+      desc: 'III-1-1의 probabilistic 1%는 트래픽이 많은 서비스엔 충분하지만, 초당 몇 건뿐인 admin-api 같은 저트래픽 서비스는 하루에 trace가 거의 안 잡힌다. 게다가 head-based는 요청 시작 시점에 결정하므로, 그 요청이 나중에 에러가 날지 500ms 넘게 걸릴지 알 수 없다. 정작 보고 싶은 희소 에러가 통계적으로 버려지는 것이 가장 뼈아프다. 그래서 "비율을 자동으로 맞추거나(adaptive)", "결과를 보고 결정하는(tail)" 두 진화가 등장한다.',
+    };
+    const S2 = {
+      key: 'adaptive',
+      title: 'Step 2. Adaptive — collector가 목표 처리량에 맞춰 비율을 자동 조정',
+      desc: 'Adaptive 샘플링은 head-based의 진화다. collector가 서비스·operation별 실제 처리량을 계속 관측하다가, 각각이 목표 trace/s(target)에 수렴하도록 확률을 주기적으로(예: 1분마다) 다시 계산한다. 저트래픽 admin-api는 비율을 확 올려 목표를 채우고, 폭주하는 checkout-api는 비율을 내려 과금을 막는다. 운영자가 서비스마다 손으로 튜닝하던 per_service_strategies를 collector가 대신 해주는 셈이다. 저장에는 메모리 기반 또는 스토리지 기반 전략 저장소가 필요하다.',
+    };
+    const S3 = {
+      key: 'tail',
+      title: 'Step 3. Tail-based — trace 완료까지 기다렸다가 결과를 보고 결정',
+      desc: 'Tail-based는 결정 시점을 아예 뒤(tail)로 옮긴다. OTel Collector의 tail_sampling processor가 한 trace의 모든 span을 decision_wait 시간 동안 메모리에 모은 뒤, 그 trace가 에러였는지·느렸는지 보고 나서 보존 여부를 정한다. 그래서 "에러 난 trace는 100% 보존" 같은, head-based로는 불가능한 정책이 가능하다. 대신 완성될 때까지 버퍼링하므로 메모리를 많이 쓰고, 모든 span이 같은 collector로 모여야 해서(trace_id 기반 로드밸런싱) 아키텍처가 복잡해진다.',
+    };
+    const S4 = {
+      key: 'policy',
+      title: 'Step 4. 에러 100% 보존 — tail 정책은 위에서 아래로, OR 결합',
+      desc: 'tail_sampling의 policies는 배열 순서대로 평가되고 "하나라도 통과하면 보존"하는 OR 결합이다. 그래서 status_code=ERROR와 latency>500ms를 앞에 두면, 정상 trace를 1%로 줄이면서도 에러와 느린 요청은 빠짐없이 잡는다. 실무에선 여기에 특정 고객(attribute)·특정 endpoint를 and_policy로 조합해 "VIP의 결제 실패는 전량 보존" 같은 정교한 규칙을 만든다. 함정은 정책이 늘수록 튜닝이 어려워지고, decision_wait보다 늦게 도착한 span은 판정에서 누락된다는 점이다.',
+    };
+    const S5 = {
+      key: 'compare',
+      title: 'Step 5. 언제 무엇을 — head / adaptive / tail 선택 기준',
+      desc: '세 전략은 대체재가 아니라 계층이다. 시작은 head-based probabilistic(단순·저비용)로 하고, 서비스별 트래픽 편차가 커서 손튜닝이 힘들면 adaptive로 올린다. 에러·지연을 반드시 놓치지 말아야 하는 핵심 서비스에는 tail-based를 붙인다. 흔한 프로덕션 구성은 "엣지에서 head로 1차 걸러 collector 부하를 줄이고, tail collector에서 에러·느린 것을 다시 건져 올리는" 2단 구조다. tail은 메모리·완성 대기·로드밸런싱 비용이 크므로 전 구간이 아니라 중요한 경로에만 선택 적용한다.',
+    };
+
     const STEPS = [
-      {
-        key: 'limit',
-        title: 'Step 1. head-based의 한계 — 저트래픽 서비스는 굶고, 희소 에러는 놓친다',
-        desc: 'III-1-1의 probabilistic 1%는 트래픽이 많은 서비스엔 충분하지만, 초당 몇 건뿐인 admin-api 같은 저트래픽 서비스는 하루에 trace가 거의 안 잡힌다. 게다가 head-based는 요청 시작 시점에 결정하므로, 그 요청이 나중에 에러가 날지 500ms 넘게 걸릴지 알 수 없다. 정작 보고 싶은 희소 에러가 통계적으로 버려지는 것이 가장 뼈아프다. 그래서 "비율을 자동으로 맞추거나(adaptive)", "결과를 보고 결정하는(tail)" 두 진화가 등장한다.',
+      // ── Step 1. head-based의 한계 ──────────────────────────────
+      { ...S1,
+        beat: {
+          label: '고정 1% 를 선언한다',
+          at: 'problem-recap.yaml L2–4',
+          caption: 'default_strategy 하나로 모든 서비스에 같은 확률 1% 를 못 박는다. 서비스별 사정은 반영되지 않는다.',
+          changes: [
+            { mark: 'new',  text: 'default_strategy 선언' },
+            { mark: 'read', text: 'param 0.01 = 전 서비스 일괄' },
+          ],
+        },
+        legend: '전 서비스 일괄 param=0.01 — 트래픽 차이를 전혀 모른 채 같은 비율',
+        code: { ...CODE.limit, highlight: [2, 3, 4] },
+      },
+      { ...S1,
+        beat: {
+          label: '저트래픽이 굶는다',
+          at: 'problem-recap.yaml L6–9',
+          caption: '같은 1% 라도 5,000 rps 는 초당 50건, 3 rps 는 초당 0.03건. admin-api 는 사실상 관측 불가다.',
+          changes: [
+            { mark: 'read',    text: 'checkout-api 50 trace/s' },
+            { mark: 'changed', text: 'admin-api 0.03 trace/s' },
+            { mark: 'gone',    text: '저트래픽 서비스 관측 불가' },
+          ],
+        },
+        legend: '맹점 1 — 비율이 같아도 절대량이 다르다. 저트래픽 서비스는 굶는다',
+        code: { ...CODE.limit, highlight: [6, 7, 8, 9] },
+      },
+      { ...S1,
+        beat: {
+          label: '앞에서는 결과를 모른다',
+          at: 'problem-recap.yaml L11–14',
+          caption: '요청이 막 도착한 시점엔 아직 아무것도 실행되지 않았다. 에러가 날지, 느릴지 알 수 없는 채로 주사위를 던진다.',
+          changes: [
+            { mark: 'gone', text: '지연·에러 정보 없음' },
+            { mark: 'read', text: '희소 에러도 1% 확률로만 포착' },
+          ],
+        },
+        legend: '맹점 2 — head 는 결과를 모른 채 결정한다. 희소 에러가 통계적으로 버려진다',
+        code: { ...CODE.limit, highlight: [11, 12, 13, 14] },
+      },
+      { ...S1,
+        beat: {
+          label: '두 갈래 해법이 나온다',
+          at: 'problem-recap.yaml L16–20',
+          caption: '맹점 1 은 adaptive(비율 자동 조정), 맹점 2 는 tail-based(완료 후 결정)로 각각 푼다.',
+          changes: [
+            { mark: 'new', text: 'A. Adaptive — 비율 자동 조정' },
+            { mark: 'new', text: 'B. Tail-based — 완료 후 결정' },
+          ],
+        },
         legend: '고정 비율의 두 맹점 — 저트래픽 과소 샘플 + 결과를 모른 채 앞에서 결정',
-        code: {
-          lang: 'yaml',
-          filename: 'problem-recap.yaml — 고정 비율의 두 맹점',
-          lines: [
-            '# III-1-1 복습: probabilistic 1% 고정의 문제점',
-            'default_strategy:',
-            '  type: probabilistic',
-            '  param: 0.01                 # 모든 서비스에 일괄 1%',
-            '',
-            '# 맹점 1) 저트래픽 서비스 과소 샘플 ─────────',
-            '#  checkout-api : 5,000 rps × 1% = 50 trace/s  (충분)',
-            '#  admin-api    :     3 rps × 1% = 0.03 trace/s',
-            '#                 → 하루에 겨우 2,592건, 사실상 안 보임',
-            '',
-            '# 맹점 2) 결과를 모른 채 앞(head)에서 결정 ──',
-            '#  요청 도착 시점엔 아직 아무것도 실행 안 됨',
-            '#  → 이 요청이 500ms 걸릴지, 500 에러 날지 모름',
-            '#  → 정작 중요한 희소 에러가 1% 확률로만 잡힘',
-            '',
-            '# 두 갈래의 해법',
-            '#  A. Adaptive  : collector가 서비스별 비율을 자동 조정',
-            '#                 (저트래픽엔 비율↑, 고트래픽엔 비율↓)',
-            '#  B. Tail-based: trace 완료까지 버퍼링 후 결정',
-            '#                 (에러·느린 것만 골라 100% 보존)',
-          ],
-          highlight: [2, 3, 4, 6, 7, 8, 9],
-        },
+        code: { ...CODE.limit, highlight: [16, 17, 18, 19, 20] },
       },
-      {
-        key: 'adaptive',
-        title: 'Step 2. Adaptive — collector가 목표 처리량에 맞춰 비율을 자동 조정',
-        desc: 'Adaptive 샘플링은 head-based의 진화다. collector가 서비스·operation별 실제 처리량을 계속 관측하다가, 각각이 목표 trace/s(target)에 수렴하도록 확률을 주기적으로(예: 1분마다) 다시 계산한다. 저트래픽 admin-api는 비율을 확 올려 목표를 채우고, 폭주하는 checkout-api는 비율을 내려 과금을 막는다. 운영자가 서비스마다 손으로 튜닝하던 per_service_strategies를 collector가 대신 해주는 셈이다. 저장에는 메모리 기반 또는 스토리지 기반 전략 저장소가 필요하다.',
+
+      // ── Step 2. Adaptive ───────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: 'Jaeger 리소스를 연다',
+          at: 'jaeger-adaptive.yaml L2–7',
+          caption: 'production 전략의 Jaeger CR 을 만든다. collector·query 가 분리된 이 구성이라야 collector 가 비율을 계산해 배포할 수 있다.',
+          changes: [
+            { mark: 'new',  text: 'Jaeger CR jaeger-adaptive' },
+            { mark: 'read', text: 'strategy: production' },
+          ],
+        },
+        legend: 'collector 가 분리된 production 구성 — 자동 조정의 전제',
+        code: { ...CODE.adaptive, highlight: [2, 3, 4, 5, 6, 7] },
+      },
+      { ...S2,
+        beat: {
+          label: 'adaptive 모드를 켠다',
+          at: 'jaeger-adaptive.yaml L10–13',
+          caption: 'collector 의 sampling.strategies.type 을 adaptive 로 바꾸는 한 줄이 전환점이다. 이제 확률은 파일이 아니라 collector 가 정한다.',
+          changes: [
+            { mark: 'changed', text: 'type: probabilistic → adaptive' },
+            { mark: 'gone',    text: '고정 param 지정 불필요' },
+          ],
+        },
+        legend: 'type: adaptive — 확률의 주인이 설정 파일에서 collector 로 넘어간다',
+        code: { ...CODE.adaptive, highlight: [10, 11, 12, 13] },
+      },
+      { ...S2,
+        beat: {
+          label: '목표와 주기를 정한다',
+          at: 'jaeger-adaptive.yaml L14–17',
+          caption: '서비스·operation 마다 초당 1건을 목표로 잡고, 1분마다 확률을 다시 계산한다. 이 둘이 자동 조정의 조준점이다.',
+          changes: [
+            { mark: 'new', text: 'target-samples-per-second: 1' },
+            { mark: 'new', text: 'calculation-interval: 1m' },
+          ],
+        },
+        legend: '목표 1 trace/s · 재계산 1분 — 수렴할 지점과 속도를 정한다',
+        code: { ...CODE.adaptive, highlight: [14, 15, 16, 17] },
+      },
+      { ...S2,
+        beat: {
+          label: '시작값과 하한을 건다',
+          at: 'jaeger-adaptive.yaml L18–21',
+          caption: '관측 데이터가 쌓이기 전에 쓸 초기 확률과, 아무리 트래픽이 적어도 내려가지 않을 최소 확률을 정한다.',
+          changes: [
+            { mark: 'new', text: 'initial-sampling-probability 0.001' },
+            { mark: 'new', text: 'min-sampling-probability 0.00001' },
+          ],
+        },
+        legend: '부트스트랩 확률 + 하한 clamp — 관측 전과 극저트래픽을 방어한다',
+        code: { ...CODE.adaptive, highlight: [18, 19, 20, 21] },
+      },
+      { ...S2,
+        beat: {
+          label: '전략 저장소를 붙인다',
+          at: 'jaeger-adaptive.yaml L22–23',
+          caption: 'adaptive 는 계산한 확률을 어딘가 보관해야 collector 가 재시작해도 이어진다. 여기서는 trace 저장소인 ES 를 함께 쓴다.',
+          changes: [
+            { mark: 'new',  text: 'storage.type: elasticsearch' },
+            { mark: 'read', text: '계산된 확률의 보관처' },
+          ],
+        },
+        legend: '전략 저장소 필요 — 계산한 확률을 재시작 뒤에도 유지한다',
+        code: { ...CODE.adaptive, highlight: [22, 23] },
+      },
+      { ...S2,
+        beat: {
+          label: '1분마다 다시 계산한다',
+          at: 'jaeger-adaptive.yaml L25–30',
+          caption: '최근 qps 를 집계하고 p = target / observed_qps 로 확률을 구한 뒤, 새 확률을 각 client 에 원격으로 내려보낸다.',
+          changes: [
+            { mark: 'read',    text: '서비스별 관측 qps' },
+            { mark: 'changed', text: 'p = target / observed_qps' },
+            { mark: 'new',     text: '새 확률을 client 로 원격 전파' },
+          ],
+        },
+        legend: 'observed_qps 를 재서 확률을 역산 → 원격 전파. 손튜닝이 사라진다',
+        code: { ...CODE.adaptive, highlight: [25, 26, 27, 28, 29, 30] },
+      },
+      { ...S2,
+        beat: {
+          label: '두 서비스가 반대로 움직인다',
+          at: 'jaeger-adaptive.yaml L31–32',
+          caption: '3 qps 인 admin-api 는 확률이 0.33 까지 올라가고, 5,000 qps 인 checkout-api 는 0.0002 까지 내려간다. 둘 다 목표 1/s 로 수렴한다.',
+          changes: [
+            { mark: 'changed', text: 'admin-api p 0.01 → 0.33' },
+            { mark: 'changed', text: 'checkout-api p 0.01 → 0.0002' },
+          ],
+        },
         legend: '목표 target trace/s로 수렴 — 비율은 트래픽에 반비례해 collector가 자동 조정',
-        code: {
-          lang: 'yaml',
-          filename: 'jaeger-adaptive.yaml — collector 자동 조정',
-          lines: [
-            '# Adaptive: collector가 목표 처리량에 맞춰 비율 자동 계산',
-            'apiVersion: jaegertracing.io/v1',
-            'kind: Jaeger',
-            'metadata:',
-            '  name: jaeger-adaptive',
-            'spec:',
-            '  strategy: production',
-            '  collector:',
-            '    options:',
-            '      sampling:',
-            '        strategies:',
-            '          # adaptive 모드 활성화',
-            '          type: adaptive',
-            '      # 서비스·operation별 목표 trace/s',
-            '      sampling.target-samples-per-second: 1',
-            '      # 비율 재계산 주기',
-            '      sampling.calculation-interval: 1m',
-            '      # 초기 비율 (관측 전 부트스트랩)',
-            '      sampling.initial-sampling-probability: 0.001',
-            '      # 최소 비율 (저트래픽도 최소한 보장)',
-            '      sampling.min-sampling-probability: 0.00001',
-            '  storage:',
-            '    type: elasticsearch          # 전략 저장소로도 사용',
-            '',
-            '# collector의 자동 조정 루프 ─────────────',
-            '#  매 1분:',
-            '#   1) 서비스별 최근 처리량(qps) 집계',
-            '#   2) target(1/s) 대비 필요한 확률 재계산',
-            '#      p = target / observed_qps  (상·하한 clamp)',
-            '#   3) 새 확률을 각 client에 원격 전파',
-            '#  → admin-api(3qps): p≈0.33  (거의 다 잡음)',
-            '#  → checkout-api(5000qps): p≈0.0002 (과금 방지)',
-          ],
-          highlight: [12, 13, 15, 17, 19, 21],
-        },
+        code: { ...CODE.adaptive, highlight: [31, 32] },
       },
-      {
-        key: 'tail',
-        title: 'Step 3. Tail-based — trace 완료까지 기다렸다가 결과를 보고 결정',
-        desc: 'Tail-based는 결정 시점을 아예 뒤(tail)로 옮긴다. OTel Collector의 tail_sampling processor가 한 trace의 모든 span을 decision_wait 시간 동안 메모리에 모은 뒤, 그 trace가 에러였는지·느렸는지 보고 나서 보존 여부를 정한다. 그래서 "에러 난 trace는 100% 보존" 같은, head-based로는 불가능한 정책이 가능하다. 대신 완성될 때까지 버퍼링하므로 메모리를 많이 쓰고, 모든 span이 같은 collector로 모여야 해서(trace_id 기반 로드밸런싱) 아키텍처가 복잡해진다.',
+
+      // ── Step 3. Tail-based ─────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: 'processor 를 열고 기다린다',
+          at: 'otel-collector.yaml L2–5',
+          caption: 'OTel Collector 의 tail_sampling processor 를 선언하고, 첫 span 이후 10초 동안 trace 가 완성되기를 기다린다.',
+          changes: [
+            { mark: 'new', text: 'tail_sampling processor' },
+            { mark: 'new', text: 'decision_wait: 10s' },
+          ],
+        },
+        legend: 'decision_wait 10s — 판정을 뒤로 미루고 span 이 다 모이길 기다린다',
+        code: { ...CODE.tail, highlight: [2, 3, 4, 5] },
+      },
+      { ...S3,
+        beat: {
+          label: '메모리 상한을 건다',
+          at: 'otel-collector.yaml L6–9',
+          caption: '버퍼링이 곧 메모리다. 동시에 추적할 trace 수와 초당 유입 상한을 정해 collector 가 터지지 않게 막는다.',
+          changes: [
+            { mark: 'new', text: 'num_traces: 100000' },
+            { mark: 'new', text: 'expected_new_traces_per_sec: 2000' },
+          ],
+        },
+        legend: 'tail 의 대가는 메모리 — num_traces 로 버퍼 상한을 명시한다',
+        code: { ...CODE.tail, highlight: [6, 7, 8, 9] },
+      },
+      { ...S3,
+        beat: {
+          label: '에러는 전량 보존',
+          at: 'otel-collector.yaml L10–15',
+          caption: 'status_code 정책으로 ERROR 인 trace 를 무조건 KEEP 한다. 완성 후에 판정하니 가능한 규칙이다.',
+          changes: [
+            { mark: 'new',  text: 'policies 배열 시작' },
+            { mark: 'new',  text: 'keep-errors (status_code)' },
+            { mark: 'read', text: 'status_codes: [ERROR] → 100% 보존' },
+          ],
+        },
+        legend: 'status_code=ERROR 는 100% KEEP — head-based 로는 만들 수 없는 정책',
+        code: { ...CODE.tail, highlight: [10, 11, 12, 13, 14, 15] },
+      },
+      { ...S3,
+        beat: {
+          label: '느린 것도 전량 보존',
+          at: 'otel-collector.yaml L16–20',
+          caption: 'latency 정책으로 500ms 를 넘긴 trace 를 KEEP 한다. 지연 역시 완성 후에야 알 수 있는 값이다.',
+          changes: [
+            { mark: 'new',  text: 'keep-slow (latency)' },
+            { mark: 'read', text: 'threshold_ms: 500' },
+          ],
+        },
+        legend: 'latency > 500ms 도 전량 KEEP — 지연은 완성 후에만 알 수 있다',
+        code: { ...CODE.tail, highlight: [16, 17, 18, 19, 20] },
+      },
+      { ...S3,
+        beat: {
+          label: '정상은 1% 만',
+          at: 'otel-collector.yaml L21–25',
+          caption: '나머지 정상 trace 에는 probabilistic 1% 를 걸어 양을 줄인다. 중요한 것은 남기고 배경 트래픽만 깎는 구조다.',
+          changes: [
+            { mark: 'new',     text: 'sample-normal (probabilistic)' },
+            { mark: 'changed', text: '정상 trace → 1% 만 보존' },
+          ],
+        },
+        legend: '정상 trace 만 1% 로 축소 — 총량은 줄이고 신호는 남긴다',
+        code: { ...CODE.tail, highlight: [21, 22, 23, 24, 25] },
+      },
+      { ...S3,
+        beat: {
+          label: '흐름을 정리한다',
+          at: 'otel-collector.yaml L27–30',
+          caption: 'span 은 trace_id 별 버퍼에 쌓이고, decision_wait 가 지나면 정책을 위에서 아래로 훑어 하나라도 keep 이면 보존한다.',
+          changes: [
+            { mark: 'read', text: 'trace_id 별 버퍼 누적' },
+            { mark: 'read', text: '정책 OR 평가 → keep / drop' },
+          ],
+        },
         legend: 'decision_wait 동안 span 모아 완성 → 결과(에러·지연)를 보고 사후 판정',
-        code: {
-          lang: 'yaml',
-          filename: 'otel-collector.yaml — tail_sampling processor',
-          lines: [
-            '# OpenTelemetry Collector: 완료된 trace를 보고 결정',
-            'processors:',
-            '  tail_sampling:',
-            '    # trace 완성을 기다리는 시간 (첫 span 이후)',
-            '    decision_wait: 10s',
-            '    # 동시에 추적 중인 최대 trace 수 (메모리 상한)',
-            '    num_traces: 100000',
-            '    # 초당 신규 trace 유입 상한',
-            '    expected_new_traces_per_sec: 2000',
-            '    policies:',
-            '      # 1) 에러는 무조건 100% 보존',
-            '      - name: keep-errors',
-            '        type: status_code',
-            '        status_code:',
-            '          status_codes: [ERROR]',
-            '      # 2) 느린 trace(500ms 초과)도 100% 보존',
-            '      - name: keep-slow',
-            '        type: latency',
-            '        latency:',
-            '          threshold_ms: 500',
-            '      # 3) 나머지 정상 trace는 1%만',
-            '      - name: sample-normal',
-            '        type: probabilistic',
-            '        probabilistic:',
-            '          sampling_percentage: 1',
-            '',
-            '# 흐름 ──────────────────────────────────',
-            '#  span 도착 → trace_id별 버퍼에 누적',
-            '#  decision_wait 경과 → 정책을 위→아래로 평가',
-            '#  하나라도 keep이면 보존, 아니면 drop',
-          ],
-          highlight: [3, 5, 11, 12, 13, 16, 17, 18, 21, 22, 23],
-        },
+        code: { ...CODE.tail, highlight: [27, 28, 29, 30] },
       },
-      {
-        key: 'policy',
-        title: 'Step 4. 에러 100% 보존 — tail 정책은 위에서 아래로, OR 결합',
-        desc: 'tail_sampling의 policies는 배열 순서대로 평가되고 "하나라도 통과하면 보존"하는 OR 결합이다. 그래서 status_code=ERROR와 latency>500ms를 앞에 두면, 정상 trace를 1%로 줄이면서도 에러와 느린 요청은 빠짐없이 잡는다. 실무에선 여기에 특정 고객(attribute)·특정 endpoint를 and_policy로 조합해 "VIP의 결제 실패는 전량 보존" 같은 정교한 규칙을 만든다. 함정은 정책이 늘수록 튜닝이 어려워지고, decision_wait보다 늦게 도착한 span은 판정에서 누락된다는 점이다.',
+
+      // ── Step 4. 정책 결합 ──────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: '정책 골격만 남긴다',
+          at: 'tail-policies-advanced.yaml L2–4',
+          caption: 'decision_wait 는 그대로 두고, policies 배열만 정교하게 다시 짠다. 평가 순서는 이 배열의 순서다.',
+          changes: [
+            { mark: 'read', text: 'decision_wait 10s 유지' },
+            { mark: 'new',  text: 'policies 재구성 시작' },
+          ],
+        },
+        legend: 'policies 는 배열 — 위에서 아래로 평가되고 순서가 곧 우선순위',
+        code: { ...CODE.policy, highlight: [2, 3, 4] },
+      },
+      { ...S4,
+        beat: {
+          label: 'and 정책을 연다',
+          at: 'tail-policies-advanced.yaml L5–9',
+          caption: 'type: and 는 하위 조건을 모두 만족해야 통과하는 정책이다. and_sub_policy 안에 조건들을 나열한다.',
+          changes: [
+            { mark: 'new', text: 'vip-payment-error (type: and)' },
+            { mark: 'new', text: 'and_sub_policy 블록' },
+          ],
+        },
+        legend: 'and 정책 — 내부 조건은 AND 결합. 여기서만 조건을 겹칠 수 있다',
+        code: { ...CODE.policy, highlight: [5, 6, 7, 8, 9] },
+      },
+      { ...S4,
+        beat: {
+          label: '조건 1: 에러인가',
+          at: 'tail-policies-advanced.yaml L10–13',
+          caption: '첫 하위 조건은 status_code 가 ERROR 인지 본다. 이 하나만으로는 아직 보존이 결정되지 않는다.',
+          changes: [
+            { mark: 'new',  text: 'is-error 하위 조건' },
+            { mark: 'read', text: 'status_codes: [ERROR]' },
+          ],
+        },
+        legend: 'AND 의 첫 항 — status=ERROR. 아직 판정은 보류다',
+        code: { ...CODE.policy, highlight: [10, 11, 12, 13] },
+      },
+      { ...S4,
+        beat: {
+          label: '조건 2: VIP 인가',
+          at: 'tail-policies-advanced.yaml L14–18',
+          caption: 'string_attribute 로 customer.tier 가 vip 또는 enterprise 인지 확인한다. 두 조건이 모두 참이어야 A 가 통과한다.',
+          changes: [
+            { mark: 'new',     text: 'is-vip (string_attribute)' },
+            { mark: 'read',    text: 'customer.tier ∈ [vip, enterprise]' },
+            { mark: 'changed', text: 'A = ERROR ∧ VIP → KEEP' },
+          ],
+        },
+        legend: 'AND 완성 — VIP 이면서 에러인 trace 만 A 로 전량 보존',
+        code: { ...CODE.policy, highlight: [14, 15, 16, 17, 18] },
+      },
+      { ...S4,
+        beat: {
+          label: 'B: 나머지 에러도 보존',
+          at: 'tail-policies-advanced.yaml L19–23',
+          caption: 'A 에서 걸리지 않은 일반 고객의 에러도 별도 정책으로 전량 KEEP 한다. policies 는 OR 이라 A 와 B 는 겹쳐도 된다.',
+          changes: [
+            { mark: 'new',  text: 'all-errors 정책' },
+            { mark: 'read', text: 'A 와 OR 결합 — 겹침 허용' },
+          ],
+        },
+        legend: 'policies 는 OR — A 가 놓친 에러를 B 가 다시 건진다',
+        code: { ...CODE.policy, highlight: [19, 20, 21, 22, 23] },
+      },
+      { ...S4,
+        beat: {
+          label: 'C: 정상은 0.5%',
+          at: 'tail-policies-advanced.yaml L24–28',
+          caption: '마지막에 baseline 을 두어 정상 trace 를 0.5% 만 남긴다. 앞 정책에서 이미 KEEP 된 trace 는 여기까지 오지 않는다.',
+          changes: [
+            { mark: 'new',     text: 'baseline 정책 (맨 뒤)' },
+            { mark: 'changed', text: '정상 trace → 0.5%' },
+          ],
+        },
+        legend: 'baseline 은 맨 뒤 — 앞에서 KEEP 되면 평가되지 않는다',
+        code: { ...CODE.policy, highlight: [24, 25, 26, 27, 28] },
+      },
+      { ...S4,
+        beat: {
+          label: '평가 규칙과 함정',
+          at: 'tail-policies-advanced.yaml L30–33',
+          caption: 'policies 는 OR, and 내부는 AND 다. 그리고 decision_wait 가 지난 뒤 도착한 span 은 판정에 끼지 못하고 누락된다.',
+          changes: [
+            { mark: 'read', text: '바깥 OR · 안쪽 AND' },
+            { mark: 'gone', text: 'decision_wait 후 도착 span 누락' },
+          ],
+        },
         legend: '정책 OR 평가 — 에러·지연은 전량, 정상은 소량. 순서와 결합이 핵심',
-        code: {
-          lang: 'yaml',
-          filename: 'tail-policies-advanced.yaml — 조합 정책',
-          lines: [
-            '# 정교한 정책: and_policy로 조건 결합',
-            'tail_sampling:',
-            '  decision_wait: 10s',
-            '  policies:',
-            '    # A) VIP 고객의 결제 실패는 전량 보존',
-            '    - name: vip-payment-error',
-            '      type: and',
-            '      and:',
-            '        and_sub_policy:',
-            '          - name: is-error',
-            '            type: status_code',
-            '            status_code:',
-            '              status_codes: [ERROR]',
-            '          - name: is-vip',
-            '            type: string_attribute',
-            '            string_attribute:',
-            '              key: customer.tier',
-            '              values: [vip, enterprise]',
-            '    # B) 그 외 모든 에러도 보존',
-            '    - name: all-errors',
-            '      type: status_code',
-            '      status_code:',
-            '        status_codes: [ERROR]',
-            '    # C) 정상 trace는 0.5%만',
-            '    - name: baseline',
-            '      type: probabilistic',
-            '      probabilistic:',
-            '        sampling_percentage: 0.5',
-            '',
-            '# 평가 규칙 ─────────────────────────────',
-            '#  policies는 OR — 하나라도 keep이면 보존',
-            '#  and 내부의 and_sub_policy는 AND — 모두 참이어야',
-            '#  함정: decision_wait 후 도착한 span은 누락',
-          ],
-          highlight: [6, 7, 8, 10, 11, 14, 15, 19, 20, 21],
-        },
+        code: { ...CODE.policy, highlight: [30, 31, 32, 33] },
       },
-      {
-        key: 'compare',
-        title: 'Step 5. 언제 무엇을 — head / adaptive / tail 선택 기준',
-        desc: '세 전략은 대체재가 아니라 계층이다. 시작은 head-based probabilistic(단순·저비용)로 하고, 서비스별 트래픽 편차가 커서 손튜닝이 힘들면 adaptive로 올린다. 에러·지연을 반드시 놓치지 말아야 하는 핵심 서비스에는 tail-based를 붙인다. 흔한 프로덕션 구성은 "엣지에서 head로 1차 걸러 collector 부하를 줄이고, tail collector에서 에러·느린 것을 다시 건져 올리는" 2단 구조다. tail은 메모리·완성 대기·로드밸런싱 비용이 크므로 전 구간이 아니라 중요한 경로에만 선택 적용한다.',
-        legend: 'head→adaptive→tail은 계층 — 단순·저비용에서 정교·고비용으로. 핵심 경로만 tail',
-        code: {
-          lang: 'yaml',
-          filename: 'decision-guide.yaml — 선택 기준 요약',
-          lines: [
-            '# 세 전략 비교표 ─────────────────────────',
-            '#                    head      adaptive   tail',
-            '#  결정 시점         시작       시작        완료 후',
-            '#  에러 100% 보존    ✕          ✕           ◎',
-            '#  저트래픽 보정     ✕          ◎           △',
-            '#  비용(메모리)      낮음       낮음        높음',
-            '#  구현/운영 난이도  ◎ 단순     △           ✕ 복잡',
-            '#  서비스간 일관성   ◎          ◎           ◎(완성 대기)',
-            '',
-            '# 선택 플로우 ───────────────────────────',
-            '#  1) 일단 head probabilistic로 시작 (III-1-1)',
-            '#  2) 서비스별 트래픽 편차 큼 → adaptive 승격',
-            '#  3) 에러/지연 절대 놓치면 안 됨 → tail 추가',
-            '',
-            '# 실무 2단 구성 (권장) ──────────────────',
-            'pipeline:',
-            '  edge-agent:',
-            '    sampling: head-probabilistic   # 1차 부하 차단',
-            '    param: 0.1',
-            '  tail-collector:',
-            '    sampling: tail_sampling        # 2차 정밀 선별',
-            '    keep: [errors, slow>500ms]',
-            '    loadbalancing: by-trace-id     # 같은 trace는 한 곳으로',
-            '',
-            '# 흔한 함정 ─────────────────────────────',
-            '#  ✗ adaptive 파라미터가 많아 초기 튜닝이 까다로움',
-            '#  ✗ tail decision_wait만큼 결과가 지연 노출',
-            '#  ✗ tail은 메모리·LB 비용 → 전 구간 적용 금물',
-            '#  ✗ 저트래픽 서비스는 여전히 min-probability로 방어',
+
+      // ── Step 5. 선택 기준 ──────────────────────────────────────
+      { ...S5,
+        beat: {
+          label: '결정 시점이 갈린다',
+          at: 'decision-guide.yaml L2–5',
+          caption: 'head 와 adaptive 는 요청 시작 시점에, tail 은 완료 후에 정한다. 에러 100% 보존이 tail 에서만 ◎ 인 이유가 이것이다.',
+          changes: [
+            { mark: 'read',    text: 'head·adaptive = 시작 시점 결정' },
+            { mark: 'changed', text: 'tail = 완료 후 결정' },
           ],
-          highlight: [16, 17, 18, 19, 20, 21, 22, 23],
         },
+        legend: '결정 시점의 차이가 능력의 차이 — 에러 100% 보존은 tail 만 가능',
+        code: { ...CODE.compare, highlight: [2, 3, 4, 5] },
+      },
+      { ...S5,
+        beat: {
+          label: '대가는 비용과 난이도',
+          at: 'decision-guide.yaml L6–8',
+          caption: 'tail 은 버퍼링 때문에 메모리 비용과 운영 난이도가 높다. 정확도를 사려면 복잡도를 지불해야 한다.',
+          changes: [
+            { mark: 'changed', text: 'tail 메모리 비용 높음' },
+            { mark: 'changed', text: 'tail 운영 난이도 ✕ 복잡' },
+          ],
+        },
+        legend: '정확도의 대가 — tail 은 메모리·운영 비용이 가장 크다',
+        code: { ...CODE.compare, highlight: [6, 7, 8] },
+      },
+      { ...S5,
+        beat: {
+          label: '순서대로 올라간다',
+          at: 'decision-guide.yaml L10–13',
+          caption: 'head 로 시작해 트래픽 편차가 커지면 adaptive 로, 에러·지연을 절대 놓칠 수 없으면 tail 로 승격한다.',
+          changes: [
+            { mark: 'read', text: '1) head probabilistic 로 시작' },
+            { mark: 'read', text: '2) 편차 크면 adaptive' },
+            { mark: 'read', text: '3) 필수 보존이면 tail 추가' },
+          ],
+        },
+        legend: '대체가 아니라 승격 — 필요가 생길 때 한 단계씩 올린다',
+        code: { ...CODE.compare, highlight: [10, 11, 12, 13] },
+      },
+      { ...S5,
+        beat: {
+          label: '1단: 엣지에서 걸러낸다',
+          at: 'decision-guide.yaml L16–19',
+          caption: '엣지 agent 가 head-probabilistic 10% 로 1차로 양을 줄여 뒤쪽 collector 의 부하를 낮춘다.',
+          changes: [
+            { mark: 'new',  text: 'edge-agent 파이프라인' },
+            { mark: 'read', text: 'head-probabilistic param 0.1' },
+          ],
+        },
+        legend: '2단 구성 1단계 — 엣지에서 10% 로 1차 부하 차단',
+        code: { ...CODE.compare, highlight: [16, 17, 18, 19] },
+      },
+      { ...S5,
+        beat: {
+          label: '2단: tail 로 건져 올린다',
+          at: 'decision-guide.yaml L20–23',
+          caption: '남은 10% 중에서 tail collector 가 에러·500ms 초과를 골라낸다. 같은 trace 가 흩어지지 않게 trace_id 로 로드밸런싱한다.',
+          changes: [
+            { mark: 'new',  text: 'tail-collector 단계' },
+            { mark: 'read', text: 'keep: errors, slow>500ms' },
+            { mark: 'new',  text: 'loadbalancing: by-trace-id' },
+          ],
+        },
+        legend: '2단 구성 2단계 — trace_id LB 로 모아 정밀 선별. LB 가 빠지면 판정이 깨진다',
+        code: { ...CODE.compare, highlight: [20, 21, 22, 23] },
+      },
+      { ...S5,
+        beat: {
+          label: '함정을 확인한다',
+          at: 'decision-guide.yaml L25–29',
+          caption: 'adaptive 는 초기 튜닝이 까다롭고, tail 은 결과가 decision_wait 만큼 늦게 보이며 비용이 크다. 전 구간 적용은 금물이다.',
+          changes: [
+            { mark: 'gone', text: 'tail 전 구간 적용 금지' },
+            { mark: 'read', text: '저트래픽은 min-probability 로 방어' },
+          ],
+        },
+        legend: 'head→adaptive→tail은 계층 — 단순·저비용에서 정교·고비용으로. 핵심 경로만 tail',
+        code: { ...CODE.compare, highlight: [25, 26, 27, 28, 29] },
       },
     ];
 
@@ -717,7 +1109,7 @@
       );
     }
 
-    function LiveDataPane({ step }) {
+    function LiveDataPane({ beat, step }) {
       let inner = null;
       if (step.key === 'limit') inner = <HeadLimit />;
       else if (step.key === 'adaptive') inner = <AdaptiveTune />;
@@ -726,6 +1118,29 @@
       else if (step.key === 'compare') inner = <CompareMatrix />;
       return (
         <div className="space-y-2">
+          {beat && (
+            <div className="mb-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-zinc-900">{beat.label}</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold border border-zinc-300 bg-zinc-50 text-zinc-700">↔ {beat.at}</span>
+              </div>
+              <p className="text-[11px] mt-1 text-zinc-600">{beat.caption}</p>
+              {beat.changes && (
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {beat.changes.map((c, i) => {
+                    const m = MARK[c.mark] || MARK.changed;
+                    return (
+                      <span key={i} className="trn-mark text-[10px] px-1.5 py-0.5 rounded border"
+                            style={{ background: m.bg, borderColor: m.bd, color: m.color }}>
+                        <b>{m.sign}</b> {c.text}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           {inner}
           <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-[10px] text-slate-500 leading-snug">
             {step.legend}
@@ -866,13 +1281,13 @@
             </header>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-              <LiveDataPane step={step} />
+              <LiveDataPane beat={step.beat} step={step} />
               <CodeViewer code={step.code} stepIdx={stepIdx} />
             </div>
 
             <div className="p-4 rounded-xl text-white shadow-sm" style={{ background: DEEP }}>
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">Step {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-100">세부 {stepIdx + 1} / {STEPS.length} — {step.title}</h3>
                 <span className="text-xs text-cyan-100">키보드 &larr;/&rarr;</span>
               </div>
               <p className="text-sm leading-relaxed">{step.desc}</p>
