@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="ko" data-trn-native-beats="1">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -307,331 +307,1474 @@
       gone:    { sign: '−', color: '#78716c', bg: '#fafaf9', bd: '#d6d3d1' },
     };
 
+    // 코드 본문은 스텝마다 하나뿐이라 상수로 묶고, beat 는 강조 줄만 바꿔 쓴다
+    const CODE = {
+      metaNone: {lang:"python", filename:"metadata-side-db.py", lines:[
+        "# FAISS는 벡터(float)와 정수 ID만 저장 — 메타데이터는 분리",
+        "import faiss",
+        "import numpy as np",
+        "",
+        "# 1) FAISS 인덱스 생성 (768차원 L2)",
+        "index = faiss.IndexIDMap(faiss.IndexFlatL2(768))",
+        "",
+        "# 2) 벡터 추가 — ID는 직접 부여",
+        "ids     = np.array([17, 23, 42, 56, 71, 88], dtype=np.int64)",
+        "vectors = np.random.rand(6, 768).astype(np.float32)",
+        "index.add_with_ids(vectors, ids)",
+        "",
+        "# 3) 검색 결과는 ID + 거리뿐",
+        "q = np.random.rand(1, 768).astype(np.float32)",
+        "D, I = index.search(q, k=3)",
+        "# I = [[42, 23, 71]]",
+        "# D = [[0.13, 0.27, 0.44]]",
+        "",
+        "# 문제: ID=42가 어떤 문서인지 FAISS는 모른다",
+        "#  - title?    → ✗",
+        "#  - category? → ✗",
+        "#  - 작성일?   → ✗",
+        "# 메타는 다른 저장소(SQLite/Redis/Postgres)에 따로 둬야 한다",
+      ]},
+      metaSqlite: {lang:"python", filename:"metadata-side-db.py", lines:[
+        "# 보완: SQLite에 같은 ID로 메타데이터 저장 → 2-step 조회",
+        "import faiss, sqlite3, numpy as np",
+        "",
+        "# 1) 메타데이터 테이블 — FAISS와 같은 정수 ID를 PK로",
+        "conn = sqlite3.connect(\"metadata.db\")",
+        "conn.execute(\"\"\"",
+        "  CREATE TABLE IF NOT EXISTS docs (",
+        "    id INTEGER PRIMARY KEY,",
+        "    title TEXT,",
+        "    category TEXT,",
+        "    created_at TEXT",
+        "  )",
+        "\"\"\")",
+        "",
+        "# 2) 적재 시 두 곳에 같은 ID로 동시 기록",
+        "def insert_doc(doc_id, vector, title, category):",
+        "    index.add_with_ids(vector.reshape(1, -1),",
+        "                       np.array([doc_id], dtype=np.int64))",
+        "    conn.execute(",
+        "      \"INSERT INTO docs(id, title, category) VALUES(?,?,?)\",",
+        "      (doc_id, title, category),",
+        "    )",
+        "    conn.commit()",
+        "",
+        "# 3) 검색 = FAISS로 ID 회수 → SQLite로 메타 조회",
+        "D, I = index.search(q, k=3)            # [[42, 71, 23]]",
+        "rows = conn.execute(",
+        "  \"SELECT id,title,category FROM docs WHERE id IN (?,?,?)\",",
+        "  tuple(int(i) for i in I[0])",
+        ").fetchall()",
+        "",
+        "# → [(42, \"FAISS 정리\", \"ai\"), (71, \"pgvector\", \"ai\"), ...]",
+        "# 핵심: ID라는 끈으로 두 저장소를 묶음 — 동기화는 직접 책임",
+      ]},
+      persistence: {lang:"python", filename:"persistence.py", lines:[
+        "# FAISS 영속성 — 저장/로드는 OK, 자동 동기화는 직접 구현",
+        "import faiss, os, pickle",
+        "",
+        "INDEX_PATH  = \"my_index.faiss\"",
+        "CHUNKS_PATH = \"chunks.pkl\"",
+        "",
+        "# 1) 저장 — 인덱스와 원본 청크를 함께",
+        "def save_index(index, chunks):",
+        "    faiss.write_index(index, INDEX_PATH)",
+        "    with open(CHUNKS_PATH, \"wb\") as f:",
+        "        pickle.dump(chunks, f)",
+        "    print(f\"저장 완료: {index.ntotal}개 벡터\")",
+        "",
+        "# 2) 로드 — 앱 시작 시",
+        "def load_index():",
+        "    if not os.path.exists(INDEX_PATH):",
+        "        return None, None",
+        "    index = faiss.read_index(INDEX_PATH)",
+        "    with open(CHUNKS_PATH, \"rb\") as f:",
+        "        chunks = pickle.load(f)",
+        "    print(f\"로드 완료: {index.ntotal}개 벡터\")",
+        "    return index, chunks",
+        "",
+        "# 3) 새 벡터 add — 두 가지 함정",
+        "#   (a) 저장된 파일에는 반영되지 않음 → 다시 write 필요",
+        "#   (b) IVF/PQ 같은 학습형 인덱스는 add가 누적되면",
+        "#       클러스터 균형이 깨져 검색 정확도 하락",
+        "index.add_with_ids(new_vec, new_ids)",
+        "save_index(index, chunks)              # 매번 다시 써야 한다",
+        "",
+        "# 4) 결국 운영에서는 cron으로 \"전체 리빌드\"가 일반적",
+        "#   - 새 데이터 누적 → 야간에 재학습 + write_index",
+        "#   - \"라이브 add + 자동 저장\"을 원하면 Chroma/pgvector 권장",
+      ]},
+      preFilter: {lang:"python", filename:"pre-filter.py", lines:[
+        "# pre-filter — 메타DB로 먼저 후보 ID를 좁힌 뒤 FAISS 검색",
+        "import faiss, numpy as np",
+        "",
+        "# 1) SQLite로 카테고리 필터된 ID 후보 만들기",
+        "rows = conn.execute(",
+        "  \"SELECT id FROM docs WHERE category=?\", (\"ai\",)",
+        ").fetchall()",
+        "candidate_ids = np.array([r[0] for r in rows], dtype=np.int64)",
+        "#  → [42, 71]",
+        "",
+        "# 2) FAISS IDSelector로 후보 안에서만 검색",
+        "sel = faiss.IDSelectorBatch(candidate_ids)",
+        "params = faiss.SearchParametersIVF(sel=sel) \\",
+        "         if hasattr(faiss, \"SearchParametersIVF\") else None",
+        "",
+        "D, I = index.search(q, k=3, params=params)",
+        "#  → I = [[42, 71, -1]]   (-1 = 후보 부족)",
+        "",
+        "# 장점: 결과 카테고리가 100% \"ai\" 보장 + 정확한 top-k",
+        "# 단점:",
+        "#  - 후보 ID 리스트가 크면 IDSelector 비용 ↑",
+        "#  - 메타 필터 종류마다 후보 다시 계산 → 캐시 전략 필요",
+        "#  - IndexFlat 외 인덱스는 IDSelector 지원이 부분적",
+        "",
+        "# 적합 상황:",
+        "#  - 카테고리가 소수(< 1만개) → 후보 작아도 됨",
+        "#  - 정확성이 중요 — top-k 손실 허용 안 함",
+      ]},
+      recommendation: {lang:"markdown", filename:"recommendation.md", lines:[
+        "# FAISS vs 통합 벡터 DB — 어느 쪽을 고를까",
+        "",
+        "## FAISS가 강한 경우 (그대로 쓰기)",
+        "- 100만 건 이상 + GPU 가속 필요",
+        "- 검색 latency가 mission-critical",
+        "- 메타데이터/필터가 거의 없는 단순 의미 검색",
+        "- 라이브러리로 임베딩 파이프라인에 직접 끼워넣고 싶을 때",
+        "",
+        "## 통합 벡터 DB가 합리적인 경우 (대다수 RAG)",
+        "- 메타데이터 필터링이 일상적",
+        "- \"추가/삭제/업데이트\"가 라이브로 돌아야 함",
+        "- 자동 영속성 + 백업 + 복제가 필요",
+        "- 운영 인력이 적어 인프라 코드를 줄이고 싶을 때",
+        "",
+        "## 후보",
+        "- Chroma   : 파이썬 친화 · 로컬 시작 · 메타 필터 내장 (Part III)",
+        "- pgvector : Postgres 확장 · SQL과 결합 · 트랜잭션 지원",
+        "- Weaviate : 모듈식 (하이브리드 검색, 멀티테넌시)",
+        "- Milvus   : 대규모 분산",
+        "- Qdrant   : Rust 기반 · 메타 필터 강력",
+        "",
+        "## 자주 쓰는 조합 패턴",
+        "- \"FAISS(검색) + SQLite(메타)\"      ← 학습/프로토타입",
+        "- \"Chroma(전부)\"                     ← 단일 컨테이너 RAG",
+        "- \"pgvector + Postgres\"              ← 기존 RDB 인프라 재활용",
+        "- \"FAISS(GPU 캐시) + pgvector(원본)\" ← 고급 하이브리드",
+        "",
+        "## 결론",
+        "- FAISS 한계 4종(메타/영속/필터/CRUD)을 직접 짜야 한다면",
+        "  통합 벡터 DB로 가는 것이 코드/운영 모두 단순.",
+        "- Part III(Chroma) → Part IV(pgvector) 순으로 학습 권장.",
+      ]},
+    };
+
+    // Step 4 의 두 번째 탭(codeAlt) — 원본 그대로 유지한다
+    const CODE_ALT = {lang:"python", filename:"post-filter.py", lines:[
+      "# post-filter — FAISS로 넉넉히 검색하고 메타DB로 거르기",
+      "import faiss",
+      "",
+      "# 1) k를 크게 잡아 넉넉히 회수 (예: 원하는 5의 10배)",
+      "TARGET_K = 5",
+      "OVERFETCH = 50",
+      "D, I = index.search(q, k=OVERFETCH)",
+      "",
+      "# 2) 결과 ID로 SQLite에서 메타 조회 + 필터",
+      "placeholders = \",\".join(\"?\" * len(I[0]))",
+      "rows = conn.execute(",
+      "  f\"SELECT id,title,category FROM docs WHERE id IN ({placeholders}) AND category=?\",",
+      "  (*[int(i) for i in I[0]], \"ai\"),",
+      ").fetchall()",
+      "",
+      "# 3) 거리 순서 유지하며 상위 k만",
+      "meta_by_id = {r[0]: r for r in rows}",
+      "final = []",
+      "for idx in I[0]:",
+      "    if int(idx) in meta_by_id:",
+      "        final.append(meta_by_id[int(idx)])",
+      "    if len(final) >= TARGET_K:",
+      "        break",
+      "",
+      "# 장점: FAISS 인덱스 그대로 활용 — 추가 자료구조 불필요",
+      "# 단점:",
+      "#  - 카테고리가 전체의 1%면 50개 회수해도 0~1개만 통과",
+      "#  - \"결과 부족 → 더 가져오기\" 재시도 루프가 흔함",
+      "#  - 인기 없는 카테고리 검색에서 결과 누락 위험",
+    ], highlight: [4,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23,26,27,28,29]};
+
+    const S1 = { title: "Step 1. 메타데이터 없음 — FAISS는 ID만 안다",
+                 desc: "FAISS 인덱스에 들어간 벡터는 정수 ID + float 배열뿐. 검색 결과로 \"ID=42, 거리=0.13\"을 받지만 \"그 문서의 title은? category는?\"은 답할 수 없다. 메타데이터를 따로 보관할 외부 저장소가 필요하다는 것을 의미한다." };
+    const S2 = { title: "Step 2. 보완 1 — SQLite로 ID → 메타데이터 매핑",
+                 desc: "FAISS 옆에 SQLite를 두고 같은 ID로 메타(title/category/created_at)를 저장한다. 검색은 (1) FAISS로 ID 회수 → (2) SQLite에서 메타 조회 2-step. 단순하지만 효과적이고, ID만 일치시키면 Redis/Postgres로도 똑같이 패턴이 적용된다." };
+    const S3 = { title: "Step 3. 영속성 부분 지원 — 인덱스 저장은 되지만 add는 재빌드",
+                 desc: "faiss.write_index() / read_index()로 디스크에 통째로 저장·로드는 가능. 하지만 새 벡터를 add하려면 파일을 다시 쓰거나, IVF 같은 학습형 인덱스는 add가 누적될수록 군집 균형이 깨져 결국 전체 재빌드가 답이 된다. \"자동 영속성\"은 사용자가 직접 짜야 한다." };
+    const S4 = { title: "Step 4. 필터링 한계 — pre-filter는 어렵고 post-filter는 손실 위험",
+                 desc: "\"category=ai 중에서 유사한 top-3\"이 흔한 요구. FAISS는 인덱스 내부 필터를 제공하지 않는다 (IDSelector 일부 가능). 그래서 (1) pre-filter: 후보 ID를 먼저 SQLite로 걸러 IDSelector로 검색, (2) post-filter: 넉넉히 검색하고 SQLite로 거르기. pre는 작은 후보집에 적합, post는 top-k가 다 빠질 위험." };
+    const S5 = { title: "Step 5. 결론 — Chroma / pgvector로 가면 메타·영속·필터가 한 곳에",
+                 desc: "FAISS는 \"검색 알고리즘 라이브러리\"다. 메타데이터·영속성·필터·CRUD를 모두 직접 짜야 한다면 도메인 코드가 인프라 코드에 잠식된다. 통합 벡터 DB(Chroma·pgvector·Weaviate)는 이 4가지를 처음부터 한 패키지에서 제공한다. 검색 속도/GPU가 절대적으로 중요한 경우만 FAISS, 일반 RAG는 통합 벡터 DB가 합리적." };
+
     const STEPS = [
-      {
-        title: 'Step 1. 메타데이터 없음 — FAISS는 ID만 안다',
-        desc: 'FAISS 인덱스에 들어간 벡터는 정수 ID + float 배열뿐. 검색 결과로 "ID=42, 거리=0.13"을 받지만 "그 문서의 title은? category는?"은 답할 수 없다. 메타데이터를 따로 보관할 외부 저장소가 필요하다는 것을 의미한다.',
-        faiss: {
-          vectors: [
-            { id: 17, label: 'vec_17', hit: false },
-            { id: 23, label: 'vec_23', hit: false },
-            { id: 42, label: 'vec_42', hit: true },
-            { id: 56, label: 'vec_56', hit: false },
-            { id: 71, label: 'vec_71', hit: false },
-            { id: 88, label: 'vec_88', hit: false },
+      // ── Step 1 ─────────────────────────────────────
+      { ...S1,
+        beat: {
+          label: "빈 인덱스 생성",
+          at: "metadata-side-db.py L5–6",
+          caption: "IndexIDMap 으로 감싸면 벡터마다 내가 정한 정수 ID 를 붙일 수 있다.",
+          changes: [
+            {mark: "new", text: "index (IndexIDMap)"},
+            {mark: "gone", text: "아직 벡터 0개"},
           ],
-          searchHit: { id: 42, dist: 0.13 },
+        },
+        faiss: {
+          vectors: []
         },
         metaDb: null,
         showLink: false,
         persist: null,
         filter: null,
         conclusion: false,
-        code: {
-          lang: 'python',
-          filename: 'metadata-side-db.py',
-          lines: [
-            '# FAISS는 벡터(float)와 정수 ID만 저장 — 메타데이터는 분리',
-            'import faiss',
-            'import numpy as np',
-            '',
-            '# 1) FAISS 인덱스 생성 (768차원 L2)',
-            'index = faiss.IndexIDMap(faiss.IndexFlatL2(768))',
-            '',
-            '# 2) 벡터 추가 — ID는 직접 부여',
-            'ids     = np.array([17, 23, 42, 56, 71, 88], dtype=np.int64)',
-            'vectors = np.random.rand(6, 768).astype(np.float32)',
-            'index.add_with_ids(vectors, ids)',
-            '',
-            '# 3) 검색 결과는 ID + 거리뿐',
-            'q = np.random.rand(1, 768).astype(np.float32)',
-            'D, I = index.search(q, k=3)',
-            '# I = [[42, 23, 71]]',
-            '# D = [[0.13, 0.27, 0.44]]',
-            '',
-            '# 문제: ID=42가 어떤 문서인지 FAISS는 모른다',
-            '#  - title?    → ✗',
-            '#  - category? → ✗',
-            '#  - 작성일?   → ✗',
-            '# 메타는 다른 저장소(SQLite/Redis/Postgres)에 따로 둬야 한다',
-          ],
-          highlight: [6, 11, 14, 15, 19, 20, 21, 22, 23],
-        },
+        code: {...CODE.metaNone, highlight: [5,6]},
       },
-      {
-        title: 'Step 2. 보완 1 — SQLite로 ID → 메타데이터 매핑',
-        desc: 'FAISS 옆에 SQLite를 두고 같은 ID로 메타(title/category/created_at)를 저장한다. 검색은 (1) FAISS로 ID 회수 → (2) SQLite에서 메타 조회 2-step. 단순하지만 효과적이고, ID만 일치시키면 Redis/Postgres로도 똑같이 패턴이 적용된다.',
+      { ...S1,
+        beat: {
+          label: "ID 와 함께 적재",
+          at: "metadata-side-db.py L8–11",
+          caption: "add_with_ids 로 6개 벡터를 17·23·42·56·71·88 이라는 ID 로 넣는다.",
+          changes: [
+            {mark: "new", text: "벡터 6개 (id 17~88)"},
+            {mark: "read", text: "ID 는 직접 부여"},
+          ],
+        },
         faiss: {
           vectors: [
-            { id: 17, label: 'vec_17', hit: false },
-            { id: 23, label: 'vec_23', hit: false },
-            { id: 42, label: 'vec_42', hit: true },
-            { id: 56, label: 'vec_56', hit: false },
-            { id: 71, label: 'vec_71', hit: true },
-            { id: 88, label: 'vec_88', hit: false },
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: false
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: false
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ]
+        },
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaNone, highlight: [8,9,10,11]},
+      },
+      { ...S1,
+        beat: {
+          label: "검색 실행",
+          at: "metadata-side-db.py L13–15",
+          caption: "무작위 쿼리로 top-3 를 찾으면 거리 배열 D 와 ID 배열 I 만 돌아온다.",
+          changes: [
+            {mark: "new", text: "검색 결과 id=42, dist=0.13"},
           ],
-          searchHit: { id: 42, dist: 0.13 },
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: false
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaNone, highlight: [13,14,15]},
+      },
+      { ...S1,
+        beat: {
+          label: "반환값 확인",
+          at: "metadata-side-db.py L16–17",
+          caption: "I = [[42, 23, 71]], D = [[0.13, 0.27, 0.44]] — 상위 3개가 ID 로만 표시된다.",
+          changes: [
+            {mark: "read", text: "상위 3개 id = 42, 23, 71"},
+            {mark: "read", text: "거리 0.13 / 0.27 / 0.44"},
+          ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: true
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: true
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaNone, highlight: [16,17]},
+      },
+      { ...S1,
+        beat: {
+          label: "메타데이터 부재",
+          at: "metadata-side-db.py L19–23",
+          caption: "ID=42 가 어떤 문서인지 FAISS 는 모른다. title·category·작성일 모두 답할 수 없다.",
+          changes: [
+            {mark: "gone", text: "title / category / 작성일"},
+            {mark: "read", text: "외부 저장소 필요"},
+          ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: false
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaNone, highlight: [19,20,21,22,23]},
+      },
+      // ── Step 2 ─────────────────────────────────────
+      { ...S2,
+        beat: {
+          label: "메타 테이블 스키마",
+          at: "metadata-side-db.py L5–12",
+          caption: "FAISS 와 같은 정수 ID 를 PK 로 두는 docs 테이블을 만든다. 아직 행은 없다.",
+          changes: [
+            {mark: "new", text: "SQLite metadata.db"},
+            {mark: "new", text: "docs(id, title, category, created_at)"},
+          ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: false
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
         },
         metaDb: {
-          rows: [
-            { id: 17, title: 'Spark 입문',  category: 'data',  hit: false },
-            { id: 23, title: 'K8s 운영',   category: 'infra', hit: false },
-            { id: 42, title: 'FAISS 정리', category: 'ai',    hit: true  },
-            { id: 56, title: 'Airflow',    category: 'data',  hit: false },
-            { id: 71, title: 'pgvector',   category: 'ai',    hit: true  },
-            { id: 88, title: 'Redis cache',category: 'infra', hit: false },
+          rows: []
+        },
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaSqlite, highlight: [5,6,7,8,9,10,11,12]},
+      },
+      { ...S2,
+        beat: {
+          label: "FAISS 쪽 기록",
+          at: "metadata-side-db.py L15–18",
+          caption: "insert_doc 은 먼저 벡터를 같은 doc_id 로 FAISS 에 넣는다.",
+          changes: [
+            {mark: "new", text: "id 로 두 저장소를 연결"},
+            {mark: "read", text: "add_with_ids(doc_id)"},
           ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: false
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: {
+          rows: []
         },
         showLink: true,
         persist: null,
         filter: null,
         conclusion: false,
-        code: {
-          lang: 'python',
-          filename: 'metadata-side-db.py',
-          lines: [
-            '# 보완: SQLite에 같은 ID로 메타데이터 저장 → 2-step 조회',
-            'import faiss, sqlite3, numpy as np',
-            '',
-            '# 1) 메타데이터 테이블 — FAISS와 같은 정수 ID를 PK로',
-            'conn = sqlite3.connect("metadata.db")',
-            'conn.execute("""',
-            '  CREATE TABLE IF NOT EXISTS docs (',
-            '    id INTEGER PRIMARY KEY,',
-            '    title TEXT,',
-            '    category TEXT,',
-            '    created_at TEXT',
-            '  )',
-            '""")',
-            '',
-            '# 2) 적재 시 두 곳에 같은 ID로 동시 기록',
-            'def insert_doc(doc_id, vector, title, category):',
-            '    index.add_with_ids(vector.reshape(1, -1),',
-            '                       np.array([doc_id], dtype=np.int64))',
-            '    conn.execute(',
-            '      "INSERT INTO docs(id, title, category) VALUES(?,?,?)",',
-            '      (doc_id, title, category),',
-            '    )',
-            '    conn.commit()',
-            '',
-            '# 3) 검색 = FAISS로 ID 회수 → SQLite로 메타 조회',
-            'D, I = index.search(q, k=3)            # [[42, 71, 23]]',
-            'rows = conn.execute(',
-            '  "SELECT id,title,category FROM docs WHERE id IN (?,?,?)",',
-            '  tuple(int(i) for i in I[0])',
-            ').fetchall()',
-            '',
-            '# → [(42, "FAISS 정리", "ai"), (71, "pgvector", "ai"), ...]',
-            '# 핵심: ID라는 끈으로 두 저장소를 묶음 — 동기화는 직접 책임',
-          ],
-          highlight: [5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 26, 27, 28, 29, 30],
-        },
+        code: {...CODE.metaSqlite, highlight: [15,16,17,18]},
       },
-      {
-        title: 'Step 3. 영속성 부분 지원 — 인덱스 저장은 되지만 add는 재빌드',
-        desc: 'faiss.write_index() / read_index()로 디스크에 통째로 저장·로드는 가능. 하지만 새 벡터를 add하려면 파일을 다시 쓰거나, IVF 같은 학습형 인덱스는 add가 누적될수록 군집 균형이 깨져 결국 전체 재빌드가 답이 된다. "자동 영속성"은 사용자가 직접 짜야 한다.',
+      { ...S2,
+        beat: {
+          label: "SQLite 쪽 기록",
+          at: "metadata-side-db.py L19–23",
+          caption: "같은 트랜잭션 흐름에서 메타 행도 넣는다. 두 저장소의 동기화는 내 책임.",
+          changes: [
+            {mark: "new", text: "메타 6행 적재"},
+            {mark: "changed", text: "동기화는 애플리케이션 몫"},
+          ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: false
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: {
+          rows: [
+            {
+              id: 17,
+              title: "Spark 입문",
+              category: "data",
+              hit: false
+            },
+            {
+              id: 23,
+              title: "K8s 운영",
+              category: "infra",
+              hit: false
+            },
+            {
+              id: 42,
+              title: "FAISS 정리",
+              category: "ai",
+              hit: false
+            },
+            {
+              id: 56,
+              title: "Airflow",
+              category: "data",
+              hit: false
+            },
+            {
+              id: 71,
+              title: "pgvector",
+              category: "ai",
+              hit: false
+            },
+            {
+              id: 88,
+              title: "Redis cache",
+              category: "infra",
+              hit: false
+            }
+          ]
+        },
+        showLink: true,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaSqlite, highlight: [19,20,21,22,23]},
+      },
+      { ...S2,
+        beat: {
+          label: "1단계 — ID 회수",
+          at: "metadata-side-db.py L25–26",
+          caption: "검색은 FAISS 로 시작한다. 돌아오는 것은 여전히 ID 배열 [[42, 71, 23]].",
+          changes: [
+            {mark: "changed", text: "상위 결과 id 42, 71"},
+            {mark: "read", text: "거리 순서 유지"},
+          ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: true
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: {
+          rows: [
+            {
+              id: 17,
+              title: "Spark 입문",
+              category: "data",
+              hit: false
+            },
+            {
+              id: 23,
+              title: "K8s 운영",
+              category: "infra",
+              hit: false
+            },
+            {
+              id: 42,
+              title: "FAISS 정리",
+              category: "ai",
+              hit: false
+            },
+            {
+              id: 56,
+              title: "Airflow",
+              category: "data",
+              hit: false
+            },
+            {
+              id: 71,
+              title: "pgvector",
+              category: "ai",
+              hit: false
+            },
+            {
+              id: 88,
+              title: "Redis cache",
+              category: "infra",
+              hit: false
+            }
+          ]
+        },
+        showLink: true,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaSqlite, highlight: [25,26]},
+      },
+      { ...S2,
+        beat: {
+          label: "2단계 — 메타 조회",
+          at: "metadata-side-db.py L27–33",
+          caption: "회수한 ID 를 IN 절에 넣어 title·category 를 가져온다. 두 저장소를 묶는 끈은 정수 ID 하나뿐.",
+          changes: [
+            {mark: "new", text: "메타 조회 결과 2행"},
+            {mark: "read", text: "(42, \"FAISS 정리\", \"ai\")"},
+            {mark: "changed", text: "동기화는 애플리케이션 책임"},
+          ],
+        },
+        faiss: {
+          vectors: [
+            {
+              id: 17,
+              label: "vec_17",
+              hit: false
+            },
+            {
+              id: 23,
+              label: "vec_23",
+              hit: false
+            },
+            {
+              id: 42,
+              label: "vec_42",
+              hit: true
+            },
+            {
+              id: 56,
+              label: "vec_56",
+              hit: false
+            },
+            {
+              id: 71,
+              label: "vec_71",
+              hit: true
+            },
+            {
+              id: 88,
+              label: "vec_88",
+              hit: false
+            }
+          ],
+          searchHit: {
+            id: 42,
+            dist: 0.13
+          }
+        },
+        metaDb: {
+          rows: [
+            {
+              id: 17,
+              title: "Spark 입문",
+              category: "data",
+              hit: false
+            },
+            {
+              id: 23,
+              title: "K8s 운영",
+              category: "infra",
+              hit: false
+            },
+            {
+              id: 42,
+              title: "FAISS 정리",
+              category: "ai",
+              hit: true
+            },
+            {
+              id: 56,
+              title: "Airflow",
+              category: "data",
+              hit: false
+            },
+            {
+              id: 71,
+              title: "pgvector",
+              category: "ai",
+              hit: true
+            },
+            {
+              id: 88,
+              title: "Redis cache",
+              category: "infra",
+              hit: false
+            }
+          ]
+        },
+        showLink: true,
+        persist: null,
+        filter: null,
+        conclusion: false,
+        code: {...CODE.metaSqlite, highlight: [27,28,29,30,31,32,33]},
+      },
+      // ── Step 3 ─────────────────────────────────────
+      { ...S3,
+        beat: {
+          label: "저장 경로 상수",
+          at: "persistence.py L4–5",
+          caption: "인덱스 파일과 원본 청크 파일을 나눠 잡는다. 지금은 메모리에만 있는 상태.",
+          changes: [
+            {mark: "new", text: "INDEX_PATH / CHUNKS_PATH"},
+            {mark: "read", text: "index.ntotal = 6"},
+          ],
+        },
         faiss: null,
         metaDb: null,
         showLink: false,
         persist: {
           steps: [
-            { kind: 'mem',     label: '메모리 인덱스',       detail: 'index.ntotal = 6', active: true },
-            { kind: 'save',    label: 'write_index()',       detail: 'my_index.faiss (디스크)', active: true },
-            { kind: 'restart', label: '프로세스 재시작',      detail: '메모리 휘발',             active: true },
-            { kind: 'load',    label: 'read_index()',        detail: 'index 복구 ✓',            active: true },
-            { kind: 'add',     label: 'add(new_vector)',     detail: 'IVF면 재학습 필요 ⚠',     active: true },
-            { kind: 'rebuild', label: '주기적 전체 리빌드',   detail: '운영 부담 (cron/jobs)',   active: true },
-          ],
+            {
+              kind: "mem",
+              label: "메모리 인덱스",
+              detail: "index.ntotal = 6",
+              active: true
+            }
+          ]
         },
         filter: null,
         conclusion: false,
-        code: {
-          lang: 'python',
-          filename: 'persistence.py',
-          lines: [
-            '# FAISS 영속성 — 저장/로드는 OK, 자동 동기화는 직접 구현',
-            'import faiss, os, pickle',
-            '',
-            'INDEX_PATH  = "my_index.faiss"',
-            'CHUNKS_PATH = "chunks.pkl"',
-            '',
-            '# 1) 저장 — 인덱스와 원본 청크를 함께',
-            'def save_index(index, chunks):',
-            '    faiss.write_index(index, INDEX_PATH)',
-            '    with open(CHUNKS_PATH, "wb") as f:',
-            '        pickle.dump(chunks, f)',
-            '    print(f"저장 완료: {index.ntotal}개 벡터")',
-            '',
-            '# 2) 로드 — 앱 시작 시',
-            'def load_index():',
-            '    if not os.path.exists(INDEX_PATH):',
-            '        return None, None',
-            '    index = faiss.read_index(INDEX_PATH)',
-            '    with open(CHUNKS_PATH, "rb") as f:',
-            '        chunks = pickle.load(f)',
-            '    print(f"로드 완료: {index.ntotal}개 벡터")',
-            '    return index, chunks',
-            '',
-            '# 3) 새 벡터 add — 두 가지 함정',
-            '#   (a) 저장된 파일에는 반영되지 않음 → 다시 write 필요',
-            '#   (b) IVF/PQ 같은 학습형 인덱스는 add가 누적되면',
-            '#       클러스터 균형이 깨져 검색 정확도 하락',
-            'index.add_with_ids(new_vec, new_ids)',
-            'save_index(index, chunks)              # 매번 다시 써야 한다',
-            '',
-            '# 4) 결국 운영에서는 cron으로 "전체 리빌드"가 일반적',
-            '#   - 새 데이터 누적 → 야간에 재학습 + write_index',
-            '#   - "라이브 add + 자동 저장"을 원하면 Chroma/pgvector 권장',
-          ],
-          highlight: [8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30, 32, 33, 34],
-        },
+        code: {...CODE.persistence, highlight: [4,5]},
       },
-      {
-        title: 'Step 4. 필터링 한계 — pre-filter는 어렵고 post-filter는 손실 위험',
-        desc: '"category=ai 중에서 유사한 top-3"이 흔한 요구. FAISS는 인덱스 내부 필터를 제공하지 않는다 (IDSelector 일부 가능). 그래서 (1) pre-filter: 후보 ID를 먼저 SQLite로 걸러 IDSelector로 검색, (2) post-filter: 넉넉히 검색하고 SQLite로 거르기. pre는 작은 후보집에 적합, post는 top-k가 다 빠질 위험.',
+      { ...S3,
+        beat: {
+          label: "저장 함수",
+          at: "persistence.py L7–12",
+          caption: "write_index 로 인덱스를, pickle 로 원본 청크를 함께 저장한다. 둘은 항상 짝이다.",
+          changes: [
+            {mark: "new", text: "my_index.faiss"},
+            {mark: "new", text: "chunks.pkl"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: {
+          steps: [
+            {
+              kind: "mem",
+              label: "메모리 인덱스",
+              detail: "index.ntotal = 6",
+              active: true
+            },
+            {
+              kind: "save",
+              label: "write_index()",
+              detail: "my_index.faiss (디스크)",
+              active: true
+            }
+          ]
+        },
+        filter: null,
+        conclusion: false,
+        code: {...CODE.persistence, highlight: [7,8,9,10,11,12]},
+      },
+      { ...S3,
+        beat: {
+          label: "프로세스 재시작",
+          at: "persistence.py L14–18",
+          caption: "앱이 다시 뜨면 메모리는 비어 있다. 파일이 없으면 None 을 돌려주고 새로 만들어야 한다.",
+          changes: [
+            {mark: "gone", text: "메모리 인덱스 휘발"},
+            {mark: "read", text: "os.path.exists 로 확인"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: {
+          steps: [
+            {
+              kind: "mem",
+              label: "메모리 인덱스",
+              detail: "index.ntotal = 6",
+              active: true
+            },
+            {
+              kind: "save",
+              label: "write_index()",
+              detail: "my_index.faiss (디스크)",
+              active: true
+            },
+            {
+              kind: "restart",
+              label: "프로세스 재시작",
+              detail: "메모리 휘발",
+              active: true
+            }
+          ]
+        },
+        filter: null,
+        conclusion: false,
+        code: {...CODE.persistence, highlight: [14,15,16,17,18]},
+      },
+      { ...S3,
+        beat: {
+          label: "로드로 복구",
+          at: "persistence.py L19–22",
+          caption: "read_index 와 pickle.load 로 인덱스·청크를 되살린다. 여기까지는 깔끔하게 동작한다.",
+          changes: [
+            {mark: "new", text: "index 복구 완료"},
+            {mark: "read", text: "chunks 복구"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: {
+          steps: [
+            {
+              kind: "mem",
+              label: "메모리 인덱스",
+              detail: "index.ntotal = 6",
+              active: true
+            },
+            {
+              kind: "save",
+              label: "write_index()",
+              detail: "my_index.faiss (디스크)",
+              active: true
+            },
+            {
+              kind: "restart",
+              label: "프로세스 재시작",
+              detail: "메모리 휘발",
+              active: true
+            },
+            {
+              kind: "load",
+              label: "read_index()",
+              detail: "index 복구 ✓",
+              active: true
+            }
+          ]
+        },
+        filter: null,
+        conclusion: false,
+        code: {...CODE.persistence, highlight: [19,20,21,22]},
+      },
+      { ...S3,
+        beat: {
+          label: "add 의 두 함정",
+          at: "persistence.py L24–29",
+          caption: "새 벡터를 넣어도 파일에는 반영되지 않고, 학습형 인덱스는 클러스터 균형이 깨진다.",
+          changes: [
+            {mark: "gone", text: "파일 자동 반영 없음"},
+            {mark: "changed", text: "IVF/PQ 정확도 하락"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: {
+          steps: [
+            {
+              kind: "mem",
+              label: "메모리 인덱스",
+              detail: "index.ntotal = 6",
+              active: true
+            },
+            {
+              kind: "save",
+              label: "write_index()",
+              detail: "my_index.faiss (디스크)",
+              active: true
+            },
+            {
+              kind: "restart",
+              label: "프로세스 재시작",
+              detail: "메모리 휘발",
+              active: true
+            },
+            {
+              kind: "load",
+              label: "read_index()",
+              detail: "index 복구 ✓",
+              active: true
+            },
+            {
+              kind: "add",
+              label: "add(new_vector)",
+              detail: "IVF면 재학습 필요 ⚠",
+              active: true
+            }
+          ]
+        },
+        filter: null,
+        conclusion: false,
+        code: {...CODE.persistence, highlight: [24,25,26,27,28,29]},
+      },
+      { ...S3,
+        beat: {
+          label: "주기적 리빌드",
+          at: "persistence.py L31–33",
+          caption: "결국 운영에서는 야간 cron 으로 전체 재학습 + write_index 를 도는 게 일반적이다.",
+          changes: [
+            {mark: "new", text: "cron 전체 리빌드"},
+            {mark: "read", text: "라이브 add 가 필요하면 Chroma/pgvector"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: {
+          steps: [
+            {
+              kind: "mem",
+              label: "메모리 인덱스",
+              detail: "index.ntotal = 6",
+              active: true
+            },
+            {
+              kind: "save",
+              label: "write_index()",
+              detail: "my_index.faiss (디스크)",
+              active: true
+            },
+            {
+              kind: "restart",
+              label: "프로세스 재시작",
+              detail: "메모리 휘발",
+              active: true
+            },
+            {
+              kind: "load",
+              label: "read_index()",
+              detail: "index 복구 ✓",
+              active: true
+            },
+            {
+              kind: "add",
+              label: "add(new_vector)",
+              detail: "IVF면 재학습 필요 ⚠",
+              active: true
+            },
+            {
+              kind: "rebuild",
+              label: "주기적 전체 리빌드",
+              detail: "운영 부담 (cron/jobs)",
+              active: true
+            }
+          ]
+        },
+        filter: null,
+        conclusion: false,
+        code: {...CODE.persistence, highlight: [31,32,33]},
+      },
+      // ── Step 4 ─────────────────────────────────────
+      { ...S4,
+        beat: {
+          label: "후보 ID 좁히기",
+          at: "pre-filter.py L4–9",
+          caption: "먼저 SQLite 에서 category=\"ai\" 인 ID 만 뽑는다. 결과는 {42, 71}.",
+          changes: [
+            {mark: "new", text: "candidate_ids = [42, 71]"},
+            {mark: "read", text: "메타DB 가 1차 필터"},
+          ],
+        },
         faiss: null,
         metaDb: null,
         showLink: false,
         persist: null,
         filter: {
-          query: 'category=ai 중 유사 top-3',
+          query: "category=ai 중 유사 top-3",
           pre: {
-            label: 'pre-filter — 먼저 걸러 검색',
+            label: "pre-filter — 먼저 걸러 검색",
             steps: [
-              { t: 'SQLite: WHERE category="ai"', detail: '→ ID = {42, 71}', good: true },
-              { t: 'IDSelector(ids={42,71})로 FAISS 검색', detail: '후보가 작아 ANN 인덱스 효율 ↓', warn: true },
-              { t: '결과: top-2 (정확)', detail: '✓ 정확하지만 후보 클수록 느려짐', good: true },
-            ],
+              {
+                t: "SQLite: WHERE category=\"ai\"",
+                detail: "→ ID = {42, 71}",
+                good: true
+              }
+            ]
           },
           post: {
-            label: 'post-filter — 넉넉히 검색하고 거르기',
-            steps: [
-              { t: 'FAISS: search(k=50)', detail: '넉넉히 50개 회수', good: true },
-              { t: 'SQLite: category="ai" 필터', detail: '50개 중 ai만 남김', good: true },
-              { t: '결과: 0~3개 (top-k 손실 위험)', detail: '⚠ 카테고리가 희소하면 결과 부족', warn: true },
-            ],
-          },
+            label: "post-filter — 넉넉히 검색하고 거르기",
+            steps: []
+          }
         },
         conclusion: false,
-        code: {
-          lang: 'python',
-          filename: 'pre-filter.py',
-          lines: [
-            '# pre-filter — 메타DB로 먼저 후보 ID를 좁힌 뒤 FAISS 검색',
-            'import faiss, numpy as np',
-            '',
-            '# 1) SQLite로 카테고리 필터된 ID 후보 만들기',
-            'rows = conn.execute(',
-            '  "SELECT id FROM docs WHERE category=?", ("ai",)',
-            ').fetchall()',
-            'candidate_ids = np.array([r[0] for r in rows], dtype=np.int64)',
-            '#  → [42, 71]',
-            '',
-            '# 2) FAISS IDSelector로 후보 안에서만 검색',
-            'sel = faiss.IDSelectorBatch(candidate_ids)',
-            'params = faiss.SearchParametersIVF(sel=sel) \\',
-            '         if hasattr(faiss, "SearchParametersIVF") else None',
-            '',
-            'D, I = index.search(q, k=3, params=params)',
-            '#  → I = [[42, 71, -1]]   (-1 = 후보 부족)',
-            '',
-            '# 장점: 결과 카테고리가 100% "ai" 보장 + 정확한 top-k',
-            '# 단점:',
-            '#  - 후보 ID 리스트가 크면 IDSelector 비용 ↑',
-            '#  - 메타 필터 종류마다 후보 다시 계산 → 캐시 전략 필요',
-            '#  - IndexFlat 외 인덱스는 IDSelector 지원이 부분적',
-            '',
-            '# 적합 상황:',
-            '#  - 카테고리가 소수(< 1만개) → 후보 작아도 됨',
-            '#  - 정확성이 중요 — top-k 손실 허용 안 함',
-          ],
-          highlight: [5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23],
-        },
-        codeAlt: {
-          lang: 'python',
-          filename: 'post-filter.py',
-          lines: [
-            '# post-filter — FAISS로 넉넉히 검색하고 메타DB로 거르기',
-            'import faiss',
-            '',
-            '# 1) k를 크게 잡아 넉넉히 회수 (예: 원하는 5의 10배)',
-            'TARGET_K = 5',
-            'OVERFETCH = 50',
-            'D, I = index.search(q, k=OVERFETCH)',
-            '',
-            '# 2) 결과 ID로 SQLite에서 메타 조회 + 필터',
-            'placeholders = ",".join("?" * len(I[0]))',
-            'rows = conn.execute(',
-            '  f"SELECT id,title,category FROM docs '
-            + 'WHERE id IN ({placeholders}) AND category=?",',
-            '  (*[int(i) for i in I[0]], "ai"),',
-            ').fetchall()',
-            '',
-            '# 3) 거리 순서 유지하며 상위 k만',
-            'meta_by_id = {r[0]: r for r in rows}',
-            'final = []',
-            'for idx in I[0]:',
-            '    if int(idx) in meta_by_id:',
-            '        final.append(meta_by_id[int(idx)])',
-            '    if len(final) >= TARGET_K:',
-            '        break',
-            '',
-            '# 장점: FAISS 인덱스 그대로 활용 — 추가 자료구조 불필요',
-            '# 단점:',
-            '#  - 카테고리가 전체의 1%면 50개 회수해도 0~1개만 통과',
-            '#  - "결과 부족 → 더 가져오기" 재시도 루프가 흔함',
-            '#  - 인기 없는 카테고리 검색에서 결과 누락 위험',
-          ],
-          highlight: [4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 26, 27, 28, 29],
-        },
+        codeAlt: CODE_ALT,
+        code: {...CODE.preFilter, highlight: [4,5,6,7,8,9]},
       },
-      {
-        title: 'Step 5. 결론 — Chroma / pgvector로 가면 메타·영속·필터가 한 곳에',
-        desc: 'FAISS는 "검색 알고리즘 라이브러리"다. 메타데이터·영속성·필터·CRUD를 모두 직접 짜야 한다면 도메인 코드가 인프라 코드에 잠식된다. 통합 벡터 DB(Chroma·pgvector·Weaviate)는 이 4가지를 처음부터 한 패키지에서 제공한다. 검색 속도/GPU가 절대적으로 중요한 경우만 FAISS, 일반 RAG는 통합 벡터 DB가 합리적.',
+      { ...S4,
+        beat: {
+          label: "IDSelector 구성",
+          at: "pre-filter.py L11–14",
+          caption: "IDSelectorBatch 로 후보 집합을 만들고 SearchParametersIVF 에 실어 넘긴다.",
+          changes: [
+            {mark: "new", text: "sel (IDSelectorBatch)"},
+            {mark: "changed", text: "ANN 인덱스 효율 하락"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: {
+          query: "category=ai 중 유사 top-3",
+          pre: {
+            label: "pre-filter — 먼저 걸러 검색",
+            steps: [
+              {
+                t: "SQLite: WHERE category=\"ai\"",
+                detail: "→ ID = {42, 71}",
+                good: true
+              },
+              {
+                t: "IDSelector(ids={42,71})로 FAISS 검색",
+                detail: "후보가 작아 ANN 인덱스 효율 ↓",
+                warn: true
+              }
+            ]
+          },
+          post: {
+            label: "post-filter — 넉넉히 검색하고 거르기",
+            steps: []
+          }
+        },
+        conclusion: false,
+        codeAlt: CODE_ALT,
+        code: {...CODE.preFilter, highlight: [11,12,13,14]},
+      },
+      { ...S4,
+        beat: {
+          label: "후보 안에서만 검색",
+          at: "pre-filter.py L16–17",
+          caption: "k=3 을 요청해도 후보가 2개뿐이라 세 번째 자리는 -1(결과 없음)로 채워진다.",
+          changes: [
+            {mark: "new", text: "I = [[42, 71, -1]]"},
+            {mark: "read", text: "카테고리 100% 보장"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: {
+          query: "category=ai 중 유사 top-3",
+          pre: {
+            label: "pre-filter — 먼저 걸러 검색",
+            steps: [
+              {
+                t: "SQLite: WHERE category=\"ai\"",
+                detail: "→ ID = {42, 71}",
+                good: true
+              },
+              {
+                t: "IDSelector(ids={42,71})로 FAISS 검색",
+                detail: "후보가 작아 ANN 인덱스 효율 ↓",
+                warn: true
+              },
+              {
+                t: "결과: top-2 (정확)",
+                detail: "✓ 정확하지만 후보 클수록 느려짐",
+                good: true
+              }
+            ]
+          },
+          post: {
+            label: "post-filter — 넉넉히 검색하고 거르기",
+            steps: []
+          }
+        },
+        conclusion: false,
+        codeAlt: CODE_ALT,
+        code: {...CODE.preFilter, highlight: [16,17]},
+      },
+      { ...S4,
+        beat: {
+          label: "장점과 대가",
+          at: "pre-filter.py L19–20",
+          caption: "정확한 top-k 를 얻는 대신, 후보를 만드는 비용을 매 검색마다 치른다.",
+          changes: [
+            {mark: "read", text: "정확한 top-k"},
+            {mark: "new", text: "대안: post-filter 넉넉히 검색"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: {
+          query: "category=ai 중 유사 top-3",
+          pre: {
+            label: "pre-filter — 먼저 걸러 검색",
+            steps: [
+              {
+                t: "SQLite: WHERE category=\"ai\"",
+                detail: "→ ID = {42, 71}",
+                good: true
+              },
+              {
+                t: "IDSelector(ids={42,71})로 FAISS 검색",
+                detail: "후보가 작아 ANN 인덱스 효율 ↓",
+                warn: true
+              },
+              {
+                t: "결과: top-2 (정확)",
+                detail: "✓ 정확하지만 후보 클수록 느려짐",
+                good: true
+              }
+            ]
+          },
+          post: {
+            label: "post-filter — 넉넉히 검색하고 거르기",
+            steps: [
+              {
+                t: "FAISS: search(k=50)",
+                detail: "넉넉히 50개 회수",
+                good: true
+              }
+            ]
+          }
+        },
+        conclusion: false,
+        codeAlt: CODE_ALT,
+        code: {...CODE.preFilter, highlight: [19,20]},
+      },
+      { ...S4,
+        beat: {
+          label: "후보가 커지면",
+          at: "pre-filter.py L21–23",
+          caption: "후보 ID 가 많아지면 IDSelector 비용이 커지고, 필터 종류마다 다시 계산해야 한다.",
+          changes: [
+            {mark: "gone", text: "필터별 후보 재계산"},
+            {mark: "new", text: "대안 2단계: 메타DB로 거르기"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: {
+          query: "category=ai 중 유사 top-3",
+          pre: {
+            label: "pre-filter — 먼저 걸러 검색",
+            steps: [
+              {
+                t: "SQLite: WHERE category=\"ai\"",
+                detail: "→ ID = {42, 71}",
+                good: true
+              },
+              {
+                t: "IDSelector(ids={42,71})로 FAISS 검색",
+                detail: "후보가 작아 ANN 인덱스 효율 ↓",
+                warn: true
+              },
+              {
+                t: "결과: top-2 (정확)",
+                detail: "✓ 정확하지만 후보 클수록 느려짐",
+                good: true
+              }
+            ]
+          },
+          post: {
+            label: "post-filter — 넉넉히 검색하고 거르기",
+            steps: [
+              {
+                t: "FAISS: search(k=50)",
+                detail: "넉넉히 50개 회수",
+                good: true
+              },
+              {
+                t: "SQLite: category=\"ai\" 필터",
+                detail: "50개 중 ai만 남김",
+                good: true
+              }
+            ]
+          }
+        },
+        conclusion: false,
+        codeAlt: CODE_ALT,
+        code: {...CODE.preFilter, highlight: [21,22,23]},
+      },
+      { ...S4,
+        beat: {
+          label: "어느 쪽을 고를까",
+          at: "pre-filter.py L25–27",
+          caption: "카테고리가 소수이고 top-k 손실을 허용할 수 없으면 pre-filter 가 맞다.",
+          changes: [
+            {mark: "read", text: "pre = 정확 / post = 빠름"},
+            {mark: "gone", text: "post 는 결과 부족 위험"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: {
+          query: "category=ai 중 유사 top-3",
+          pre: {
+            label: "pre-filter — 먼저 걸러 검색",
+            steps: [
+              {
+                t: "SQLite: WHERE category=\"ai\"",
+                detail: "→ ID = {42, 71}",
+                good: true
+              },
+              {
+                t: "IDSelector(ids={42,71})로 FAISS 검색",
+                detail: "후보가 작아 ANN 인덱스 효율 ↓",
+                warn: true
+              },
+              {
+                t: "결과: top-2 (정확)",
+                detail: "✓ 정확하지만 후보 클수록 느려짐",
+                good: true
+              }
+            ]
+          },
+          post: {
+            label: "post-filter — 넉넉히 검색하고 거르기",
+            steps: [
+              {
+                t: "FAISS: search(k=50)",
+                detail: "넉넉히 50개 회수",
+                good: true
+              },
+              {
+                t: "SQLite: category=\"ai\" 필터",
+                detail: "50개 중 ai만 남김",
+                good: true
+              },
+              {
+                t: "결과: 0~3개 (top-k 손실 위험)",
+                detail: "⚠ 카테고리가 희소하면 결과 부족",
+                warn: true
+              }
+            ]
+          }
+        },
+        conclusion: false,
+        codeAlt: CODE_ALT,
+        code: {...CODE.preFilter, highlight: [25,26,27]},
+      },
+      // ── Step 5 ─────────────────────────────────────
+      { ...S5,
+        beat: {
+          label: "FAISS 가 강한 경우",
+          at: "recommendation.md L3–7",
+          caption: "100만 건 이상 + GPU, latency 가 최우선, 메타·필터가 거의 없는 단순 의미 검색.",
+          changes: [
+            {mark: "read", text: "GPU · 대규모 · 검색 최우선"},
+          ],
+        },
         faiss: null,
         metaDb: null,
         showLink: false,
         persist: null,
         filter: null,
         conclusion: true,
-        code: {
-          lang: 'markdown',
-          filename: 'recommendation.md',
-          lines: [
-            '# FAISS vs 통합 벡터 DB — 어느 쪽을 고를까',
-            '',
-            '## FAISS가 강한 경우 (그대로 쓰기)',
-            '- 100만 건 이상 + GPU 가속 필요',
-            '- 검색 latency가 mission-critical',
-            '- 메타데이터/필터가 거의 없는 단순 의미 검색',
-            '- 라이브러리로 임베딩 파이프라인에 직접 끼워넣고 싶을 때',
-            '',
-            '## 통합 벡터 DB가 합리적인 경우 (대다수 RAG)',
-            '- 메타데이터 필터링이 일상적',
-            '- "추가/삭제/업데이트"가 라이브로 돌아야 함',
-            '- 자동 영속성 + 백업 + 복제가 필요',
-            '- 운영 인력이 적어 인프라 코드를 줄이고 싶을 때',
-            '',
-            '## 후보',
-            '- Chroma   : 파이썬 친화 · 로컬 시작 · 메타 필터 내장 (Part III)',
-            '- pgvector : Postgres 확장 · SQL과 결합 · 트랜잭션 지원',
-            '- Weaviate : 모듈식 (하이브리드 검색, 멀티테넌시)',
-            '- Milvus   : 대규모 분산',
-            '- Qdrant   : Rust 기반 · 메타 필터 강력',
-            '',
-            '## 자주 쓰는 조합 패턴',
-            '- "FAISS(검색) + SQLite(메타)"      ← 학습/프로토타입',
-            '- "Chroma(전부)"                     ← 단일 컨테이너 RAG',
-            '- "pgvector + Postgres"              ← 기존 RDB 인프라 재활용',
-            '- "FAISS(GPU 캐시) + pgvector(원본)" ← 고급 하이브리드',
-            '',
-            '## 결론',
-            '- FAISS 한계 4종(메타/영속/필터/CRUD)을 직접 짜야 한다면',
-            '  통합 벡터 DB로 가는 것이 코드/운영 모두 단순.',
-            '- Part III(Chroma) → Part IV(pgvector) 순으로 학습 권장.',
+        code: {...CODE.recommendation, highlight: [3,4,5,6,7]},
+      },
+      { ...S5,
+        beat: {
+          label: "통합 DB 가 맞는 경우",
+          at: "recommendation.md L9–13",
+          caption: "메타 필터가 일상적이고 라이브 CRUD·자동 영속성이 필요하면 통합 벡터 DB.",
+          changes: [
+            {mark: "read", text: "메타 필터 · 라이브 CRUD"},
+            {mark: "changed", text: "인프라 코드를 줄인다"},
           ],
-          highlight: [3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 27, 28, 29, 30, 31, 32],
         },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: true,
+        code: {...CODE.recommendation, highlight: [9,10,11,12,13]},
+      },
+      { ...S5,
+        beat: {
+          label: "후보 목록",
+          at: "recommendation.md L15–20",
+          caption: "Chroma·pgvector·Weaviate·Milvus·Qdrant — 성격이 조금씩 다르다.",
+          changes: [
+            {mark: "new", text: "후보 5종"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: true,
+        code: {...CODE.recommendation, highlight: [15,16,17,18,19,20]},
+      },
+      { ...S5,
+        beat: {
+          label: "조합 패턴",
+          at: "recommendation.md L22–26",
+          caption: "학습용은 FAISS+SQLite, 단일 컨테이너 RAG 는 Chroma, 기존 RDB 가 있으면 pgvector.",
+          changes: [
+            {mark: "read", text: "상황별 조합 4종"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: true,
+        code: {...CODE.recommendation, highlight: [22,23,24,25,26]},
+      },
+      { ...S5,
+        beat: {
+          label: "결론",
+          at: "recommendation.md L28–31",
+          caption: "한계 4종(메타·영속·필터·CRUD)을 직접 짜야 한다면 통합 벡터 DB 가 단순하다.",
+          changes: [
+            {mark: "changed", text: "Part III → Part IV 로 이어짐"},
+          ],
+        },
+        faiss: null,
+        metaDb: null,
+        showLink: false,
+        persist: null,
+        filter: null,
+        conclusion: true,
+        code: {...CODE.recommendation, highlight: [28,29,30,31]},
       },
     ];
 
