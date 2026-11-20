@@ -1,4 +1,4 @@
-# 사용: PYTHONUTF8=1 python scripts/check_redis_anim.py redis/part1/I-1-1.html [...]   (tech-roadmap 루트 기준 경로, http://localhost:8766 이 저장소를 서비스 중이어야 함)
+# 사용: PYTHONUTF8=1 python scripts/check_anim.py redis/part1/I-1-1.html [...]   (tech-roadmap 루트 기준 경로, http://localhost:8766 이 저장소를 서비스 중이어야 함)
 # 각 페이지에 대해:
 #  1) 콘솔 오류 / 페이지 오류
 #  2) 모든 beat 에서 장면을 u = 0.4, 1.5, 2.95 초 시점으로 그려 보고
@@ -11,7 +11,7 @@ from playwright.sync_api import sync_playwright
 from PIL import Image, ImageDraw, ImageFont
 
 import os, tempfile
-OUT = pathlib.Path(os.environ.get("ANIM_OUT") or pathlib.Path(tempfile.gettempdir()) / "redis-anim-check"); OUT.mkdir(parents=True, exist_ok=True)
+OUT = pathlib.Path(os.environ.get("ANIM_OUT") or pathlib.Path(tempfile.gettempdir()) / "anim-check"); OUT.mkdir(parents=True, exist_ok=True)
 FONT = next((ImageFont.truetype(f, 22) for f in ["C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"] if os.path.exists(f)), ImageFont.load_default())
 
 PROBE = r"""() => {
@@ -43,7 +43,7 @@ total = 0
 with sync_playwright() as p:
     b = p.chromium.launch()
     for rel in sys.argv[1:]:
-        pid = pathlib.Path(rel).stem; errs = []
+        pid = pathlib.Path(rel).parts[0] + '_' + pathlib.Path(rel).stem; errs = []   # 주제마다 같은 번호가 있으므로 주제 이름을 붙인다
         pg = b.new_page(viewport={"width": 1440, "height": 900}, reduced_motion="reduce")
         pg.on("console", lambda m: m.type == "error" and errs.append(m.text))
         pg.on("pageerror", lambda e: errs.append(str(e)))
