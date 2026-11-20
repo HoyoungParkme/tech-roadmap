@@ -133,7 +133,7 @@
       sub(400, 386, '다 같이 틀리는 패턴은 평균으로 못 고친다 → 부스팅', fade(u, 2.2), { 'font-size': 15 }); } }
 
   // ---------- 3. 부스팅: 잔차 계단 ----------
-  const RES = [0.412, 0.255, 0.149, 0.074, 0.029];   // 코드 주석: round 1~5 잔차 크기
+  const RES = [0.455, 0.393, 0.346, 0.309, 0.282];   // 코드 주석: round 1~5 잔차 크기 (연체율 35% 합성 데이터 실행값)
   function s3(t, c) { const { k, u } = c, Bo = c.beat.boost || {}, rs = Bo.rounds || [], prs = ((c.prev && c.prev.boost) || {}).rounds || [];
     if (k === 6) { // 배깅 vs 부스팅 구조
       lbl(110, 70, '배깅', 1, { fill: GOOD, 'font-size': 17 }); sub(110, 94, '병렬 · 평균', 1, { 'font-size': 14 });
@@ -171,10 +171,10 @@
         card(690, 110 + i * 60, 360, 46, { rx: 8, text: s, fs: 15, mono: true, stroke: on ? ACC : GRID, color: on ? ACC : INK, sw: on ? 2.6 : 1.5 }); });
       rs.slice(1).forEach((r, i) => mono(520, 330 + i * 30, `R${r.r}: ${r.pred.toFixed(2)} · 잔차 ${r.residual}%`, { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 1.0 + i * 0.8) }));
       return; }
-    if (k === 4 || k === 5) { if (k === 4) { const ch = R.axes(560, 90, 330, 220, { x: [1, 5], y: [0, 0.45], xt: [1, 2, 3, 4, 5], yt: [0, 0.2, 0.4], yl: '잔차 크기 (코드 출력)' });
+    if (k === 4 || k === 5) { if (k === 4) { const ch = R.axes(560, 90, 330, 220, { x: [1, 5], y: [0, 0.5], xt: [1, 2, 3, 4, 5], yt: [0, 0.25, 0.5], yl: '평균 |잔차| (코드 출력)' });
         R.line(ch, RES.map((v, i) => [i + 1, v]), E(u, 0.4, 1.8), BAD, { sw: 3 }); R.scatter(ch, RES.map((v, i) => [i + 1, v, BAD]), { u: E(u, 0.4, 1.8), r: 5 });
-        mono(ch.X(1) + 10, ch.Y(0.412) + 4, '0.412', { 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.5) }); mono(ch.X(5), ch.Y(0.029) - 12, '0.029', { 'font-size': 14.5, 'font-weight': 700, fill: BAD, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
-        note(560, 380, '편향이 계단식으로 줄어든다', fade(u, 2.2), { fill: GOOD }); return; }
+        mono(ch.X(1) + 10, ch.Y(0.455) - 8, '0.455', { 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.5) }); mono(ch.X(5), ch.Y(0.282) - 14, '0.282', { 'font-size': 14.5, 'font-weight': 700, fill: BAD, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
+        note(560, 380, '라운드마다 많아야 30%(eta) 씩 준다', fade(u, 2.2), { fill: GOOD }); return; }
       // k5: 쌓인 막대로 F(x)
       const x0 = 640, base = R.axes(x0, 60, 1, 300, { x: [0, 1], y: [0, 1] }).Y;
       mono(x0 + 120, 50, 'F(x)', { 'font-size': 18, 'font-weight': 800, fill: ACC, 'text-anchor': 'middle' });
@@ -278,7 +278,7 @@
       [['RF', 0.912, '8.4s', 8.4, GOOD], ['XGB', 0.934, '41.2s', 41.2, ACC]].forEach(([nm, auc, ts, sec, col], i) => {
         tx(ax, 102 + i * 50, nm, { 'font-size': 15, 'font-weight': 700, fill: col }); R.hbar(ax + 46, 88 + i * 50, 170, auc - 0.85, 0.1, { u: E(u, 0.3 + i * 0.3, 1.0 + i * 0.3), col, text: auc.toFixed(3) });
         tx(ax, 254 + i * 50, nm, { 'font-size': 15, 'font-weight': 700, fill: col }); R.hbar(ax + 46, 240 + i * 50, 170, sec, 45, { u: E(u, 1.2 + i * 0.3, 1.9 + i * 0.3), col: i ? WARN : col, text: ts }); });
-      tx(ax, 360, 'AUC +0.022 · 시간 약 5배', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 2.2) });
+      tx(ax, 360, 'AUC +0.022 · 시간 약 5배 (실행 예)', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 2.2) });
       sub(ax + 120, 390, 'AUC 막대는 0.85 부터', fade(u, 2.3), { 'font-size': 13.5 }); } }
 
   R.page({ title: '앙상블 — 숲의 투표와 잔차 계단', scenes: [s1, s2, s3, s4, s5] });

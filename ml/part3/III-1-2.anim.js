@@ -61,12 +61,12 @@
         if (k === 6) ring(ax, p, 12 + 3 * Math.sin(t * 6), BAD, fade(u, 0.3)); } });
     if (k >= 2) cen.forEach((p, i) => cent(ax, p, k === 2 ? pop(u, 0.3 + i * 0.2) : 1, { op: k <= 3 ? 0.45 : 1 }));
     // k5: 한 점에서 두 중심까지의 거리
-    if (k === 5) { const p = d.P[0], near = d.KM.labels[0], g = E(u, 1.4, 2.0);
+    if (k === 5) { const rc = d.KM.centroids[0].x > d.KM.centroids[1].x ? 0 : 1, ti = d.P.reduce((b, q, i) => (q.m === 0 && d.KM.labels[i] === rc && (b < 0 || q.x > d.P[b].x) ? i : b), -1), p = d.P[Math.max(0, ti)], near = d.KM.labels[Math.max(0, ti)], g = E(u, 1.4, 2.0);
       [0, 1].forEach((j) => { const q = d.KM.centroids[j]; if (g > 0) el('line', { x1: ax.X(p.x), y1: ax.Y(p.y), x2: ax.X(lerp(p.x, q.x, g)), y2: ax.Y(lerp(p.y, q.y, g)), stroke: j === near ? KMC(j) : MUT, 'stroke-width': j === near ? 3 : 2, 'stroke-dasharray': j === near ? null : '4 4' }); });
       ring(ax, p, 13, INK, fade(u, 1.3)); }
 
     // 오른쪽 칸
-    if (k === 0) { head(64, '원본 데이터', fade(u, 0.2)); mono(552, 100, 'make_moons(n_samples=80,', { 'font-size': 15, opacity: fade(u, 0.3) }); mono(552, 124, '           noise=0.09)', { 'font-size': 15, opacity: fade(u, 0.3) });
+    if (k === 0) { head(64, '원본 데이터', fade(u, 0.2)); mono(552, 100, 'make_moons(n_samples=80,', { 'font-size': 15, opacity: fade(u, 0.3) }); mono(552, 124, '           noise=0.05)', { 'font-size': 15, opacity: fade(u, 0.3) });
       row(176, '점 개수', Math.round(80 * E(u, 0.2, 2.3)) + '점', fade(u, 0.3));
       sub(740, 240, '사람 눈에는 명백히 두 덩어리', fade(u, 2.2), { 'font-size': 15 }); }
     if (k === 1) { head(64, '실전 데이터의 오염', fade(u, 0.1));
@@ -185,7 +185,7 @@
       tx(552, 316, '이 목록이 곧 이상치', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 2.1) });
       sub(740, 346, '별도 알고리즘 없이 군집화의 부산물', fade(u, 2.3), { 'font-size': 15 }); }
     if (k === 4) { head(64, 'db.core_sample_indices_', fade(u, 0.1));
-      row(116, 'core 점', Math.round(76 * E(u, 0.3, 1.2)) + '개', fade(u, 0.3), { col: ACC });
+      row(116, 'core 점', Math.round(d.DB.kind.filter((x) => x === 'core').length * E(u, 0.3, 1.2)) + '개', fade(u, 0.3), { col: ACC });
       tx(552, 176, '새 점을 배정할 때 기준이 되는', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.3) });
       tx(552, 200, '재사용 가능한 요약', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 1.5) }); }
     if (k === 5) orderDemo(u);

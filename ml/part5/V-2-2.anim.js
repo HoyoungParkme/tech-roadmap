@@ -75,7 +75,7 @@
   const HY = (v) => (v / 40) * 220;
   function hist(c, u) { const h = c.beat.histogram, bins = h.bins, pn = c.prev ? c.prev.histogram.bins.length : 0, k = c.k;
     el('line', { x1: HX - 10, y1: HB, x2: HX + 6 * HW + 6, y2: HB, stroke: MUT, 'stroke-width': 1.8 });
-    tx(HX - 10, 44, 'age 분포 (%)', { 'font-size': 15, 'font-weight': 800 });
+    tx(HX - 10, 44, 'age 연령대별 (%)', { 'font-size': 15, 'font-weight': 800 });
     rect(HX + 120, 32, 14, 14, { fill: INFO }); tx(HX + 140, 44, '학습 시점', { 'font-size': 14, fill: INFO, 'font-weight': 700 });
     rect(HX + 230, 32, 14, 14, { fill: WARN }); tx(HX + 250, 44, '최근 7일', { 'font-size': 14, fill: WARN, 'font-weight': 700 });
     bins.forEach((b, i) => { const g = i < pn ? 1 : E(u, 0.3 + (i - pn) * 0.3, 0.8 + (i - pn) * 0.3), x = HX + i * HW, hot = b.label === '20대' && k >= 2;
@@ -85,8 +85,12 @@
       if (g > 0.6) { mono(x + 17, HB - HY(b.train) - 6, String(b.train), { 'font-size': 13.5, 'font-weight': 700, fill: INFO, 'text-anchor': 'middle' });
         mono(x + 45, HB - HY(b.now) - 6, String(b.now), { 'font-size': 13.5, 'font-weight': 700, fill: WARN, 'text-anchor': 'middle' }); }
       tx(x + 31, HB + 20, b.label, { 'font-size': 14, 'font-weight': 600, 'text-anchor': 'middle', fill: MUT, opacity: g > 0 ? 1 : 0 }); });
-    if (k >= 2) { const a = k === 2 ? fade(u, 0.4) : 0.6; for (let i = 1; i < 6; i++) el('line', { x1: HX + i * HW - 3, y1: 60, x2: HX + i * HW - 3, y2: HB, stroke: INK, 'stroke-width': 1.5, 'stroke-dasharray': '4 4', opacity: a });
-      tx(HX - 10, HB + 48, '구간 경계 = 학습 분포 기준으로 고정', { 'font-size': 15, 'font-weight': 700, fill: INK, opacity: a }); } }
+    if (k >= 2) { // 학습 분포의 10분위 경계(구간 안은 고르게 퍼졌다고 보고 누적 비율로 위치를 잡는다) — 이 경계로 PSI 를 잰다
+      const a = k === 2 ? 1 : 0.6, cum = [0]; bins.forEach((b) => cum.push(cum[cum.length - 1] + b.train));
+      for (let q = 10; q < 100; q += 10) { const i = cum.findIndex((v, j) => j > 0 && v >= q) - 1, age = i + (q - cum[i]) / bins[i].train, x = HX - 3 + age * HW, g = k === 2 ? E(u, 0.3 + q * 0.008, 0.6 + q * 0.008) : 1;
+        el('line', { x1: x, y1: 66, x2: x, y2: 66 + 18 * g, stroke: INK, 'stroke-width': 2, opacity: a }); }
+      el('line', { x1: HX - 3, y1: 75, x2: HX - 3 + 6 * HW, y2: 75, stroke: INK, 'stroke-width': 1.2, opacity: a * 0.6 });
+      tx(HX - 10, HB + 48, '위 눈금 = 학습 분포 10분위 경계 (PSI 구간, 고정)', { 'font-size': 15, 'font-weight': 700, fill: INK, opacity: k === 2 ? fade(u, 1.2) : a }); } }
   const GX = (v) => 560 + (v / 0.5) * 360;
   function gauge(c, u) { const p = c.beat.psi, pp = c.prev ? c.prev.psi.value : p.value, k = c.k, v = tween(pp, p.value, u, 1.2), on = v >= 0.25;
     tx(560, 44, 'age 피처 PSI', { 'font-size': 15, 'font-weight': 800 });
@@ -95,7 +99,7 @@
     if (p.value > 0 || pp > 0) { el('path', { d: `M${GX(v)},56 l-8,-12 h16 Z`, fill: on ? BAD : INK });
       mono(920, 44, v.toFixed(2), { 'font-size': 18, 'font-weight': 800, fill: on ? BAD : INK, 'text-anchor': 'end' }); }
     else mono(920, 44, '실행 전', { 'font-size': 14, fill: MUT, 'text-anchor': 'end' }); }
-  const SCAN = [['age', '0.31', '3.2e-19', 'ALERT', BAD], ['monthly_visits', '0.18', '1.1e-02', 'WARN', WARN], ['plan_price', '0.07', '2.1e-01', 'OK', GOOD]];
+  const SCAN = [['age', '0.35', '6.4e-108', 'ALERT', BAD], ['monthly_visits', '0.18', '1.1e-02', 'WARN', WARN], ['plan_price', '0.07', '2.1e-01', 'OK', GOOD]];
   function s2(t, c) { const { k, u } = c;
     hist(c, u); gauge(c, u);
     if (k === 0) { mono(560, 170, 'PSI = Σ (now% − train%)', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 0.5) });
@@ -107,8 +111,9 @@
       tx(712, 210, '분포가 같은가 검정', { 'font-size': 14.5, fill: MUT, opacity: k === 1 ? fade(u, 1.3) : 1 }); }
     if (k === 2) tx(560, 260, '20대: 14% → 38%', { 'font-size': 18, 'font-weight': 800, fill: WARN, opacity: fade(u, 1.6) });
     if (k === 3) { mono(560, 260, '0% 구간 → 1e-6 (log 0 방지)', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 0.3) });
-      mono(560, 296, '구간별 기여를 합산 → 0.31', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.9) });
-      pill(740, 350, 'PSI 0.31 ≥ 0.25 → 드리프트 확정', BAD, pop(u, 1.6), { fs: 15 }); }
+      mono(560, 296, '학습 10분위 구간 합 → 0.35', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.9) });
+      tx(560, 324, '(그림의 연령대 6구간으로 합하면 0.37)', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 1.3) });
+      pill(740, 350, 'PSI 0.35 ≥ 0.25 → 드리프트 확정', BAD, pop(u, 1.6), { fs: 15 }); }
     if (k >= 4) { const x0 = 560, y0 = 150;
       ['feature', 'psi', 'ks_pvalue', 'status'].forEach((h, j) => mono(x0 + [0, 140, 200, 300][j], y0, h, { 'font-size': 13.5, 'font-weight': 700, fill: MUT }));
       SCAN.forEach(([f, p, ks, st, col], i) => { const y = y0 + 40 + i * 44, a = k === 4 ? fade(u, 0.4 + i * 0.4) : 1, hot = k === 6 && i === 0;
@@ -118,6 +123,7 @@
         mono(x0 + 200, y, ks, { 'font-size': 14.5, opacity: a * (k === 4 ? fade(u, 1.0 + i * 0.4) : 1) });
         if (k >= 5) pill(x0 + 334, y - 5, st, col, k === 5 ? pop(u, 0.4 + i * 0.35) : 1, { mono: true, fs: 13.5 }); });
       if (k === 4) tx(x0, 340, '매일 배치 · 피처마다 PSI + KS', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.0) });
+      if (k >= 4) tx(x0, 396, '학습 10,000건 · 최근 7일 2,000건 기준', { 'font-size': 13.5, fill: MUT, opacity: k === 4 ? fade(u, 2.2) : 1 });
       if (k === 5) { tx(x0, 340, '≥ 0.25 ALERT · ≥ 0.10 WARN · 나머지 OK', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
         tx(x0, 368, 'PSI 큰 순 정렬 → 맨 윗줄이 오늘 가장 변한 것', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 2.1) }); }
       if (k === 6) { tx(x0, 340, '원인: 20대 유입으로 age 분포 이동', { 'font-size': 15.5, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.0) });
@@ -200,7 +206,7 @@
       mono(cx, 244, v, { 'font-size': 32, 'font-weight': 800, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 0.4 + i * 0.5) });
       tx(cx, 280, d, { 'font-size': 14.5, 'text-anchor': 'middle', opacity: fade(u, 0.5 + i * 0.5) }); });
     if (k === 2) { const VX = (v) => 210 + (v / 0.4) * 400;
-      [['피처 PSI (age)', 0.31], ['예측분포 PSI', 0.27]].forEach(([n, v], i) => { const y = 150 + i * 60, g = E(u, 0.3 + i * 0.4, 0.9 + i * 0.4);
+      [['피처 PSI (age)', 0.35], ['예측분포 PSI', 0.27]].forEach(([n, v], i) => { const y = 150 + i * 60, g = E(u, 0.3 + i * 0.4, 0.9 + i * 0.4);
         tx(196, y + 15, n, { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'end' }); rect(210, y, (VX(v) - 210) * g, 22, { fill: BAD, opacity: 0.85 });
         mono(VX(v) * g + 210 * (1 - g) + 8, y + 17, v.toFixed(2), { 'font-size': 15, 'font-weight': 800, fill: BAD, opacity: g }); });
       el('line', { x1: VX(0.25), y1: 136, x2: VX(0.25), y2: 236, stroke: INK, 'stroke-width': 2, 'stroke-dasharray': '5 4' });

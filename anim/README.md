@@ -38,6 +38,12 @@ RA.page({ title: '그림 칸 제목', scenes: [s1, s2, s3, s4, s5], codeOpen: [t
 - 그래프 도구: `axes`(좌표축 → X(v)/Y(v)), `scatter`(점), `line`(꺾은선을 u 만큼), `heat`(행렬·히트맵), `hbar`(값 막대).
 - 색은 `RA.C` 의 토큰만 쓴다 (`INK MUT OFF GRID SOFT PANEL ACC ACCBG BAD GOOD WARN INFO` …).
 
+## 표·정리 보기 (RefPanel)
+
+그림으로 옮기기 어려운 표·링크·목록(선택 기준표, 이어지는 주제, 실무 적용 예, 한계 목록 등)은 지우지 말고
+페이지의 본 스크립트에 `function RefPanel({ step, stepIdx })` 를 정의해 돌려준다. 그림·코드 아래 전체 폭의 접는 상자에 들어간다.
+훅을 쓰지 않는 함수여야 하고, 그 단계에 보여 줄 것이 없으면 `null`. `<table>`, `<h4>`, `<ul>` 는 기본 모양이 잡혀 있다.
+
 ## 그림 원칙 (tweenkit animation-html 스킬의 규칙을 이 페이지들에 맞게 옮김)
 
 주제의 실제 대상을 그린다: Redis 는 키·TTL·슬롯, ML 은 데이터 표·결정 경계·손실 곡선·혼동 행렬처럼.

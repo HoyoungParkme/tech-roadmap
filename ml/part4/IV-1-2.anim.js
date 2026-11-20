@@ -36,7 +36,7 @@
       [0, 1, 2, 3].forEach((c) => { const a = (o.op ? o.op(r, c) : 1) * op; if (a <= 0) return; const xx = x + c * cs, yy = y + r * cs, v = row ? row[c] : null;
         el('rect', { x: xx, y: yy, width: cs - 4, height: cs - 4, rx: 6, fill: PANEL, stroke: GRID, 'stroke-width': 1.5, opacity: a });
         if (v != null && r < 3 && v > 0) el('rect', { x: xx, y: yy, width: cs - 4, height: cs - 4, rx: 6, fill: ACC, opacity: a * (0.1 + 0.6 * clamp(v / 10)) });
-        if (v != null) mono(xx + (cs - 4) / 2, yy + (cs - 4) / 2 + 5, r === 3 ? '·' : v.toFixed(1), { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', fill: r === 3 ? OFF : v > 6.5 ? PANEL : v > 0 ? INK : OFF, opacity: a });
+        if (v != null) mono(xx + (cs - 4) / 2, yy + (cs - 4) / 2 + 5, r === 3 ? '·' : Math.abs(v * 10 - Math.round(v * 10)) < 1e-6 ? v.toFixed(1) : v.toFixed(2), { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', fill: r === 3 ? OFF : v > 6.5 ? PANEL : v > 0 ? INK : OFF, opacity: a });
         const isHi = o.hi && o.hi[0] === r && o.hi[1] === c, isMax = o.rowMax && r < 3 && mx > 0 && Math.abs(v - mx) < 1e-9;
         if (isHi || isMax) el('rect', { x: xx - 2, y: yy - 2, width: cs, height: cs, rx: 7, fill: 'none', stroke: isHi ? WARN : INK, 'stroke-width': 3, opacity: isHi ? 1 : (o.rowMax ?? 1) }); }); }); }
   const qv = (c, u) => { const b = c.beat.qtable, p = c.prev && c.prev.qtable; if (!b) return null;

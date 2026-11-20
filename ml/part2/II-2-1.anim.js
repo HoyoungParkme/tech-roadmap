@@ -20,10 +20,10 @@
     if (o.ring) el('circle', { cx, cy, r: r + 7, fill: 'none', stroke: INK, 'stroke-width': 2.5, opacity: o.ring });
     if (o.bad) el('circle', { cx, cy, r: r + 5, fill: 'none', stroke: BAD, 'stroke-width': 2.5, opacity: o.bad }); }
   // w1·x + w2·y + b = 0 직선을 판 안에서 u 만큼 그린다
-  function seg2(w1, w2, b) { const P = []; const add = (x, y) => { if (x > -1e-6 && x < 100 + 1e-6 && y > -1e-6 && y < 100 + 1e-6 && !P.some((q) => Math.hypot(q[0] - x, q[1] - y) < 1e-3)) P.push([x, y]); };
-    if (Math.abs(w2) > 1e-9) { add(0, -b / w2); add(100, -(b + 100 * w1) / w2); } if (Math.abs(w1) > 1e-9) { add(-b / w1, 0); add(-(b + 100 * w2) / w1, 100); }
+  function seg2(w1, w2, b, L) { L = L || 100; const P = []; const add = (x, y) => { if (x > -1e-6 && x < L + 1e-6 && y > -1e-6 && y < L + 1e-6 && !P.some((q) => Math.hypot(q[0] - x, q[1] - y) < 1e-3)) P.push([x, y]); };
+    if (Math.abs(w2) > 1e-9) { add(0, -b / w2); add(L, -(b + L * w1) / w2); } if (Math.abs(w1) > 1e-9) { add(-b / w1, 0); add(-(b + L * w2) / w1, L); }
     P.sort((a, c) => a[0] - c[0] || c[1] - a[1]); return P; }
-  function wline(ax, w1, w2, b, u, col, o) { o = o || {}; const p = seg2(w1, w2, b); if (p.length < 2 || u <= 0) return null; const [a, c] = p, f = clamp(u);
+  function wline(ax, w1, w2, b, u, col, o) { o = o || {}; const p = seg2(w1, w2, b, o.lim); if (p.length < 2 || u <= 0) return null; const [a, c] = p, f = clamp(u);
     el('line', { x1: ax.X(a[0]), y1: ax.Y(a[1]), x2: ax.X(lerp(a[0], c[0], f)), y2: ax.Y(lerp(a[1], c[1], f)), stroke: col || MUT, 'stroke-width': o.sw || 2.6, 'stroke-dasharray': o.dash, opacity: o.op ?? 1, 'stroke-linecap': 'round' }); return p; }
   // 도로(마진): 중심선 w·x+b=0 양쪽으로 폭 width(데이터 단위)
   function road(ax, w1, w2, b, width, o) { o = o || {}; if (width <= 0.05) return; const n2 = w1 * w1 + w2 * w2, n = Math.sqrt(n2), p0 = [-b * w1 / n2, -b * w2 / n2], d = [-w2 / n, w1 / n];
@@ -32,7 +32,8 @@
   const proj = (x, y, c) => { const t = (c - x - y) / 2; return [x + t, y + t]; };   // x+y=c 로 내린 수선의 발
   const A8 = [[15, 25], [25, 15], [30, 40], [45, 25]], B8 = [[62, 78], [78, 62], [60, 70], [72, 58]];
   const P8 = A8.map((p) => [...p, 'A']).concat(B8.map((p) => [...p, 'B']));
-  const isSV = (p) => p[0] + p[1] === 70 || p[0] + p[1] === 130;
+  const isSV = (p) => p[0] + p[1] === 70 || p[0] + p[1] === 130;          // 마진 위의 점 4개
+  const isSV3 = (p) => isSV(p) && !(p[0] === 60 && p[1] === 70);          // sklearn 이 저장한 3개 (α>0)
   const MW = 42.43;    // 하드 마진 폭 2/‖w‖ (코드 주석 margin = 42.43)
   function dots(ax, pts, f) { pts.forEach((p, i) => pt(ax, p[0], p[1], p[2], f ? f(p, i) : {})); }
   function note(x, y, s, op, a) { return tx(x, y, s, Object.assign({ 'font-size': 16, 'font-weight': 700, opacity: op }, a || {})); }
@@ -104,22 +105,25 @@
       tx(500, 270, '도로 안에 들어온 점 0개', { 'font-size': 16, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.8) }); check(720, 264, 10, pop(u, 1.9));
       pill(660, 330, '하드 마진', INK, pop(u, 2.2), { fs: 15 }); return; }
     if (k === 2) { road(ax, 1, 1, -100, MW); wline(ax, 1, 1, -100, 1, INK, { sw: 3 });
-      const sv = P8.filter(isSV), rest = P8.filter((p) => !isSV(p));
+      const sv = P8.filter(isSV3), rest = P8.filter((p) => !isSV3(p));
       rest.forEach((p) => pt(ax, p[0], p[1], p[2], { op: 1 - 0.65 * E(u, 1.4, 1.9) }));
       sv.forEach((p, i) => pt(ax, p[0], p[1], p[2], { ring: pop(u, 0.3 + i * 0.25) }));
+      const z = [60, 70]; el('circle', { cx: ax.X(z[0]), cy: ax.Y(z[1]), r: 14, fill: 'none', stroke: MUT, 'stroke-width': 2, 'stroke-dasharray': '4 3', opacity: fade(u, 1.2) });
+      mono(ax.X(z[0]) - 18, ax.Y(z[1]) - 18, 'α=0', { 'font-size': 14, 'font-weight': 700, fill: MUT, 'text-anchor': 'end', opacity: fade(u, 1.3) });
       mono(470, 80, 'svm.support_vectors_', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 0.3) });
       sv.forEach((p, i) => card(560, 112 + i * 42, 140, 34, { rx: 6, text: `[${p[0]}. ${p[1]}.]`, fs: 15, mono: true, stroke: p[2] === 'A' ? INFO : WARN, color: p[2] === 'A' ? INFO : WARN, s: pop(u, 0.5 + i * 0.25) }));
-      mono(470, 312, 'n_support_ = [2 2]', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.7) });
-      note(700, 120, '모델이 기억하는 점', fade(u, 1.2)); note(700, 150, '= 이 4개뿐', fade(u, 1.4), { fill: ACC });
-      sub(780, 220, '나머지 4개는 저장하지 않는다', fade(u, 2.0), { 'font-size': 14.5 }); return; }
-    if (k === 3) { road(ax, 1, 1, -100, MW); wline(ax, 1, 1, -100, 1, INK, { sw: 3 }); dots(ax, P8, (p) => ({ ring: isSV(p) ? 1 : 0 }));
+      mono(470, 280, 'n_support_ = [2 1]', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.7) });
+      note(700, 120, '모델이 기억하는 점', fade(u, 1.2)); note(700, 150, '= 이 3개뿐', fade(u, 1.4), { fill: ACC });
+      sub(780, 200, '(60,70) 은 마진 위지만 α=0', fade(u, 1.8), { 'font-size': 14.5 });
+      sub(780, 228, '나머지 5개는 저장하지 않는다', fade(u, 2.1), { 'font-size': 14.5 }); return; }
+    if (k === 3) { road(ax, 1, 1, -100, MW); wline(ax, 1, 1, -100, 1, INK, { sw: 3 }); dots(ax, P8, (p) => ({ ring: isSV3(p) ? 1 : 0 }));
       const g = E(u, 0.3, 1.0); el('line', { x1: ax.X(35), y1: ax.Y(35), x2: ax.X(lerp(35, 65, g)), y2: ax.Y(lerp(35, 65, g)), stroke: BAD, 'stroke-width': 3, 'marker-end': g > 0.97 ? 'url(#ra-ahr)' : null });
       mono(ax.X(58), ax.Y(30), MW.toFixed(2), { 'font-size': 17, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.0) });
       [['w = svm.coef_[0]', 0.6], ['‖w‖ = np.linalg.norm(w)', 1.0], ['margin = 2 / ‖w‖', 1.4]].forEach(([s, at], i) => mono(470, 110 + i * 40, s, { 'font-size': 16, opacity: fade(u, at) }));
       const v = MW * E(u, 1.6, 2.3); mono(470, 270, `= ${v.toFixed(2)}`, { 'font-size': 30, 'font-weight': 800, fill: ACC, opacity: fade(u, 1.6) });
       sub(620, 320, '눈으로 보던 도로 폭이 숫자가 된다', fade(u, 2.3), { 'font-size': 15 }); return; }
     if (k === 4) { road(ax, 1, 1, -100, MW); wline(ax, 1, 1, -100, 1, INK, { sw: 3 });
-      dots(ax, P8, (p) => (p[0] === 15 && p[1] === 25 ? { op: 1 - 0.75 * E(u, 0.7, 1.1) } : { ring: isSV(p) ? 1 : 0 }));
+      dots(ax, P8, (p) => (p[0] === 15 && p[1] === 25 ? { op: 1 - 0.75 * E(u, 0.7, 1.1) } : { ring: isSV3(p) ? 1 : 0 }));
       cross(ax.X(15), ax.Y(25), 10, pop(u, 0.4));
       const d = 1 - E(u, 1.2, 2.0); if (u > 1.2) wline(ax, 1, 1, -100 - 22 * d, 1, BAD, { dash: '6 5', sw: 2.2 });
       mono(470, 110, 'mask[0] = False   # (15,25)', { 'font-size': 15, opacity: fade(u, 0.4) });
@@ -131,7 +135,7 @@
       const w1 = lerp(1 / n0, 27 / n1, g), w2 = lerp(1 / n0, 33 / n1, g), b = lerp(-100 / n0, -2949 / n1, g);
       wline(ax, 1, 1, -100, 1, OFF, { dash: '6 5', sw: 2, op: g });
       road(ax, w1, w2, b, lerp(MW, 42.64, g), { col: g > 0.05 ? WARNBG : ACCBG, edge: g > 0.05 ? WARN : ACC }); wline(ax, w1, w2, b, 1, g > 0.05 ? WARN : INK, { sw: 3 });
-      dots(ax, P8, (p) => (p[0] === 30 && p[1] === 40 ? { op: 1 - 0.75 * E(u, 0.5, 0.9) } : { ring: (p[0] === 45 || p[0] === 72) && u > 2.0 ? fade(u, 2.0) : isSV(p) && u < 0.9 ? 1 : 0 }));
+      dots(ax, P8, (p) => (p[0] === 30 && p[1] === 40 ? { op: 1 - 0.75 * E(u, 0.5, 0.9) } : { ring: (p[0] === 45 || p[0] === 72) && u > 2.0 ? fade(u, 2.0) : isSV3(p) && u < 0.9 ? 1 : 0 }));
       cross(ax.X(30), ax.Y(40), 10, pop(u, 0.3));
       note(470, 110, '서포트 벡터 (30,40) 하나를 지우면', fade(u, 0.3));
       note(470, 160, '경계가 통째로 기울어 움직인다', fade(u, 1.4), { fill: WARN });
@@ -139,8 +143,9 @@
       pill(640, 290, '경계 근처 라벨 오류에 민감', BAD, pop(u, 2.3), { fs: 15 }); } }
 
   // ---------- 3. 소프트 마진과 C ----------
-  const OUT2 = [[55, 57, 'A'], [42, 47, 'B']], P10 = P8.concat(OUT2);
-  const CMAR = { 'C=0.01': 88.1, 'C=1': 52.3, 'C=100': 18.42 };
+  const OUT2 = [[40, 50, 'A'], [30, 50, 'B']], P10 = P8.concat(OUT2);
+  // 코드(X/10)로 학습한 실제 경계를 원래 좌표로: [w1, w2, b, 도로 폭] — 폭은 출력 margin × 10
+  const CFIT = { 'C=0.01': [0.147, 0.163, -13.974, 91.1], 'C=1': [0.24713, 0.53448, -38.7931, 34.0], 'C=100': [-1.99902, 10.4948, -454.7726, 1.87] };
   function mini(x, y, s, id) { return plot({ px: x, py: y, pw: s, ph: s, xt: [], yt: [], xl: null, yl: null, id }); }
   function crow(rows, cname) { return (rows || []).find((r) => r.c === cname); }
   function s3(t, c) { const { k, u } = c, rows = (c.beat.pane.cTrade || {}).rows || [], prow = ((c.prev && c.prev.pane.cTrade) || {}).rows || [];
@@ -154,18 +159,19 @@
       note(480, 230, 'ξ = 점이 도로 안으로 들어온 깊이', fade(u, 1.8));
       note(480, 280, 'C = 위반 1단위의 값 (환율)', fade(u, 2.2), { fill: ACC }); return; }
     if (k === 1) { const ax = plot(), g = E(u, 1.2, 1.9);
-      road(ax, 1, 1, -100, MW * (1 - g), { col: g > 0.05 ? 'var(--badbg)' : ACCBG, edge: g > 0.05 ? BAD : ACC }); wline(ax, 1, 1, -100, 1, g > 0.05 ? BAD : INK, { sw: 3, dash: g > 0.5 ? '8 6' : null });
+      const H = CFIT['C=100'], hn = Math.hypot(H[0], H[1]), w1 = lerp(1 / Math.SQRT2, H[0] / hn, g), w2 = lerp(1 / Math.SQRT2, H[1] / hn, g), b0 = lerp(-100 / Math.SQRT2, H[2] / hn, g);
+      road(ax, w1, w2, b0, lerp(MW, H[3], g), { col: g > 0.05 ? 'var(--badbg)' : ACCBG, edge: g > 0.05 ? BAD : ACC }); wline(ax, w1, w2, b0, 1, g > 0.05 ? BAD : INK, { sw: 3 });
       dots(ax, P8);
       OUT2.forEach(([x, y, cl], i) => { const f = E(u, 0.3 + i * 0.3, 0.9 + i * 0.3), sx = 470, sy = 120 + i * 50;
         if (f < 1) { const X = lerp(sx, ax.X(x), f), Y = lerp(sy, ax.Y(y), f); el('circle', { cx: X, cy: Y, r: 7, fill: cl === 'A' ? INFO : WARN }); }
         else pt(ax, x, y, cl, { bad: 1, s: 1 + bump(u, 0.9 + i * 0.3) }); });
-      mono(470, 110, '[55, 57] → A (B 진영 근처)', { 'font-size': 15, fill: INFO, opacity: fade(u, 0.3) });
-      mono(470, 160, '[42, 47] → B (A 진영 근처)', { 'font-size': 15, fill: WARN, opacity: fade(u, 0.6) });
-      cross(500, 250, 12, pop(u, 2.0)); note(530, 256, '하드 마진: 해가 없다', fade(u, 2.0), { fill: BAD });
-      sub(640, 300, '"모든 점이 도로 밖" 을 만족할 수 없다', fade(u, 2.3), { 'font-size': 15 }); return; }
+      mono(470, 110, '[40, 50] → A (경계 바로 앞)', { 'font-size': 15, fill: INFO, opacity: fade(u, 0.3) });
+      mono(470, 160, '[30, 50] → B (A 진영 한가운데)', { 'font-size': 15, fill: WARN, opacity: fade(u, 0.6) });
+      note(470, 250, '하드 마진: 도로 폭이 거의 0', fade(u, 2.0), { fill: BAD });
+      sub(640, 290, '두 점 사이로 경계가 눕듯이 기운다', fade(u, 2.3), { 'font-size': 15 }); return; }
     const NAMES = ['C=0.01', 'C=1', 'C=100'];
     if (k === 2) { NAMES.forEach((nm, i) => { const x = 50 + i * 305, at = 0.3 + i * 0.5, ax = mini(x, 70, 230, 'ra221m' + i);
-        road(ax, 1, 1, -100, CMAR[nm] * E(u, at, at + 0.6), { id: 'ra221m' + i }); wline(ax, 1, 1, -100, E(u, at, at + 0.4), INK, { sw: 2.4 });
+        const F = CFIT[nm]; road(ax, F[0], F[1], F[2], F[3] * E(u, at, at + 0.6), { id: 'ra221m' + i }); wline(ax, F[0], F[1], F[2], E(u, at, at + 0.4), INK, { sw: 2.4 });
         dots(ax, P10, () => ({ r: 5 }));
         lbl(x + 115, 56, nm, fade(u, at), { 'font-size': 17, class: 'mono' });
         for (let f = 0; f < 5; f++) el('rect', { x: x + f * 47, y: 322, width: 41, height: 20, rx: 4, fill: f / 5 < E(u, 1.8, 2.5) ? ACC : SOFT, opacity: 0.85 }); });
@@ -177,7 +183,7 @@
       rows.forEach((r, i) => { const old = crow(prow, r.c), op = old ? 1 : fade(u, 0.3 + i * 0.3), y = y0 + 40 + i * 38, best = r.c === 'C=1' && k >= 4;
         if (best) el('rect', { x: x0 + 30, y: y - 25, width: 420, height: 34, rx: 6, fill: ACCBG, opacity: fade(u, 1.6) });
         [r.c, String(r.margin), String(r.sv), r.train + '%', r.test + '%'].forEach((s, j) => mono(x0 + COLS[j][1], y, s, { 'font-size': 15.5, 'font-weight': j === 0 || j === 4 ? 700 : 400, fill: j === 4 ? ACC : INK, opacity: op })); }); }
-    if (k === 3) { const ax = plot(); road(ax, 1, 1, -100, 18.42 * E(u, 0.2, 0.9) + MW * (1 - E(u, 0.2, 0.9)), { col: WARNBG, edge: WARN }); wline(ax, 1, 1, -100, 1, INK, { sw: 3 }); dots(ax, P10, (p) => ({ bad: p.length === 3 && OUT2.some((o) => o[0] === p[0] && o[1] === p[1]) ? 1 : 0 }));
+    if (k === 3) { const ax = plot(), F = CFIT['C=100']; road(ax, F[0], F[1], F[2], F[3], { col: WARNBG, edge: WARN }); wline(ax, F[0], F[1], F[2], E(u, 0.2, 0.9), INK, { sw: 3 }); dots(ax, P10, (p) => ({ bad: p.length === 3 && OUT2.some((o) => o[0] === p[0] && o[1] === p[1]) ? 1 : 0 }));
       lbl(220, 24, 'C=100', 1, { class: 'mono', fill: WARN });
       sheet(420, 70);
       const r = crow(rows, 'C=100');
@@ -193,12 +199,12 @@
       R.line(ch, all.map((r, i) => [i, r.train]), lu, INK, { dash: '7 5' }); R.line(ch, all.map((r, i) => [i, r.test]), lu, ACC, { sw: 3 });
       R.scatter(ch, all.map((r, i) => [i, r.test, ACC]), { u: lu, r: 5 });
       mono(ch.X(2) + 8, ch.Y(100) - 8, 'train', { 'font-size': 14, fill: INK, 'text-anchor': 'end', opacity: lu > 0.95 ? 1 : 0 });
-      mono(ch.X(1), ch.Y(93) - 14, 'cv', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'middle', opacity: lu > 0.95 ? 1 : 0 }); }
-    if (k === 4) { note(30, 250, 'train 은 C 따라 계속 오르고', fade(u, 1.9)); note(30, 282, 'cv 는 가운데(C=1)에서 꺾인다', fade(u, 2.2), { fill: ACC }); return; }
+      mono(ch.X(1), ch.Y(90) - 14, 'cv', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'middle', opacity: lu > 0.95 ? 1 : 0 }); }
+    if (k === 4) { note(30, 250, 'train 은 C 따라 0.80 → 0.90 → 1.00', fade(u, 1.9)); note(30, 282, 'cv 는 가운데(C=1, 0.90)에서 꺾인다', fade(u, 2.2), { fill: ACC }); return; }
     el('rect', { x: ch.X(-0.3), y: 60, width: ch.X(0.5) - ch.X(-0.3), height: 250, fill: INFOBG, opacity: 0.6 * fade(u, 0.3) });
     el('rect', { x: ch.X(1.5), y: 60, width: ch.X(2.3) - ch.X(1.5), height: 250, fill: 'var(--badbg)', opacity: 0.6 * fade(u, 0.6) });
-    tx(ch.X(0.1), 300, '과소적합', { 'font-size': 14, 'font-weight': 700, fill: INFO, 'text-anchor': 'middle', opacity: fade(u, 0.4) });
-    tx(ch.X(1.9), 300, '과적합', { 'font-size': 14, 'font-weight': 700, fill: BAD, 'text-anchor': 'middle', opacity: fade(u, 0.7) });
+    tx(ch.X(0.1), ch.Y(90) + 5, '과소적합', { 'font-size': 14, 'font-weight': 700, fill: INFO, 'text-anchor': 'middle', opacity: fade(u, 0.4) });
+    tx(ch.X(1.9), ch.Y(90) + 5, '과적합', { 'font-size': 14, 'font-weight': 700, fill: BAD, 'text-anchor': 'middle', opacity: fade(u, 0.7) });
     tx(30, 240, 'C↑ 마진↓ 과적합 · C↓ 마진↑ 과소적합', { 'font-size': 15.5, 'font-weight': 700, opacity: fade(u, 1.0) });
     ['0.01', '0.1', '1', '10', '100'].forEach((s, i) => { const x = 50 + i * 95; el('line', { x1: x, y1: 300, x2: x, y2: 312, stroke: INK, 'stroke-width': 2, opacity: fade(u, 1.4 + i * 0.15) }); mono(x, 334, s, { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.4 + i * 0.15) }); });
     grow(50, 306, 430, 306, E(u, 1.4, 2.1), MUT, { plain: true });
@@ -243,16 +249,17 @@
       note(450, 120, '좌하 · 우상 = A', fade(u, 1.0), { fill: INFO }); note(450, 160, '좌상 · 우하 = B', fade(u, 1.4), { fill: WARN });
       note(450, 240, '대각 맞은편끼리 같은 라벨 = XOR', fade(u, 2.0));
       sub(640, 290, '직선 하나로는 못 나눈다', fade(u, 2.3), { 'font-size': 15 }); return; }
-    if (k === 2) { const th = lerp(0.15, Math.PI - 0.15, E(u, 0.3, 2.2)), nx = Math.cos(th), ny = Math.sin(th);
-      // 법선 (nx,ny) · (p − 중심) 부호로 나누고, 더 많이 맞는 쪽 배정을 쓴다
-      const side = P.map((p) => nx * (p[0] - 5) + ny * (p[1] - 5) > 0);
-      const okA = P.filter((p, i) => (side[i] ? 'A' : 'B') === p[2]).length, flip = okA < P.length / 2, wrong = P.map((p, i) => ((side[i] !== flip) ? 'A' : 'B') !== p[2]);
-      wline(ax, nx * 10, ny * 10, -(nx * 50 + ny * 50), 1, MUT, { dash: '8 6' });
+    if (k === 2) { const fin = u > 1.9, th = lerp(0.15, Math.PI - 0.15, E(u, 0.3, 1.8)), nx = Math.cos(th), ny = Math.sin(th);
+      // 훑는 동안: 중심을 지나는 직선, 법선 부호로 나누고 더 많이 맞는 배정. 끝: 코드의 linear SVC 가 찾은 실제 직선
+      const LW = [0.22779, 0.17114, -1.39704], val = (p) => (fin ? LW[0] * p[0] + LW[1] * p[1] + LW[2] : nx * (p[0] - 5) + ny * (p[1] - 5));
+      const side = P.map((p) => val(p) > 0);
+      const okA = P.filter((p, i) => (side[i] ? 'A' : 'B') === p[2]).length, flip = fin ? true : okA < P.length / 2, wrong = P.map((p, i) => ((side[i] !== flip) ? 'A' : 'B') !== p[2]);
+      if (fin) wline(ax, LW[0], LW[1], LW[2], 1, INK, { sw: 2.6, lim: 10 }); else wline(ax, nx, ny, -(nx * 5 + ny * 5), 1, MUT, { dash: '8 6', lim: 10 });
       xdots(ax, P, (p, i) => ({ bad: wrong[i] ? 1 : 0 }));
       const acc = P.length - wrong.filter(Boolean).length;
       mono(470, 120, `맞힌 점 ${acc} / ${P.length}`, { 'font-size': 20, 'font-weight': 800 });
-      note(470, 180, '어디에 그어도 절반은 틀린다', fade(u, 1.0), { fill: BAD });
-      mono(470, 260, 'linear SVC → score ≈ 0.50', { 'font-size': 18, 'font-weight': 800, fill: BAD, opacity: fade(u, 2.1) });
+      note(470, 180, '어디에 그어도 한 군집 이상은 틀린다', fade(u, 1.0), { fill: BAD });
+      mono(470, 260, 'linear SVC → score = 0.75', { 'font-size': 18, 'font-weight': 800, fill: BAD, opacity: fade(u, 2.0) });
       sub(640, 310, '문제는 C 가 아니라 직선이라는 가설', fade(u, 2.4), { 'font-size': 15 }); return; }
     if (k === 3) { const ch = R.axes(560, 60, 320, 300, { x: [0, 10], y: [-14, 14], xt: [0, 5, 10], yt: [-10, 0, 10], xl: 'x1', yl: '(x1−5)(x2−5)' });
       xdots(ax, P, () => ({ op: 0.35 }));
@@ -271,23 +278,25 @@
     if (k === 5) { kshade(ax, P, 0.1, E(u, 0.3, 1.6)); xdots(ax, P);
       mono(470, 110, 'SVC(kernel="rbf", gamma=0.1)', { 'font-size': 16, 'font-weight': 700, fill: ACC, opacity: fade(u, 0.2) });
       note(470, 180, 'A 군집 둘을 감싸는 곡선 경계', fade(u, 1.4));
-      pill(560, 240, 'score ≈ 0.99', GOOD, pop(u, 1.8), { mono: true, fs: 16 });
+      pill(560, 240, 'score = 1.00 · SV 11', GOOD, pop(u, 1.8), { mono: true, fs: 16 });
       sub(660, 300, '바뀐 코드는 kernel 인자 하나', fade(u, 2.2), { 'font-size': 15 }); return; }
     // k 6, 7 : gamma 비교 판 3개는 별도 좌표
     }
   function s4g(t, c) { const { k, u } = c, P = xorPts(c);
-    const G = [['gamma=0.001', 'train 0.55 · SV 98', '거의 직선 · 과소적합', WARN], ['gamma=0.1', 'train 0.99 · SV 14', '군집 단위 곡선', GOOD], ['gamma=10', 'train 1.00 · SV 97', '점마다 섬 · 과적합', BAD]];
+    const G = [['gamma=0.0001', 'train 0.75 · test 0.75', '거의 직선 · 과소적합', WARN], ['gamma=0.1', 'train 1.00 · test 1.00', '군집 단위 곡선 · SV 11', GOOD], ['gamma=100', 'train 1.00 · test 0.64', '점마다 섬 · 과적합 · SV 99', BAD]];
     G.forEach(([nm, res, why, col], i) => { const x = 50 + i * 305, show = i < 2 || k === 7, at = k === 6 ? 0.3 + i * 0.7 : i === 2 ? 0.3 : 0, ax = plot({ px: x, py: 70, pw: 230, ph: 230, x: [0, 10], y: [0, 10], xt: [], yt: [], xl: null, yl: null, id: 'ra221g' + i });
       lbl(x + 115, 54, nm, 1, { class: 'mono', 'font-size': 16 });
       if (!show) { mono(x + 115, 195, '?', { 'font-size': 40, 'font-weight': 800, fill: OFF, 'text-anchor': 'middle' }); xdots(ax, P, () => ({ op: 0.3, r: 5 })); return; }
-      if (i === 0) { const g = E(u, at, at + 0.6); if (g > 0) { el('rect', { x: ax.x, y: ax.y, width: ax.w, height: ax.h, fill: 'none' }); el('polygon', { points: `${ax.X(0)},${ax.Y(10)} ${ax.X(10)},${ax.Y(0)} ${ax.X(10)},${ax.Y(10)}`, fill: INFOBG, opacity: g }); el('polygon', { points: `${ax.X(0)},${ax.Y(10)} ${ax.X(10)},${ax.Y(0)} ${ax.X(0)},${ax.Y(0)}`, fill: WARNBG, opacity: g }); } }
+      if (i === 0) { const g = E(u, at, at + 0.6), n = 18; // 직선에 가까운 경계: 선형 SVC 와 같은 한 군집 오분류(train 0.75)
+        for (let a = 0; a < n; a++) for (let q = 0; q < n; q++) { if ((a + q) / (2 * n) > g) continue; const x = (a + 0.5) * 10 / n, y = (q + 0.5) * 10 / n, v = 0.22779 * x + 0.17114 * y - 1.39704;
+          el('rect', { x: ax.x + a * ax.w / n, y: ax.y + ax.h - (q + 1) * ax.h / n, width: ax.w / n + 0.5, height: ax.h / n + 0.5, fill: v < 0 ? INFOBG : WARNBG, opacity: 0.9 }); } }
       if (i === 1) kshade(ax, P, 0.1, E(u, at, at + 0.6), 18);
       if (i === 2) islands(ax, P, u - at);
       xdots(ax, P, () => ({ r: 5 }));
       mono(x + 115, 326, res, { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', fill: col, opacity: fade(u, at + 0.6) });
       tx(x + 115, 352, why, { 'font-size': 15, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, at + 0.8) }); });
     if (k === 6) sub(480, 396, 'gamma = 한 점의 영향 반경의 역수 — 작을수록 완만하다', fade(u, 2.0), { 'font-size': 15 });
-    if (k === 7) tx(480, 396, 'SV 97개 = 점을 거의 다 외웠다 → C 와 gamma 를 함께 그리드서치', { 'font-size': 15.5, 'font-weight': 700, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 1.6) }); }
+    if (k === 7) tx(480, 396, 'test 0.64 · SV 99개 = 점을 외웠다 → C 와 gamma 를 함께 그리드서치', { 'font-size': 15.5, 'font-weight': 700, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 1.6) }); }
   function s4all(t, c) { return c.k >= 6 ? s4g(t, c) : s4(t, c); }
 
   // ---------- 5. 실전 파이프라인 ----------
@@ -307,9 +316,9 @@
   function s5(t, c) { const { k, u } = c;
     if (k === 0) { lbl(240, 70, '‖a − b‖² = Σ (특성 차이)²', fade(u, 0.2), { 'font-size': 18, class: 'mono' });
       const big = E(u, 0.6, 1.5); el('rect', { x: 60, y: 110, width: 360 * big, height: 40, rx: 5, fill: WARN, opacity: 0.85 });
-      mono(60, 176, '단위 ~2500 인 특성', { 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.8) });
+      mono(60, 176, '값 범위 ~4069 인 특성', { 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.8) });
       el('rect', { x: 60 + 360 * big, y: 110, width: 3, height: 40, fill: INFO, opacity: fade(u, 1.3) });
-      mono(60, 210, '단위 ~0.001 인 특성 → 거의 0', { 'font-size': 15, 'font-weight': 700, fill: INFO, opacity: fade(u, 1.4) });
+      mono(60, 210, '값 범위 ~0.03 인 특성 → 거의 0', { 'font-size': 15, 'font-weight': 700, fill: INFO, opacity: fade(u, 1.4) });
       note(60, 280, '큰 축 하나가 거리를 독점한다', fade(u, 1.8), { fill: BAD });
       note(560, 130, 'SVM 마진 = 거리', fade(u, 0.4));
       sub(700, 166, '좌표 단위에 그대로 휘둘린다', fade(u, 0.8), { 'font-size': 15 });
@@ -341,14 +350,15 @@
       lock(580, 250, true, WARN, pop(u, 0.4)); mono(610, 258, 'X_te — 아직 한 번도 안 봤다', { 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.5) });
       note(560, 330, '최선 조합을 골라 훈련셋 전체로 재학습', fade(u, 2.2)); return; }
     if (k === 5 || k === 6) { pipe(60, 70, u, { noScaler: k === 6, cross: pop(u, 0.3) });
-      mono(60, 140, 'best: C=10 · gamma="scale"', { 'font-size': 16, 'font-weight': 700, fill: ACC, opacity: k === 5 ? fade(u, 0.3) : 1 });
+      mono(60, 140, 'best: C=10 · gamma=0.01', { 'font-size': 16, 'font-weight': 700, fill: ACC, opacity: k === 5 ? fade(u, 0.3) : 1 });
       const toV = (v) => (v - 0.5) / 0.5;
-      tx(60, 206, 'cv', { 'font-size': 15, fill: MUT }); R.hbar(120, 192, 420, toV(0.976), 1, { u: k === 5 ? E(u, 0.6, 1.2) : 1, col: INFO, text: '0.976', label: k === 5 ? u > 0.9 : true });
-      const tv = k === 5 ? 0.982 : tween(0.982, 0.63, u, 1.2);
-      tx(60, 256, 'test', { 'font-size': 15, fill: MUT }); R.hbar(120, 242, 420, toV(tv), 1, { u: k === 5 ? E(u, 1.0, 1.6) : 1, col: k === 6 && u > 0.5 ? BAD : ACC, text: tv.toFixed(k === 6 && u > 1.3 ? 2 : 3), label: k === 5 ? u > 1.3 : true });
-      mono(120, 296, '0.5', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' }); mono(540, 296, '1.0', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' });
+      tx(60, 206, 'cv', { 'font-size': 15, fill: MUT }); R.hbar(120, 192, 420, toV(0.980), 1, { u: k === 5 ? E(u, 0.6, 1.2) : 1, col: INFO, text: '0.980', label: k === 5 ? u > 0.9 : true });
+      const tv = k === 5 ? 0.982 : tween(0.982, 0.947, u, 1.2);
+      tx(60, 256, 'test', { 'font-size': 15, fill: MUT }); R.hbar(120, 242, 420, toV(tv), 1, { u: k === 5 ? E(u, 1.0, 1.6) : 1, col: k === 6 && u > 0.5 ? WARN : ACC, text: tv.toFixed(3), label: k === 5 ? u > 1.3 : true });
+      if (k === 6) { tx(60, 306, '고정', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.5) }); R.hbar(120, 292, 420, toV(0.632), 1, { u: E(u, 1.5, 2.1), col: BAD, text: '0.632', label: u > 1.8 }); }
+      mono(120, 346, '0.5', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' }); mono(540, 346, '1.0', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' });
       if (k === 5) { note(620, 220, 'cv ≈ test', fade(u, 1.8), { fill: GOOD }); sub(760, 256, '선택 과정이 과적합되지 않았다', fade(u, 2.1), { 'font-size': 14.5 }); }
-      else { note(620, 200, '같은 그리드, 스케일러만 뺐다', fade(u, 0.5), { fill: BAD }); sub(760, 236, '단위 0.001 ~ 2500 인 30개 특성', fade(u, 1.4), { 'font-size': 14.5 }); note(620, 290, '에러 없이 성능만 무너진다', fade(u, 2.1)); }
+      else { note(620, 200, '스케일러만 뺐다', fade(u, 0.5), { fill: BAD }); sub(760, 236, '다시 찾은 최선 C=100 → 0.947', fade(u, 1.1), { 'font-size': 14.5 }); sub(760, 262, 'C=10·γ=0.01 고정 → 0.632', fade(u, 1.7), { 'font-size': 14.5, fill: BAD }); note(620, 320, '에러 없이 성능만 무너진다', fade(u, 2.2)); }
       return; }
     if (k === 7) { const ax = R.axes(70, 70, 300, 240, { x: [-4, 4], y: [0, 1], xt: [0], yt: [0, 0.5, 1], xl: 'SVM 거리 f(x)', yl: 'P(y=1)' });
       const S = []; for (let i = 0; i <= 40; i++) { const v = -4 + i * 0.2; S.push([v, 1 / (1 + Math.exp(-1.6 * v))]); }

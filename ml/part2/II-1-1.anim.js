@@ -283,7 +283,7 @@
           card(RX + 160, y, 320, 54, { rx: 10, stroke: col, sw: 2, s }); mono(RX + 16, y - 2, n, { 'font-size': 15, 'font-weight': 800, fill: col === OFF ? INK : col, opacity: fade(u, 0.7 + i * 0.5) });
           tx(RX + 16, y + 18, d, { 'font-size': 14, fill: MUT, opacity: fade(u, 0.7 + i * 0.5) }); }); return; }
       if (k === 1 || k === 2) { // summary 보고서
-        const lines = [['coef  const 0.856 · x1 0.1136', 0], ['P>|t|  0.000', 1], ['95% CI  0.105 ~ 0.122', 2], ['R²  0.992', 3]];
+        const lines = [['coef  const 0.8558 · x1 0.1136', 0], ['P>|t|  0.000', 1], ['95% CI  0.105 ~ 0.122', 2], ['R²  0.992', 3]];
         el('rect', { x: RX - 10, y: 50, width: 360, height: 196, rx: 10, fill: SOFT, stroke: GRID, 'stroke-width': 1.5, opacity: k === 1 ? fade(u, 0.2) : 1 });
         mono(RX + 4, 76, 'sm.OLS(y, sm.add_constant(x))', { 'font-size': 14, fill: MUT, opacity: k === 1 ? fade(u, 0.3) : 1 });
         lines.forEach(([s, i]) => { const op = k === 1 ? fade(u, 0.8 + i * 0.3) : 1, hot = k === 2;

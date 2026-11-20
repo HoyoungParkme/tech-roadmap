@@ -13,7 +13,7 @@
   // =========================================================
   const SEEDS = [0, 7, 13, 42, 99], NC = 20;
   const testIdx = (seed) => { const idx = [...Array(NC).keys()].sort((a, b) => rnd(seed + 1, a) - rnd(seed + 1, b)); return new Set(idx.slice(0, 4)); };
-  const AX1 = { x0: 560, x1: 920, lo: 78, hi: 90 }, AX = (v) => lerp(AX1.x0, AX1.x1, (v - AX1.lo) / (AX1.hi - AX1.lo));
+  const AX1 = { x0: 560, x1: 920, lo: 90, hi: 98 }, AX = (v) => lerp(AX1.x0, AX1.x1, (v - AX1.lo) / (AX1.hi - AX1.lo));
   function s1(t, c) { const { k, u } = c, rows = c.beat.splitTrials.rows, prows = c.prev ? c.prev.splitTrials.rows : [];
     if (k === 0) { // 데이터 행렬 + 모델
       const op = fade(u, 0.2); for (let r = 0; r < 12; r++) for (let q = 0; q < 16; q++) el('rect', { x: 120 + q * 16, y: 80 + r * 16, width: 14, height: 14, rx: 2, fill: q === 15 ? WARNBG : INFOBG, stroke: q === 15 ? WARN : INFO, 'stroke-width': 1, opacity: op * clamp(u * 3 - r * 0.15) });
@@ -28,18 +28,18 @@
       const r = rows.find((q) => q.seed === sd); if (!r) return;
       const fresh = !prows.find((q) => q.seed === sd), j = rows.indexOf(r), a = fresh ? 0.4 + (j - prows.length) * 0.5 : 0;
       grow(510, y + 13, AX(r.acc) - 10, y + 13, fresh ? E(u, a, a + 0.5) : 1, GRID, { plain: true, sw: 1.5, dash: '3 4' });
-      const hot = r.acc === 89.2 ? WARN : r.acc === 79.3 ? BAD : ACC, s = fresh ? pop(u, a + 0.4) : 1;
+      const accs = SPLIT_ACC, hot = r.acc === Math.max(...accs) ? WARN : r.acc === Math.min(...accs) ? BAD : ACC, s = fresh ? pop(u, a + 0.4) : 1;
       el('circle', { cx: AX(r.acc), cy: y + 13, r: 9 * s, fill: hot });
-      mono(AX(r.acc) + (r.acc > 88 ? -14 : 14), y + 18, pct(r.acc), { 'font-size': 14.5, 'font-weight': 800, fill: hot, 'text-anchor': r.acc > 88 ? 'end' : 'start', opacity: fresh ? fade(u, a + 0.5) : 1 }); });
+      mono(AX(r.acc) + (r.acc > 96.8 ? -14 : 14), y + 18, pct(r.acc), { 'font-size': 14.5, 'font-weight': 800, fill: hot, 'text-anchor': r.acc > 96.8 ? 'end' : 'start', opacity: fresh ? fade(u, a + 0.5) : 1 }); });
     // 정확도 축
     const ay = 360; el('line', { x1: AX1.x0, y1: ay, x2: AX1.x1, y2: ay, stroke: MUT, 'stroke-width': 1.8 });
-    [78, 80, 82, 84, 86, 88, 90].forEach((v) => { el('line', { x1: AX(v), y1: ay, x2: AX(v), y2: ay + 5, stroke: MUT }); mono(AX(v), ay + 22, String(v), { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }); });
+    [90, 92, 94, 96, 98].forEach((v) => { el('line', { x1: AX(v), y1: ay, x2: AX(v), y2: ay + 5, stroke: MUT }); mono(AX(v), ay + 22, String(v), { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }); });
     tx(AX1.x0, 72, 'test 정확도 (%)', { 'font-size': 13.5, 'font-weight': 700, fill: MUT });
     sub(430, 384, '■ test 20%', 1, { fill: WARN, 'text-anchor': 'start' });
     if (rows.length >= 3) { const lo = Math.min(...rows.map((r) => r.acc)), hi = Math.max(...rows.map((r) => r.acc)), pl = c.prev && c.prev.splitTrials.rows.length >= 3 ? c.prev.splitTrials.rows : null;
       const plo = pl ? Math.min(...pl.map((r) => r.acc)) : lo, phi = pl ? Math.max(...pl.map((r) => r.acc)) : lo, h = lerp(phi, hi, E(u, 1.4, 2.2)), by = ay - 22;
       el('path', { d: `M${AX(plo)},${by + 6} V${by} H${AX(h)} V${by + 6}`, fill: 'none', stroke: WARN, 'stroke-width': 2.2, opacity: fade(u, 1.2) });
-      mono((AX(lo) + AX(h)) / 2, by - 6, '폭 ' + (h - lo).toFixed(1) + '%p', { 'font-size': 14.5, 'font-weight': 800, fill: WARN, 'text-anchor': 'middle', opacity: fade(u, 1.4) }); }
+      mono((AX(lo) + AX(h)) / 2, by - 6, '폭 ' + ((c.beat.splitTrials.spread.match(/폭 ([0-9.]+)%p/) || [])[1] || (h - lo).toFixed(1)) + '%p', { 'font-size': 14.5, 'font-weight': 800, fill: WARN, 'text-anchor': 'middle', opacity: fade(u, 1.4) }); }
     if (k === 4) pill(735, 46, '보고하고 싶은 숫자 = 운', WARN, pop(u, 1.6), { fs: 14 });
     if (k === 5) { banner(735, 40, '단일 split 점수 = 실력 + 분할 운', pop(u, 0.3)); }
   }
@@ -77,21 +77,21 @@
         if (r < act) mono(470, 50 + r * 60 + 35, fa.scores[r].toFixed(3), { 'font-size': 16, 'font-weight': 800, fill: ACC }); }
       sub(280, 382, '■ 검증 fold — 모든 샘플이 정확히 한 번', 1, { fill: WARN });
       // 오른쪽: 점수 축
-      const ax = axes(600, 80, 320, 220, { x: [0.83, 0.90], y: [0, 1], xt: [0.84, 0.86, 0.88, 0.9] });
+      const ax = axes(600, 80, 320, 220, { x: [0.92, 0.99], y: [0, 1], xt: [0.93, 0.95, 0.97, 0.99] });
       fa.scores.slice(0, act).forEach((v, i) => el('circle', { cx: ax.X(v), cy: ax.Y(0.2 + i * 0.15), r: 8, fill: ACC }));
       if (k === 4) { const m = fa.mean, sd = fa.std, op = fade(u, 0.4);
         el('rect', { x: ax.X(m - sd), y: 80, width: ax.X(m + sd) - ax.X(m - sd), height: 220, fill: ACCBG, opacity: 0.6 * op });
         el('line', { x1: ax.X(m), y1: 80, x2: ax.X(m), y2: 300, stroke: ACC, 'stroke-width': 3, opacity: op });
         mono(ax.X(m), 66, m.toFixed(3) + ' ± ' + sd.toFixed(3), { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 0.8) });
-        el('line', { x1: ax.X(0.892), y1: 80, x2: ax.X(0.892), y2: 300, stroke: WARN, 'stroke-width': 2.5, 'stroke-dasharray': '6 5', opacity: fade(u, 1.4) });
-        mono(ax.X(0.892), 318 + 22, '단일 split 89.2%', { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'end', fill: WARN, opacity: fade(u, 1.6) });
+        el('line', { x1: ax.X(0.974), y1: 80, x2: ax.X(0.974), y2: 300, stroke: WARN, 'stroke-width': 2.5, 'stroke-dasharray': '6 5', opacity: fade(u, 1.4) });
+        mono(ax.X(0.974), 318 + 22, '단일 split 최고 97.4%', { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'end', fill: WARN, opacity: fade(u, 1.6) });
         sub(760, 386, '평균 = 실력 추정 · 표준편차 = 신뢰도', fade(u, 2.0), { 'font-size': 14.5 }); }
       else mono(600, 66, 'fold별 점수', { 'font-size': 14, fill: MUT, 'font-weight': 700 });
       return; }
     // k5 TimeSeriesSplit
     tx(40, 40, 'TimeSeriesSplit(n_splits=5) — 항상 과거로 학습, 미래로 검증', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.1) });
-    const T = (i) => 60 + i * 4.2; // 샘플 인덱스 → x
-    for (let r = 0; r < 5; r++) { const y = 70 + r * 44, s = E(u, 0.3 + r * 0.3, 0.7 + r * 0.3), tr = 100 + r * 20, va = 20;
+    const T = (i) => 60 + i * (600 / 569); // 샘플 인덱스 → x (569행, 실측 경계)
+    for (let r = 0; r < 5; r++) { const y = 70 + r * 44, s = E(u, 0.3 + r * 0.3, 0.7 + r * 0.3), tr = 99 + r * 94, va = 94;
       el('rect', { x: T(0), y, width: (T(tr) - T(0)) * s, height: 28, rx: 4, fill: INFOBG, stroke: INFO, 'stroke-width': 1.5 });
       if (s > 0.95) el('rect', { x: T(tr) + 2, y, width: T(tr + va) - T(tr) - 2, height: 28, rx: 4, fill: WARNBG, stroke: WARN, 'stroke-width': 1.5 });
       if (r < 2) mono(T(tr + va) + 12, y + 19, `train[0:${tr}] → valid[${tr}:${tr + va}]`, { 'font-size': 13.5, opacity: s }); }
@@ -111,7 +111,8 @@
   function knob(cx, cy, frac, label, val, op, col) { el('circle', { cx, cy, r: 22, fill: PANEL, stroke: col || INK, 'stroke-width': 2.5, opacity: op });
     const a = Math.PI * (0.75 + 1.5 * frac); el('line', { x1: cx, y1: cy, x2: cx + 17 * Math.cos(a), y2: cy + 17 * Math.sin(a), stroke: col || INK, 'stroke-width': 3, 'stroke-linecap': 'round', opacity: op });
     mono(cx, cy + 42, label, { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: op }); if (val != null) mono(cx, cy + 60, val, { 'font-size': 14.5, 'font-weight': 800, 'text-anchor': 'middle', fill: col || INK, opacity: op }); }
-  const CFG = [[2, 0.30, 50, 0.943, 0.018], [4, 0.10, 200, 0.965, 0.011], [9, 0.50, 500, 0.912, 0.031]];
+  const CFG = [[2, 0.30, 50, 0.960, 0.012], [4, 0.10, 200, 0.974, 0.015], [9, 0.50, 500, 0.972, 0.014]];  // 실측: xgboost 3.4 · sklearn 1.9 · cv=5
+  const SPLIT_ACC = [96.5, 97.4, 91.2, 95.6, 95.6];
   function s3(t, c) { const { k, u } = c;
     if (k <= 1) { zone(30, 30, 430, 360, '파라미터 — fit() 이 데이터에서 찾는다', { stroke: INFO, fill: PANEL, color: INFO });
       zone(500, 30, 430, 360, '하이퍼파라미터 — fit() 전에 사람이 정한다', { stroke: WARN, fill: PANEL, color: WARN });
@@ -128,19 +129,19 @@
       pill(715, 340, '심판은 CV 점수', ACC, pop(u, 2.2), { fs: 15 }); return; }
     // k2~5: 설정 3개
     CFG.forEach(([d, lr, n, m, sd], i) => { const cx = 160 + i * 320, op = k === 2 ? fade(u, 0.2 + i * 0.4) : 1, win = k >= 4 && i === 1, worst = k >= 4 && i === 2;
-      el('rect', { x: cx - 140, y: 24, width: 280, height: 238, rx: 12, fill: win ? ACCBG : PANEL, stroke: win ? ACC : worst ? BAD : GRID, 'stroke-width': win || worst ? 2.5 : 1.5, opacity: op });
+      el('rect', { x: cx - 140, y: 24, width: 280, height: 238, rx: 12, fill: win ? ACCBG : PANEL, stroke: win ? ACC : worst ? WARN : GRID, 'stroke-width': win || worst ? 2.5 : 1.5, opacity: op });
       mono(cx, 48, `depth=${d} · lr=${lr.toFixed(2)} · n=${n}`, { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'middle', opacity: op });
-      tree(cx, 70, d, 200, op, win ? ACC : worst ? BAD : INFO);
+      tree(cx, 70, d, 200, op, win ? ACC : worst ? WARN : INFO);
       if (k >= 3) { const cv = k === 3 ? Math.min(5, Math.floor(seg(u, 0.3 + i * 0.5, 1.3 + i * 0.5) * 5.999)) : 5;
         for (let f = 0; f < 5; f++) el('rect', { x: cx - 95 + f * 38, y: 214, width: 34, height: 20, rx: 3, fill: f < cv ? (f === cv - 1 && k === 3 ? WARNBG : INFOBG) : SOFT, stroke: f < cv ? INFO : GRID });
         mono(cx, 252, '5-fold CV', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }); } });
     if (k === 3) { pill(480, 300, 'train 점수', OFF, fade(u, 1.8), { fs: 15 }); cross(540, 300, 10, pop(u, 2.1)); sub(480, 340, 'train 점수로 고르면 언제나 가장 복잡한 설정이 이긴다', fade(u, 2.2), { 'font-size': 14.5 }); }
-    if (k === 4) { const ax = axes(110, 300, 600, 70, { x: [0.87, 0.99], y: [0, 1], xt: [0.88, 0.9, 0.92, 0.94, 0.96, 0.98] });
-      CFG.forEach(([d, lr, n, m, sd], i) => { const y = ax.Y(0.8 - i * 0.3), s = E(u, 0.3 + i * 0.4, 0.9 + i * 0.4), col = i === 1 ? ACC : i === 2 ? BAD : INFO;
+    if (k === 4) { const ax = axes(110, 300, 600, 70, { x: [0.94, 0.99], y: [0, 1], xt: [0.94, 0.95, 0.96, 0.97, 0.98, 0.99] });
+      CFG.forEach(([d, lr, n, m, sd], i) => { const y = ax.Y(0.8 - i * 0.3), s = E(u, 0.3 + i * 0.4, 0.9 + i * 0.4), col = i === 1 ? ACC : i === 2 ? WARN : INFO;
         el('line', { x1: ax.X(m - sd), y1: y, x2: ax.X(m + sd), y2: y, stroke: col, 'stroke-width': 2.5, opacity: s });
         el('circle', { cx: ax.X(m), cy: y, r: 7, fill: col, opacity: s });
         mono(728, y + 5, `depth ${d}: ${m.toFixed(3)} ± ${sd.toFixed(3)}`, { 'font-size': 13.5, 'font-weight': 700, fill: col, opacity: s }); });
-      pill(480, 278, '가장 복잡한 설정이 최하위', BAD, pop(u, 2.0), { fs: 14 }); }
+      pill(480, 278, '차이는 표준편차 안 — 깊이 9 는 이득 없음', WARN, pop(u, 2.0), { fs: 14 }); }
     if (k === 5) { const rows = c.beat.hyperTable.rows;
       rows.forEach((r, i) => { const y = 290 + i * 40, op = fade(u, 0.2 + i * 0.4);
         mono(40, y + 5, r.name, { 'font-size': 14.5, 'font-weight': 800, opacity: op }); tx(190, y + 5, '↓ ' + r.low, { 'font-size': 13.5, fill: INFO, opacity: op }); tx(500, y + 5, '↑ ' + r.high, { 'font-size': 13.5, fill: BAD, opacity: op }); });
@@ -185,6 +186,8 @@
   // =========================================================
   // 5. 실무 프로토콜 — 금고는 한 번만
   // =========================================================
+  // 실측 50 trials (TPESampler(seed=0), X_work 5-fold CV)
+  const TRIALS = [0.967, 0.976, 0.969, 0.967, 0.974, 0.967, 0.974, 0.967, 0.963, 0.963, 0.969, 0.967, 0.976, 0.967, 0.974, 0.978, 0.978, 0.971, 0.971, 0.969, 0.971, 0.978, 0.978, 0.971, 0.976, 0.971, 0.974, 0.967, 0.971, 0.976, 0.976, 0.971, 0.978, 0.967, 0.974, 0.976, 0.978, 0.976, 0.976, 0.978, 0.976, 0.971, 0.965, 0.974, 0.976, 0.967, 0.967, 0.976, 0.978, 0.976];
   const BX = 40, BW = 880;
   function slider(x, y, w, label, lo, hi, log, op, col) { el('line', { x1: x, y1: y, x2: x + w, y2: y, stroke: col || ACC, 'stroke-width': 4, 'stroke-linecap': 'round', opacity: op });
     if (log) for (let i = 0; i <= 4; i++) el('line', { x1: x + w * i / 4, y1: y - 7, x2: x + w * i / 4, y2: y + 7, stroke: col || ACC, 'stroke-width': 2, opacity: op });
@@ -216,14 +219,14 @@
       grow(BX + wW + 70, 100, BX + wW + 70, 160, E(u, 1.0, 1.4), BAD); cross(BX + wW + 70, 120, 12, pop(u, 1.6));
       sub(480, 200, 'CV 는 work 안에서만 — test 정보 유입 경로 차단', fade(u, 1.8), { 'font-size': 15, fill: GOOD, 'font-weight': 700 }); }
     if (k === 6 || k === 7) { // 시도 이력
-      const ax = axes(110, 130, 360, 150, { x: [0, 50], y: [0.90, 0.97], xt: [0, 25, 50], yt: [0.9, 0.97] }), n = k === 6 ? Math.round(lerp(1, 50, E(u, 0.2, 2.2))) : 50;
+      const ax = axes(110, 130, 360, 150, { x: [0, 50], y: [0.96, 0.98], xt: [0, 25, 50], yt: [0.96, 0.97, 0.98] }), n = k === 6 ? Math.round(lerp(1, 50, E(u, 0.2, 2.2))) : 50;
       tx(110, 118, 'study.optimize(n_trials=50)', { 'font-size': 14, class: 'mono', 'font-weight': 700 });
-      let best = 0.9; const bl = []; for (let i = 0; i < n; i++) { const v = 0.905 + 0.06 * rnd(i, 3) * (0.4 + 0.6 * Math.min(1, i / 20)); const vv = Math.min(v, 0.968); best = Math.max(best, i === 37 ? 0.968 : vv); bl.push([i + 1, best]);
-        el('circle', { cx: ax.X(i + 1), cy: ax.Y(i === 37 ? 0.968 : vv), r: 3.5, fill: ACC, opacity: 0.55 }); }
+      let best = 0; const bl = []; for (let i = 0; i < n; i++) { const vv = TRIALS[i]; best = Math.max(best, vv); bl.push([i + 1, best]);
+        el('circle', { cx: ax.X(i + 1), cy: ax.Y(vv), r: 3.5, fill: ACC, opacity: 0.55 }); }
       line(ax, bl, 1, ACC, { sw: 2.5 });
-      if (n >= 38) mono(ax.X(38) + 6, ax.Y(0.968) - 10, 'best CV 0.968', { 'font-size': 14.5, 'font-weight': 800, fill: ACC }); }
+      if (n >= 16) mono(ax.X(16) + 6, ax.Y(0.978) - 10, 'best CV 0.978 (16번째)', { 'font-size': 14.5, 'font-weight': 800, fill: ACC }); }
     if (k === 7) { const op = fade(u, 0.3); lock(BX + wW + 140, 62, false, BAD, 1);
-      grow(BX + wW + 90, 92, 690, 150, E(u, 0.3, 0.9), BAD); card(720, 180, 230, 56, { text: 'test (1회) = 0.961', fs: 17, mono: true, stroke: BAD, fill: BADBG, color: BAD, s: pop(u, 0.9) });
+      grow(BX + wW + 90, 92, 690, 150, E(u, 0.3, 0.9), BAD); card(720, 180, 230, 56, { text: 'test (1회) = 0.956', fs: 17, mono: true, stroke: BAD, fill: BADBG, color: BAD, s: pop(u, 0.9) });
       sub(720, 230, '여러 번 열면 Step 1 의 시드 고르기', fade(u, 1.4), { 'font-size': 14 }); }
     // 아래: 우선순위
     if (pr.length) { tx(500, 288, '성능 개선 우선순위', { 'font-size': 13.5, 'font-weight': 700, fill: MUT });

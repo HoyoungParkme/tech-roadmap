@@ -43,7 +43,7 @@ total = 0
 with sync_playwright() as p:
     b = p.chromium.launch()
     for rel in sys.argv[1:]:
-        pid = pathlib.Path(rel).stem; errs = []
+        pid = pathlib.Path(rel).parts[0] + '_' + pathlib.Path(rel).stem; errs = []   # 주제마다 같은 번호가 있으므로 주제 이름을 붙인다
         pg = b.new_page(viewport={"width": 1440, "height": 900}, reduced_motion="reduce")
         pg.on("console", lambda m: m.type == "error" and errs.append(m.text))
         pg.on("pageerror", lambda e: errs.append(str(e)))

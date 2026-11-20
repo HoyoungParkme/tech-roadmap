@@ -104,23 +104,38 @@ function AnimPane({ state, stepIdx, fold }) {
   );
 }
 
+// 페이지가 RefPanel({ step, stepIdx }) 를 정의하면 그 결과를 그림·코드 아래 전체 폭 "표·정리 보기" 접는 상자에 넣는다.
+// (예전 왼쪽 패널에만 있던 표·링크·목록용. 훅을 쓰지 않는 함수여야 한다. 보여 줄 것이 없으면 null)
 function HybridBody({ step, stepIdx }) {
   const [pick, setPick] = React.useState({ file: null, open: null });
+  const [refOpen, setRefOpen] = React.useState(false);   // 표·정리 보기: 단계를 넘겨도 열린 상태 유지
+  const refBox = { open: refOpen, toggle: () => setRefOpen((o) => !o) };
   const { g } = raGroupOf(stepIdx);
   const cfg = window.RA.cfg || {};
   const file = step.code.filename;
   const dflt = cfg.codeOpen && cfg.codeOpen[g] != null ? cfg.codeOpen[g] : step.code.lang !== 'markdown';
   const open = pick.file === file && pick.open !== null ? pick.open : dflt;
   const fold = { open, file, toggle: () => setPick({ file, open: !open }) };
-  if (open) return (
+  const body = open ? (
     <div className="ra-split grid grid-cols-1 gap-4">
       <AnimPane state={step} stepIdx={stepIdx} fold={fold} />
       <CodeViewer code={step.code} stepIdx={stepIdx} total={STEPS.length} />
     </div>
+  ) : (
+    <AnimPane state={step} stepIdx={stepIdx} fold={fold} />
   );
+  const ref = typeof RefPanel === 'function' ? RefPanel({ step, stepIdx }) : null;
   return (
-    <div className="max-w-5xl mx-auto">
-      <AnimPane state={step} stepIdx={stepIdx} fold={fold} />
+    <div className={open ? '' : 'max-w-5xl mx-auto'}>
+      {body}
+      {ref && (
+        <div className="mt-3 rounded-xl border border-neutral-300 bg-white">
+          <button onClick={refBox.toggle} aria-expanded={refBox.open} className="w-full flex items-center justify-between px-4 py-2 text-xs font-bold text-neutral-700 hover:bg-neutral-50 rounded-xl">
+            <span>📋 {cfg.refTitle || '표·정리 보기'}</span><span className="font-normal text-neutral-500">{refBox.open ? '접기 ▴' : '펼치기 ▾'}</span>
+          </button>
+          {refBox.open && <div className="ra-ref px-4 pb-3 text-xs text-neutral-700 leading-relaxed">{ref}</div>}
+        </div>
+      )}
     </div>
   );
 }

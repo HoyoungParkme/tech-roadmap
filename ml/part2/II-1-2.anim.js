@@ -177,8 +177,8 @@
   // =========================================================
   // 4. 과적합 — 깊이 무제한 vs 가지치기
   // =========================================================
-  // 깊이 무제한 트리(노이즈 14건)의 잎 영역 — 중간점 기준 CART 로 계산한 결과
-  const DEEP = [[0, 2.1, 20, 65, 0], [2.1, 10, 20, 26.5, 0], [2.1, 2.75, 26.5, 65, 1], [2.75, 4.5, 26.5, 65, 0], [4.5, 7.25, 26.5, 65, 1], [7.25, 7.75, 26.5, 65, 0], [7.75, 10, 26.5, 65, 1]];
+  // 깊이 무제한 트리(노이즈 14건)의 잎 영역 — sklearn export_text(deep) 결과 그대로
+  const DEEP = [[0, 2.1, 20, 65, 0], [2.1, 10, 20, 26.5, 0], [2.1, 2.75, 26.5, 65, 1], [2.75, 4.5, 26.5, 65, 0], [4.5, 10, 26.5, 46, 1], [4.5, 10, 46, 48.5, 0], [4.5, 10, 48.5, 65, 1]];
   const STUMP = [[0, 4.5, 20, 65, 0], [4.5, 10, 20, 65, 1]];
   function s4(t, c) { const { k, u } = c;
     const a = plot();
@@ -190,8 +190,9 @@
     regs.forEach(([x0, x1, y0, y1, l]) => region(a, x0, x1, y0, y1, l, op));
     if (regs === CLEAN) { vsplit(a, 4.5, 1, OFF, { sw: 2 }); hsplit(a, 55, 1, OFF, { x1: 4.5, sw: 2 }); hsplit(a, 26.5, 1, OFF, { x0: 4.5, sw: 2 }); }
     if (regs === DEEP) { const g = k === 2 ? E(u, 0.2, 1.4) : 1; vsplit(a, 2.1, g, ACC, { sw: 2 }); hsplit(a, 26.5, g, ACC, { x0: 2.1, sw: 2 });
-      [4.5, 2.75, 7.25, 7.75].forEach((x, i) => vsplit(a, x, k === 2 ? E(u, 0.5 + i * 0.2, 1.4 + i * 0.2) : 1, ACC, { y0: 26.5, sw: 2 }));
-      if (k === 3) [[2.1, 2.75], [7.25, 7.75]].forEach(([x0, x1]) => el('rect', { x: a.X(x0) - 2, y: a.Y(65), width: a.X(x1) - a.X(x0) + 4, height: a.Y(26.5) - a.Y(65), fill: 'none', stroke: BAD, 'stroke-width': 2.6, 'stroke-dasharray': '6 4', opacity: fade(u, 0.3) })); }
+      [4.5, 2.75].forEach((x, i) => vsplit(a, x, k === 2 ? E(u, 0.5 + i * 0.2, 1.4 + i * 0.2) : 1, ACC, { y0: 26.5, sw: 2 }));
+      [46, 48.5].forEach((y, i) => hsplit(a, y, k === 2 ? E(u, 0.9 + i * 0.2, 1.8 + i * 0.2) : 1, ACC, { x0: 4.5, sw: 2 }));
+      if (k === 3) [[2.1, 2.75, 26.5, 65], [4.5, 10, 46, 48.5]].forEach(([x0, x1, y0, y1]) => el('rect', { x: a.X(x0) - 2, y: a.Y(y1) - 2, width: a.X(x1) - a.X(x0) + 4, height: a.Y(y0) - a.Y(y1) + 4, fill: 'none', stroke: BAD, 'stroke-width': 2.6, 'stroke-dasharray': '6 4', opacity: fade(u, 0.3) })); }
     if (regs === STUMP) vsplit(a, 4.5, k === 5 ? E(u, 0.2, 1.0) : 1, ACC);
     points(a, null);
     noise(a, k === 0 ? pop(u, 0.4) : 1, { col: WARN });

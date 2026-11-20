@@ -19,7 +19,7 @@
   // =========================================================
   // 1. 지도학습 — X 옆에 정답 y
   // =========================================================
-  function table(u, k, o) { o = o || {}; const x0 = 40, y0 = 104, cw = 26, rh = 34, Y = ['0', '1', '0', '…'];
+  function table(u, k, o) { o = o || {}; const x0 = 40, y0 = 104, cw = 26, rh = 34, Y = ['1', '1', '0', '…'];
     tx(x0, 82, 'X  (특성 8개)', { 'font-size': 14, 'font-weight': 700, fill: MUT }); tx(x0 + 8 * cw + 18, 82, 'y', { 'font-size': 15, 'font-weight': 800, fill: INFO });
     for (let r = 0; r < 4; r++) { const op = o.enter ? fade(u, 0.2 + r * 0.15) : 1;
       for (let c = 0; c < 8; c++) el('rect', { x: x0 + c * cw, y: y0 + r * rh, width: cw - 3, height: rh - 4, rx: 3, fill: r === 3 ? 'none' : rnd(r * 8 + c) > 0.5 ? ACCBG : SOFT, stroke: r === 3 ? 'none' : GRID, opacity: op });
@@ -35,7 +35,7 @@
     if (k === 0) { table(u, k, { enter: true, yIn: 0 }); pills(640, 110, ['LogisticRegression', 'train_test_split', 'accuracy_score'], u, 0.4, INFO);
       sub(640, 260, '카드는 열렸지만 아직 비어 있다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k <= 2) { table(u, k, { yIn: k === 1 ? fade(u, 0.4) : 1, pair: k === 1 ? fade(u, 1.0) : 0 });
-      if (k === 1) { pill(640, 130, '학습 신호 = 정답 라벨 (X, y)', INFO, pop(u, 1.4), { fs: 15 }); sub(640, 176, 'y = [0, 1, 0, …] ← 이탈 여부', fade(u, 1.8), { 'font-size': 15, fill: INK, class: 'mono' }); }
+      if (k === 1) { pill(640, 130, '학습 신호 = 정답 라벨 (X, y)', INFO, pop(u, 1.4), { fs: 15 }); sub(640, 176, 'y = [1, 1, 0, …] ← 이탈 여부', fade(u, 1.8), { 'font-size': 15, fill: INK, class: 'mono' }); }
       if (k === 2) { const x0 = 440, w = 440, y = 140, sp = E(u, 0.3, 1.1);
         tx(x0, y - 16, '1,000건', { 'font-size': 15, 'font-weight': 800 });
         el('rect', { x: x0, y, width: w * 0.8 - sp * 6, height: 40, rx: 6, fill: INFO, opacity: 0.8 });
