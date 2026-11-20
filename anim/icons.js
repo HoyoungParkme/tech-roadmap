@@ -1,0 +1,21 @@
+/* 플랫폼 아이콘·분류 그림 세트 — 선 굵기 1.6(아이콘)·2.4(그림), 둥근 끝, 분류색 한 가지씩 (anim/platform.css 와 함께) */
+window.ICON = {
+  // 16px 선 아이콘
+  parts: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5l6-3 6 3-6 3z"/><path d="M2 8.5l6 3 6-3"/><path d="M2 11.5l6 3 6-3"/></svg>',
+  pages: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="2" width="10" height="12" rx="2"/><path d="M6 6h4M6 9h4"/></svg>',
+  steps: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="3.5" cy="12" r="1.6"/><circle cx="8" cy="8" r="1.6"/><circle cx="12.5" cy="4" r="1.6"/><path d="M4.8 10.8l2-1.6M9.3 6.8l2-1.6"/></svg>',
+  grid: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2" width="5" height="5" rx="1.5"/><rect x="9" y="2" width="5" height="5" rx="1.5"/><rect x="2" y="9" width="5" height="5" rx="1.5"/><rect x="9" y="9" width="5" height="5" rx="1.5"/></svg>',
+  map: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M1.5 3.5l4-1.5 5 2 4-1.5v10l-4 1.5-5-2-4 1.5z"/><path d="M5.5 2v10M10.5 4v10"/></svg>',
+  play: '<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M5 3.2v9.6a.6.6 0 0 0 .9.5l7.4-4.8a.6.6 0 0 0 0-1L5.9 2.7a.6.6 0 0 0-.9.5z"/></svg>',
+  back: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3L5 8l5 5"/></svg>',
+};
+/* 분류 그림 (64x64): 판 위에 분류의 실제 대상 하나 */
+window.ART = {
+  ai: (c) => `<svg viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="18" fill="${c}" opacity=".14"/><g stroke="${c}" stroke-width="2.4" stroke-linecap="round"><path d="M16 20L32 32M16 32L32 32M16 44L32 32M32 32L48 24M32 32L48 40"/></g><g fill="#fff" stroke="${c}" stroke-width="2.4"><circle cx="16" cy="20" r="5"/><circle cx="16" cy="32" r="5"/><circle cx="16" cy="44" r="5"/><circle cx="32" cy="32" r="6"/><circle cx="48" cy="24" r="5"/><circle cx="48" cy="40" r="5"/></g></svg>`,
+  be: (c) => `<svg viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="18" fill="${c}" opacity=".14"/><g fill="#fff" stroke="${c}" stroke-width="2.4"><rect x="14" y="14" width="36" height="10" rx="3"/><rect x="14" y="27" width="36" height="10" rx="3"/><rect x="14" y="40" width="36" height="10" rx="3"/></g><g fill="${c}"><circle cx="43" cy="19" r="2"/><circle cx="43" cy="32" r="2"/><circle cx="43" cy="45" r="2"/></g></svg>`,
+  fe: (c) => `<svg viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="18" fill="${c}" opacity=".14"/><rect x="12" y="15" width="40" height="34" rx="5" fill="#fff" stroke="${c}" stroke-width="2.4"/><path d="M12 23h40" stroke="${c}" stroke-width="2.4"/><g fill="${c}"><circle cx="17" cy="19" r="1.6"/><circle cx="22" cy="19" r="1.6"/></g><rect x="18" y="29" width="13" height="13" rx="2.5" fill="${c}" opacity=".85"/><path d="M36 31h10M36 36h10M36 41h6" stroke="${c}" stroke-width="2.4" stroke-linecap="round"/></svg>`,
+  data: (c) => `<svg viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="18" fill="${c}" opacity=".14"/><g fill="#fff" stroke="${c}" stroke-width="2.4"><path d="M18 20v24c0 3 6.3 5.5 14 5.5S46 47 46 44V20"/><ellipse cx="32" cy="20" rx="14" ry="5.5"/><path d="M18 32c0 3 6.3 5.5 14 5.5S46 35 46 32" fill="none"/></g></svg>`,
+  ops: (c) => `<svg viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="18" fill="${c}" opacity=".14"/><g fill="#fff" stroke="${c}" stroke-width="2.4" stroke-linejoin="round"><path d="M14 26l10-5 10 5v12l-10 5-10-5z"/><path d="M30 26l10-5 10 5v12l-10 5-10-5z"/></g><path d="M14 26l10 5 10-5M24 31v12M30 26l10 5 10-5M40 31v12" fill="none" stroke="${c}" stroke-width="2.4" stroke-linejoin="round"/></svg>`,
+};
+window.KCOL = { ai: '#7c5cff', be: '#0d9488', fe: '#e0712c', data: '#2f6fdb', ops: '#4b5563' };
+window.KKEY = ['ai', 'be', 'fe', 'data', 'ops'];
