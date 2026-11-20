@@ -51,10 +51,24 @@ with sync_playwright() as p:
         probs = pg.evaluate(PROBE)
         n = pg.evaluate("STEPS.length"); groups = pg.evaluate("STEPS.map((_, i) => raGroupOf(i).k)")
         labels = pg.evaluate("STEPS.map((s, i) => i + '. ' + (s.beat ? s.beat.label : s.title))")
+        # 레슨 화면(A형)이면 문제 데이터도 본다: 확인 문제는 장면 수만큼, 정리는 3~4줄(80자 이하, 줄표 없음), 복습 문제 3개
+        lesson = pg.evaluate("!!window.LESSON")
+        if lesson:
+            probs += pg.evaluate("""(() => { const q = (RA.cfg && RA.cfg.quiz) || [], ng = new Set(STEPS.map((_, i) => raGroupOf(i).g)).size, out = [];
+              if (q.length !== ng) out.push(`확인 문제 ${q.length}개 / 장면 ${ng}개`);
+              q.forEach((x, k) => { if (!x || !x.q || !Array.isArray(x.o) || x.o.length < 2 || x.o.length > 4 || !(x.a >= 0 && x.a < x.o.length) || !x.why) out.push(`확인 문제 ${k + 1} 형식 오류`); });
+              const sm = (RA.cfg && RA.cfg.summary) || [], rv = (RA.cfg && RA.cfg.review) || [];
+              if (sm.length < 3 || sm.length > 4) out.push(`정리 ${sm.length}줄 (3~4줄)`);
+              sm.forEach((t, k) => { if (typeof t !== 'string' || t.length > 80) out.push(`정리 ${k + 1} 너무 김 (${t.length}자)`); if (/[—–]/.test(t)) out.push(`정리 ${k + 1}에 줄표`); });
+              if (rv.length !== 3) out.push(`복습 문제 ${rv.length}개 (3개)`);
+              rv.forEach((x, k) => { if (!x || !x.q || !Array.isArray(x.o) || x.o.length < 2 || x.o.length > 4 || !(x.a >= 0 && x.a < x.o.length) || !x.why) out.push(`복습 문제 ${k + 1} 형식 오류`); });
+              return out; })()""")
         pg.reload(); pg.wait_for_selector(".rp-stage svg g"); pg.wait_for_timeout(500)
         shots = []
         for i in range(n):
-            if i: pg.get_by_role("button", name="다음 단계").click(); pg.wait_for_timeout(250)
+            if i:
+                if lesson: pg.evaluate(f"__lesson.go(__lesson.items.findIndex(x => x.i === {i}))"); pg.wait_for_timeout(250)   # 레슨 화면: 확인 문제를 건너뛰고 단계로 바로
+                else: pg.get_by_role("button", name="다음 단계").click(); pg.wait_for_timeout(250)
             if groups[i] == 0: pg.screenshot(path=str(OUT / f"{pid}_g{sum(1 for x in groups[:i+1] if x == 0) - 1}.png"), full_page=True)
             pth = OUT / f"_tmp_{pid}.png"; pg.locator(".rp-stage").screenshot(path=str(pth)); im = Image.open(pth).convert("RGB")
             shots.append(im.resize((640, int(640 * im.height / im.width))))

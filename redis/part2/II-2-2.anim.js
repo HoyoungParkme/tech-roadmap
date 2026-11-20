@@ -346,5 +346,43 @@
     card(715, 360, 440, 70, { rx: 10, stroke: ACC, sw: 2, s: pop(u, 1.6) });
     mono(715, 366, '"me": {"rank": 1, "score": ' + Math.round(tween(pme, me, u - 0.9)) + '}', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 1.8) }); }
 
-  R.page({ title: 'Set / Sorted Set 들여다보기', scenes: [s1, s2, s3, s4, s5] });
+  // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터, why 는 맞혔을 때 보이는 해설
+  const quiz = [
+    { q: 'Set에 SADD로 "redis"를 두 번 넣으면 멤버는 몇 개가 되나?',
+      o: ['오류가 난다 — 이미 있는 값이다', '2개 — 넣은 만큼 쌓인다', '1개 — 중복은 무시된다'], a: 2,
+      why: 'Set은 중복 없는 집합이라 같은 값을 몇 번 SADD해도 멤버는 하나다. 중복 체크 코드가 필요 없다.' },
+    { q: 'alice와 bob이 둘 다 팔로우하는 사람을 구하는 명령은 무엇인가?',
+      o: ['SINTER', 'SUNION', 'SDIFF'], a: 0,
+      why: 'SINTER는 교집합을 돌려준다. 예제의 결과는 carol 하나이고, SQL JOIN이 필요 없다.' },
+    { q: 'Sorted Set에 이미 있는 멤버 Alice를 새 점수로 다시 ZADD하면 어떻게 되나?',
+      o: ['Alice가 두 번 들어간다', '점수가 새 값으로 덮어써지고 순위가 바로 바뀐다', '기존 점수에 새 점수가 더해진다'], a: 1,
+      why: '멤버는 유일하므로 ZADD는 score 덮어쓰기다(1200 → 1500). 점수를 더하려면 ZINCRBY를 쓴다.' },
+    { q: 'ZREVRANK가 Bob에게 2를 돌려줬다. 화면에 보여 줄 순위는 몇 등인가?',
+      o: ['1등', '2등', '3등'], a: 2,
+      why: 'ZREVRANK는 0부터 센다. 사용자에게 보일 때는 +1 해서 3등이다.' },
+    { q: '일간·주간·월간 리더보드를 따로 운영하는 방법은 무엇인가?',
+      o: ['기간마다 다른 키 이름에 ZINCRBY한다', '한 키의 score 소수점에 기간을 섞는다', '조회할 때 ZRANGEBYSCORE로 기간을 거른다'], a: 0,
+      why: '기간별 리더보드는 로직이 아니라 키 이름으로 나눈다. 점수를 얻으면 세 키에 파이프라인으로 ZINCRBY하고, 일간 키에는 7일 TTL을 건다.' },
+  ];
+
+  // 완료 화면: 정리는 짧은 문장 3~4개, 복습 문제는 장면을 넘나드는 3개
+  const summary = [
+    'Set은 중복 없는 집합이다. 같은 값을 여러 번 SADD해도 멤버는 하나라 중복 검사가 필요 없다.',
+    '교집합, 합집합, 차집합 명령으로 공통 친구나 추천 대상을 SQL JOIN 없이 구한다.',
+    'Sorted Set은 멤버마다 score를 두고 넣는 순간 정렬한다. skip list라 삽입이 O(log N)이다.',
+    '리더보드는 ZINCRBY로 점수를 쌓고 ZREVRANGE와 ZREVRANK로 읽는다. 기간별 순위는 키로 나눈다.',
+  ];
+  const review = [
+    { q: '앱이 ZSCORE로 점수를 읽고 더한 뒤 ZADD로 쓰자, 동시 요청에서 점수가 빠졌다. 가장 맞는 수정은?',
+      o: ['ZADD에 gt 옵션을 붙인다', 'ZINCRBY로 서버에서 더한다', 'ZREVRANK로 순위를 먼저 확인한다'], a: 1,
+      why: '읽고 쓰는 사이에 다른 요청이 끼면 그 점수가 덮어써진다. ZINCRBY는 현재 점수를 읽지 않고 원자적으로 더하며, gt는 더 클 때만 덮어쓰는 옵션이라 누적이 안 된다.' },
+    { q: '친구 추천을 요청마다 큰 Set 두 개의 SINTER로 계산했더니 Redis가 바빠졌다. 가장 맞는 조치는?',
+      o: ['SINTERSTORE로 결과를 저장하고 TTL을 건다', 'SMEMBERS로 둘 다 받아 앱에서 교집합을 구한다', 'Set을 List로 바꿔 저장한다'], a: 0,
+      why: '큰 Set 연산은 결과를 새 키에 저장하고 TTL을 걸어 재사용한다. SMEMBERS로 통째로 받아 오면 O(N) 조회와 전송이 오히려 늘어난다.' },
+    { q: '리더보드 키에 순위 밖 사용자가 계속 쌓인다. 상위 100명만 남기는 명령은?',
+      o: ['ZREMRANGEBYRANK key 0 99', 'ZREM key 100', 'ZREMRANGEBYRANK key 0 -101'], a: 2,
+      why: 'rank는 낮은 점수부터 0으로 센다. 0부터 -101까지 지우면 점수가 높은 100명만 남고, 0 99를 지우면 하위 100명만 빠진다.' },
+  ];
+
+  R.page({ title: 'Set / Sorted Set 들여다보기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

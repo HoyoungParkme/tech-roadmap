@@ -270,5 +270,43 @@
       const x = [130, 330, 520, 680, 820][i]; pill(x, 300 + (i % 2) * 50, s, ACC, pop(u, 1.6 + i * 0.15), { fs: 14 }); });
   }
 
-  R.page({ title: 'Redis Cluster 의 slot 지도', scenes: [s1, s2, s3, s4, s5] });
+  // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터, why 는 맞혔을 때 보이는 해설
+  const quiz = [
+    { q: 'Replica 를 붙여도 해결되지 않는 단일 노드의 한계는?',
+      o: ['노드가 죽었을 때의 가용성', '읽기 부하 분산', '데이터 크기 상한 — 서버 RAM 한 대'], a: 2,
+      why: 'Replica 는 가용성을 올려 주지만 메모리 상한을 올려 주지는 않는다. 256GB 이상이거나 200K ops/s 를 넘기면 Cluster 로 수평 확장한다.' },
+    { q: 'Redis Cluster 에서 키가 어느 노드로 갈지는 어떻게 정해지나?',
+      o: ['CRC16(key) % 16384 로 slot 을 구하고, 그 slot 을 맡은 노드로 간다', '키 이름의 알파벳 순서로 노드를 나눈다', '빈 메모리가 가장 많은 노드로 간다'], a: 0,
+      why: '16384개 slot 을 primary 가 나눠 맡는다(3대면 각 약 5461개). 예를 들어 mykey 는 slot 14687 이라 N3 가 담당한다.' },
+    { q: 'Cluster 에서 MGET user:1 cart:1 이 CROSSSLOT 에러를 낸다. 어떻게 고치나?',
+      o: ['클라이언트 timeout 을 늘린다', '{user:1}:cart 처럼 hashtag 로 같은 slot 에 묶는다', '노드를 하나 더 추가한다'], a: 1,
+      why: '중괄호가 있으면 그 안쪽만 CRC16 대상이라 접두·접미가 달라도 같은 slot(10778)에 모인다. 대신 너무 크게 묶으면 한 노드로 부하가 쏠린다.' },
+    { q: '새 노드 7006 을 add-node 로 합류시킨 직후, 이 노드가 처리하는 트래픽은?',
+      o: ['없다 — slot 을 받기 전까지 아무것도 처리하지 않는다', '곧바로 전체 트래픽의 1/4', '모든 읽기 요청'], a: 0,
+      why: '노드를 띄우기, 합류시키기, slot 주기는 별개 단계다. reshard 로 4096 slot 을 옮겨야 그 slot 의 키와 트래픽이 함께 따라온다.' },
+    { q: 'MOVED 와 ASK 응답은 어떻게 다른가?',
+      o: ['같은 뜻이고 Redis 버전만 다르다', 'ASK 는 영구 이동이라 캐시를 고치고, MOVED 는 이번 요청만 돌려보낸다', 'MOVED 는 영구 이동이라 매핑 캐시를 고치고, ASK 는 이동 중인 slot 의 이번 요청만 돌려보낸다'], a: 2,
+      why: '캐시가 낡으면 MOVED 를 받고 매핑을 갱신한다. ASK 는 reshard 도중 이미 옮겨진 키에만 오며, ASKING 후 한 번만 다시 보내고 캐시는 그대로 둔다.' },
+  ];
+
+  // 완료 화면: 정리는 짧은 문장 3~4개, 복습 문제는 장면을 넘나드는 3개
+  const summary = [
+    '단일 노드의 데이터는 서버 RAM 한 대를 넘을 수 없다. replica를 붙여도 이 상한은 그대로다.',
+    'Cluster는 16384개 slot을 primary들이 나눠 맡는다. 키의 slot은 CRC16(key) % 16384로 정해진다.',
+    'slot이 다른 키는 MGET 같은 multi-key 명령에 같이 못 쓴다. hashtag로 같은 slot에 묶는다.',
+    '노드를 더하면 reshard로 slot을 옮긴다. 클라이언트가 MOVED와 ASK를 따라가 서비스는 멈추지 않는다.',
+  ];
+  const review = [
+    { q: '데이터가 64GB에 한참 못 미치는 서비스가 장애 대비를 이유로 Cluster를 도입하려 한다. 더 맞는 선택은?',
+      o: ['규모와 상관없이 Cluster부터 만든다', 'hashtag로 모든 키를 한 slot에 묶는다', '단일 노드에 replica와 Sentinel을 붙인다'], a: 2,
+      why: '장애 대비는 replica와 Sentinel로 된다. Cluster는 메모리나 처리량이 한 대를 넘을 때 쓰는 것이라, 규모를 재지 않고 들이면 운영 비용만 는다.' },
+    { q: '한 유저의 프로필, 장바구니, 주문을 모두 {user:1} 같은 hashtag로 묶었더니 인기 유저가 있는 노드만 CPU가 높다. 무엇이 문제인가?',
+      o: ['묶는 단위가 너무 커서 한 노드로 부하가 쏠렸다', 'CRC16 계산이 무거워 그 노드가 느려졌다', '매핑 캐시가 낡아 MOVED가 반복된다'], a: 0,
+      why: 'hashtag는 분산을 포기하는 대가로 multi-key를 얻는다. 인기 유저의 데이터가 한 slot에 모이면 그 노드만 뜨거워진다.' },
+    { q: 'Cluster로 옮긴 뒤 일반 Redis 클라이언트로 붙인 앱이 MOVED 에러를 자주 낸다. 가장 맞는 대처는?',
+      o: ['MOVED 문자열을 파싱해 다시 보내는 코드를 곳곳에 넣는다', 'cluster-aware 클라이언트로 바꾸고 시작 노드를 여러 개 준다', 'slot을 노드 하나에 모두 몰아준다'], a: 1,
+      why: 'cluster-aware 클라이언트는 slot 매핑을 캐시해 맞는 노드로 바로 보내고, MOVED를 받으면 스스로 매핑을 고친다. 시작 노드가 여럿이면 한 대가 죽어도 붙는다.' },
+  ];
+
+  R.page({ title: 'Redis Cluster 의 slot 지도', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();
