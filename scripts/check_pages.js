@@ -101,7 +101,13 @@ function checkAnim(Babel, src, full) {
   if (!src.includes('./' + id + '.anim.js')) return id + '.anim.js 를 불러오지 않는다';
   if (!fs.existsSync(anim)) return id + '.anim.js 파일이 없다';
   try { new Function(fs.readFileSync(anim, 'utf8')); } catch (e) { return id + '.anim.js 구문 오류 — ' + e.message; }
-  if (!src.includes('<HybridBody')) return '<HybridBody> 를 쓰지 않는다';
+  if (!src.includes('<HybridBody') && !src.includes('<LessonApp')) return '<LessonApp> 또는 <HybridBody> 를 쓰지 않는다';
+  const LT = /<script type="text\/babel"[^>]*src="([^"]*anim\/lesson\.jsx)"/, lm = src.match(LT);
+  if (src.includes('<LessonApp')) {
+    if (!lm) return 'lesson.jsx 를 불러오지 않는다';
+    try { Babel.transform(fs.readFileSync(path.resolve(path.dirname(full), lm[1]), 'utf8'), { presets: ['react'], filename: 'lesson.jsx' }); } catch (e) { return 'lesson.jsx 구문 오류 — ' + String(e.message).split('\n')[0]; }
+    if (!/window\.LESSON = \{/.test(src)) return 'window.LESSON 이 없다';
+  }
   return null;
 }
 

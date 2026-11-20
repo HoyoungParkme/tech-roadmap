@@ -252,5 +252,43 @@
       if (u > 1.2 + i * 0.3) mono(x0 + 117, y + 5, 'await r.set', { 'font-size': 13.5, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1.2 + i * 0.3) }); });
     mid(730, 330, 'FastAPI 같은 async 서버와 궁합이 좋다', { fill: MUT, opacity: fade(u, 2.2) }); }
 
-  R.page({ title: '터미널과 Redis 안쪽', scenes: [s1, s2, s3, s4, s5] });
+  // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터, why 는 맞혔을 때 보이는 해설
+  const quiz = [
+    { q: 'docker run 한 줄로 띄운 Redis를 운영에 가깝게 만들려면 무엇을 붙여야 하나?',
+      o: ['-d 백그라운드 옵션', '볼륨과 AOF(--appendonly yes)', '-p 6379:6379 포트 연결'], a: 1,
+      why: 'docker run만으로는 재시작하면 데이터가 사라진다. redis-data 볼륨을 /data에 붙이고 AOF를 켜야 데이터가 남는다.' },
+    { q: 'Redis와의 연결이 살아 있는지 가장 간단히 확인하는 방법은 무엇인가?',
+      o: ['DBSIZE로 키 개수를 본다', 'KEYS *로 키 목록을 본다', 'PING을 보내 PONG을 받는다'], a: 2,
+      why: 'PING → PONG이 가장 단순한 health check다. 운영에서 첫 디버깅도 여기서 시작한다.' },
+    { q: 'TTL이 걸린 키에 옵션 없이 SET으로 값을 덮어쓰면 TTL은 어떻게 되나?',
+      o: ['기존 TTL이 함께 사라진다', '남은 TTL이 그대로 유지된다', 'TTL이 처음 값부터 다시 시작된다'], a: 0,
+      why: '기본 SET은 기존 TTL도 날린다. TTL을 지키려면 KEEPTTL을 붙여야 한다.' },
+    { q: '운영 서버에서 키 전체를 훑어야 할 때 써야 하는 명령은 무엇인가?',
+      o: ['KEYS *', 'SCAN (커서 방식)', 'FLUSHDB'], a: 1,
+      why: 'KEYS는 전체를 한 번에 훑어 단일 스레드인 Redis의 모든 요청을 멈춘다. SCAN은 커서로 조금씩 돌려줘 서버를 멈추지 않는다.' },
+    { q: 'redis-py에서 decode_responses=True를 켜면 무엇이 달라지나?',
+      o: ['연결이 비동기 방식으로 바뀐다', '커넥션 풀이 자동으로 만들어진다', '응답이 bytes 대신 str로 온다'], a: 2,
+      why: '켜지 않으면 b"world" 같은 bytes가 와서 문자열 비교가 어긋난다. 그래서 처음부터 켜 두는 편이 낫다.' },
+  ];
+
+  // 완료 화면: 정리는 짧은 문장 3~4개, 복습 문제는 장면을 넘나드는 3개
+  const summary = [
+    'docker run 한 줄이면 Redis가 6379 포트로 뜬다. 데이터를 남기려면 볼륨과 AOF를 붙인다.',
+    'redis-cli로 접속해 PING을 보내고 PONG이 오면 연결은 정상이다.',
+    'SET과 GET이 기본이다. 캐시 키에는 EX로 TTL을 붙여 메모리가 스스로 회수되게 한다.',
+    '운영에서 키를 훑을 땐 KEYS 대신 SCAN을 쓴다. 파이썬에서는 redis-py가 같은 명령을 준다.',
+  ];
+  const review = [
+    { q: '조회수를 파이썬에서 GET으로 읽고 1을 더해 SET했더니 동시 요청에서 숫자가 덜 올랐다. 가장 맞는 수정은?',
+      o: ['decode_responses=True를 켠다', 'INCR로 서버에서 한 번에 올린다', 'SET에 KEEPTTL을 붙인다'], a: 1,
+      why: '읽기와 쓰기 사이에 다른 요청이 끼어 같은 값을 덮어쓴 것이다. INCR는 읽고 더하고 쓰기를 서버에서 한 번에 처리해 경쟁이 생기지 않는다.' },
+    { q: 'SET session:abc 1 EX 60 을 실행하고 만료 시간이 지난 뒤 TTL session:abc 를 보냈다. 결과는?',
+      o: ['-2', '-1', '0'], a: 0,
+      why: 'EX 60으로 건 키는 60초 뒤 스스로 사라진다. 키가 없으면 TTL은 -2를 주고, -1은 키는 있는데 만료가 없을 때다.' },
+    { q: '서버 여러 대 가운데 먼저 온 한 대만 작업을 시작하게 표시를 남기려 한다. 맞는 명령은?',
+      o: ['SET lock:job 1 XX EX 60', 'SET lock:job 1 KEEPTTL', 'SET lock:job 1 NX EX 60'], a: 2,
+      why: 'NX는 키가 없을 때만 저장하므로 처음 온 한 대만 성공하고 나머지는 (nil)을 받는다. EX를 함께 걸면 그 서버가 죽어도 표시가 저절로 풀린다.' },
+  ];
+
+  R.page({ title: '터미널과 Redis 안쪽', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

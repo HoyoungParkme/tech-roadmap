@@ -256,5 +256,43 @@
     [['SETNX', '→ SET NX EX', BAD], ['DEL', '→ Lua owner 확인', WARN], ['단일 노드', '→ Redlock 과반', INFO], ['TTL 만료', '→ fencing token', ACC]].forEach(([a, b, col], i) => { const s = pop(u, 1.2 + i * 0.25), cx = 150 + i * 220;
       card(cx, 290, 200, 76, { rx: 10, stroke: col, s, sw: 2 }); if (s > 0.3) { mono(cx, 284, a, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: col }); tx(cx, 308, b, { 'text-anchor': 'middle', 'font-size': 14, fill: INK }); } }); }
 
-  R.page({ title: '분산 락 시뮬레이션', scenes: [s1, s2, s3, s4, s5] });
+  // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터, why 는 맞혔을 때 보이는 해설
+  const quiz = [
+    { q: 'SETNX 로만 락을 잡은 프로세스가 OOM 으로 죽으면 어떻게 되나?',
+      o: ['Redis 가 알아서 락을 풀어 준다', '락 키가 영원히 남아 아무도 락을 못 잡는다', '다음 요청자가 락을 덮어쓴다'], a: 1,
+      why: 'SETNX 에는 만료가 없고 해제는 DEL 을 부르는 코드에만 달려 있다. 주인이 죽으면 사람이 키를 지울 때까지 P2 는 계속 0 을 받는 데드락이 된다.' },
+    { q: 'SETNX 와 EXPIRE 두 줄 대신 SET key val NX EX 30 한 명령을 쓰는 이유는?',
+      o: ['두 명령 사이에 죽으면 만료 없는 락이 남기 때문', 'EXPIRE 는 30초를 지정할 수 없기 때문', '한 명령이 메모리를 덜 쓰기 때문'], a: 0,
+      why: '"없을 때만 쓰기"와 "만료 설정"이 한 번에 일어나야 한다. 둘로 쪼개면 그 틈에 holder 가 죽어 다시 데드락이 난다.' },
+    { q: '락을 풀 때 GET-비교-DEL 을 Lua 스크립트로 묶는 이유는?',
+      o: ['Lua 가 DEL 보다 빠르게 키를 지워서', 'Cluster 에서는 DEL 을 쓸 수 없어서', 'GET 과 DEL 사이에 TTL 이 끝나 남의 락을 지우는 틈을 없애려고'], a: 2,
+      why: 'Redis 는 스크립트 하나를 통째로 단일 실행하므로 확인과 삭제 사이에 끼어들 수 없다. 내 token 이 아니면 0 을 돌려주고 아무것도 지우지 않는다.' },
+    { q: 'Redlock 이 락을 확보했다고 판단하는 조건은?',
+      o: ['5대 모두에서 성공했을 때', '서로 독립인 5대 중 3대 이상에서 성공하고, 걸린 시간이 TTL 보다 짧을 때', 'primary 에서 성공하고 replica 4대로 복제됐을 때'], a: 1,
+      why: '과반(3/5)만 되면 두 대가 죽거나 느려도 진행한다. 획득에 TTL 이상 걸렸다면 남은 TTL 이 없으므로 실패로 보고 전 노드에서 해제한다.' },
+    { q: 'GC pause 로 락이 만료된 P1 의 늦은 쓰기를 fencing token 은 어떻게 막나?',
+      o: ['TTL 을 GC pause 보다 길게 늘린다', 'Redis 가 만료된 락의 쓰기를 거부한다', '저장소가 최근 번호보다 작은 token 의 쓰기를 거부한다'], a: 2,
+      why: '락마다 단조 증가 번호를 주면 P2 의 34 는 통과하고 늦게 온 P1 의 33 은 거부된다. 이 검증은 Redis 가 아니라 DB/스토리지가 해 줘야 한다.' },
+  ];
+
+  // 완료 화면: 정리는 짧은 문장 3~4개, 복습 문제는 장면을 넘나드는 3개
+  const summary = [
+    'SETNX만 쓴 락은 주인이 죽으면 아무도 풀 수 없다. 락에는 반드시 만료가 있어야 한다.',
+    'SET NX EX 한 명령으로 잡으면 주인이 죽어도 30초 뒤 Redis가 락을 회수한다.',
+    '작업이 TTL보다 길면 남의 락을 지울 수 있다. 값에 token을 넣고 Lua로 확인한 뒤 지운다.',
+    '대부분은 redis-py Lock으로 충분하다. 두 번 실행되면 안 되는 작업은 DB 트랜잭션으로 막는다.',
+  ];
+  const review = [
+    { q: '락 TTL을 30초로 잡았는데 작업이 가끔 그보다 오래 걸린다. 가장 맞는 대처는?',
+      o: ['처음부터 TTL을 아주 길게 잡는다', '작업 중에 lock.extend로 TTL을 늘려 간다', '해제를 Lua 대신 DEL로 바꾼다'], a: 1,
+      why: 'TTL을 길게 잡으면 주인이 죽었을 때 그만큼 오래 막힌다. extend는 token을 확인하는 Lua라 내 락일 때만 늘어난다.' },
+    { q: 'primary와 replica로 된 Redis에서 락을 잡았는데, failover 직후 두 프로세스가 같은 락을 쥐었다. 원인은?',
+      o: ['해제 Lua가 token을 비교하지 않았다', 'SET NX EX 대신 SETNX를 썼다', '락 키가 replica로 넘어가기 전에 primary가 죽었다'], a: 2,
+      why: '복제는 비동기라 승격된 replica에 락 정보가 없을 수 있다. Redlock은 서로 독립인 노드 과반에서 락을 잡아 이 구멍을 줄인다.' },
+    { q: '두 번 실행되면 돈이 잘못 나가는 작업인데 GC pause도 가끔 길다. 세 가지 중 가장 맞는 선택은?',
+      o: ['DB 트랜잭션이나 fencing token으로 쓰기를 막는다', 'redis-py Lock의 TTL만 넉넉히 늘린다', 'Redlock으로 바꿔 노드 수를 늘린다'], a: 0,
+      why: 'TTL 기반 락은 멈춰 있던 주인에게 만료를 알려 줄 수 없어 노드를 늘려도 둘이 동시에 일할 수 있다. 중복이 절대 안 되면 저장소가 쓰기를 거부해야 한다.' },
+  ];
+
+  R.page({ title: '분산 락 시뮬레이션', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

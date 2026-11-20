@@ -4,7 +4,7 @@
 #  - stage.jsx 다음에 ../../anim/lesson.jsx
 #  - 페이지의 App 은 <LessonApp /> 한 줄이 된다 (머리·단계 막대·버튼은 lesson.jsx 가 그린다)
 # 이전/다음 장과 제목은 주제 페이지(<topic>/index.html)의 SECTIONS 에서 읽는다. 이미 바뀐 페이지는 건너뛴다.
-import json, pathlib, re, sys
+import html, json, pathlib, re, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -19,6 +19,7 @@ def sections(topic):
     return name, [{"id": i, "title": t, "file": f} for i, _, t, f in items]
 
 def text_of(jsx):
+    jsx = html.unescape(jsx)
     t = re.sub(r"<[^>]+>", " ", jsx); t = re.sub(r"\{[^{}]*\}", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
@@ -37,7 +38,8 @@ for arg in sys.argv[1:]:
     h1 = re.search(r"<h1[^>]*>([\s\S]*?)</h1>", app); sub = re.search(r"</h1>\s*<p[^>]*>([\s\S]*?)</p>", app)
     wrap = re.search(r"\{isLast && \(([\s\S]*?)\n\s*\)\}", app)
     wrap_t = text_of(wrap.group(1)) if wrap else ""
-    wrap_t = re.sub(r"^[✅\s]*핵심 정리\s*", "", wrap_t).strip()
+    wrap_t = html.unescape(wrap_t)
+    wrap_t = re.sub(r"^[^\w가-힣\"']*(?:핵심\s*정리|정리)\s*[—–:-]?\s*", "", wrap_t).strip()   # 맨 앞 "✅/🎓 핵심 정리 —" 같은 머리는 뺀다
     meta = {"topic": topic, "topicName": name, "topicHref": up + "index.html", "id": pid, "title": items[idx]["title"],
             "sub": text_of(sub.group(1)) if sub else "", "path": here,
             "prev": link(items[idx - 1] if idx > 0 else None), "next": link(items[idx + 1] if idx + 1 < len(items) else None),

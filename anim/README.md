@@ -63,3 +63,22 @@ python scripts/check_anim.py redis/part1/I-1-1.html   # 콘솔 오류, 무대 �
 ```
 
 자동 점검은 글자와 도형이 겹치는 것은 못 잡는다. 캡처 모음을 눈으로 본다.
+
+---
+
+# 플랫폼 표준 (A 레슨형) — 2026-11
+
+레퍼런스: Brilliant. 설계도 원본은 저장소 밖 디자인 작업 폴더의 DESIGN.md, 요약은 아래.
+
+| 화면 | 파일 | 만드는 법 |
+|---|---|---|
+| 첫 화면 | `index.html` + `anim/home.js` | `python scripts/build_hub.py` (CATS 리터럴은 그대로 옮긴다, ANIM 장 수를 다시 센다) |
+| 주제 페이지(학습 경로) | `<주제>/index.html` + `anim/topic.js` | `python scripts/to_topic.py [<주제>…]` (예전 노트의 SECTIONS 를 읽어 다시 만든다) |
+| 챕터(레슨) | 챕터 html + `anim/lesson.jsx` | `python scripts/to_lesson.py <페이지>…` (애니메이션 틀이 붙은 페이지만) |
+
+- 공용 색·부품: `anim/platform.css` (`pf-` 접두사), 아이콘·분류 그림: `anim/icons.js`
+- 진도: `localStorage['trn-read-<주제>'][장 id] = true` (레슨 완료 화면에서 기록), 이어서 보기: `trn-last`
+- 챕터 레슨: 한 화면에 한 단계. 장면(Step) 끝마다 확인 문제, 끝에 완료 화면(`window.LESSON.wrap`).
+- 코드: 그 단계의 강조 줄 두세 줄만 그림 아래에, 전체는 접기. 코드 파일이 마크다운(설명 문서)이면 코드를 보이지 않는다.
+- 확인 문제: `<id>.anim.js` 의 `RA.page({ …, quiz: [{ q, o:[…], a, why }] })` — 장면 수만큼, 그 장면 내용으로만, 답 위치는 섞는다.
+- 새 주제를 애니메이션으로 바꿀 때 순서: `anim_convert.py` → 장면(`<id>.anim.js`)·확인 문제 작성 → `to_lesson.py` → `to_topic.py <주제>` → `build_hub.py` → `check_anim.py`·`check_pages.js`

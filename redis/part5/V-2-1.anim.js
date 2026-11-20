@@ -487,5 +487,43 @@
     tx(40, 336, '본문 ← summary', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 1.4) });
     grow(196, 295, 360, 295, E(u, 0.9, 1.2), ACC); grow(184, 331, 360, 331, E(u, 1.4, 1.7), ACC); }
 
-  R.page({ title: 'Redis 모니터링 콘솔', scenes: [s1, s2, s3, s4, s5] });
+  // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터, why 는 맞혔을 때 보이는 해설
+  const quiz = [
+    { q: 'INFO stats 의 keyspace_hits 와 keyspace_misses 로 구하는 값은?',
+      o: ['캐시 히트율 = hits / (hits + misses)', '메모리 단편화 비율', '복제 지연 시간'], a: 0,
+      why: '예시의 히트율은 95.0% 다. 누적값이라 천천히 움직이므로 급락을 보려면 rate() 로 최근 값만 봐야 한다.' },
+    { q: 'SLOWLOG 에 기록되는 소요 시간에 들어가는 것은?',
+      o: ['네트워크 왕복 시간', '명령을 실행한 시간만', '앞 명령을 기다린 대기 시간'], a: 1,
+      why: 'SLOWLOG 는 실행 구간만 잰다(기본 임계 10ms). 클라이언트가 느리다는데 SLOWLOG 가 비어 있다면 네트워크나 대기열 쪽을 의심한다.' },
+    { q: '운영 서버에서 MONITOR 를 오래 켜 두면 안 되는 이유는?',
+      o: ['SLOWLOG 기록이 꺼지기 때문', '연결된 클라이언트가 모두 끊기기 때문', '모든 명령을 복사해 내보내 CPU 가 50% 넘게 오르기 때문'], a: 2,
+      why: 'MONITOR 는 디버그 전용이다. 쓰더라도 timeout 10 처럼 짧게 자르고, 평소에는 CLIENT LIST 와 commandstats 로 대신한다.' },
+    { q: 'redis_exporter + Prometheus + Grafana 구성에서 redis_exporter 가 맡는 일은?',
+      o: ['대시보드를 그린다', 'Redis INFO 를 읽어 9121 의 /metrics 에 Prometheus 형식으로 내놓는다', '알람을 Slack 으로 보낸다'], a: 1,
+      why: 'exporter 가 번역하고, Prometheus 가 30초마다 긁어(pull) 시계열로 쌓고, Grafana 가 그 데이터를 그린다.' },
+    { q: 'RedisDown 알람 규칙에 for: 30s 를 붙이는 이유는?',
+      o: ['스크랩 한 번 실패 같은 순간 끊김에 알람이 울리지 않게 하려고', 'Redis 재시작에 정확히 30초가 걸려서', 'Slack 전송 한도를 넘지 않으려고'], a: 0,
+      why: 'for 절이 없으면 스크랩 한 번 실패에도 알람이 울린다. 히트율 알람도 배포 직후의 자연스러운 하락을 거르려고 10분을 둔다.' },
+  ];
+
+  // 완료 화면: 정리는 짧은 문장 3~4개, 복습 문제는 장면을 넘나드는 3개
+  const summary = [
+    '장애가 나면 INFO부터 본다. 메모리, 연결, 히트율, 복제 상태가 한 번에 나온다.',
+    'SLOWLOG는 실행이 10ms를 넘은 명령을 남긴다. KEYS 같은 단골 범인은 SCAN으로 바꾼다.',
+    'MONITOR는 모든 명령을 복사해 CPU를 크게 쓴다. timeout으로 짧게만 켜고 평소엔 commandstats를 본다.',
+    'exporter, Prometheus, Grafana로 지표를 쌓는다. 알람에는 for 절을 둬 지속되는 문제만 알린다.',
+  ];
+  const review = [
+    { q: '히트율 패널은 95% 근처로 평온한데 지난 5분 동안 DB 조회가 크게 늘었다. 패널 식에서 먼저 의심할 것은?',
+      o: ['누적 Counter를 rate() 없이 그대로 나눴다', 'scrape 간격을 30초로 잡았다', 'fragmentation_ratio가 1.5를 넘었다'], a: 0,
+      why: 'hits와 misses는 서비스 시작 이후의 누적값이라 그냥 나누면 긴 평균이 나와 급락이 묻힌다. rate()로 최근 구간만 봐야 한다.' },
+    { q: 'OPS가 높은 운영 서버에서 누군가 FLUSHDB를 쳤다. 범인 클라이언트를 찾는 가장 맞는 순서는?',
+      o: ['MONITOR를 밤새 켜 두고 다음 날 아침 로그를 훑는다', 'CLIENT LIST로 좁히고 MONITOR는 timeout으로 잠깐만 켠다', 'SLOWLOG RESET으로 비우고 다시 일어나기를 기다린다'], a: 1,
+      why: 'MONITOR는 바쁠수록 비용이 커져 오래 켜 두면 안 된다. 상시 부담이 없는 CLIENT LIST로 접속자와 마지막 명령을 먼저 본다.' },
+    { q: '메모리 90% 알람이 울렸을 땐 이미 늦은 편이다. eviction이 시작되기 전에 알아채려면?',
+      o: ['80% 경고 알람을 함께 둔다', '초당 evicted_keys가 늘기 시작하면 알린다', 'redis_up 알람만 남긴다'], a: 0,
+      why: 'eviction은 maxmemory에 닿아야 시작되니, evicted_keys가 움직였을 땐 이미 키가 지워지고 있다. 더 낮은 80% 경고가 손쓸 여유를 준다.' },
+  ];
+
+  R.page({ title: 'Redis 모니터링 콘솔', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

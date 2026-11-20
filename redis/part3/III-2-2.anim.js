@@ -227,5 +227,43 @@
       mono(120, 336, 'eventually_consistent=' + (on ? 'True' : 'False'), { 'text-anchor': 'middle', 'font-size': 13.5, 'font-weight': 700, fill: on ? INFO : ACC });
       if (!on) dot(route(0), seg(u, 1.5, 2.2), ACC, 8); } }
 
-  R.page({ title: '복제 시뮬레이션', scenes: [s1, s2, s3, s4, s5] });
+  // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터, why 는 맞혔을 때 보이는 해설
+  const quiz = [
+    { q: 'primary-replica 구성에서 replica 에 SET 을 보내면 어떻게 되나?',
+      o: ['primary 로 자동 전달된다', 'replica 에만 저장되고 나중에 primary 로 올라간다', 'READONLY 에러로 거부된다'], a: 2,
+      why: 'replica 는 읽기 전용이 기본값(replica-read-only yes)이라 GET 은 되지만 SET 은 READONLY 에러다. 쓰기는 primary 에만 보낸다.' },
+    { q: 'Redis 기본 복제가 "비동기"라는 것은 무슨 뜻인가?',
+      o: ['replica 에 전파가 끝나야 클라이언트에 응답한다', 'primary 가 먼저 응답하고 replica 로는 그 뒤에 전파한다', 'replica 가 1분마다 전체 데이터를 다시 받는다'], a: 1,
+      why: 'primary 가 응답한 다음 전파하므로 1ms~수초의 시차(lag)가 생길 수 있다. 전파를 확인하고 싶으면 WAIT 를 쓴다.' },
+    { q: 'Sentinel 설정의 quorum 2 는 무엇을 뜻하나?',
+      o: ['primary 다운이라고 합의(odown)하는 데 필요한 최소 Sentinel 수', 'replica 를 최대 2대까지 승격할 수 있다', 'Sentinel 이 데이터 사본을 2벌씩 가진다'], a: 0,
+      why: '각 Sentinel 이 의심(sdown)하고 quorum 만큼 동의해야 odown 으로 확정된다. 한 대의 오판으로 failover 가 일어나지 않게 하는 장치이고, Sentinel 은 데이터를 갖지 않는다.' },
+    { q: 'replica lag 을 꼭 감시해야 하는 가장 큰 이유는?',
+      o: ['lag 이 크면 replica 메모리가 두 배로 늘기 때문', 'failover 때 승격된 replica 가 뒤처진 만큼 데이터가 사라지기 때문', 'lag 이 크면 exporter 가 지표를 못 읽기 때문'], a: 1,
+      why: 'failover 때는 가장 최신 replica 가 승격되지만, 그 replica 도 뒤처진 만큼의 데이터는 없다. 그래서 lag 모니터링이 데이터 손실을 미리 가늠하는 핵심이다.' },
+    { q: '읽기를 replica 로 나눌 때 primary 에 남겨야 하는 읽기는?',
+      o: ['인기 글 본문', '검색 결과', '쓰기 직후 읽기 · 잔고 · 락'], a: 2,
+      why: 'replica 는 lag 이 있어 쓰고 바로 읽으면 아직 안 넘어온 값을 볼 수 있다. 정확성이 중요한 읽기만 primary 로 남기고 나머지는 replica 로 보낸다.' },
+  ];
+
+  // 완료 화면: 정리는 짧은 문장 3~4개, 복습 문제는 장면을 넘나드는 3개
+  const summary = [
+    'replica 쪽에 replicaof 한 줄을 적으면 전체 동기화 뒤 쓰기가 실시간으로 전파된다.',
+    '복제는 비동기라 lag이 생긴다. failover로 승격된 replica도 뒤처진 만큼은 잃는다.',
+    'Sentinel 3대가 다운에 합의하면 가장 최신 replica를 승격한다. 클라이언트는 Sentinel에 주소를 묻는다.',
+    '쓰기는 primary에만 보낸다. 쓰기 직후나 잔고 같은 읽기만 남기고 나머지 읽기를 replica로 나눈다.',
+  ];
+  const review = [
+    { q: 'Sentinel이 failover를 끝냈는데도 앱이 계속 Redis 연결 오류를 낸다. 먼저 의심할 것은?',
+      o: ['quorum이 2라서 승격이 취소됐다', '앱이 옛 primary 주소를 코드에 박아 두었다', 'replica가 아직 전체 동기화 중이다'], a: 1,
+      why: '승격과 재배선은 Sentinel이 하지만 주소를 박아 둔 클라이언트는 그 사실을 모른다. master_for로 현재 primary를 물어야 failover가 앱까지 이어진다.' },
+    { q: '쓰기가 많은 서비스에서 짧은 네트워크 끊김 뒤 replica가 매번 RDB 전체를 다시 받는다. 손볼 곳은?',
+      o: ['min-replicas-to-write 값', 'Sentinel의 quorum', 'repl-backlog-size'], a: 2,
+      why: '끊긴 동안 빠진 쓰기가 backlog(기본 1MB) 안에 남아 있어야 PSYNC로 그만큼만 받는다. 쓰기량이 backlog를 넘기면 짧은 끊김도 전체 동기화가 된다.' },
+    { q: '읽기를 replica로 나눈 뒤, 프로필을 고친 직후 다시 조회하면 가끔 옛 값이 보인다. 원인과 대처로 맞는 것은?',
+      o: ['비동기 복제의 lag이다. 쓰기 직후 읽기는 primary에서 한다', 'replica가 READONLY라 쓰기가 버려졌다. replica에도 쓴다', 'Sentinel이 failover 중이었다. quorum을 1로 낮춘다'], a: 0,
+      why: 'primary가 먼저 응답하고 replica로는 그 뒤에 전파하므로, 쓰자마자 replica를 읽으면 아직 안 넘어온 값을 볼 수 있다. 쓰기는 애초에 primary로만 간다.' },
+  ];
+
+  R.page({ title: '복제 시뮬레이션', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();
