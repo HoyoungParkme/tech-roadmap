@@ -1,8 +1,8 @@
 /**
- * 모듈: redis/anim/engine.js
- * 목적: Redis 챕터 페이지의 애니메이션 무대(SVG 960×420)를 그리는 도구 모음.
+ * 모듈: anim/engine.js (모든 주제 공용)
+ * 목적: 챕터 페이지의 애니메이션 무대(SVG 960×420)를 그리는 도구 모음.
  *       페이지마다 <id>.anim.js 가 RA.page({...}) 로 장면 5개를 등록하고,
- *       ../anim/stage.jsx 의 AnimStage 가 beat 가 바뀔 때마다 RA.render 로 그린다.
+ *       ../../anim/stage.jsx 의 AnimStage 가 beat 가 바뀔 때마다 RA.render 로 그린다.
  *
  * 시간 규칙: 한 장면(Step)의 beat k 는 장면 시각 [k*BEAT, (k+1)*BEAT) 구간을 차지한다.
  *   그리기 함수는 draw(t, c) 하나다. t 는 장면 시각, c 는 { k, u, n, beat, prev, steps } 이며
@@ -141,6 +141,39 @@
     el('rect', { x, y, width: w, height: h, rx: 8, fill: SOFT, stroke: GRID, 'stroke-width': 1.5, opacity: op });
     lines.forEach((s, i) => spans(x + 18, y + 14 + fs + i * lh, tokens(s), { 'font-size': fs, opacity: op })); return { w, h }; }
 
+  // ---------- 그래프 (ML·데이터 주제용) ----------
+  // 좌표축: 범위 o.x=[min,max], o.y=[min,max]. 돌려준 X(v)/Y(v) 로 값→좌표. o.xl/o.yl 축 이름, o.xt/o.yt 눈금 값 배열
+  function axes(x, y, w, h, o) { o = o || {}; const [x0, x1] = o.x || [0, 1], [y0, y1] = o.y || [0, 1];
+    const X = (v) => x + ((v - x0) / (x1 - x0)) * w, Y = (v) => y + h - ((v - y0) / (y1 - y0)) * h;
+    el('line', { x1: x, y1: y + h, x2: x + w, y2: y + h, stroke: MUT, 'stroke-width': 1.8 }); el('line', { x1: x, y1: y, x2: x, y2: y + h, stroke: MUT, 'stroke-width': 1.8 });
+    (o.xt || []).forEach((v) => { el('line', { x1: X(v), y1: y + h, x2: X(v), y2: y + h + 5, stroke: MUT }); mono(X(v), y + h + 20, String(v), { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' }); });
+    (o.yt || []).forEach((v) => { el('line', { x1: x - 5, y1: Y(v), x2: x, y2: Y(v), stroke: MUT }); mono(x - 9, Y(v) + 5, String(v), { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end' }); });
+    if (o.grid) (o.yt || []).forEach((v) => el('line', { x1: x, y1: Y(v), x2: x + w, y2: Y(v), stroke: GRID, 'stroke-width': 1, 'stroke-dasharray': '3 4' }));
+    if (o.xl) tx(x + w, y + h + 40, o.xl, { 'font-size': 14, fill: MUT, 'text-anchor': 'end', 'font-weight': 600 });
+    if (o.yl) tx(x, y - 12, o.yl, { 'font-size': 14, fill: MUT, 'font-weight': 600 });
+    return { X, Y, x, y, w, h }; }
+  // 점 찍기: pts [[vx, vy, 색(선택), 모양 'o'|'x'(선택)]], u(0→1)만큼 앞에서부터 나타남
+  function scatter(ax, pts, o) { o = o || {}; const u = o.u ?? 1, r = o.r || 6, n = pts.length;
+    pts.forEach(([vx, vy, col, sh], i) => { const s = clamp(u * n - i); if (s <= 0) return; const cx = ax.X(vx), cy = ax.Y(vy), c = col || o.col || ACC;
+      if (sh === 'x') el('path', { d: `M${cx - r},${cy - r} L${cx + r},${cy + r} M${cx + r},${cy - r} L${cx - r},${cy + r}`, stroke: c, 'stroke-width': 2.5, opacity: s });
+      else el('circle', { cx, cy, r: r * (0.4 + 0.6 * s), fill: o.hollow ? PANEL : c, stroke: c, 'stroke-width': 2, opacity: s }); }); }
+  // 꺾은선: pts [[vx, vy]] 를 u 만큼 그려 나감
+  function line(ax, pts, u, col, o) { o = o || {}; if (u <= 0 || pts.length < 2) return; const n = pts.length - 1, k = clamp(u) * n, i = Math.floor(k);
+    const ps = pts.slice(0, i + 1).map(([a, b]) => [ax.X(a), ax.Y(b)]); if (i < n) { const [a0, b0] = pts[i], [a1, b1] = pts[i + 1], f = k - i; ps.push([ax.X(lerp(a0, a1, f)), ax.Y(lerp(b0, b1, f))]); }
+    el('polyline', { points: ps.map((p) => p.join(',')).join(' '), fill: 'none', stroke: col || ACC, 'stroke-width': o.sw || 2.6, 'stroke-dasharray': o.dash, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', opacity: o.op ?? 1 }); }
+  // 행렬/히트맵: m[행][열] 숫자, 칸 크기 cs. 진할수록 큰 값(o.max 기준). o.rows/o.cols 머리글, o.fmt 값 표기, o.hi(r,c) 강조
+  function heat(x, y, m, cs, o) { o = o || {}; const max = o.max ?? Math.max(...m.flat().map(Math.abs)) ?? 1, fs = o.fs || 14.5;
+    m.forEach((row, r) => row.forEach((v, c) => { const cx = x + c * cs, cy = y + r * cs, a = clamp(Math.abs(v) / (max || 1)), hi = o.hi && o.hi(r, c);
+      el('rect', { x: cx, y: cy, width: cs - 3, height: cs - 3, rx: 4, fill: v < 0 ? C.BAD : o.col || ACC, opacity: 0.12 + 0.75 * a });
+      if (hi) el('rect', { x: cx - 1, y: cy - 1, width: cs - 1, height: cs - 1, rx: 5, fill: 'none', stroke: INK, 'stroke-width': 2.5 });
+      mono(cx + (cs - 3) / 2, cy + (cs - 3) / 2 + fs * 0.36, o.fmt ? o.fmt(v) : String(v), { 'font-size': fs, 'text-anchor': 'middle', 'font-weight': 700, fill: a > 0.6 ? PANEL : INK }); }));
+    (o.cols || []).forEach((s, c) => tx(x + c * cs + (cs - 3) / 2, y - 10, s, { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', 'font-weight': 600 }));
+    (o.rows || []).forEach((s, r) => tx(x - 10, y + r * cs + (cs - 3) / 2 + 5, s, { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', 'font-weight': 600 })); }
+  // 막대 하나: 값 v / 최대 max, 길이 w. 끝에 값 표기
+  function hbar(x, y, w, v, max, o) { o = o || {}; const h = o.h || 18, len = Math.max(2, (w * clamp(v / (max || 1))) * (o.u ?? 1));
+    el('rect', { x, y, width: w, height: h, rx: 4, fill: SOFT }); el('rect', { x, y, width: len, height: h, rx: 4, fill: o.col || ACC });
+    if (o.label !== false) mono(x + w + 8, y + h * 0.5 + 5, o.text ?? String(v), { 'font-size': 14, 'font-weight': 700, fill: o.col || INK }); }
+
   // ---------- 무대 ----------
   function defs(svg) { if (svg.querySelector('#ra-ah')) return; const d = el('defs', {}, svg);
     [['ra-ah', MUT], ['ra-ahb', ACC], ['ra-ahr', C.BAD]].forEach(([id, col]) => { const m = el('marker', { id, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto' }, d); el('path', { d: 'M0,0 L10,5 L0,10 z', fill: col }, m); }); }
@@ -149,6 +182,7 @@
     BEAT, C, el, tx, clamp, seg, ease, E, lerp, spring, pop, fade, bump, tw, tween,
     G, card, spans, mono, sub, lbl, pill, banner, grow, fly, dot, cells, kvTable, zone,
     server, dbIcon, redisBox, person, crowd, browser, cross, check, lock, clock, meters, terminal, tokens, snippet,
+    axes, scatter, line, heat, hbar,
     cfg: null,
     // 페이지 장면 등록: { title, scenes: [draw × 장면 수], codeOpen?: [bool…], vb?: [string…] }
     page(cfg) { RA.cfg = cfg; },

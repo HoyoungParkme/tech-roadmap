@@ -1,6 +1,6 @@
 /**
- * 모듈: redis/anim/stage.jsx  (페이지의 본 스크립트보다 먼저 type="text/babel" 로 불린다)
- * 목적: Redis 챕터 페이지의 본문 레이아웃 "C안".
+ * 모듈: anim/stage.jsx (모든 주제 공용)  (페이지의 본 스크립트보다 먼저 type="text/babel" 로 불린다)
+ * 목적: 챕터 페이지의 본문 레이아웃 "C안".
  *   - 코드가 필요한 단계: 왼쪽 애니메이션 + 오른쪽 CodeViewer
  *   - 코드가 필요 없는 단계(기본: 마크다운 문서): 애니메이션을 크게, 코드는 접힘
  *   - "코드 접기 / 코드 보기" 버튼으로 언제든 바꾼다. 파일이 바뀌면 기본값으로 돌아간다.
@@ -69,6 +69,15 @@ function RaBeatNote({ state }) {
   );
 }
 
+// 페이지 데이터의 alert({tone, text}) — 예전 왼쪽 패널이 보여 주던 설명 상자
+const RA_ALERT = {
+  info: { background: '#eff6ff', borderColor: '#93c5fd', color: '#1e3a8a' },
+  good: { background: '#f0fdf4', borderColor: '#86efac', color: '#14532d' },
+  warn: { background: '#fffbeb', borderColor: '#fcd34d', color: '#78350f' },
+  danger: { background: '#fef2f2', borderColor: '#fca5a5', color: '#7f1d1d' },
+  bad: { background: '#fef2f2', borderColor: '#fca5a5', color: '#7f1d1d' },
+};
+
 function AnimPane({ state, stepIdx, fold }) {
   const tones = typeof TONE !== 'undefined' ? TONE : {};
   const t = tones[state.verdictTone] || tones.warn || { badge: 'bg-amber-200 text-amber-800' };
@@ -87,6 +96,9 @@ function AnimPane({ state, stepIdx, fold }) {
       <AnimStage stepIdx={stepIdx} />
       <RaBeatNote state={state} />
       {typeof SummaryTable !== 'undefined' && <SummaryTable summary={state.summary} />}
+      {state.alert && state.alert.text && state.alert.text !== state.keyPoint && (
+        <div className="mt-3 text-xs rounded p-2 border" style={RA_ALERT[state.alert.tone] || RA_ALERT.info}>{state.alert.text}</div>
+      )}
       {state.keyPoint && <div className="mt-3 text-xs text-neutral-800 bg-neutral-100 border border-neutral-300 rounded p-2">💡 {state.keyPoint}</div>}
     </div>
   );

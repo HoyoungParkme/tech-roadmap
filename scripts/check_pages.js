@@ -9,7 +9,7 @@
  *   1) Babel 구문 오류      → 페이지가 통째로 빈 화면이 된다 (HTTP 200 이라 눈에 안 띔)
  *   2) hljs 가 React 자식 덮어쓰기 → 코드 패널이 통째로 빈다
  *   3) textContent 리셋 누락  → 스텝을 넘겨도 코드가 한 박자 뒤처진다
- *   4) 애니메이션 틀(redis/anim) 페이지의 장면 파일 누락·구문 오류
+ *   4) 애니메이션 틀(anim/) 페이지의 장면 파일 누락·구문 오류
  *
  * 주요 의존성: @babel/standalone (CI 에서 npm i 로 설치, 페이지와 같은 7.25.6)
  * 실행: node scripts/check_pages.js
@@ -89,7 +89,7 @@ function checkTextContentReset(src) {
   return null;
 }
 
-/** 4) 애니메이션 틀(redis/anim)을 쓰는 페이지: 장면 파일이 있고 JS 로 읽히는가 */
+/** 4) 애니메이션 틀(anim/)을 쓰는 페이지: 장면 파일이 있고 JS 로 읽히는가 */
 const ANIM_TAG = /<script type="text\/babel"[^>]*src="([^"]*anim\/stage\.jsx)"/;
 function checkAnim(Babel, src, full) {
   const m = src.match(ANIM_TAG);
