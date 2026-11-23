@@ -40,6 +40,39 @@ function lsSentences(t) {
   return t.split(/(?<=[.!?다요])\s+(?=\S)/).map((x) => x.trim()).filter(Boolean);
 }
 
+// 왼쪽 단계 목록: 장면마다 한 줄, 지금 장면은 펼쳐서 단계·확인 문제를 보인다. 누르면 그 장표로 바로 간다
+function LsSide({ L, items, groups, quiz, at, solved, pick }) {
+  const cur = items[at];
+  return (<nav className="pf-side" aria-label="이 장의 단계">
+    <div className="hd"><small>{L.topicName} · {L.id}</small><b>{L.title}</b></div>
+    <ol className="sc">
+      {groups.map((idx, g) => {
+        const first = items.findIndex((x) => x.g === g && !x.done);
+        const state = cur.done || cur.g > g ? 'done' : cur.g === g ? 'cur' : '';
+        return (<li key={g} className={state}>
+          <button className="sh" onClick={() => pick(first)} aria-current={state === 'cur' ? 'step' : undefined}>
+            <i>{state === 'done' ? '✓' : g + 1}</i><span>{STEPS[idx[0]].title.replace(/^Step\s*\d+\.\s*/, '')}</span>
+            {state !== 'cur' && <small>{idx.length + (quiz[g] ? 1 : 0)}</small>}
+          </button>
+          {state === 'cur' && (<ol className="bt">
+            {items.map((x, n) => x.g !== g || x.done ? null : (
+              <li key={n}><button className={(n === at ? 'on ' : '') + (n < at || solved[n] ? 'past' : '')} onClick={() => pick(n)}>
+                {x.quiz != null ? <span className="q">{solved[n] ? '✓ ' : ''}확인 문제</span> : (STEPS[x.i].beat && STEPS[x.i].beat.label) || STEPS[x.i].title}
+              </button></li>))}
+          </ol>)}
+        </li>);
+      })}
+      <li className={cur.done ? 'cur' : ''}>
+        <button className="sh" onClick={() => pick(items.length - 1)}><i>★</i><span>정리 · 복습 문제</span></button>
+      </li>
+    </ol>
+    <div className="ch">
+      {L.prev ? <a href={L.prev.href}>← {L.prev.id}</a> : <span />}
+      {L.next ? <a href={L.next.href}>{L.next.id} →</a> : <span />}
+    </div>
+  </nav>);
+}
+
 function LessonApp() {
   const L = window.LESSON || {};
   const { items, groups, quiz } = React.useMemo(lsItems, []);
@@ -50,6 +83,7 @@ function LessonApp() {
   const [refOpen, setRefOpen] = React.useState(false);
   const [pick, setPick] = React.useState(null);
   const [res, setRes] = React.useState(null);   // 확인 문제: null | 'ok' | 'no'
+  const [sideOpen, setSideOpen] = React.useState(false);   // 좁은 화면: 단계 목록 서랍
   const [rv, setRv] = React.useState({});      // 완료 화면 복습 문제: 문제 번호 → 고른 보기 (한 번만 고른다)
   const it = items[at];
 
@@ -143,15 +177,21 @@ function LessonApp() {
 
   const isQuiz = it.quiz != null && !solved[at];
   const check = () => { if (pick == null) return; const ok = pick === quiz[it.quiz].a; setRes(ok ? 'ok' : 'no'); if (ok) setSolved((s) => ({ ...s, [at]: true })); };
+  const pickStep = (n) => { setAt(n); setSideOpen(false); };
   return (
     <React.Fragment>
       <header className="pf-ltop"><div className="in">
         <a className="pf-x" href={L.topicHref || '../index.html'} aria-label={(L.topicName ? L.topicName + ' 주제' : '주제') + '로 돌아가기'}>✕</a>
+        <button className="pf-toc" onClick={() => setSideOpen((o) => !o)} aria-expanded={sideOpen} aria-label="단계 목록">☰</button>
         <span className="pf-where">{L.topicName} · {L.id}</span>
         <div className="pf-prog">{segs.map((f, g) => <i key={g}><b style={{ width: (f * 100) + '%' }} /></i>)}</div>
         <span className="pf-cnt">{Math.min(at + 1, items.length - 1)} / {items.length - 1}</span>
       </div></header>
-      <main className="pf-lmain">{body}</main>
+      <div className={'pf-lwrap' + (sideOpen ? ' open' : '')}>
+        <LsSide L={L} items={items} groups={groups} quiz={quiz} at={at} solved={solved} pick={pickStep} />
+        {sideOpen && <div className="pf-scrim" onClick={() => setSideOpen(false)} />}
+        <main className="pf-lmain">{body}</main>
+      </div>
       <footer className="pf-lfoot"><div className="in">
         <button className="pf-btn" onClick={() => go(-1)} disabled={at === 0} aria-label="이전 단계">이전</button>
         {it.done ? (L.next ? <a className="pf-btn primary" href={L.next.href}>다음 장</a> : <a className="pf-btn primary" href={L.topicHref || '../index.html'}>주제로</a>)
