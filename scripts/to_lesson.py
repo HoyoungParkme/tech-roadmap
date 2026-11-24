@@ -27,8 +27,8 @@ def text_of(jsx):
 for arg in sys.argv[1:]:
     p = (ROOT / arg).resolve(); rel = p.relative_to(ROOT).as_posix(); topic = rel.split("/")[0]; pid = p.stem
     s = p.read_text(encoding="utf-8")
-    if "anim/lesson.jsx" in s: print("skip", rel); continue
-    assert "anim/stage.jsx" in s, "애니메이션 틀이 없는 페이지: " + rel
+    if re.search(r"<script[^>]*src=\"[./]*anim/lesson.jsx\"", s): print("skip", rel); continue
+    assert re.search(r"<script[^>]*src=\"[./]*anim/stage.jsx\"", s), "애니메이션 틀이 없는 페이지: " + rel
     name, items = sections(topic)
     idx = next(k for k, it in enumerate(items) if it["id"] == pid)
     here = items[idx]["file"]; depth = here.count("/")
@@ -37,7 +37,7 @@ for arg in sys.argv[1:]:
     a = s.index("\n    function App() {"); b = min(x for x in [s.find("\n    const root", a), s.find("\n    ReactDOM.createRoot", a)] if x > 0)
     app = s[a:b]
     h1 = re.search(r"<h1[^>]*>([\s\S]*?)</h1>", app); sub = re.search(r"</h1>\s*<p[^>]*>([\s\S]*?)</p>", app)
-    wrap = re.search(r"\{isLast && \(([\s\S]*?)\n\s*\)\}", app)
+    wrap = re.search(r"\{(?:isLast|isEnd|stepIdx === STEPS\.length - 1) && \(([\s\S]*?)\n\s*\)\}", app)
     wrap_t = text_of(wrap.group(1)) if wrap else ""
     wrap_t = html.unescape(wrap_t)
     wrap_t = re.sub(r"^[^\w가-힣\"']*(?:핵심\s*정리|정리)\s*[—–:-]?\s*", "", wrap_t).strip()   # 맨 앞 "✅/🎓 핵심 정리 —" 같은 머리는 뺀다
