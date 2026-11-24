@@ -21,7 +21,8 @@ def sections(topic):
 def text_of(jsx):
     jsx = html.unescape(jsx)
     t = re.sub(r"<[^>]+>", " ", jsx); t = re.sub(r"\{[^{}]*\}", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"\s+([)\]},.!?])", r"\1", re.sub(r"([(\[{])\s+", r"\1", t))   # JSX 태그를 지우며 생긴 괄호 안·문장부호 앞 공백
 
 for arg in sys.argv[1:]:
     p = (ROOT / arg).resolve(); rel = p.relative_to(ROOT).as_posix(); topic = rel.split("/")[0]; pid = p.stem
