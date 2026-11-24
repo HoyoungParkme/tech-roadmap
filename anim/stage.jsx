@@ -32,6 +32,7 @@ function AnimStage({ stepIdx }) {
     const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     let raf; const start = performance.now();
     const tick = (now) => {
+      if (!gRef.current) return;   // 화면을 빨리 넘겨 무대가 이미 내려간 뒤에 온 프레임은 버린다
       const t = reduce ? t1 - 0.001 : Math.min(t1 - 0.001, t0 + ((now - start) / 1000) * 1.15);
       window.RA.render(gRef.current, g, t, { ...c, u: t - t0 });
       if (t < t1 - 0.001) raf = requestAnimationFrame(tick);
