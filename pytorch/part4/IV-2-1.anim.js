@@ -201,40 +201,40 @@
 
   // ---------- 확인 문제 · 정리 · 복습 ----------
   const quiz = [
-    { q: 'Step 1 의 순수 학습 루프에서 프로젝트마다 실제로 달라지는 "과학" 코드는 무엇인가?',
-      o: ['model.train() 과 model.eval()', 'logits = model(x) 와 loss = loss_fn(logits, y)', 'loss.backward() 와 optimizer.step()'], a: 1,
-      why: '코드 주석으로 세면 과학은 순전파·손실 2줄, 잡무는 11줄이다. backward·step 은 어떤 모델을 쓰든 글자 그대로 같다.' },
-    { q: 'LightningModule 로 옮긴 뒤 training_step 에 남는 것은 무엇인가?',
+    { q: 'Step 1의 순수 학습 루프에서 프로젝트마다 실제로 달라지는 "과학" 코드는 무엇인가?',
+      o: ['model.train()과 model.eval()', 'logits = model(x)와 loss = loss_fn(logits, y)', 'loss.backward()와 optimizer.step()'], a: 1,
+      why: '코드 주석으로 세면 과학은 순전파·손실 2줄, 잡무는 11줄이다. backward·step은 어떤 모델을 쓰든 글자 그대로 같다.' },
+    { q: 'LightningModule로 옮긴 뒤 training_step에 남는 것은 무엇인가?',
       o: ['한 배치의 순전파와 손실 계산', 'epoch 루프와 device 이동', 'zero_grad, backward, step'], a: 0,
-      why: 'training_step 은 배치 하나를 어떻게 처리할지만 쓴다. loss 를 돌려주면 backward·step 은 Lightning 이 한다.' },
-    { q: 'Trainer 에 precision="16-mixed" 를 주면 무엇이 달라지는가?',
+      why: 'training_step은 배치 하나를 어떻게 처리할지만 쓴다. loss를 돌려주면 backward·step은 Lightning이 한다.' },
+    { q: 'Trainer에 precision="16-mixed" 를 주면 무엇이 달라지는가?',
       o: ['모델 구조가 절반 크기로 바뀐다', '학습 루프를 다시 짜야 한다', 'autocast·GradScaler 없이 혼합정밀(AMP) 학습이 켜진다'], a: 2,
-      why: '학습 방식은 인자로 선언한다. 같은 LightningModule 을 그대로 두고 precision 인자 하나로 AMP 가 켜진다.' },
-    { q: 'EarlyStopping(monitor="val_acc", patience=3) 이 학습을 멈추는 때는 언제인가?',
-      o: ['val_acc 가 3 에폭 연속 나아지지 않았을 때', '학습을 시작하고 3 에폭이 지났을 때', 'val_acc 가 0.3 아래로 떨어졌을 때'], a: 0,
-      why: 'patience 는 개선 없이 기다릴 에폭 수다. monitor 이름은 validation_step 에서 self.log 로 남긴 키와 같아야 한다.' },
-    { q: 'Lightning Fabric 이 알맞은 상황은 무엇인가?',
-      o: ['루프를 전혀 보고 싶지 않을 때', '내 순수 루프 구조는 그대로 두고 device·분산·AMP 만 얹고 싶을 때', 'Keras 모델을 PyTorch 로 옮길 때'], a: 1,
-      why: 'Fabric 은 LightningModule 로 바꾸지 않는다. fabric.setup 으로 감싸고 loss.backward() 를 fabric.backward(loss) 로 바꾸면 된다.' },
+      why: '학습 방식은 인자로 선언한다. 같은 LightningModule을 그대로 두고 precision 인자 하나로 AMP가 켜진다.' },
+    { q: 'EarlyStopping(monitor="val_acc", patience=3)이 학습을 멈추는 때는 언제인가?',
+      o: ['val_acc가 3 에폭 연속 나아지지 않았을 때', '학습을 시작하고 3 에폭이 지났을 때', 'val_acc가 0.3 아래로 떨어졌을 때'], a: 0,
+      why: 'patience는 개선 없이 기다릴 에폭 수다. monitor 이름은 validation_step에서 self.log로 남긴 키와 같아야 한다.' },
+    { q: 'Lightning Fabric이 알맞은 상황은 무엇인가?',
+      o: ['루프를 전혀 보고 싶지 않을 때', '내 순수 루프 구조는 그대로 두고 device·분산·AMP만 얹고 싶을 때', 'Keras 모델을 PyTorch로 옮길 때'], a: 1,
+      why: 'Fabric은 LightningModule로 바꾸지 않는다. fabric.setup으로 감싸고 loss.backward()를 fabric.backward(loss)로 바꾸면 된다.' },
   ];
 
   const summary = [
     '순수 학습 루프에서 프로젝트마다 바뀌는 과학은 2줄이고 잡무는 11줄이다.',
-    'LightningModule 은 코드를 지우지 않고 __init__, training_step 같은 자리로 옮긴다.',
+    'LightningModule은 코드를 지우지 않고 __init__, training_step 같은 자리로 옮긴다.',
     'Trainer 인자만 바꿔 epoch 수, 장치, 혼합정밀을 정하고 fit 한 줄로 학습한다.',
-    '끼어들기는 콜백, 관측은 로거로 빼고, 루프를 지키고 싶으면 Fabric 을 쓴다.',
+    '끼어들기는 콜백, 관측은 로거로 빼고, 루프를 지키고 싶으면 Fabric을 쓴다.',
   ];
   const review = [
-    { q: 'Lightning 으로 옮겼더니 trainer.predict 에서 forward 가 없다는 오류가 났다. 고칠 곳은?',
-      o: ['Trainer 의 accelerator 인자', 'LitClassifier 에 predict_step 이나 forward 를 정의한다', 'validation_step 에서 self.log 를 지운다'], a: 1,
-      why: 'Trainer 는 배치마다 predict_step 을 부르고, 기본 구현은 forward 를 부른다. 이 장의 LitClassifier 는 둘 다 없어서 직접 정의해야 한다.' },
-    { q: 'EarlyStopping 을 붙였는데 50 에폭을 끝까지 돈다. 가장 먼저 확인할 것은?',
-      o: ['monitor 이름이 self.log 로 남긴 키와 같은지', 'precision 을 16-mixed 로 했는지', 'devices 를 2 로 했는지'], a: 0,
-      why: '콜백은 self.log 로 남긴 이름을 지켜본다. "val_acc" 와 다른 이름을 적으면 조용히 동작하지 않는다.' },
-    { q: 'GAN 처럼 옵티마이저 두 개를 번갈아 쓰는 루프를 멀티 GPU 로 돌리고 싶다. 알맞은 선택은?',
-      o: ['Trainer 의 기본 fit 에 그대로 맞춘다', 'Keras 의 model.fit 으로 옮긴다', 'Fabric 으로 내 루프를 유지하고 setup 과 backward 만 바꾼다'], a: 2,
-      why: '비표준 루프는 프레임워크 틀에 끼우는 비용이 크다. Fabric 은 루프를 내 손에 두고 장치·분산·AMP 만 얹어 준다.' },
+    { q: 'Lightning으로 옮겼더니 trainer.predict에서 forward가 없다는 오류가 났다. 고칠 곳은?',
+      o: ['Trainer의 accelerator 인자', 'LitClassifier에 predict_step이나 forward를 정의한다', 'validation_step에서 self.log를 지운다'], a: 1,
+      why: 'Trainer는 배치마다 predict_step을 부르고, 기본 구현은 forward를 부른다. 이 장의 LitClassifier는 둘 다 없어서 직접 정의해야 한다.' },
+    { q: 'EarlyStopping을 붙였는데 50 에폭을 끝까지 돈다. 가장 먼저 확인할 것은?',
+      o: ['monitor 이름이 self.log로 남긴 키와 같은지', 'precision을 16-mixed로 했는지', 'devices를 2로 했는지'], a: 0,
+      why: '콜백은 self.log로 남긴 이름을 지켜본다. "val_acc" 와 다른 이름을 적으면 조용히 동작하지 않는다.' },
+    { q: 'GAN처럼 옵티마이저 두 개를 번갈아 쓰는 루프를 멀티 GPU로 돌리고 싶다. 알맞은 선택은?',
+      o: ['Trainer의 기본 fit에 그대로 맞춘다', 'Keras의 model.fit으로 옮긴다', 'Fabric으로 내 루프를 유지하고 setup과 backward만 바꾼다'], a: 2,
+      why: '비표준 루프는 프레임워크 틀에 끼우는 비용이 크다. Fabric은 루프를 내 손에 두고 장치·분산·AMP만 얹어 준다.' },
   ];
 
-  R.page({ title: 'Lightning 으로 옮기기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
+  R.page({ title: 'Lightning으로 옮기기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

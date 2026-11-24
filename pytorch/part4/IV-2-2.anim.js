@@ -206,39 +206,39 @@
 
   // ---------- 확인 문제 · 정리 · 복습 ----------
   const quiz = [
-    { q: 'AutoModel.from_pretrained("bert-base-uncased") 가 돌려주는 것은 무엇인가?',
-      o: ['Hugging Face 전용 객체라 PyTorch 메서드는 쓸 수 없다', 'torch.nn.Module 을 상속한 모델이라 .parameters() 와 .to() 가 그대로 된다', 'TensorFlow 모델을 감싼 래퍼다'], a: 1,
-      why: 'isinstance(model, nn.Module) 이 True 다. 그래서 파라미터 109,482,240개를 세는 것도, .to(device)·.eval() 도 Part Ⅰ 그대로다.' },
+    { q: 'AutoModel.from_pretrained("bert-base-uncased")가 돌려주는 것은 무엇인가?',
+      o: ['Hugging Face 전용 객체라 PyTorch 메서드는 쓸 수 없다', 'torch.nn.Module을 상속한 모델이라 .parameters()와 .to()가 그대로 된다', 'TensorFlow 모델을 감싼 래퍼다'], a: 1,
+      why: 'isinstance(model, nn.Module)이 True다. 그래서 파라미터 109,482,240개를 세는 것도, .to(device)·.eval()도 Part Ⅰ 그대로다.' },
     { q: 'pipeline("sentiment-analysis") 안에서 순서대로 도는 세 단계는 무엇인가?',
       o: ['다운로드 → 압축 해제 → 저장', 'softmax → forward → 토큰화', '토크나이저 전처리 → 모델 forward → softmax·argmax 후처리'], a: 2,
-      why: '문장을 input_ids 로 바꾸고, 모델이 logits 를 내고, 후처리가 사람이 읽는 라벨과 점수로 되돌린다.' },
-    { q: '수동으로 분해했을 때 out.logits 의 정체는 무엇인가?',
-      o: ['모양이 [1, 2] 인 평범한 torch.Tensor', '라벨 문자열이 든 파이썬 리스트', 'Hugging Face 전용 확률 객체'], a: 0,
-      why: '"I love PyTorch!" 의 logits 는 [−4.2110, 4.5178] 인 텐서다. softmax 를 걸면 POSITIVE 0.9998 이 되고 loss·backward 도 그대로 붙는다.' },
-    { q: 'Hugging Face Trainer.train() 과 같은 위상의 도구는 무엇인가?',
-      o: ['torch.no_grad()', 'Lightning 의 trainer.fit() 과 Keras 의 model.fit()', 'AutoTokenizer.from_pretrained()'], a: 1,
-      why: '셋 다 반복되는 학습 루프를 프레임워크에 맡기는 도구다. 안에서는 결국 forward → loss → backward 가 돈다.' },
-    { q: 'DistilBERT 분류 모델에 r=8 LoRA 를 씌운 뒤 학습 대상은 얼마나 되는가?',
+      why: '문장을 input_ids로 바꾸고, 모델이 logits를 내고, 후처리가 사람이 읽는 라벨과 점수로 되돌린다.' },
+    { q: '수동으로 분해했을 때 out.logits의 정체는 무엇인가?',
+      o: ['모양이 [1, 2]인 평범한 torch.Tensor', '라벨 문자열이 든 파이썬 리스트', 'Hugging Face 전용 확률 객체'], a: 0,
+      why: '"I love PyTorch!" 의 logits는 [−4.2110, 4.5178]인 텐서다. softmax를 걸면 POSITIVE 0.9998이 되고 loss·backward도 그대로 붙는다.' },
+    { q: 'Hugging Face Trainer.train()과 같은 위상의 도구는 무엇인가?',
+      o: ['torch.no_grad()', 'Lightning의 trainer.fit()과 Keras의 model.fit()', 'AutoTokenizer.from_pretrained()'], a: 1,
+      why: '셋 다 반복되는 학습 루프를 프레임워크에 맡기는 도구다. 안에서는 결국 forward → loss → backward가 돈다.' },
+    { q: 'DistilBERT 분류 모델에 r=8 LoRA를 씌운 뒤 학습 대상은 얼마나 되는가?',
       o: ['전체의 약 1.09% (739,586개)', '전체의 50%', '전체 그대로 100%'], a: 0,
-      why: '어댑터 147,456개와 분류 헤드 592,130개만 학습하고 원본 66,955,010개는 얼린다. print_trainable_parameters() 로 확인한다.' },
+      why: '어댑터 147,456개와 분류 헤드 592,130개만 학습하고 원본 66,955,010개는 얼린다. print_trainable_parameters()로 확인한다.' },
   ];
 
   const summary = [
-    'transformers 가 주는 모델은 nn.Module 이라 Part Ⅰ 에서 배운 메서드가 그대로 통한다.',
-    'pipeline 은 토크나이저, 모델 forward, 후처리 세 단계를 한 줄로 묶은 것이다.',
-    '손으로 분해하면 logits 는 평범한 텐서라 loss 와 backward 를 얹어 파인튜닝한다.',
-    '배포 전에 모델 카드와 라이선스를 보고, 큰 모델은 LoRA 로 1% 남짓만 학습한다.',
+    'transformers가 주는 모델은 nn.Module이라 Part Ⅰ 에서 배운 메서드가 그대로 통한다.',
+    'pipeline은 토크나이저, 모델 forward, 후처리 세 단계를 한 줄로 묶은 것이다.',
+    '손으로 분해하면 logits는 평범한 텐서라 loss와 backward를 얹어 파인튜닝한다.',
+    '배포 전에 모델 카드와 라이선스를 보고, 큰 모델은 LoRA로 1% 남짓만 학습한다.',
   ];
   const review = [
     { q: '감정 분석 결과가 이상하게 나온다. 토크나이저는 distilbert, 모델은 bert-base 체크포인트로 불렀다. 먼저 고칠 것은?',
-      o: ['softmax 대신 sigmoid 를 쓴다', '토크나이저와 모델을 같은 체크포인트 이름으로 맞춘다', 'model.eval() 을 지운다'], a: 1,
-      why: '토큰 번호는 체크포인트마다 사전이 달라 섞으면 조용히 어긋난다. 같은 name 으로 둘 다 from_pretrained 한다.' },
+      o: ['softmax 대신 sigmoid를 쓴다', '토크나이저와 모델을 같은 체크포인트 이름으로 맞춘다', 'model.eval()을 지운다'], a: 1,
+      why: '토큰 번호는 체크포인트마다 사전이 달라 섞으면 조용히 어긋난다. 같은 name으로 둘 다 from_pretrained 한다.' },
     { q: '노트북 디스크가 갑자기 가득 찼다. Hugging Face 모델을 여러 개 받아 본 뒤다. 먼저 볼 곳은?',
-      o: ['~/.cache/huggingface 캐시 폴더', 'model.config.id2label', 'DataLoader 의 batch_size'], a: 0,
-      why: 'from_pretrained 로 받은 가중치는 기본 캐시에 쌓인다. HF_HOME 으로 위치를 옮기거나 delete-cache 로 정리한다.' },
-    { q: '작은 GPU 로 큰 분류 모델을 파인튜닝하다 메모리가 부족했다. 학습 코드를 거의 그대로 두면서 쓸 방법은?',
-      o: ['pipeline 으로 바꿔 학습한다', 'num_labels 를 1 로 줄인다', 'get_peft_model 로 LoRA 를 씌워 어댑터와 헤드만 학습한다'], a: 2,
-      why: 'LoRA 는 원본을 얼리고 작은 행렬만 학습한다. 감싼 모델은 Step 4 의 루프나 Trainer 에 그대로 넣으면 된다.' },
+      o: ['~/.cache/huggingface 캐시 폴더', 'model.config.id2label', 'DataLoader의 batch_size'], a: 0,
+      why: 'from_pretrained로 받은 가중치는 기본 캐시에 쌓인다. HF_HOME으로 위치를 옮기거나 delete-cache로 정리한다.' },
+    { q: '작은 GPU로 큰 분류 모델을 파인튜닝하다 메모리가 부족했다. 학습 코드를 거의 그대로 두면서 쓸 방법은?',
+      o: ['pipeline으로 바꿔 학습한다', 'num_labels를 1로 줄인다', 'get_peft_model로 LoRA를 씌워 어댑터와 헤드만 학습한다'], a: 2,
+      why: 'LoRA는 원본을 얼리고 작은 행렬만 학습한다. 감싼 모델은 Step 4의 루프나 Trainer에 그대로 넣으면 된다.' },
   ];
 
   R.page({ title: 'Hugging Face 지도', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

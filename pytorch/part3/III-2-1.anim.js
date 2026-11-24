@@ -252,39 +252,39 @@
     sub(820, 380, '최근 k 개만 남긴다 (k=3)', fade(u, 2.0), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
 
   const quiz = [
-    { q: 'model.state_dict() 에 들어 있지 않은 것은 무엇인가?',
-      o: ['fc1.weight 텐서', 'forward 의 계산 순서', 'fc2.bias 텐서'], a: 1,
-      why: 'state_dict 는 이름 → 텐서 사전이다. 계산 순서는 Net 클래스 코드에만 있어서, 로드할 때 클래스가 꼭 필요하다.' },
+    { q: 'model.state_dict()에 들어 있지 않은 것은 무엇인가?',
+      o: ['fc1.weight 텐서', 'forward의 계산 순서', 'fc2.bias 텐서'], a: 1,
+      why: 'state_dict는 이름 → 텐서 사전이다. 계산 순서는 Net 클래스 코드에만 있어서, 로드할 때 클래스가 꼭 필요하다.' },
     { q: 'torch.save(model, "whole.pt") 방식이 위험한 가장 큰 이유는 무엇인가?',
-      o: ['pickle 이 클래스 위치를 굳혀 코드 이동·이름 변경에 깨져서', '파일이 state_dict 보다 몇 배 커서', 'GPU 에서만 열려서'], a: 0,
-      why: '크기는 거의 같다(410,185 대 409,289 바이트). 문제는 pickle 이 __main__.Net 같은 경로를 함께 저장한다는 점이다.' },
+      o: ['pickle이 클래스 위치를 굳혀 코드 이동·이름 변경에 깨져서', '파일이 state_dict보다 몇 배 커서', 'GPU 에서만 열려서'], a: 0,
+      why: '크기는 거의 같다(410,185 대 409,289 바이트). 문제는 pickle이 __main__.Net 같은 경로를 함께 저장한다는 점이다.' },
     { q: '로드한 모델로 추론했더니 같은 입력에 결과가 매번 다르다. 빠진 한 줄은 무엇인가?',
       o: ['torch.load(..., map_location="cpu")', 'load_state_dict(..., strict=False)', 'model.eval()'], a: 2,
-      why: 'train 모드에서는 Dropout 이 매번 다른 뉴런을 끈다. eval() 로 바꿔야 결과가 고정된다.' },
+      why: 'train 모드에서는 Dropout이 매번 다른 뉴런을 끈다. eval()로 바꿔야 결과가 고정된다.' },
     { q: '재개할 때 옵티마이저를 새로 만들면 무슨 일이 생기는가?',
-      o: ['아무 차이 없이 이어진다', 'Adam 의 누적 모멘트가 0 이 되어 손실이 잠시 튄다', '모델 가중치가 난수로 돌아간다'], a: 1,
-      why: '실험에서 재개 직후 배치 손실이 0.038 에서 0.129 로 튀었고, 에폭 평균도 0.0375 대신 0.0730 이 됐다.' },
+      o: ['아무 차이 없이 이어진다', 'Adam의 누적 모멘트가 0이 되어 손실이 잠시 튄다', '모델 가중치가 난수로 돌아간다'], a: 1,
+      why: '실험에서 재개 직후 배치 손실이 0.038에서 0.129로 튀었고, 에폭 평균도 0.0375 대신 0.0730이 됐다.' },
     { q: '저장 도중 프로세스가 죽어도 이전 체크포인트를 지키는 방법은 무엇인가?',
-      o: ['임시 파일에 다 쓴 뒤 os.replace 로 바꿔치기', '확장자를 .pth 로 바꾸기', '매 배치마다 저장하기'], a: 0,
+      o: ['임시 파일에 다 쓴 뒤 os.replace로 바꿔치기', '확장자를 .pth로 바꾸기', '매 배치마다 저장하기'], a: 0,
       why: '다 쓴 뒤에만 이름을 바꾸므로 반쯤 쓰인 파일이 원본을 덮지 않는다.' },
   ];
 
   const summary = [
-    '모델의 학습된 값은 state_dict 에 있고, 계산 순서는 클래스 코드에 있다.',
-    '저장은 torch.save(model.state_dict()) 가 표준이다. 통째 저장은 클래스 경로에 묶인다.',
+    '모델의 학습된 값은 state_dict에 있고, 계산 순서는 클래스 코드에 있다.',
+    '저장은 torch.save(model.state_dict())가 표준이다. 통째 저장은 클래스 경로에 묶인다.',
     '불러오기는 Net() 생성, load_state_dict, eval() 순서로 한다.',
     '재개용 파일에는 옵티마이저 상태까지 넣는다. 빼면 재개 직후 손실이 튄다.',
   ];
   const review = [
-    { q: '클래스 Net 을 models/net.py 로 옮겼더니 예전에 저장한 파일이 안 열린다. 어떤 저장 방식이었을까?',
-      o: ['torch.save(model.state_dict(), ...)', 'torch.save(model, ...)', 'os.replace 로 저장'], a: 1,
-      why: '통째 저장은 pickle 이 __main__.Net 같은 클래스 위치를 굳힌다. state_dict 파일이었다면 새 위치의 Net() 에 값을 부으면 된다.' },
-    { q: '분류층을 10개에서 5개 클래스로 바꾸고 strict=False 로 로드했더니 size mismatch 가 났다. 어떻게 하나?',
-      o: ['strict=True 로 바꾼다', 'map_location="cpu" 를 준다', '모양이 다른 fc2 키를 사전에서 지우고 로드한다'], a: 2,
-      why: 'strict=False 는 이름이 어긋난 키만 건너뛴다. 이름이 같고 모양이 다르면 여전히 멈추므로 그 키를 빼고 넣는다.' },
-    { q: '밤새 학습이 12에폭에서 죽었다. last.pt 에 model 만 있고 optimizer 가 없다. 다시 돌리면 예상되는 모습은?',
+    { q: '클래스 Net을 models/net.py로 옮겼더니 예전에 저장한 파일이 안 열린다. 어떤 저장 방식이었을까?',
+      o: ['torch.save(model.state_dict(), ...)', 'torch.save(model, ...)', 'os.replace로 저장'], a: 1,
+      why: '통째 저장은 pickle이 __main__.Net 같은 클래스 위치를 굳힌다. state_dict 파일이었다면 새 위치의 Net()에 값을 부으면 된다.' },
+    { q: '분류층을 10개에서 5개 클래스로 바꾸고 strict=False로 로드했더니 size mismatch가 났다. 어떻게 하나?',
+      o: ['strict=True로 바꾼다', 'map_location="cpu" 를 준다', '모양이 다른 fc2 키를 사전에서 지우고 로드한다'], a: 2,
+      why: 'strict=False는 이름이 어긋난 키만 건너뛴다. 이름이 같고 모양이 다르면 여전히 멈추므로 그 키를 빼고 넣는다.' },
+    { q: '밤새 학습이 12에폭에서 죽었다. last.pt에 model만 있고 optimizer가 없다. 다시 돌리면 예상되는 모습은?',
       o: ['처음 몇 스텝 손실이 튀었다가 따라온다', '0에폭부터 다시 시작한다', '손실이 전혀 변하지 않는다'], a: 0,
-      why: '모델 값은 이어받지만 Adam 의 모멘트가 0 에서 다시 쌓인다. 이 장의 실험처럼 손실이 잠시 튀었다가 회복된다.' },
+      why: '모델 값은 이어받지만 Adam의 모멘트가 0에서 다시 쌓인다. 이 장의 실험처럼 손실이 잠시 튀었다가 회복된다.' },
   ];
 
   R.page({ title: '체크포인트 — state_dict 저장·재개', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

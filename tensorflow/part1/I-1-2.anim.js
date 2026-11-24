@@ -317,39 +317,39 @@
     else tx(600, 120, 'shape → dtype → 값', { 'font-size': 20, 'font-weight': 800, 'text-anchor': 'middle', fill: WARN, opacity: fade(u, 1.6) }); }
 
   const quiz = [
-    { q: 'int32 텐서 a 와 float32 텐서 b 를 a + b 로 더하면 어떻게 되나?',
-      o: ['float32 로 자동 변환되어 6.0 이 나온다', 'InvalidArgumentError 가 난다', 'int32 로 잘려 6 이 나온다'], a: 1,
-      why: 'TF 는 dtype 을 알아서 맞춰 주지 않는다. tf.cast(a, tf.float32) 로 맞춰야 6.0 이 나온다.' },
-    { q: 'tf.Variable 과 tf.constant 의 차이로 맞는 것은?',
-      o: ['Variable 만 assign 으로 내용을 바꿀 수 있다', 'constant 만 GPU 에 올라간다', 'Variable 은 print 로 값을 볼 수 없다'], a: 0,
-      why: 'constant 에는 assign 이 없어 AttributeError 가 난다. 학습으로 바뀌어야 하는 가중치·편향이 전부 Variable 인 이유다.' },
-    { q: 'A 가 [[1, 2, 3], [4, 5, 6]] 일 때 tf.reduce_sum(A, axis=0) 은 무엇인가?',
+    { q: 'int32 텐서 a와 float32 텐서 b를 a + b로 더하면 어떻게 되나?',
+      o: ['float32로 자동 변환되어 6.0이 나온다', 'InvalidArgumentError가 난다', 'int32로 잘려 6이 나온다'], a: 1,
+      why: 'TF는 dtype을 알아서 맞춰 주지 않는다. tf.cast(a, tf.float32)로 맞춰야 6.0이 나온다.' },
+    { q: 'tf.Variable과 tf.constant의 차이로 맞는 것은?',
+      o: ['Variable만 assign으로 내용을 바꿀 수 있다', 'constant만 GPU에 올라간다', 'Variable은 print로 값을 볼 수 없다'], a: 0,
+      why: 'constant에는 assign이 없어 AttributeError가 난다. 학습으로 바뀌어야 하는 가중치·편향이 전부 Variable인 이유다.' },
+    { q: 'A가 [[1, 2, 3], [4, 5, 6]]일 때 tf.reduce_sum(A, axis=0)은 무엇인가?',
       o: ['[6. 15.]', '21.0', '[5. 7. 9.]'], a: 2,
-      why: 'axis=0 은 행 축을 접어 열마다 더한다. 행별 합 [6. 15.] 은 axis=1 의 결과다.' },
-    { q: 'tf.constant(3.0) 으로 만든 x 에 대해 watch 없이 tape.gradient(z, x) 를 부르면 무엇이 나오나?',
+      why: 'axis=0은 행 축을 접어 열마다 더한다. 행별 합 [6. 15.]은 axis=1의 결과다.' },
+    { q: 'tf.constant(3.0)으로 만든 x에 대해 watch 없이 tape.gradient(z, x)를 부르면 무엇이 나오나?',
       o: ['6.0', 'None', '0.0'], a: 1,
-      why: '테이프는 Variable 만 자동으로 지켜본다. constant 는 tape.watch(x) 를 불러야 6.0 이 나온다.' },
-    { q: '학습 루프 안에서 매 스텝 w = tf.Variable(0.0) 을 새로 만들면 어떻게 되나?',
+      why: '테이프는 Variable만 자동으로 지켜본다. constant는 tape.watch(x)를 불러야 6.0이 나온다.' },
+    { q: '학습 루프 안에서 매 스텝 w = tf.Variable(0.0)을 새로 만들면 어떻게 되나?',
       o: ['값이 누적되지 않고 매번 처음으로 돌아간다', '자동으로 같은 변수를 재사용해 문제없다', '메모리만 조금 더 쓰고 결과는 같다'], a: 0,
-      why: '매번 새 변수라 assign_add(0.1) 를 해도 항상 0.1 이다. 루프 밖에서 한 번 만들면 1000번 뒤 약 100 까지 쌓인다.' },
+      why: '매번 새 변수라 assign_add(0.1)를 해도 항상 0.1이다. 루프 밖에서 한 번 만들면 1000번 뒤 약 100까지 쌓인다.' },
   ];
 
   const summary = [
-    'TF2 의 텐서는 만드는 순간 값이 생기고 print 하면 값과 shape, dtype 이 함께 보인다.',
-    '정수 리터럴은 int32, 실수는 float32 라서 섞어 더하면 에러가 나고 tf.cast 로 맞춘다.',
-    '학습으로 바뀌는 가중치는 Variable 이고 assign_add 로 갱신하며 루프 밖에서 한 번 만든다.',
-    'GradientTape 는 Variable 을 알아서 기록해 w² 의 기울기 6.0 을 되감아 준다.',
+    'TF2의 텐서는 만드는 순간 값이 생기고 print 하면 값과 shape, dtype이 함께 보인다.',
+    '정수 리터럴은 int32, 실수는 float32라서 섞어 더하면 에러가 나고 tf.cast로 맞춘다.',
+    '학습으로 바뀌는 가중치는 Variable이고 assign_add로 갱신하며 루프 밖에서 한 번 만든다.',
+    'GradientTape는 Variable을 알아서 기록해 w²의 기울기 6.0을 되감아 준다.',
   ];
   const review = [
-    { q: 'tf.matmul(x, W) 에서 에러가 났다. 디버깅 루틴대로라면 가장 먼저 찍어 볼 것은?',
-      o: ['x.numpy() 로 값 전체', 'x.shape 와 W.shape', '옵티마이저 학습률'], a: 1,
-      why: '행렬곱은 안쪽 차원이 같아야 한다. shape 를 먼저 보고 dtype, 값 순서로 좁힌다.' },
-    { q: '커스텀 루프에서 tape.gradient 가 None 을 돌려줬다. 먼저 의심할 것은?',
-      o: ['미분하려는 값이 Variable 이 아니라 constant 이거나 테이프 밖에서 계산됐다', '학습률이 너무 작다', 'GPU 메모리가 부족하다'], a: 0,
-      why: '테이프는 블록 안에서 일어난 연산만, 그리고 Variable 만 자동으로 기록한다. constant 라면 watch 가 필요하다.' },
+    { q: 'tf.matmul(x, W)에서 에러가 났다. 디버깅 루틴대로라면 가장 먼저 찍어 볼 것은?',
+      o: ['x.numpy()로 값 전체', 'x.shape와 W.shape', '옵티마이저 학습률'], a: 1,
+      why: '행렬곱은 안쪽 차원이 같아야 한다. shape를 먼저 보고 dtype, 값 순서로 좁힌다.' },
+    { q: '커스텀 루프에서 tape.gradient가 None을 돌려줬다. 먼저 의심할 것은?',
+      o: ['미분하려는 값이 Variable이 아니라 constant 이거나 테이프 밖에서 계산됐다', '학습률이 너무 작다', 'GPU 메모리가 부족하다'], a: 0,
+      why: '테이프는 블록 안에서 일어난 연산만, 그리고 Variable만 자동으로 기록한다. constant라면 watch가 필요하다.' },
     { q: '전이학습에서 앞 층은 그대로 두고 마지막 층만 학습시키고 싶다. 무엇을 쓰나?',
-      o: ['앞 층 가중치를 tf.constant 로 다시 만든다', '앞 층에 assign_add(0) 을 매번 부른다', '앞 층 Variable 을 trainable=False 로 둔다'], a: 2,
-      why: '옵티마이저는 trainable_variables 만 갱신한다. trainable=False 인 Variable 은 그 목록에서 빠진다.' },
+      o: ['앞 층 가중치를 tf.constant로 다시 만든다', '앞 층에 assign_add(0)을 매번 부른다', '앞 층 Variable을 trainable=False로 둔다'], a: 2,
+      why: '옵티마이저는 trainable_variables만 갱신한다. trainable=False인 Variable은 그 목록에서 빠진다.' },
   ];
 
   R.page({ title: '텐서와 변수', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

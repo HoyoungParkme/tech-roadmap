@@ -222,40 +222,40 @@
     sub(480, 380, '커스텀 콜백이 fit 으로 할 수 있는 것의 끝이다', fade(u, 1.6), { 'font-weight': 700, fill: INK, 'font-size': 15 }); }
 
   const quiz = [
-    { q: '검증 손실을 보고 멈출지·저장할지·lr 을 낮출지 결정하기 가장 좋은 훅은 무엇인가?',
+    { q: '검증 손실을 보고 멈출지·저장할지·lr을 낮출지 결정하기 가장 좋은 훅은 무엇인가?',
       o: ['on_train_begin', 'on_epoch_end', 'on_train_batch_begin'], a: 1,
-      why: 'on_epoch_end 는 그 에폭의 검증 평가가 막 끝난 직후라 logs["val_loss"] 를 손에 쥐고 있다.' },
-    { q: 'val_loss 가 7에폭 0.37 에서 최저를 찍고 계속 나빠질 때, patience=3 인 EarlyStopping 은 언제 멈추는가?',
+      why: 'on_epoch_end는 그 에폭의 검증 평가가 막 끝난 직후라 logs["val_loss"]를 손에 쥐고 있다.' },
+    { q: 'val_loss가 7에폭 0.37에서 최저를 찍고 계속 나빠질 때, patience=3인 EarlyStopping은 언제 멈추는가?',
       o: ['8에폭', '7에폭', '10에폭'], a: 2,
-      why: '8·9·10 에폭 세 번 연속 개선이 없어야 patience 가 다 찬다. restore_best_weights=True 면 7에폭 가중치로 되돌린다.' },
-    { q: 'save_best_only=True 인 ModelCheckpoint 가 디스크에 남기는 것은 무엇인가?',
+      why: '8·9·10 에폭 세 번 연속 개선이 없어야 patience가 다 찬다. restore_best_weights=True면 7에폭 가중치로 되돌린다.' },
+    { q: 'save_best_only=True인 ModelCheckpoint가 디스크에 남기는 것은 무엇인가?',
       o: ['감시 지표가 가장 좋았던 에폭의 모델 하나', '마지막 에폭의 모델', '모든 에폭의 모델'], a: 0,
       why: '갱신될 때만 덮어쓰므로 예시 곡선에서는 1~7에폭에만 파일이 바뀌고, 결국 7에폭 모델이 남는다.' },
-    { q: 'ReduceLROnPlateau 의 patience 를 EarlyStopping 보다 짧게(2 < 3) 잡는 이유는 무엇인가?',
+    { q: 'ReduceLROnPlateau의 patience를 EarlyStopping보다 짧게(2 < 3) 잡는 이유는 무엇인가?',
       o: ['TensorBoard 로그를 줄이려고', '멈추기 전에 학습률을 먼저 낮춰 보려고', '체크포인트 파일 수를 줄이려고'], a: 1,
-      why: '예시 곡선에서 lr 은 9에폭 끝에 1e-3 에서 5e-4 로 줄고, 그래도 나아지지 않으면 10에폭에 EarlyStopping 이 멈춘다.' },
-    { q: '생성자와 판별자를 번갈아 학습하는 GAN 을 콜백만으로 만들 수 없는 이유는 무엇인가?',
-      o: ['콜백은 self.model 에 접근할 수 없어서', '콜백은 on_epoch_end 를 쓸 수 없어서', '콜백은 fit 이 정한 경계에 끼어들 뿐 한 스텝의 순서를 바꾸지 못해서'], a: 2,
-      why: 'fit 의 한 스텝은 순전파·손실·역전파·갱신 순서로 고정돼 있다. 순서를 바꾸려면 GradientTape 로 루프를 직접 쓴다.' },
+      why: '예시 곡선에서 lr은 9에폭 끝에 1e-3에서 5e-4로 줄고, 그래도 나아지지 않으면 10에폭에 EarlyStopping이 멈춘다.' },
+    { q: '생성자와 판별자를 번갈아 학습하는 GAN을 콜백만으로 만들 수 없는 이유는 무엇인가?',
+      o: ['콜백은 self.model에 접근할 수 없어서', '콜백은 on_epoch_end를 쓸 수 없어서', '콜백은 fit이 정한 경계에 끼어들 뿐 한 스텝의 순서를 바꾸지 못해서'], a: 2,
+      why: 'fit의 한 스텝은 순전파·손실·역전파·갱신 순서로 고정돼 있다. 순서를 바꾸려면 GradientTape로 루프를 직접 쓴다.' },
   ];
 
   const summary = [
-    '콜백은 fit 이 학습 시작, 에폭 경계, 배치 경계, 학습 끝마다 대신 불러 주는 훅이다.',
-    'EarlyStopping 은 val_loss 가 patience 만큼 안 줄면 멈추고 최저점 가중치로 되돌린다.',
-    'ModelCheckpoint 는 감시 지표가 좋아진 에폭만 디스크에 저장해 최고 모델을 남긴다.',
-    'ReduceLROnPlateau 로 학습률을 먼저 낮추고, 순서를 바꿔야 하면 GradientTape 로 간다.',
+    '콜백은 fit이 학습 시작, 에폭 경계, 배치 경계, 학습 끝마다 대신 불러 주는 훅이다.',
+    'EarlyStopping은 val_loss가 patience 만큼 안 줄면 멈추고 최저점 가중치로 되돌린다.',
+    'ModelCheckpoint는 감시 지표가 좋아진 에폭만 디스크에 저장해 최고 모델을 남긴다.',
+    'ReduceLROnPlateau로 학습률을 먼저 낮추고, 순서를 바꿔야 하면 GradientTape로 간다.',
   ];
   const review = [
-    { q: 'EarlyStopping 을 붙였는데 최종 모델 성능이 최저점보다 나쁘다. 먼저 확인할 것은?',
-      o: ['patience 를 0 으로 줄였는지', 'restore_best_weights=True 를 켰는지', 'TensorBoard 를 붙였는지'], a: 1,
+    { q: 'EarlyStopping을 붙였는데 최종 모델 성능이 최저점보다 나쁘다. 먼저 확인할 것은?',
+      o: ['patience를 0으로 줄였는지', 'restore_best_weights=True를 켰는지', 'TensorBoard를 붙였는지'], a: 1,
       why: '이 인자가 없으면 멈춘 시점(예시에서는 나빠진 10에폭)의 가중치가 남는다. 켜면 7에폭 가중치로 돌아간다.' },
     { q: '긴 학습 중 세션이 끊겨 메모리의 모델을 잃었다. 미리 해 뒀어야 할 것은?',
-      o: ['ModelCheckpoint(save_best_only=True) 로 디스크에 최고 모델 남기기', 'ReduceLROnPlateau 의 factor 를 0.5 로 두기', 'epochs 를 작게 잡기'], a: 0,
-      why: 'restore_best_weights 는 메모리 안에서만 지킨다. 디스크에 남긴 best_model.keras 는 load_model 한 줄로 되살릴 수 있다.' },
-    { q: 'EarlyStopping(patience=3) 과 ReduceLROnPlateau(patience=5) 를 같이 썼더니 lr 이 한 번도 줄지 않았다. 왜인가?',
-      o: ['factor 가 0.5 라서', 'TensorBoard 가 lr 을 고정해서', 'lr 을 낮추기 전에 EarlyStopping 이 먼저 멈춰서'], a: 2,
-      why: '정체가 3에폭 이어지면 EarlyStopping 이 먼저 학습을 끝낸다. lr 을 먼저 낮추려면 ReduceLROnPlateau 의 patience 를 더 짧게 잡는다.' },
+      o: ['ModelCheckpoint(save_best_only=True)로 디스크에 최고 모델 남기기', 'ReduceLROnPlateau의 factor를 0.5로 두기', 'epochs를 작게 잡기'], a: 0,
+      why: 'restore_best_weights는 메모리 안에서만 지킨다. 디스크에 남긴 best_model.keras는 load_model 한 줄로 되살릴 수 있다.' },
+    { q: 'EarlyStopping(patience=3)과 ReduceLROnPlateau(patience=5)를 같이 썼더니 lr이 한 번도 줄지 않았다. 왜인가?',
+      o: ['factor가 0.5라서', 'TensorBoard가 lr을 고정해서', 'lr을 낮추기 전에 EarlyStopping이 먼저 멈춰서'], a: 2,
+      why: '정체가 3에폭 이어지면 EarlyStopping이 먼저 학습을 끝낸다. lr을 먼저 낮추려면 ReduceLROnPlateau의 patience를 더 짧게 잡는다.' },
   ];
 
-  R.page({ title: '콜백으로 fit 에 끼어들기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
+  R.page({ title: '콜백으로 fit에 끼어들기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

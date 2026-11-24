@@ -248,40 +248,40 @@
     tx(480, 356, '워밍업 버리고 → 반복 측정 → 안 빨라지면 retracing 의심', { 'font-size': 15.5, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 1.7) }); }
 
   const quiz = [
-    { q: 'eager 에서 작은 연산을 아주 많이 돌릴 때 느려지는 주된 이유는 무엇인가?',
+    { q: 'eager에서 작은 연산을 아주 많이 돌릴 때 느려지는 주된 이유는 무엇인가?',
       o: ['matmul 계산 자체가 느려서', '연산마다 파이썬과 커널 사이를 왕복해서', '텐서가 매번 디스크에 저장돼서'], a: 1,
-      why: '100×100 matmul 은 금방 끝난다. 연산 하나마다 붙는 파이썬 왕복이 쌓여 장치는 기다리고 파이썬이 병목이 된다.' },
-    { q: '@tf.function 함수를 세 번 부르면 함수 안의 파이썬 print 는 몇 번 찍히나?',
+      why: '100×100 matmul은 금방 끝난다. 연산 하나마다 붙는 파이썬 왕복이 쌓여 장치는 기다리고 파이썬이 병목이 된다.' },
+    { q: '@tf.function 함수를 세 번 부르면 함수 안의 파이썬 print는 몇 번 찍히나?',
       o: ['3번', '0번', '1번'], a: 2,
-      why: '파이썬 print 는 그래프를 만드는 첫 호출(트레이싱) 때만 돈다. 그래프 안 연산인 tf.print 는 세 번 모두 찍힌다.' },
-    { q: 'f(1), f(2), f(3) 처럼 파이썬 int 를 바꿔 넣으면 트레이싱은 몇 번 일어나나?',
+      why: '파이썬 print는 그래프를 만드는 첫 호출(트레이싱) 때만 돈다. 그래프 안 연산인 tf.print는 세 번 모두 찍힌다.' },
+    { q: 'f(1), f(2), f(3)처럼 파이썬 int를 바꿔 넣으면 트레이싱은 몇 번 일어나나?',
       o: ['1번', '3번', '0번'], a: 1,
-      why: '파이썬 값이 바뀔 때마다 새 시그니처로 보고 그래프를 다시 만든다. tf.constant(i) 로 넘기면 1번으로 줄어든다.' },
-    { q: '@tf.function 안에서 collected.append(x) 를 하고 세 번 불렀다. collected 에는 몇 개가 들어 있나?',
+      why: '파이썬 값이 바뀔 때마다 새 시그니처로 보고 그래프를 다시 만든다. tf.constant(i)로 넘기면 1번으로 줄어든다.' },
+    { q: '@tf.function 안에서 collected.append(x)를 하고 세 번 불렀다. collected에는 몇 개가 들어 있나?',
       o: ['1개', '3개', '0개'], a: 0,
-      why: 'append 는 파이썬 부수효과라 트레이싱 때 한 번만 일어난다. 그래프 안에서 값을 모으려면 tf.TensorArray 를 쓴다.' },
-    { q: '@tf.function 이 정말 빨라졌는지 잴 때 첫 호출을 버리는 이유는 무엇인가?',
-      o: ['첫 호출은 결과가 틀리기 때문', '첫 호출에는 트레이싱 비용이 섞여 있기 때문', '첫 호출은 GPU 를 쓰지 않기 때문'], a: 1,
+      why: 'append는 파이썬 부수효과라 트레이싱 때 한 번만 일어난다. 그래프 안에서 값을 모으려면 tf.TensorArray를 쓴다.' },
+    { q: '@tf.function이 정말 빨라졌는지 잴 때 첫 호출을 버리는 이유는 무엇인가?',
+      o: ['첫 호출은 결과가 틀리기 때문', '첫 호출에는 트레이싱 비용이 섞여 있기 때문', '첫 호출은 GPU를 쓰지 않기 때문'], a: 1,
       why: '첫 호출은 그래프를 만드는 시간까지 포함한다. 워밍업 한 번을 버리고 반복만 재야 공정하게 비교된다.' },
   ];
 
   const summary = [
-    'eager 는 연산마다 파이썬과 커널을 왕복해서 작은 연산이 많은 루프에서 느려진다.',
-    '@tf.function 은 첫 호출에 그래프를 채록하고 그 뒤로는 파이썬을 건너뛰고 그래프만 돌린다.',
-    '파이썬 int 를 바꿔 넣으면 매번 다시 트레이싱하므로 값은 텐서로 넘기거나 input_signature 로 고정한다.',
-    'list.append 같은 부수효과는 그래프에 안 담기고, 디버깅할 땐 run_functions_eagerly 를 잠시 켠다.',
+    'eager는 연산마다 파이썬과 커널을 왕복해서 작은 연산이 많은 루프에서 느려진다.',
+    '@tf.function은 첫 호출에 그래프를 채록하고 그 뒤로는 파이썬을 건너뛰고 그래프만 돌린다.',
+    '파이썬 int를 바꿔 넣으면 매번 다시 트레이싱하므로 값은 텐서로 넘기거나 input_signature로 고정한다.',
+    'list.append 같은 부수효과는 그래프에 안 담기고, 디버깅할 땐 run_functions_eagerly를 잠시 켠다.',
   ];
   const review = [
-    { q: 'train_step 에 @tf.function 을 붙였는데 오히려 느려졌다. 호출부를 보니 train_step(x, y, step) 에 step 으로 파이썬 int 를 넘긴다. 먼저 의심할 것은?',
-      o: ['GradientTape 가 그래프에서 동작하지 않는다', 'step 값이 바뀔 때마다 다시 트레이싱되고 있다', '옵티마이저가 eager 로만 동작한다'], a: 1,
-      why: '파이썬 스칼라 인자는 값마다 새 시그니처가 된다. tf.constant(step) 으로 넘기거나 input_signature 로 고정하면 트레이싱이 한 번으로 준다.' },
+    { q: 'train_step에 @tf.function을 붙였는데 오히려 느려졌다. 호출부를 보니 train_step(x, y, step)에 step으로 파이썬 int를 넘긴다. 먼저 의심할 것은?',
+      o: ['GradientTape가 그래프에서 동작하지 않는다', 'step 값이 바뀔 때마다 다시 트레이싱되고 있다', '옵티마이저가 eager 로만 동작한다'], a: 1,
+      why: '파이썬 스칼라 인자는 값마다 새 시그니처가 된다. tf.constant(step)으로 넘기거나 input_signature로 고정하면 트레이싱이 한 번으로 준다.' },
     { q: '@tf.function 안에서 손실값을 파이썬 리스트에 append 해 그래프로 그리려 했더니 점이 하나뿐이다. 어떻게 고치나?',
-      o: ['함수 안에서 값을 tf.TensorArray 로 모으거나 함수 밖에서 반환값을 모은다', 'print 를 한 줄 더 넣는다', '리스트를 전역 변수로 바꾼다'], a: 0,
-      why: 'append 는 트레이싱 때 한 번만 돈다. 그래프가 아는 TensorArray 에 쓰거나, 반환된 텐서를 바깥 파이썬 루프에서 모아야 한다.' },
-    { q: '그래프 함수 안의 중간값을 pdb 로 보고 싶다. 가장 간단한 방법은?',
-      o: ['tf.print 를 모든 줄에 넣는다', 'input_signature 를 지운다', 'tf.config.run_functions_eagerly(True) 로 잠시 eager 로 돌린다'], a: 2,
-      why: '스위치를 켜면 모든 @tf.function 이 eager 로 돌아 pdb 와 print 가 살아난다. 확인이 끝나면 False 로 되돌려야 속도가 돌아온다.' },
+      o: ['함수 안에서 값을 tf.TensorArray로 모으거나 함수 밖에서 반환값을 모은다', 'print를 한 줄 더 넣는다', '리스트를 전역 변수로 바꾼다'], a: 0,
+      why: 'append는 트레이싱 때 한 번만 돈다. 그래프가 아는 TensorArray에 쓰거나, 반환된 텐서를 바깥 파이썬 루프에서 모아야 한다.' },
+    { q: '그래프 함수 안의 중간값을 pdb로 보고 싶다. 가장 간단한 방법은?',
+      o: ['tf.print를 모든 줄에 넣는다', 'input_signature를 지운다', 'tf.config.run_functions_eagerly(True)로 잠시 eager로 돌린다'], a: 2,
+      why: '스위치를 켜면 모든 @tf.function이 eager로 돌아 pdb와 print가 살아난다. 확인이 끝나면 False로 되돌려야 속도가 돌아온다.' },
   ];
 
-  R.page({ title: '@tf.function 과 그래프', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
+  R.page({ title: '@tf.function과 그래프', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

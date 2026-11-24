@@ -265,39 +265,39 @@
 
   // ---------- 확인 문제 ----------
   const quiz = [
-    { q: 'CrossEntropyLoss 에 softmax 를 씌운 probs 를 넘기면 어떤 일이 생기는가?',
-      o: ['에러가 나서 바로 알 수 있다', '에러 없이 손실이 0.2413 에서 0.7017 로 커지고 기울기가 약해진다', '손실이 0 이 되어 학습이 끝난다'], a: 1,
-      why: 'CrossEntropyLoss 안에 이미 softmax 가 있어 두 번 걸린다. class 0 기울기도 −0.214 에서 −0.129 로 작아져 학습이 느려진다.' },
+    { q: 'CrossEntropyLoss에 softmax를 씌운 probs를 넘기면 어떤 일이 생기는가?',
+      o: ['에러가 나서 바로 알 수 있다', '에러 없이 손실이 0.2413에서 0.7017로 커지고 기울기가 약해진다', '손실이 0이 되어 학습이 끝난다'], a: 1,
+      why: 'CrossEntropyLoss 안에 이미 softmax가 있어 두 번 걸린다. class 0 기울기도 −0.214에서 −0.129로 작아져 학습이 느려진다.' },
     { q: 'optimizer.step() 한 줄이 실제 모델 파라미터를 바꿀 수 있는 이유는 무엇인가?',
-      o: ['옵티마이저가 파라미터 텐서의 참조를 들고 있어서', '옵티마이저가 매번 모델을 새로 만들어서', 'step() 이 model.parameters() 를 다시 복사해서'], a: 0,
-      why: 'param_groups[0]["params"][0] is model.weight 가 True 다. 같은 객체라서 제자리에서 갱신된다.' },
-    { q: '3박자에서 zero_grad 를 맨 앞에 두는 이유는 무엇인가?',
-      o: ['backward 가 .grad 를 덮어쓰지 않고 += 로 쌓기 때문', 'step 이 .grad 를 읽지 못하게 하려고', 'forward 를 빠르게 하려고'], a: 0,
-      why: '지우지 않으면 지난 기울기가 쌓인다. 실행해 보면 |w.grad| 가 2.534, 3.999 로 커지고 loss 는 100번 뒤 1.7239 에 머문다.' },
+      o: ['옵티마이저가 파라미터 텐서의 참조를 들고 있어서', '옵티마이저가 매번 모델을 새로 만들어서', 'step()이 model.parameters()를 다시 복사해서'], a: 0,
+      why: 'param_groups[0]["params"][0] is model.weight가 True다. 같은 객체라서 제자리에서 갱신된다.' },
+    { q: '3박자에서 zero_grad를 맨 앞에 두는 이유는 무엇인가?',
+      o: ['backward가 .grad를 덮어쓰지 않고 += 로 쌓기 때문', 'step이 .grad를 읽지 못하게 하려고', 'forward를 빠르게 하려고'], a: 0,
+      why: '지우지 않으면 지난 기울기가 쌓인다. 실행해 보면 |w.grad| 가 2.534, 3.999로 커지고 loss는 100번 뒤 1.7239에 머문다.' },
     { q: 'loss.backward() → optimizer.zero_grad() → optimizer.step() 순서로 쓰면 어떻게 되는가?',
-      o: ['정상 순서와 똑같이 학습된다', 'loss 가 발산해 NaN 이 된다', '방금 채운 .grad 를 지워 파라미터가 움직이지 않는다'], a: 2,
-      why: 'step 이 볼 .grad 가 비어 있다. 100번 돌려도 loss 가 2.6634 에서 그대로다.' },
-    { q: 'clip_grad_norm_ 을 넣을 자리는 어디인가?',
+      o: ['정상 순서와 똑같이 학습된다', 'loss가 발산해 NaN이 된다', '방금 채운 .grad를 지워 파라미터가 움직이지 않는다'], a: 2,
+      why: 'step이 볼 .grad가 비어 있다. 100번 돌려도 loss가 2.6634에서 그대로다.' },
+    { q: 'clip_grad_norm_을 넣을 자리는 어디인가?',
       o: ['backward 다음, optimizer.step() 전', 'optimizer.step() 다음', '에폭 루프가 끝난 뒤'], a: 0,
-      why: '.grad 가 채워진 뒤, 그 값으로 갱신하기 전에 잘라야 효과가 있다. step 뒤면 이미 갱신이 끝났다.' },
+      why: '.grad가 채워진 뒤, 그 값으로 갱신하기 전에 잘라야 효과가 있다. step 뒤면 이미 갱신이 끝났다.' },
   ];
 
   const summary = [
-    'CrossEntropyLoss 는 softmax 를 품고 있어 마지막 층은 logits 를 그대로 넘긴다.',
+    'CrossEntropyLoss는 softmax를 품고 있어 마지막 층은 logits를 그대로 넘긴다.',
     '옵티마이저는 파라미터의 참조를 쥐고 있어 step 한 줄로 실제 가중치가 바뀐다.',
-    'autograd 가 .grad 를 쌓으므로 zero_grad, backward, step 순서를 반복문 안에서 지킨다.',
-    '클리핑은 backward 와 step 사이, scheduler.step() 은 에폭 끝에 한 번 둔다.',
+    'autograd가 .grad를 쌓으므로 zero_grad, backward, step 순서를 반복문 안에서 지킨다.',
+    '클리핑은 backward와 step 사이, scheduler.step()은 에폭 끝에 한 번 둔다.',
   ];
   const review = [
-    { q: '분류 모델을 학습하는데 에러는 없고 손실이 아주 느리게 줄어든다. 모델 끝에 nn.Softmax 가 있다. 먼저 할 일은?',
-      o: ['학습률을 크게 올린다', '마지막 Softmax 를 빼고 logits 를 CrossEntropyLoss 에 넘긴다', 'MSELoss 로 바꾼다'], a: 1,
-      why: '손실이 softmax 를 한 번 더 걸어 기울기가 약해진 상태다. 실행값으로 class 0 기울기가 −0.214 에서 −0.129 로 줄었다.' },
-    { q: '배치 루프 안에 scheduler.step() 을 넣었더니 몇 에폭 만에 학습이 멈췄다. 원인은?',
-      o: ['StepLR 이 배치마다 불려 10 배치마다 lr 이 절반이 됐다', 'optimizer.step() 이 사라졌다', '파라미터 그룹이 하나뿐이라서'], a: 0,
-      why: 'step_size=10 은 scheduler.step() 호출 10번마다 줄인다는 뜻이다. 에폭 끝에 한 번 불러야 10 에폭마다 줄어든다.' },
-    { q: '세 박자가 다 있는데 loss 가 첫 값에서 한 번도 안 변한다. 의심할 것은?',
-      o: ['데이터가 너무 많다', 'zero_grad 를 루프 밖에 두었다', 'step 이 backward 앞에 있거나 zero_grad 가 backward 와 step 사이에 있다'], a: 2,
-      why: '두 경우 모두 step 이 비어 있는 .grad 를 본다. 루프 밖 zero_grad 는 값이 오르내리지 멈추지는 않는다.' },
+    { q: '분류 모델을 학습하는데 에러는 없고 손실이 아주 느리게 줄어든다. 모델 끝에 nn.Softmax가 있다. 먼저 할 일은?',
+      o: ['학습률을 크게 올린다', '마지막 Softmax를 빼고 logits를 CrossEntropyLoss에 넘긴다', 'MSELoss로 바꾼다'], a: 1,
+      why: '손실이 softmax를 한 번 더 걸어 기울기가 약해진 상태다. 실행값으로 class 0 기울기가 −0.214에서 −0.129로 줄었다.' },
+    { q: '배치 루프 안에 scheduler.step()을 넣었더니 몇 에폭 만에 학습이 멈췄다. 원인은?',
+      o: ['StepLR이 배치마다 불려 10 배치마다 lr이 절반이 됐다', 'optimizer.step()이 사라졌다', '파라미터 그룹이 하나뿐이라서'], a: 0,
+      why: 'step_size=10은 scheduler.step() 호출 10번마다 줄인다는 뜻이다. 에폭 끝에 한 번 불러야 10 에폭마다 줄어든다.' },
+    { q: '세 박자가 다 있는데 loss가 첫 값에서 한 번도 안 변한다. 의심할 것은?',
+      o: ['데이터가 너무 많다', 'zero_grad를 루프 밖에 두었다', 'step이 backward 앞에 있거나 zero_grad가 backward와 step 사이에 있다'], a: 2,
+      why: '두 경우 모두 step이 비어 있는 .grad를 본다. 루프 밖 zero_grad는 값이 오르내리지 멈추지는 않는다.' },
   ];
 
   R.page({ title: '손실 · 옵티마이저 · 3박자', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

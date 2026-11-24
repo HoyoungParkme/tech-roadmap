@@ -292,39 +292,39 @@
 
   // 장면(Step)마다 확인 문제 하나 — 답(a)은 0부터
   const quiz = [
-    { q: 'arr 로 shared = torch.from_numpy(arr) 를 만든 뒤 arr[0] = 99.0 을 하면 shared 는 어떻게 되는가?',
-      o: ['그대로다. from_numpy 는 값을 복사해 둔다', 'shared[0] 도 99.0 이 된다', '에러가 난다. numpy 배열은 바꿀 수 없다'], a: 1,
-      why: 'from_numpy 는 같은 메모리를 가리킬 뿐이다. 원본을 지키려면 .clone() 으로 새 메모리를 잡아야 한다.' },
-    { q: 'a 는 GPU, b 는 CPU 에 있을 때 a + b 를 실행하면 어떻게 되는가?',
-      o: ['b 가 자동으로 GPU 로 옮겨져 계산된다', '결과가 CPU 에 만들어진다', 'RuntimeError 가 난다'], a: 2,
-      why: '연산에 들어가는 텐서는 같은 device 에 있어야 한다. b.to("cuda") 로 먼저 모으면 [4., 6.] 이 나온다.' },
-    { q: 'x = torch.tensor(3.0, requires_grad=True), y = x ** 2 에서 y.backward() 뒤 x.grad 는 무엇인가?',
+    { q: 'arr로 shared = torch.from_numpy(arr)를 만든 뒤 arr[0] = 99.0을 하면 shared는 어떻게 되는가?',
+      o: ['그대로다. from_numpy는 값을 복사해 둔다', 'shared[0]도 99.0이 된다', '에러가 난다. numpy 배열은 바꿀 수 없다'], a: 1,
+      why: 'from_numpy는 같은 메모리를 가리킬 뿐이다. 원본을 지키려면 .clone()으로 새 메모리를 잡아야 한다.' },
+    { q: 'a는 GPU, b는 CPU에 있을 때 a + b를 실행하면 어떻게 되는가?',
+      o: ['b가 자동으로 GPU로 옮겨져 계산된다', '결과가 CPU에 만들어진다', 'RuntimeError가 난다'], a: 2,
+      why: '연산에 들어가는 텐서는 같은 device에 있어야 한다. b.to("cuda")로 먼저 모으면 [4., 6.]이 나온다.' },
+    { q: 'x = torch.tensor(3.0, requires_grad=True), y = x ** 2에서 y.backward() 뒤 x.grad는 무엇인가?',
       o: ['tensor(6.)', 'tensor(9.)', 'None'], a: 0,
-      why: 'y 가 grad_fn=PowBackward0 으로 출처를 기억하므로 dy/dx = 2x 가 계산된다. x=3 이면 6 이다.' },
-    { q: 'float32 텐서와 float64 텐서를 더하면 결과 dtype 은 무엇인가?',
-      o: ['float32 로 맞춰진다', 'float64 로 조용히 승격된다', 'dtype 이 달라 곧바로 에러가 난다'], a: 1,
-      why: '에러 없이 float64 가 되므로 메모리가 두 배가 되고 원인도 잘 안 보인다. 경계에서 .float() 로 통일한다.' },
-    { q: 'base 에서 만든 v = base.view(2,3), c = base.clone(), d = base.detach() 중 requires_grad 가 False 인 것은?',
+      why: 'y가 grad_fn=PowBackward0으로 출처를 기억하므로 dy/dx = 2x가 계산된다. x=3이면 6이다.' },
+    { q: 'float32 텐서와 float64 텐서를 더하면 결과 dtype은 무엇인가?',
+      o: ['float32로 맞춰진다', 'float64로 조용히 승격된다', 'dtype이 달라 곧바로 에러가 난다'], a: 1,
+      why: '에러 없이 float64가 되므로 메모리가 두 배가 되고 원인도 잘 안 보인다. 경계에서 .float()로 통일한다.' },
+    { q: 'base에서 만든 v = base.view(2,3), c = base.clone(), d = base.detach() 중 requires_grad가 False인 것은?',
       o: ['v', 'c', 'd'], a: 2,
-      why: 'view 와 clone 은 그래프에 이어져 True 이고, detach 만 그래프에서 잘려 False 다. 메모리는 v 와 d 가 base 와 공유한다.' },
+      why: 'view와 clone은 그래프에 이어져 True이고, detach만 그래프에서 잘려 False다. 메모리는 v와 d가 base와 공유한다.' },
   ];
 
   const summary = [
-    'torch.tensor 는 np.array 와 문법이 거의 같지만 from_numpy 는 메모리를 공유한다.',
+    'torch.tensor는 np.array와 문법이 거의 같지만 from_numpy는 메모리를 공유한다.',
     '텐서는 사는 곳(device)을 가지며 CPU 텐서와 GPU 텐서를 섞어 연산하면 에러가 난다.',
-    'requires_grad=True 인 텐서는 grad_fn 을 남기고, x=3 에서 y=x² 의 x.grad 는 6 이다.',
-    'torch 기본은 float32 이고 정수 텐서는 미분할 수 없으니 경계에서 .float() 로 맞춘다.',
+    'requires_grad=True인 텐서는 grad_fn을 남기고, x=3에서 y=x²의 x.grad는 6이다.',
+    'torch 기본은 float32이고 정수 텐서는 미분할 수 없으니 경계에서 .float()로 맞춘다.',
   ];
   const review = [
-    { q: 'numpy 로 읽은 데이터를 from_numpy 로 텐서로 만든 뒤 numpy 쪽을 정규화했더니 모델 입력도 바뀌었다. 먼저 의심할 것은?',
-      o: ['GPU 로 옮기면서 값이 바뀌었다', 'from_numpy 가 같은 메모리를 공유한다', 'float64 가 float32 로 잘렸다'], a: 1,
-      why: 'from_numpy 와 .numpy() 는 복사가 아니다. 원본을 따로 두려면 .clone() 으로 새 메모리를 잡는다.' },
-    { q: 'from_numpy 로 만든 입력을 float32 모델에 넣었더니 dtype 이 맞지 않는다는 에러가 났다. 알맞은 처치는?',
-      o: ['입력에 .float() 를 붙인다', '입력에 requires_grad=True 를 켠다', '입력을 .detach() 한다'], a: 0,
-      why: 'numpy 기본이 float64 라 텐서도 float64 로 넘어온다. 데이터가 들어오는 경계에서 .float() 로 맞춘다.' },
+    { q: 'numpy로 읽은 데이터를 from_numpy로 텐서로 만든 뒤 numpy 쪽을 정규화했더니 모델 입력도 바뀌었다. 먼저 의심할 것은?',
+      o: ['GPU로 옮기면서 값이 바뀌었다', 'from_numpy가 같은 메모리를 공유한다', 'float64가 float32로 잘렸다'], a: 1,
+      why: 'from_numpy와 .numpy()는 복사가 아니다. 원본을 따로 두려면 .clone()으로 새 메모리를 잡는다.' },
+    { q: 'from_numpy로 만든 입력을 float32 모델에 넣었더니 dtype이 맞지 않는다는 에러가 났다. 알맞은 처치는?',
+      o: ['입력에 .float()를 붙인다', '입력에 requires_grad=True를 켠다', '입력을 .detach() 한다'], a: 0,
+      why: 'numpy 기본이 float64라 텐서도 float64로 넘어온다. 데이터가 들어오는 경계에서 .float()로 맞춘다.' },
     { q: '검증할 때 모델 출력을 기록 없이 쓰고 싶다. 가장 알맞은 것은?',
-      o: ['출력마다 .clone() 을 붙인다', 'x.add_() 같은 in-place 연산으로 메모리를 아낀다', 'with torch.no_grad(): 블록 안에서 예측한다'], a: 2,
-      why: 'no_grad 블록 안 연산은 grad_fn 을 남기지 않아 requires_grad 가 False 다. clone 은 그래프 연결을 유지한다.' },
+      o: ['출력마다 .clone()을 붙인다', 'x.add_() 같은 in-place 연산으로 메모리를 아낀다', 'with torch.no_grad(): 블록 안에서 예측한다'], a: 2,
+      why: 'no_grad 블록 안 연산은 grad_fn을 남기지 않아 requires_grad가 False다. clone은 그래프 연결을 유지한다.' },
   ];
 
   R.page({ title: '텐서 들여다보기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

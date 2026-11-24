@@ -283,39 +283,39 @@
     tx(480, 326, '다음 장: 이 연산들을 GPU 로 올린다', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: ACC, opacity: fade(u, 1.6) }); }
 
   const quiz = [
-    { q: 'x = tensor(2.0, requires_grad=True), y = x**2 + 3*x 에서 y.backward() 뒤 x.grad 는 무엇인가?',
+    { q: 'x = tensor(2.0, requires_grad=True), y = x**2 + 3*x에서 y.backward() 뒤 x.grad는 무엇인가?',
       o: ['tensor(10.)', 'tensor(7.)', 'tensor(6.999)'], a: 1,
-      why: '손으로 구한 2x+3 에 x=2 를 넣은 7 과 정확히 같다. 수치 미분(7.000000000019)과 달리 근사가 아니다.' },
-    { q: 'z = (x + y) * w 를 실행했을 때 z.grad_fn 은 무엇인가?',
+      why: '손으로 구한 2x+3에 x=2를 넣은 7과 정확히 같다. 수치 미분(7.000000000019)과 달리 근사가 아니다.' },
+    { q: 'z = (x + y) * w를 실행했을 때 z.grad_fn은 무엇인가?',
       o: ['AddBackward0', 'AccumulateGrad', 'MulBackward0'], a: 2,
-      why: 'grad_fn 은 그 텐서를 만든 마지막 연산이다. z 는 곱셈으로 나왔고, s = x + y 가 AddBackward0 을 단다.' },
-    { q: 'w=2 에서 loss = w**2 를 zero_grad 없이 두 번 backward 하면 w.grad 는 무엇인가?',
+      why: 'grad_fn은 그 텐서를 만든 마지막 연산이다. z는 곱셈으로 나왔고, s = x + y가 AddBackward0을 단다.' },
+    { q: 'w=2에서 loss = w**2를 zero_grad 없이 두 번 backward 하면 w.grad는 무엇인가?',
       o: ['4.0', '8.0', '16.0'], a: 1,
-      why: '.grad 는 덮어쓰지 않고 더한다. 4 + 4 = 8 이라 학습 루프는 매 스텝 zero_grad 로 먼저 비운다.' },
+      why: '.grad는 덮어쓰지 않고 더한다. 4 + 4 = 8이라 학습 루프는 매 스텝 zero_grad로 먼저 비운다.' },
     { q: '검증 루프에서 손실을 모아 평균을 내려 한다. 메모리가 새지 않는 코드는 무엇인가?',
       o: ['total += loss.item()', 'total += loss', 'total += loss.clone()'], a: 0,
-      why: '.item() 은 파이썬 float 만 꺼낸다. 텐서째 더하면 tensor(12., grad_fn=<AddBackward0>) 처럼 그래프가 남는다.' },
-    { q: 'h = x * 3 처럼 중간에 나온 텐서의 grad 를 보고 싶다. 무엇을 해야 하는가?',
-      o: ['h.requires_grad_(True)', 'h.retain_grad() 를 걸고 backward 한다', 'h.detach() 를 한다'], a: 1,
-      why: '중간 텐서는 기본으로 grad 를 저장하지 않아 None 이다. retain_grad() 를 걸면 h.grad 에 12 가 남는다.' },
+      why: '.item()은 파이썬 float만 꺼낸다. 텐서째 더하면 tensor(12., grad_fn=<AddBackward0>)처럼 그래프가 남는다.' },
+    { q: 'h = x * 3처럼 중간에 나온 텐서의 grad를 보고 싶다. 무엇을 해야 하는가?',
+      o: ['h.requires_grad_(True)', 'h.retain_grad()를 걸고 backward 한다', 'h.detach()를 한다'], a: 1,
+      why: '중간 텐서는 기본으로 grad를 저장하지 않아 None이다. retain_grad()를 걸면 h.grad에 12가 남는다.' },
   ];
 
   const summary = [
-    'backward() 는 손으로 하던 체인룰을 대신한다. x=2 에서 x²+3x 의 기울기 7 이 그대로 나온다.',
-    '그래프는 코드를 실행하는 순간 grad_fn 노드가 붙으며 자라서 파이썬 for 도 그래프가 된다.',
-    '.grad 는 더해지므로 학습 루프는 zero_grad, backward, step 순서로 돈다.',
-    '추론은 no_grad, 로그는 .item(), 중간값 grad 는 retain_grad() 로 다룬다.',
+    'backward()는 손으로 하던 체인룰을 대신한다. x=2에서 x²+3x의 기울기 7이 그대로 나온다.',
+    '그래프는 코드를 실행하는 순간 grad_fn 노드가 붙으며 자라서 파이썬 for도 그래프가 된다.',
+    '.grad는 더해지므로 학습 루프는 zero_grad, backward, step 순서로 돈다.',
+    '추론은 no_grad, 로그는 .item(), 중간값 grad는 retain_grad()로 다룬다.',
   ];
   const review = [
-    { q: '학습 손실이 줄다가 다시 오르며 흔들린다. 루프에는 loss.backward() 와 opt.step() 만 있다. 먼저 의심할 것은?',
-      o: ['opt.zero_grad() 가 빠져 grad 가 쌓인다', '학습률이 너무 작다', 'requires_grad 를 너무 많이 켰다'], a: 0,
-      why: '.grad 는 누적되므로 지난 스텝 기울기가 계속 더해진다. 같은 데이터로 돌려 봐도 zero_grad 를 빼면 손실 곡선이 출렁인다.' },
-    { q: '검증할 때마다 GPU 메모리가 조금씩 늘어난다. 코드에는 total += loss 가 있다. 알맞은 처치는?',
-      o: ['loss.backward(retain_graph=True) 를 쓴다', 'total += loss.item() 으로 바꾸고 no_grad 안에서 돈다', 'loss 를 requires_grad_(False) 로 얼린다'], a: 1,
-      why: '텐서째 더하면 매 반복의 그래프가 살아남는다. .item() 으로 float 만 꺼내고, 검증은 처음부터 기록하지 않는다.' },
-    { q: 'torch.where 로 log(0) 을 피했는데도 grad 가 NaN 이다. 범인 연산을 찾는 가장 빠른 방법은?',
-      o: ['print 로 forward 값을 모두 찍는다', 'h.retain_grad() 를 모든 텐서에 건다', 'set_detect_anomaly(True) 를 켜고 다시 backward 한다'], a: 2,
-      why: 'forward 값은 0 으로 멀쩡해 보인다. anomaly 모드가 LogBackward0 에서 NaN 이 났다고 짚어 준다.' },
+    { q: '학습 손실이 줄다가 다시 오르며 흔들린다. 루프에는 loss.backward()와 opt.step()만 있다. 먼저 의심할 것은?',
+      o: ['opt.zero_grad()가 빠져 grad가 쌓인다', '학습률이 너무 작다', 'requires_grad를 너무 많이 켰다'], a: 0,
+      why: '.grad는 누적되므로 지난 스텝 기울기가 계속 더해진다. 같은 데이터로 돌려 봐도 zero_grad를 빼면 손실 곡선이 출렁인다.' },
+    { q: '검증할 때마다 GPU 메모리가 조금씩 늘어난다. 코드에는 total += loss가 있다. 알맞은 처치는?',
+      o: ['loss.backward(retain_graph=True)를 쓴다', 'total += loss.item()으로 바꾸고 no_grad 안에서 돈다', 'loss를 requires_grad_(False)로 얼린다'], a: 1,
+      why: '텐서째 더하면 매 반복의 그래프가 살아남는다. .item()으로 float만 꺼내고, 검증은 처음부터 기록하지 않는다.' },
+    { q: 'torch.where로 log(0)을 피했는데도 grad가 NaN이다. 범인 연산을 찾는 가장 빠른 방법은?',
+      o: ['print로 forward 값을 모두 찍는다', 'h.retain_grad()를 모든 텐서에 건다', 'set_detect_anomaly(True)를 켜고 다시 backward 한다'], a: 2,
+      why: 'forward 값은 0으로 멀쩡해 보인다. anomaly 모드가 LogBackward0에서 NaN이 났다고 짚어 준다.' },
   ];
 
   R.page({ title: '계산 그래프 따라가기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

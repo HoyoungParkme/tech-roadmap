@@ -200,39 +200,39 @@
     if (k === 5) banner(480, 412, '최강 조합: 서브클래싱 + 커스텀 train_step + fit', pop(u, 0.5)); }
 
   const quiz = [
-    { q: '함수형 API 로는 표현할 수 없고 서브클래싱이 필요한 모델은 무엇인가?',
+    { q: '함수형 API로는 표현할 수 없고 서브클래싱이 필요한 모델은 무엇인가?',
       o: ['입력이 두 개이고 출력이 하나인 모델', '입력 값의 평균에 따라 다른 층을 타는 모델', '층을 한 줄로 쌓은 모델'], a: 1,
       why: '함수형은 빌드할 때 연결이 굳는 정적 그래프다. 값에 따라 경로를 고르는 if 분기는 call() 안의 파이썬 코드로만 쓸 수 있다.' },
-    { q: 'Linear(units=3) 의 W 를 __init__ 이 아니라 build 에서 만드는 이유는 무엇인가?',
-      o: ['W 의 모양 (input_dim, 3) 중 input_dim 은 첫 입력을 봐야 알 수 있어서', 'build 에서 만들어야 W 가 0 으로 초기화되어서', 'call 이 매번 새 W 를 만들기 때문에'], a: 0,
-      why: '(8, 4) 입력을 처음 받는 순간 build 가 input_shape[-1] = 4 를 읽고 W (4, 3) 와 b (3,) 를 만든다. 그래서 weights 가 0개에서 2개가 된다.' },
-    { q: 'ResidualMLP(units=4, n_classes=3) 에서 h + residual 이 가능한 조건은 무엇인가?',
-      o: ['출력층이 softmax 여야 한다', 'd2 에 relu 가 걸려 있어야 한다', '입력 차원과 units 가 4 로 같아야 한다'], a: 2,
-      why: '더하려면 두 텐서의 마지막 차원이 같아야 한다. 다르면 residual 쪽에 Dense 를 하나 끼워 맞춘다.' },
-    { q: 'Keras 3 에서 build 전에 서브클래싱 모델의 summary() 를 부르면 어떻게 되는가?',
-      o: ['ValueError 로 멈춘다', '층마다 ? 와 0 (unbuilt) 가 찍힌다', '자동으로 (None, 4) 를 가정해 131 이 찍힌다'], a: 1,
-      why: '아직 입력을 본 적이 없어서 모양과 파라미터를 모른다. 더미 입력 (1, 4) 를 흘리면 80 · 0 · 51, 합계 131 로 채워진다.' },
+    { q: 'Linear(units=3)의 W를 __init__이 아니라 build에서 만드는 이유는 무엇인가?',
+      o: ['W의 모양 (input_dim, 3) 중 input_dim은 첫 입력을 봐야 알 수 있어서', 'build에서 만들어야 W가 0으로 초기화되어서', 'call이 매번 새 W를 만들기 때문에'], a: 0,
+      why: '(8, 4) 입력을 처음 받는 순간 build가 input_shape[-1] = 4를 읽고 W (4, 3)와 b (3,)를 만든다. 그래서 weights가 0개에서 2개가 된다.' },
+    { q: 'ResidualMLP(units=4, n_classes=3)에서 h + residual이 가능한 조건은 무엇인가?',
+      o: ['출력층이 softmax 여야 한다', 'd2에 relu가 걸려 있어야 한다', '입력 차원과 units가 4로 같아야 한다'], a: 2,
+      why: '더하려면 두 텐서의 마지막 차원이 같아야 한다. 다르면 residual 쪽에 Dense를 하나 끼워 맞춘다.' },
+    { q: 'Keras 3에서 build 전에 서브클래싱 모델의 summary()를 부르면 어떻게 되는가?',
+      o: ['ValueError로 멈춘다', '층마다 ? 와 0 (unbuilt)가 찍힌다', '자동으로 (None, 4)를 가정해 131이 찍힌다'], a: 1,
+      why: '아직 입력을 본 적이 없어서 모양과 파라미터를 모른다. 더미 입력 (1, 4)를 흘리면 80 · 0 · 51, 합계 131로 채워진다.' },
     { q: '층이 일자로 쌓이는 단순한 분류 모델이라면 어떤 문법이 알맞은가?',
-      o: ['Sequential, 가장 쉽고 직렬화도 자동이다', '서브클래싱, 표현력이 가장 크다', '함수형, 일자 구조에서는 Sequential 을 쓸 수 없다'], a: 0,
+      o: ['Sequential, 가장 쉽고 직렬화도 자동이다', '서브클래싱, 표현력이 가장 크다', '함수형, 일자 구조에서는 Sequential을 쓸 수 없다'], a: 0,
       why: '세 문법이 같은 MLP(파라미터 131)를 만든다면 쉬운 쪽이 이긴다. 막힐 때만 함수형, 서브클래싱으로 내려간다.' },
   ];
 
   const summary = [
     '함수형은 연결이 굳는 정적 그래프라 입력 값에 따른 분기를 담지 못한다.',
-    '커스텀 Layer 는 첫 입력을 본 build 에서 W 의 모양을 정해 가중치를 만든다.',
-    '서브클래싱 Model 도 compile 과 fit 으로 그대로 학습한다.',
-    'get_config 는 직접 써야 하고, summary 는 더미 입력으로 빌드한 뒤에 채워진다.',
+    '커스텀 Layer는 첫 입력을 본 build에서 W의 모양을 정해 가중치를 만든다.',
+    '서브클래싱 Model도 compile과 fit으로 그대로 학습한다.',
+    'get_config는 직접 써야 하고, summary는 더미 입력으로 빌드한 뒤에 채워진다.',
   ];
   const review = [
-    { q: '서브클래싱 모델을 model.save 했더니 NotImplementedError 가 났다. 먼저 할 일은?',
-      o: ['model.build((None, 4)) 를 부른다', '__init__ 인자를 돌려주는 get_config 를 구현한다', 'call 에 training 인자를 추가한다'], a: 1,
-      why: 'Keras 3 은 __init__ 인자를 복원할 방법이 없으면 저장 단계에서 멈춘다. get_config 로 units·rate 를 돌려주면 저장과 로드가 된다.' },
-    { q: '학습 정확도는 높은데 predict 결과가 매번 조금씩 달라진다. 서브클래싱 call 에서 의심할 줄은?',
-      o: ['self.drop(x) 처럼 training 을 하위 층에 넘기지 않은 줄', 'super().__init__() 를 부른 줄', 'self.dense 를 __init__ 에서 만든 줄'], a: 0,
-      why: 'training 을 넘기지 않으면 Dropout 이 엉뚱한 모드로 돌 수 있다. drop(x, training=training) 처럼 받은 값을 그대로 전달한다.' },
-    { q: 'build() 를 쓰지 않은 서브클래싱 모델에 model.build((None, 4)) 후 summary 를 봤더니 합계가 0 이다. 알맞은 처방은?',
-      o: ['batch 차원을 None 대신 1 로 바꾼다', 'Sequential 로 다시 만든다', 'model(tf.zeros((1, 4))) 로 더미 입력을 한 번 흘린다'], a: 2,
-      why: 'Keras 3 은 이 경우 경고만 내고 가중치를 만들지 않는다. 실제로 한 번 호출해야 각 층의 build 가 돌아 131 이 찍힌다.' },
+    { q: '서브클래싱 모델을 model.save 했더니 NotImplementedError가 났다. 먼저 할 일은?',
+      o: ['model.build((None, 4))를 부른다', '__init__ 인자를 돌려주는 get_config를 구현한다', 'call에 training 인자를 추가한다'], a: 1,
+      why: 'Keras 3은 __init__ 인자를 복원할 방법이 없으면 저장 단계에서 멈춘다. get_config로 units·rate를 돌려주면 저장과 로드가 된다.' },
+    { q: '학습 정확도는 높은데 predict 결과가 매번 조금씩 달라진다. 서브클래싱 call에서 의심할 줄은?',
+      o: ['self.drop(x)처럼 training을 하위 층에 넘기지 않은 줄', 'super().__init__()를 부른 줄', 'self.dense를 __init__에서 만든 줄'], a: 0,
+      why: 'training을 넘기지 않으면 Dropout이 엉뚱한 모드로 돌 수 있다. drop(x, training=training)처럼 받은 값을 그대로 전달한다.' },
+    { q: 'build()를 쓰지 않은 서브클래싱 모델에 model.build((None, 4)) 후 summary를 봤더니 합계가 0이다. 알맞은 처방은?',
+      o: ['batch 차원을 None 대신 1로 바꾼다', 'Sequential로 다시 만든다', 'model(tf.zeros((1, 4)))로 더미 입력을 한 번 흘린다'], a: 2,
+      why: 'Keras 3은 이 경우 경고만 내고 가중치를 만들지 않는다. 실제로 한 번 호출해야 각 층의 build가 돌아 131이 찍힌다.' },
   ];
 
   RA.page({ title: '서브클래싱 — 층과 모델을 클래스로 짠다', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

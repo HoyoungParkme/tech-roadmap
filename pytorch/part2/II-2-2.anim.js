@@ -222,39 +222,39 @@
 
   // ---------- 확인 문제 ----------
   const quiz = [
-    { q: 'PyTorch 에 Keras 의 fit() 같은 한 줄이 없는 이유는 무엇인가?',
-      o: ['아직 개발되지 않아서', '학습 과정을 사용자 코드로 열어 두어 어느 줄이든 고칠 수 있게 하려고', 'GPU 에서만 fit 이 동작해서'], a: 1,
-      why: 'fit() 이 감추던 에폭·배치 반복과 3박자를 직접 쓰게 해서, 로깅·손실 조합 같은 변경을 그 자리에서 넣을 수 있다.' },
-    { q: '배치 손실을 모을 때 running_loss += loss 대신 loss.item() 을 쓰는 이유는 무엇인가?',
-      o: ['loss 텐서를 그대로 더하면 grad_fn 사슬이 남아 메모리가 쌓여서', '.item() 이 손실을 더 정확하게 계산해서', 'loss 텐서는 더하기를 지원하지 않아서'], a: 0,
-      why: '텐서끼리 더하면 AddBackward0 노드가 계속 붙는다. .item() 은 파이썬 float 만 꺼내 그래프와 끊는다.' },
-    { q: 'model.eval() 과 torch.no_grad() 의 차이로 맞는 것은 무엇인가?',
-      o: ['둘은 같은 일을 하니 하나만 켜면 된다', 'eval() 은 그래프를 끄고, no_grad() 는 Dropout 을 끈다', 'eval() 은 Dropout·BN 의 모드를 바꾸고, no_grad() 는 grad_fn 생성을 멈춘다'], a: 2,
-      why: '실행해 보면 eval() 에서 Dropout 모델 출력이 −0.218 로 고정되고, no_grad() 안에서 pred.grad_fn 이 None 이 된다. 하는 일이 달라 둘 다 켠다.' },
-    { q: 'gradient accumulation(accum=4)에서 zero_grad() 는 언제 부르는가?',
+    { q: 'PyTorch에 Keras의 fit() 같은 한 줄이 없는 이유는 무엇인가?',
+      o: ['아직 개발되지 않아서', '학습 과정을 사용자 코드로 열어 두어 어느 줄이든 고칠 수 있게 하려고', 'GPU 에서만 fit이 동작해서'], a: 1,
+      why: 'fit()이 감추던 에폭·배치 반복과 3박자를 직접 쓰게 해서, 로깅·손실 조합 같은 변경을 그 자리에서 넣을 수 있다.' },
+    { q: '배치 손실을 모을 때 running_loss += loss 대신 loss.item()을 쓰는 이유는 무엇인가?',
+      o: ['loss 텐서를 그대로 더하면 grad_fn 사슬이 남아 메모리가 쌓여서', '.item()이 손실을 더 정확하게 계산해서', 'loss 텐서는 더하기를 지원하지 않아서'], a: 0,
+      why: '텐서끼리 더하면 AddBackward0 노드가 계속 붙는다. .item()은 파이썬 float만 꺼내 그래프와 끊는다.' },
+    { q: 'model.eval()과 torch.no_grad()의 차이로 맞는 것은 무엇인가?',
+      o: ['둘은 같은 일을 하니 하나만 켜면 된다', 'eval()은 그래프를 끄고, no_grad()는 Dropout을 끈다', 'eval()은 Dropout·BN의 모드를 바꾸고, no_grad()는 grad_fn 생성을 멈춘다'], a: 2,
+      why: '실행해 보면 eval()에서 Dropout 모델 출력이 −0.218로 고정되고, no_grad() 안에서 pred.grad_fn이 None이 된다. 하는 일이 달라 둘 다 켠다.' },
+    { q: 'gradient accumulation(accum=4)에서 zero_grad()는 언제 부르는가?',
       o: ['매 배치 backward 직전', '4 배치마다 step() 한 직후', '에폭이 끝날 때만'], a: 1,
-      why: '네 배치의 기울기를 일부러 쌓아야 하므로 배치마다 지우면 안 된다. step() 으로 갱신한 직후에만 지운다.' },
-    { q: 'train_one_epoch 첫 줄에 model.train() 을 두는 이유는 무엇인가?',
-      o: ['evaluate 가 바꿔 놓은 eval 모드를 매 에폭 학습 전에 되돌리려고', '파라미터를 초기화하려고', '옵티마이저를 다시 만들려고'], a: 0,
+      why: '네 배치의 기울기를 일부러 쌓아야 하므로 배치마다 지우면 안 된다. step()으로 갱신한 직후에만 지운다.' },
+    { q: 'train_one_epoch 첫 줄에 model.train()을 두는 이유는 무엇인가?',
+      o: ['evaluate가 바꿔 놓은 eval 모드를 매 에폭 학습 전에 되돌리려고', '파라미터를 초기화하려고', '옵티마이저를 다시 만들려고'], a: 0,
       why: '메인 루프가 학습과 검증을 번갈아 부르므로, 스위치를 함수 안에 고정해 두면 켜고 끄기를 빼먹을 일이 없다.' },
   ];
 
   const summary = [
-    'PyTorch 는 fit() 대신 에폭과 배치 두 겹 for 문 안에 3박자를 직접 쓴다.',
-    '배치 손실은 loss.item() 으로 float 을 꺼내 모아야 그래프가 메모리에 남지 않는다.',
-    '검증에서는 model.eval() 로 층 모드를, torch.no_grad() 로 그래프 생성을 따로 끈다.',
+    'PyTorch는 fit() 대신 에폭과 배치 두 겹 for 문 안에 3박자를 직접 쓴다.',
+    '배치 손실은 loss.item()으로 float을 꺼내 모아야 그래프가 메모리에 남지 않는다.',
+    '검증에서는 model.eval()로 층 모드를, torch.no_grad()로 그래프 생성을 따로 끈다.',
     '학습과 검증을 두 함수로 나누고 스위치를 함수 안에 고정해 에폭마다 번갈아 부른다.',
   ];
   const review = [
     { q: '검증 손실이 같은 데이터로 돌려도 매번 조금씩 다르게 나온다. 먼저 의심할 것은?',
-      o: ['evaluate 안에 model.eval() 이 빠져 Dropout 이 켜져 있다', 'torch.no_grad() 가 빠졌다', 'loss.item() 을 써서'], a: 0,
-      why: 'Dropout 이 켜져 있으면 같은 입력도 출력이 흔들린다. no_grad 를 빼면 메모리만 더 쓰고 값은 같다.' },
-    { q: 'GPU 메모리 때문에 배치를 8 로 줄였지만 배치 32 와 같은 갱신을 원한다. 루프를 어떻게 바꾸나?',
-      o: ['학습률을 4배로 올린다', '에폭 수를 4배로 늘린다', 'loss 를 4 로 나눠 backward 하고 4 배치마다 step() 후 zero_grad() 한다'], a: 2,
-      why: 'gradient accumulation 이다. 네 배치의 기울기를 쌓아 한 번에 갱신하면 큰 배치 하나와 같은 효과가 난다.' },
-    { q: '학습이 몇 에폭 지나자 메모리가 계속 늘다 결국 OOM 이 났다. 학습 루프에서 먼저 볼 줄은?',
-      o: ['model.train() 위치', 'running_loss += loss 처럼 텐서째 더하는 집계 줄', 'scheduler.step() 위치'], a: 1,
-      why: '텐서째 더하면 배치마다 그래프가 이어 붙어 메모리에 남는다. loss.item() 으로 바꾸면 사슬이 끊긴다.' },
+      o: ['evaluate 안에 model.eval()이 빠져 Dropout이 켜져 있다', 'torch.no_grad()가 빠졌다', 'loss.item()을 써서'], a: 0,
+      why: 'Dropout이 켜져 있으면 같은 입력도 출력이 흔들린다. no_grad를 빼면 메모리만 더 쓰고 값은 같다.' },
+    { q: 'GPU 메모리 때문에 배치를 8로 줄였지만 배치 32와 같은 갱신을 원한다. 루프를 어떻게 바꾸나?',
+      o: ['학습률을 4배로 올린다', '에폭 수를 4배로 늘린다', 'loss를 4로 나눠 backward하고 4 배치마다 step() 후 zero_grad() 한다'], a: 2,
+      why: 'gradient accumulation이다. 네 배치의 기울기를 쌓아 한 번에 갱신하면 큰 배치 하나와 같은 효과가 난다.' },
+    { q: '학습이 몇 에폭 지나자 메모리가 계속 늘다 결국 OOM이 났다. 학습 루프에서 먼저 볼 줄은?',
+      o: ['model.train() 위치', 'running_loss += loss처럼 텐서째 더하는 집계 줄', 'scheduler.step() 위치'], a: 1,
+      why: '텐서째 더하면 배치마다 그래프가 이어 붙어 메모리에 남는다. loss.item()으로 바꾸면 사슬이 끊긴다.' },
   ];
 
   R.page({ title: '학습 루프 직접 쓰기', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

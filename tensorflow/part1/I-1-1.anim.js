@@ -348,40 +348,40 @@
 
   // 장면(Step)마다 확인 문제 하나
   const quiz = [
-    { q: 'TF1 코드에서 c = a + b 다음 줄에 print(c) 를 하면 무엇이 찍히나?',
+    { q: 'TF1 코드에서 c = a + b 다음 줄에 print(c)를 하면 무엇이 찍히나?',
       o: ['5.0', 'Tensor("add:0", dtype=float32) 같은 노드 이름', 'None'], a: 1,
-      why: 'TF1 에서 c 는 값이 아니라 그래프의 add 노드다. 값 5.0 은 Session 을 열고 feed_dict 로 2.0 과 3.0 을 넣어야 나온다.' },
-    { q: 'Keras 의 model.fit(x, y, epochs=5) 한 줄이 대신 하는 일은 무엇인가?',
+      why: 'TF1에서 c는 값이 아니라 그래프의 add 노드다. 값 5.0은 Session을 열고 feed_dict로 2.0과 3.0을 넣어야 나온다.' },
+    { q: 'Keras의 model.fit(x, y, epochs=5) 한 줄이 대신 하는 일은 무엇인가?',
       o: ['모델 층을 쌓는 일', '손실·옵티마이저를 문자열로 고르는 일', '배치를 나눠 순전파·손실·역전파·갱신을 반복하는 학습 루프'], a: 2,
-      why: '층 쌓기는 Sequential, 재료 고르기는 compile 이 맡는다. fit 은 그 재료로 학습 루프 전체를 5 epoch 돌린다.' },
-    { q: 'TF 2.0 에서 tf.Session() 을 부르면 어떻게 되나?',
-      o: ['AttributeError 가 난다', '예전처럼 실행 엔진이 열린다', '경고만 내고 eager 로 실행한다'], a: 0,
-      why: 'TF2 는 eager 를 기본값으로 바꾸면서 tf.Session 을 없앴다. 그래서 옛 TF1 예제가 가장 먼저 여기서 멈춘다.' },
-    { q: 'model.fit() 과 GradientTape 는 어떤 관계인가?',
-      o: ['서로 다른 엔진이라 섞어 쓸 수 없다', 'fit 한 스텝의 안쪽이 GradientTape 로 되어 있다', 'GradientTape 가 fit 을 불러 쓴다'], a: 1,
-      why: 'fit 은 가장 흔한 학습 루프를 포장한 것이고, 매 배치 한 스텝은 테이프 기록, gradient, apply_gradients 순서로 돈다. 대립이 아니라 포함 관계다.' },
-    { q: '@tf.function 을 붙인 train_step 이 첫 호출에서만 느린 이유는 무엇인가?',
-      o: ['첫 호출에서 파이썬 함수를 그래프로 추적하기 때문', '가중치를 처음 내려받기 때문', 'GPU 를 처음 켜기 때문'], a: 0,
-      why: '첫 호출에서 그래프를 추적(trace)하고, 그다음 호출부터는 만든 그래프를 다시 쓴다. 그래서 eager 의 편함과 그래프의 속도를 같이 얻는다.' },
+      why: '층 쌓기는 Sequential, 재료 고르기는 compile이 맡는다. fit은 그 재료로 학습 루프 전체를 5 epoch 돌린다.' },
+    { q: 'TF 2.0에서 tf.Session()을 부르면 어떻게 되나?',
+      o: ['AttributeError가 난다', '예전처럼 실행 엔진이 열린다', '경고만 내고 eager로 실행한다'], a: 0,
+      why: 'TF2는 eager를 기본값으로 바꾸면서 tf.Session을 없앴다. 그래서 옛 TF1 예제가 가장 먼저 여기서 멈춘다.' },
+    { q: 'model.fit()과 GradientTape는 어떤 관계인가?',
+      o: ['서로 다른 엔진이라 섞어 쓸 수 없다', 'fit 한 스텝의 안쪽이 GradientTape로 되어 있다', 'GradientTape가 fit을 불러 쓴다'], a: 1,
+      why: 'fit은 가장 흔한 학습 루프를 포장한 것이고, 매 배치 한 스텝은 테이프 기록, gradient, apply_gradients 순서로 돈다. 대립이 아니라 포함 관계다.' },
+    { q: '@tf.function을 붙인 train_step이 첫 호출에서만 느린 이유는 무엇인가?',
+      o: ['첫 호출에서 파이썬 함수를 그래프로 추적하기 때문', '가중치를 처음 내려받기 때문', 'GPU를 처음 켜기 때문'], a: 0,
+      why: '첫 호출에서 그래프를 추적(trace)하고, 그다음 호출부터는 만든 그래프를 다시 쓴다. 그래서 eager의 편함과 그래프의 속도를 같이 얻는다.' },
   ];
 
   const summary = [
-    'TF1 은 그래프를 먼저 선언하고 Session 을 열어야 값이 나와서 print 로 디버깅할 수 없었다.',
-    '같은 해 나온 Keras 는 Sequential, compile, fit 세 단계로 학습을 끝내 진입장벽을 낮췄다.',
-    'TF2 는 eager 를 기본값으로 바꾸고 tf.Session 을 지웠으며 Keras 를 tf.keras 로 품었다.',
-    '그래서 TF 에는 fit 과 GradientTape 두 방식이 있고, fit 의 한 스텝 안에 tape 가 들어 있다.',
+    'TF1은 그래프를 먼저 선언하고 Session을 열어야 값이 나와서 print로 디버깅할 수 없었다.',
+    '같은 해 나온 Keras는 Sequential, compile, fit 세 단계로 학습을 끝내 진입장벽을 낮췄다.',
+    'TF2는 eager를 기본값으로 바꾸고 tf.Session을 지웠으며 Keras를 tf.keras로 품었다.',
+    '그래서 TF에는 fit과 GradientTape 두 방식이 있고, fit의 한 스텝 안에 tape가 들어 있다.',
   ];
   const review = [
-    { q: '인터넷에서 찾은 예제가 tf.placeholder 와 sess.run 을 쓰는데, TF 2.x 에서 돌리자 바로 에러가 났다. 먼저 의심할 것은?',
-      o: ['TF1 시절 정적 그래프 코드라 TF2 에는 없는 API 를 쓴다', 'GPU 드라이버가 오래됐다', 'Keras 를 따로 설치하지 않았다'], a: 0,
-      why: 'placeholder·Session·feed_dict 는 TF1 의 선언 후 실행 방식이다. TF2 에서는 tf.Session 자체가 없어 AttributeError 가 난다.' },
-    { q: '생성자와 판별자의 손실을 번갈아 갱신하는 GAN 을 만들어야 한다. 어느 쪽이 맞나?',
-      o: ['fit 한 줄이면 충분하다', 'GradientTape 로 학습 루프를 직접 짠다', 'TF1 Session 으로 돌아간다'], a: 1,
-      why: 'fit 은 표준 지도학습 루프를 포장한 것이다. 두 손실을 번갈아 다루는 루프는 tape.gradient 와 apply_gradients 로 손수 짜야 한다.' },
-    { q: 'eager 로 짠 학습 스텝이 느려서 @tf.function 을 붙였더니 첫 호출만 오래 걸리고 이후는 빨라졌다. 이 현상의 설명으로 맞는 것은?',
-      o: ['첫 호출에서 데이터를 캐시에 올렸다', '두 번째부터 eager 로 돌아갔다', '첫 호출에서 그래프를 추적하고 이후 재사용했다'], a: 2,
-      why: 'tf.function 은 첫 호출에 그래프를 만들고 다음부터 그 그래프만 실행한다. TF1 그래프의 속도를 TF2 안에서 되찾는 장치다.' },
+    { q: '인터넷에서 찾은 예제가 tf.placeholder와 sess.run을 쓰는데, TF 2.x에서 돌리자 바로 에러가 났다. 먼저 의심할 것은?',
+      o: ['TF1 시절 정적 그래프 코드라 TF2에는 없는 API를 쓴다', 'GPU 드라이버가 오래됐다', 'Keras를 따로 설치하지 않았다'], a: 0,
+      why: 'placeholder·Session·feed_dict는 TF1의 선언 후 실행 방식이다. TF2에서는 tf.Session 자체가 없어 AttributeError가 난다.' },
+    { q: '생성자와 판별자의 손실을 번갈아 갱신하는 GAN을 만들어야 한다. 어느 쪽이 맞나?',
+      o: ['fit 한 줄이면 충분하다', 'GradientTape로 학습 루프를 직접 짠다', 'TF1 Session으로 돌아간다'], a: 1,
+      why: 'fit은 표준 지도학습 루프를 포장한 것이다. 두 손실을 번갈아 다루는 루프는 tape.gradient와 apply_gradients로 손수 짜야 한다.' },
+    { q: 'eager로 짠 학습 스텝이 느려서 @tf.function을 붙였더니 첫 호출만 오래 걸리고 이후는 빨라졌다. 이 현상의 설명으로 맞는 것은?',
+      o: ['첫 호출에서 데이터를 캐시에 올렸다', '두 번째부터 eager로 돌아갔다', '첫 호출에서 그래프를 추적하고 이후 재사용했다'], a: 2,
+      why: 'tf.function은 첫 호출에 그래프를 만들고 다음부터 그 그래프만 실행한다. TF1 그래프의 속도를 TF2 안에서 되찾는 장치다.' },
   ];
 
-  R.page({ title: 'TensorFlow 가 걸어온 길', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
+  R.page({ title: 'TensorFlow가 걸어온 길', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

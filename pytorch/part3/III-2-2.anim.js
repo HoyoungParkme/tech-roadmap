@@ -222,39 +222,39 @@
     sub(780, 300, '모니터링 없는 장기 학습은 도박', fade(u, 1.4), { 'font-size': 15, fill: INK, 'font-weight': 700 }); sub(780, 330, '다음: Part Ⅳ 실전 모델링', fade(u, 1.9), { 'font-size': 14.5, fill: ACC }); }
 
   const quiz = [
-    { q: 'tqdm 진행바로 알 수 있지만 print 처럼 여전히 알 수 없는 것은 무엇인가?',
+    { q: 'tqdm 진행바로 알 수 있지만 print처럼 여전히 알 수 없는 것은 무엇인가?',
       o: ['학습이 멈췄는지 살아 있는지', '남은 시간', '어제 실험보다 손실이 나은지'], a: 2,
-      why: '진행바는 진행률·속도·최신 loss 를 한 줄로 보여 준다. 추세와 실험 간 비교는 곡선으로 그려야 보인다.' },
-    { q: 'train 과 val 손실을 TensorBoard 의 한 차트에 겹치려면 태그를 어떻게 지어야 하는가?',
-      o: ['"Loss/train", "Loss/val" 처럼 앞부분을 같게', '"train", "val" 처럼 짧게', 'writer 를 두 개 만들어 따로'], a: 0,
+      why: '진행바는 진행률·속도·최신 loss를 한 줄로 보여 준다. 추세와 실험 간 비교는 곡선으로 그려야 보인다.' },
+    { q: 'train과 val 손실을 TensorBoard의 한 차트에 겹치려면 태그를 어떻게 지어야 하는가?',
+      o: ['"Loss/train", "Loss/val" 처럼 앞부분을 같게', '"train", "val" 처럼 짧게', 'writer를 두 개 만들어 따로'], a: 0,
       why: '슬래시 앞이 차트 그룹 이름이다. 실험에서 두 곡선은 에폭 14 뒤로 벌어졌다.' },
     { q: '손실은 매끄럽게 내려가는데 앞쪽 층이 배우지 않는 문제를 잡으려면 무엇을 기록해야 하는가?',
-      o: ['add_scalar 로 loss 를 더 자주', 'add_histogram 으로 층별 기울기', 'add_graph 를 매 에폭'], a: 1,
-      why: '6층 sigmoid MLP 에서 첫 층 평균 |grad| 는 2.0e-08, 마지막 층은 2.8e-02 였다. 이런 차이는 층별 기울기 분포에서만 보인다.' },
-    { q: 'patience=7 인 EarlyStopping 이 에폭 21 에 멈췄다. 복원되는 가중치는 언제 것인가?',
+      o: ['add_scalar로 loss를 더 자주', 'add_histogram으로 층별 기울기', 'add_graph를 매 에폭'], a: 1,
+      why: '6층 sigmoid MLP에서 첫 층 평균 |grad| 는 2.0e-08, 마지막 층은 2.8e-02 였다. 이런 차이는 층별 기울기 분포에서만 보인다.' },
+    { q: 'patience=7인 EarlyStopping이 에폭 21에 멈췄다. 복원되는 가중치는 언제 것인가?',
       o: ['에폭 21', '에폭 14', '에폭 0'], a: 1,
-      why: 'val 손실이 가장 낮았던 에폭 14(0.499)의 스냅샷을 되돌린다. 에폭 21 의 가중치는 이미 과적합이 진행된 상태다.' },
-    { q: '실험 폴더 이름을 20240806_resnet18_lr0.001_bs64_augFlip 처럼 짓는 이유는 무엇인가?',
-      o: ['TensorBoard 가 이 형식만 읽어서', '폴더 이름이 짧아져서', '폴더 목록만 봐도 어떤 설정의 실험인지 알 수 있어서'], a: 2,
+      why: 'val 손실이 가장 낮았던 에폭 14(0.499)의 스냅샷을 되돌린다. 에폭 21의 가중치는 이미 과적합이 진행된 상태다.' },
+    { q: '실험 폴더 이름을 20240806_resnet18_lr0.001_bs64_augFlip처럼 짓는 이유는 무엇인가?',
+      o: ['TensorBoard가 이 형식만 읽어서', '폴더 이름이 짧아져서', '폴더 목록만 봐도 어떤 설정의 실험인지 알 수 있어서'], a: 2,
       why: 'exp1, exp2 같은 이름은 며칠 지나면 무엇이었는지 알 수 없다. 설정을 이름에 넣으면 범례만 봐도 실험이 복원된다.' },
   ];
 
   const summary = [
-    'print 로 흘러가는 숫자로는 추세도, 실험 사이의 차이도 보이지 않는다.',
-    'TensorBoard 에 Loss/train 과 Loss/val 을 함께 남기면 두 곡선이 벌어지는 에폭이 보인다.',
+    'print로 흘러가는 숫자로는 추세도, 실험 사이의 차이도 보이지 않는다.',
+    'TensorBoard에 Loss/train과 Loss/val을 함께 남기면 두 곡선이 벌어지는 에폭이 보인다.',
     '손실이 멀쩡해도 층별 기울기 분포에서 배우지 않는 층을 찾을 수 있다.',
     '조기 종료는 val 손실로 판정하고, 멈춘 뒤 가장 좋았던 에폭의 가중치로 되돌린다.',
   ];
   const review = [
-    { q: 'EarlyStopping 을 붙였는데 100 에폭을 다 돌고 끝났다. 코드를 보니 stopper 를 for 문 안에서 만들고 있다. 무엇이 문제인가?',
-      o: ['patience 가 너무 크다', '매 에폭 counter 가 0 으로 초기화된다', 'min_delta 가 너무 작다'], a: 1,
-      why: 'stopper 는 에폭을 가로질러 counter 와 best 를 들고 있어야 한다. 루프 안에서 만들면 매번 새로 시작해 patience 에 닿지 못한다.' },
+    { q: 'EarlyStopping을 붙였는데 100 에폭을 다 돌고 끝났다. 코드를 보니 stopper를 for 문 안에서 만들고 있다. 무엇이 문제인가?',
+      o: ['patience가 너무 크다', '매 에폭 counter가 0으로 초기화된다', 'min_delta가 너무 작다'], a: 1,
+      why: 'stopper는 에폭을 가로질러 counter와 best를 들고 있어야 한다. 루프 안에서 만들면 매번 새로 시작해 patience에 닿지 못한다.' },
     { q: 'train 손실로 조기 종료를 판정했더니 끝까지 멈추지 않았다. 이 장의 실험에서 그 이유는?',
-      o: ['train 손실은 과적합 구간에서도 0.658 에서 0.247 까지 계속 내려가서', 'train 손실이 NaN 이 되어서', 'min_delta 를 0 으로 둬서'], a: 0,
-      why: '과적합은 train 이 계속 좋아지는데 val 이 나빠지는 상태다. 실험에서 val 은 에폭 14 의 0.499 뒤로 다시 올랐다.' },
-    { q: 'best_state = model.state_dict() 로 스냅샷을 떴더니 복원해도 마지막 가중치와 같았다. 원인은?',
-      o: ['map_location 을 빼먹어서', 'eval() 을 안 불러서', 'state_dict 가 같은 텐서를 가리켜 이후 학습에 함께 바뀌어서'], a: 2,
-      why: 'state_dict() 는 파라미터 텐서를 복사하지 않고 이름으로 묶어 보여 준다. copy.deepcopy 로 떠야 그 순간의 값이 남는다.' },
+      o: ['train 손실은 과적합 구간에서도 0.658에서 0.247까지 계속 내려가서', 'train 손실이 NaN이 되어서', 'min_delta를 0으로 둬서'], a: 0,
+      why: '과적합은 train이 계속 좋아지는데 val이 나빠지는 상태다. 실험에서 val은 에폭 14의 0.499 뒤로 다시 올랐다.' },
+    { q: 'best_state = model.state_dict()로 스냅샷을 떴더니 복원해도 마지막 가중치와 같았다. 원인은?',
+      o: ['map_location을 빼먹어서', 'eval()을 안 불러서', 'state_dict가 같은 텐서를 가리켜 이후 학습에 함께 바뀌어서'], a: 2,
+      why: 'state_dict()는 파라미터 텐서를 복사하지 않고 이름으로 묶어 보여 준다. copy.deepcopy로 떠야 그 순간의 값이 남는다.' },
   ];
 
   R.page({ title: '학습 계기판 — tqdm · TensorBoard · 조기 종료', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

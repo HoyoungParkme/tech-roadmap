@@ -259,39 +259,39 @@
     note(560, 250, '학습 전에 한 번 눈으로 본다', fade(u, 2.3), { 'font-size': 15, fill: ACC }); }
 
   const quiz = [
-    { q: 'Compose([Resize, ToTensor, Normalize]) 에서 Normalize 를 맨 앞으로 옮기면 어떻게 되는가?',
-      o: ['순서와 상관없이 같은 결과가 나온다', 'PIL 이미지가 Normalize 에 들어가 에러가 난다', '정규화만 건너뛰고 계속 돈다'], a: 1,
-      why: '리스트 순서가 실행 순서다. Normalize 는 텐서만 받으므로 ToTensor 보다 앞에 오면 PIL 이미지를 받고 TypeError 가 난다.' },
-    { q: '픽셀 R 값 200 이 ToTensor 와 Normalize(mean 0.485, std 0.229) 를 지나면 대략 얼마가 되는가?',
+    { q: 'Compose([Resize, ToTensor, Normalize])에서 Normalize를 맨 앞으로 옮기면 어떻게 되는가?',
+      o: ['순서와 상관없이 같은 결과가 나온다', 'PIL 이미지가 Normalize에 들어가 에러가 난다', '정규화만 건너뛰고 계속 돈다'], a: 1,
+      why: '리스트 순서가 실행 순서다. Normalize는 텐서만 받으므로 ToTensor보다 앞에 오면 PIL 이미지를 받고 TypeError가 난다.' },
+    { q: '픽셀 R 값 200이 ToTensor와 Normalize(mean 0.485, std 0.229)를 지나면 대략 얼마가 되는가?',
       o: ['1.307', '0.784', '200'], a: 0,
-      why: 'ToTensor 가 200/255 = 0.784 로 내리고, Normalize 가 (0.784 - 0.485) / 0.229 = 1.307 로 옮긴다.' },
+      why: 'ToTensor가 200/255 = 0.784로 내리고, Normalize가 (0.784 - 0.485) / 0.229 = 1.307로 옮긴다.' },
     { q: 'val 파이프라인에 넣으면 안 되는 변환은 무엇인가?',
       o: ['CenterCrop(224)', 'Normalize(IMAGENET_MEAN, IMAGENET_STD)', 'RandomHorizontalFlip()'], a: 2,
-      why: 'val 은 결정적이어야 한다. 랜덤 변환이 섞이면 같은 모델을 평가할 때마다 점수가 달라진다.' },
+      why: 'val은 결정적이어야 한다. 랜덤 변환이 섞이면 같은 모델을 평가할 때마다 점수가 달라진다.' },
     { q: 'GPU 사용률이 낮고 데이터 대기가 길 때 먼저 의심할 것은 무엇인가?',
-      o: ['모델이 너무 커서 생긴 연산 병목', '변환을 CPU 가 못 따라가는 입력 병목', '학습률이 너무 높은 것'], a: 1,
-      why: 'GPU 가 놀고 있다면 데이터가 늦게 오는 것이다. num_workers 를 늘리거나 증강을 GPU 배치로 옮긴다.' },
+      o: ['모델이 너무 커서 생긴 연산 병목', '변환을 CPU가 못 따라가는 입력 병목', '학습률이 너무 높은 것'], a: 1,
+      why: 'GPU가 놀고 있다면 데이터가 늦게 오는 것이다. num_workers를 늘리거나 증강을 GPU 배치로 옮긴다.' },
     { q: '정규화된 텐서를 그대로 이미지로 저장하면 거의 까맣게 보인다. 왜 그런가?',
-      o: ['값에 음수가 섞여 있고 범위가 [0, 1] 이 아니라서', 'ToTensor 가 채널을 지워서', '저장 함수가 텐서를 못 읽어서'], a: 0,
-      why: '정규화 뒤 값은 약 -2.1 ~ 2.6 이다. x·std + mean 으로 되돌리고 [0, 1] 로 잘라야 사람이 볼 수 있다.' },
+      o: ['값에 음수가 섞여 있고 범위가 [0, 1]이 아니라서', 'ToTensor가 채널을 지워서', '저장 함수가 텐서를 못 읽어서'], a: 0,
+      why: '정규화 뒤 값은 약 -2.1 ~ 2.6이다. x·std + mean으로 되돌리고 [0, 1]로 잘라야 사람이 볼 수 있다.' },
   ];
 
   const summary = [
-    'transforms 는 __getitem__ 이 샘플을 꺼낼 때마다 그 자리에서 돈다. 원본은 디스크에 그대로 둔다.',
-    'ToTensor 는 0~255 를 0~1 로 내리고 축을 CHW 로 바꾼다. 픽셀 200 은 0.784 가 된다.',
-    'Normalize 는 채널마다 평균을 빼고 표준편차로 나눈다. train 과 val 에 같은 통계를 쓴다.',
+    'transforms는 __getitem__이 샘플을 꺼낼 때마다 그 자리에서 돈다. 원본은 디스크에 그대로 둔다.',
+    'ToTensor는 0~255를 0~1로 내리고 축을 CHW로 바꾼다. 픽셀 200은 0.784가 된다.',
+    'Normalize는 채널마다 평균을 빼고 표준편차로 나눈다. train과 val에 같은 통계를 쓴다.',
     '랜덤 증강은 train 에만 넣고, 학습 전에 역정규화한 결과를 눈으로 확인한다.',
   ];
   const review = [
     { q: '전이학습 모델이 train 정확도는 높은데 val 에서만 크게 떨어졌다. 에러는 없다. 먼저 볼 곳은?',
-      o: ['val_tf 에 Normalize 가 빠졌거나 통계가 다른지', 'num_workers 수', 'drop_last 설정'], a: 0,
+      o: ['val_tf에 Normalize가 빠졌거나 통계가 다른지', 'num_workers 수', 'drop_last 설정'], a: 0,
       why: '통계가 어긋나면 에러 없이 입력 분포만 옮겨 간다. 백본은 ImageNet 통계로 정규화된 입력에 맞춰져 있다.' },
     { q: '검증 점수가 같은 체크포인트로 평가할 때마다 조금씩 다르게 나온다. 가장 먼저 의심할 것은?',
-      o: ['Normalize 의 std 값', 'val_tf 에 Random 으로 시작하는 변환이 들어 있다', 'Resize 크기가 256 이다'], a: 1,
-      why: '결정적 파이프라인이라면 같은 입력에 대해 차이가 정확히 0 이다. 랜덤 변환이 섞여야 결과가 매번 달라진다.' },
-    { q: '탐지 데이터에 v2.RandomHorizontalFlip 을 걸었더니 이미지는 뒤집혔는데 박스 좌표가 그대로다. 원인은?',
-      o: ['v2 는 박스를 지원하지 않는다', 'ToDtype 을 빼먹었다', 'boxes 를 일반 텐서로 넘겨서 변환 대상이 아니었다'], a: 2,
-      why: 'v2 는 tv_tensors.BoundingBoxes 로 감싼 값만 박스로 알아보고 함께 바꾼다. 일반 텐서는 이미지가 따로 있으면 그대로 통과한다.' },
+      o: ['Normalize의 std 값', 'val_tf에 Random으로 시작하는 변환이 들어 있다', 'Resize 크기가 256이다'], a: 1,
+      why: '결정적 파이프라인이라면 같은 입력에 대해 차이가 정확히 0이다. 랜덤 변환이 섞여야 결과가 매번 달라진다.' },
+    { q: '탐지 데이터에 v2.RandomHorizontalFlip을 걸었더니 이미지는 뒤집혔는데 박스 좌표가 그대로다. 원인은?',
+      o: ['v2는 박스를 지원하지 않는다', 'ToDtype을 빼먹었다', 'boxes를 일반 텐서로 넘겨서 변환 대상이 아니었다'], a: 2,
+      why: 'v2는 tv_tensors.BoundingBoxes로 감싼 값만 박스로 알아보고 함께 바꾼다. 일반 텐서는 이미지가 따로 있으면 그대로 통과한다.' },
   ];
 
   R.page({ title: '변환 조립 라인 — transforms', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

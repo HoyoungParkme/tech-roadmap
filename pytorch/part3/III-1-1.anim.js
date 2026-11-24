@@ -297,39 +297,39 @@
 
   // 장면(Step)마다 확인 문제 하나
   const quiz = [
-    { q: '데이터 소스를 CSV 에서 이미지 폴더로 바꿀 때 새로 짜야 하는 것은 무엇인가?',
-      o: ['train() 학습 루프', 'Dataset 클래스', 'DataLoader 와 train() 둘 다'], a: 1,
-      why: '소스를 아는 것은 Dataset 하나뿐이다. DataLoader 와 for xb, yb in loader 루프는 그대로 쓴다.' },
-    { q: 'Dataset 이 반드시 구현해야 하는 두 메서드는 무엇인가?',
-      o: ['__len__ 과 __getitem__', '__init__ 과 __iter__', 'shuffle 과 batch'], a: 0,
-      why: '__len__ 은 샘플 수(891)를, __getitem__(i) 는 i번째 (특징, 라벨) 한 쌍을 돌려준다. 배치와 셔플은 DataLoader 몫이다.' },
-    { q: '891개를 batch_size=32, drop_last=True 로 묶으면 한 에폭의 배치 수는 무엇인가?',
+    { q: '데이터 소스를 CSV에서 이미지 폴더로 바꿀 때 새로 짜야 하는 것은 무엇인가?',
+      o: ['train() 학습 루프', 'Dataset 클래스', 'DataLoader와 train() 둘 다'], a: 1,
+      why: '소스를 아는 것은 Dataset 하나뿐이다. DataLoader와 for xb, yb in loader 루프는 그대로 쓴다.' },
+    { q: 'Dataset이 반드시 구현해야 하는 두 메서드는 무엇인가?',
+      o: ['__len__과 __getitem__', '__init__과 __iter__', 'shuffle과 batch'], a: 0,
+      why: '__len__은 샘플 수(891)를, __getitem__(i)는 i번째 (특징, 라벨) 한 쌍을 돌려준다. 배치와 셔플은 DataLoader 몫이다.' },
+    { q: '891개를 batch_size=32, drop_last=True로 묶으면 한 에폭의 배치 수는 무엇인가?',
       o: ['28개', '32개', '27개'], a: 2,
-      why: '891 = 32×27 + 27 이다. drop_last 가 마지막 자투리 27개를 버리므로 배치는 27개다.' },
-    { q: 'Windows 에서 num_workers=4 로 돌렸더니 프로세스가 끝없이 늘었다. 빠진 것은 무엇인가?',
+      why: '891 = 32×27 + 27이다. drop_last가 마지막 자투리 27개를 버리므로 배치는 27개다.' },
+    { q: 'Windows에서 num_workers=4로 돌렸더니 프로세스가 끝없이 늘었다. 빠진 것은 무엇인가?',
       o: ['pin_memory=True', 'if __name__ == "__main__": 가드', 'persistent_workers=True'], a: 1,
       why: 'spawn 방식에서는 워커가 스크립트를 다시 import 한다. 실행 코드가 가드 밖에 있으면 워커가 또 워커를 띄운다.' },
-    { q: 'val_loader 에 shuffle=False 를 주는 이유는 무엇인가?',
-      o: ['검증은 학습이 아니라 순서를 섞을 이유가 없고 결과 비교가 쉬워서', '셔플하면 검증 데이터가 학습에 섞여서', 'False 여야 pin_memory 가 켜져서'], a: 0,
+    { q: 'val_loader에 shuffle=False를 주는 이유는 무엇인가?',
+      o: ['검증은 학습이 아니라 순서를 섞을 이유가 없고 결과 비교가 쉬워서', '셔플하면 검증 데이터가 학습에 섞여서', 'False 여야 pin_memory가 켜져서'], a: 0,
       why: '셔플은 학습할 때 순서를 외우지 못하게 하려는 것이다. 검증은 같은 순서로 돌려야 실행끼리 비교하기 쉽다.' },
   ];
 
   const summary = [
     '데이터 소스가 무엇이든 학습 루프는 for xb, yb in loader 한 줄로 받는다.',
-    'Dataset 은 __len__ 과 __getitem__ 두 메서드로 샘플 하나만 책임진다.',
-    'DataLoader 는 891개를 32개씩 묶고 섞으며, drop_last 면 자투리 27개를 버린다.',
-    '길이가 다른 샘플은 collate_fn 에서 패딩하고, 워커 수는 직접 재서 고른다.',
+    'Dataset은 __len__과 __getitem__ 두 메서드로 샘플 하나만 책임진다.',
+    'DataLoader는 891개를 32개씩 묶고 섞으며, drop_last면 자투리 27개를 버린다.',
+    '길이가 다른 샘플은 collate_fn에서 패딩하고, 워커 수는 직접 재서 고른다.',
   ];
   const review = [
-    { q: '문장 데이터를 DataLoader 로 묶자 stack expects each tensor to be equal size 오류가 났다. 먼저 손볼 곳은?',
-      o: ['batch_size 를 1 로 줄이기', 'pad_sequence 로 길이를 맞추는 collate_fn 넘기기', '__len__ 반환값 고치기'], a: 1,
-      why: '기본 collate 는 torch.stack 으로 쌓으므로 길이가 다르면 멈춘다. collate_fn 에서 0 으로 패딩하고 원래 길이를 함께 넘긴다.' },
-    { q: '이미지 수십만 장 Dataset 의 __init__ 에서 모든 사진을 미리 열었더니 메모리가 터졌다. 어떻게 고치나?',
-      o: ['num_workers 를 0 으로 둔다', 'batch_size 를 키운다', '__init__ 에는 경로만 두고 __getitem__ 에서 한 장씩 연다'], a: 2,
-      why: '__init__ 은 가볍게 메타만 들고, 무거운 로딩은 샘플을 꺼낼 때 한다. 그래야 메모리에 한 배치 분량만 올라간다.' },
-    { q: 'Windows 에서 num_workers 를 0 에서 8 로 올렸는데 첫 에폭이 오히려 느려졌다. 가장 그럴듯한 이유는?',
-      o: ['워커 프로세스를 띄우는 비용이 첫 에폭에 들어가서', 'drop_last 가 꺼져 있어서', 'shuffle 이 순서를 망가뜨려서'], a: 0,
-      why: '이 장의 실측에서 첫 에폭은 2.24초에서 5.47초로 늘었지만 둘째 에폭은 2.21초에서 0.30초로 줄었다. persistent_workers 로 워커를 살려 두면 띄우는 비용은 한 번만 든다.' },
+    { q: '문장 데이터를 DataLoader로 묶자 stack expects each tensor to be equal size 오류가 났다. 먼저 손볼 곳은?',
+      o: ['batch_size를 1로 줄이기', 'pad_sequence로 길이를 맞추는 collate_fn 넘기기', '__len__ 반환값 고치기'], a: 1,
+      why: '기본 collate는 torch.stack으로 쌓으므로 길이가 다르면 멈춘다. collate_fn에서 0으로 패딩하고 원래 길이를 함께 넘긴다.' },
+    { q: '이미지 수십만 장 Dataset의 __init__에서 모든 사진을 미리 열었더니 메모리가 터졌다. 어떻게 고치나?',
+      o: ['num_workers를 0으로 둔다', 'batch_size를 키운다', '__init__에는 경로만 두고 __getitem__에서 한 장씩 연다'], a: 2,
+      why: '__init__은 가볍게 메타만 들고, 무거운 로딩은 샘플을 꺼낼 때 한다. 그래야 메모리에 한 배치 분량만 올라간다.' },
+    { q: 'Windows에서 num_workers를 0에서 8로 올렸는데 첫 에폭이 오히려 느려졌다. 가장 그럴듯한 이유는?',
+      o: ['워커 프로세스를 띄우는 비용이 첫 에폭에 들어가서', 'drop_last가 꺼져 있어서', 'shuffle이 순서를 망가뜨려서'], a: 0,
+      why: '이 장의 실측에서 첫 에폭은 2.24초에서 5.47초로 늘었지만 둘째 에폭은 2.21초에서 0.30초로 줄었다. persistent_workers로 워커를 살려 두면 띄우는 비용은 한 번만 든다.' },
   ];
 
   R.page({ title: '데이터 배관 — Dataset · DataLoader', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
