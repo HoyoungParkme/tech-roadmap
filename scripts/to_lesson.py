@@ -19,10 +19,12 @@ def sections(topic):
     return name, [{"id": i, "title": t, "file": f} for i, _, t, f in items]
 
 def text_of(jsx):
-    jsx = html.unescape(jsx)
+    # 태그를 먼저 지우고 나서 &lt; 같은 엔티티를 푼다 (거꾸로 하면 "p &lt; a+n" 의 < 가 태그로 오인돼 뒤가 잘린다)
     t = re.sub(r"<[^>]+>", " ", jsx); t = re.sub(r"\{[^{}]*\}", " ", t)
+    t = html.unescape(t)
     t = re.sub(r"\s+", " ", t).strip()
-    return re.sub(r"\s+([)\]},.!?])", r"\1", re.sub(r"([(\[{])\s+", r"\1", t))   # JSX 태그를 지우며 생긴 괄호 안·문장부호 앞 공백
+    # 마침표는 문장 끝일 때만 붙인다 ("각 .c 파일" 의 공백은 남긴다)
+    return re.sub(r"\s+([)\]},!?]|\.(?=\s|$))", r"\1", re.sub(r"([(\[{])\s+", r"\1", t))   # JSX 태그를 지우며 생긴 괄호 안·문장부호 앞 공백
 
 for arg in sys.argv[1:]:
     p = (ROOT / arg).resolve(); rel = p.relative_to(ROOT).as_posix(); topic = rel.split("/")[0]; pid = p.stem
