@@ -32,7 +32,8 @@ for f in [a for a in sys.argv[1:] if a != "--dry"]:
     else:
         s2 = s
         for key in ("caption", "desc", "keyPoint", "label", "title"):
-            s2, k = re.subn(key + r"(\s*:\s*)(" + STR.pattern + ")", lambda m: key + m.group(1) + fix_strings(m.group(2))[0], s2);
+            # caption: '…' 꼴과 "caption":"…"(JSON) 꼴 모두
+            s2, k = re.subn(r"(\"?\b" + key + r"\"?\s*:\s*)(" + STR.pattern + ")", lambda m: m.group(1) + fix_strings(m.group(2))[0], s2)
         s2, _ = re.subn(r'("wrap": )("(?:[^"\\]|\\.)*")', lambda m: m.group(1) + fix_strings(m.group(2))[0], s2)
         total = sum(1 for a, b in zip(s.splitlines(), s2.splitlines()) if a != b)
     if s2 != s:

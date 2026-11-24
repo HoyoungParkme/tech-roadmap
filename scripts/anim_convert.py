@@ -6,7 +6,9 @@
 #  - 쓰지 않게 된 LiveDataPane 함수는 지운다 (그 안에서만 쓰던 부품은 각 페이지 작업에서 정리)
 import pathlib, re, sys
 
-GRID = re.compile(r'\n( *)<div className="grid grid-cols-1 lg:grid-cols-2 gap-4">\n *<LiveDataPane [^\n]*/>\n *<CodeViewer code=\{step\.code\} stepIdx=\{stepIdx\} total=\{STEPS\.length\} />\n *</div>')
+# 옛 2단 그리드. gap 값, LiveDataPane 인자(beat/state/step)는 페이지마다 다르다.
+# CodeViewer 가 code={step.code} 를 받지 않는 페이지(파일 탭 방식)는 경고만 한다 — STEPS 에 code 를 만들어 줘야 한다.
+GRID = re.compile(r'\n( *)<div className="grid grid-cols-1 lg:grid-cols-2 gap-\d+">\n *<LiveDataPane[^\n]*/>\n *(<CodeViewer [^\n]*/>)\n *</div>')
 
 def drop_function(src, name):
     i = src.find(f"\n    function {name}(")
@@ -24,8 +26,9 @@ for f in sys.argv[1:]:
     tag = '  <script type="text/babel">'
     assert s.count(tag) == 1, f
     s = s.replace(tag, '  <script type="text/babel" data-presets="env,react" src="../../anim/stage.jsx"></script>\n' + tag)
-    s, n = GRID.subn(lambda m: f"\n{m.group(1)}<HybridBody step={{step}} stepIdx={{stepIdx}} />", s)
-    assert n == 1, f"그리드를 못 찾음: {f}"
+    found = GRID.findall(s); assert len(found) == 1, f"그리드를 못 찾음: {f}"
+    if "code={step.code}" not in found[0][1]: print("  주의: CodeViewer 가 step.code 를 받지 않음 →", found[0][1].strip())
+    s = GRID.sub(lambda m: f"\n{m.group(1)}<HybridBody step={{step}} stepIdx={{stepIdx}} />", s)
     s = drop_function(s, "LiveDataPane")
     p.write_text(s, encoding="utf-8", newline="\n")
     print("ok", f)
