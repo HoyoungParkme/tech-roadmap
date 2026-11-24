@@ -57,4 +57,10 @@ PAGE = """<!DOCTYPE html>
 </html>
 """
 (ROOT / "index.html").write_text(PAGE.replace("{cats}", cats.strip()).replace("{anim}", json.dumps(anim)), encoding="utf-8", newline="\n")
+# 지도(mindmap/index.html)도 같은 주제 목록과 레슨 장 수를 쓴다
+groups = [[m.group(1), [[a, b, c, int(d), int(e)] for a, b, c, d, e in re.findall(r"\['([\w-]+)','([^']+)','([^']*)',(\d+),(\d+)\]", m.group(2))]]
+          for m in re.finditer(r"name:'([^']+)', items:\[([\s\S]*?)\]\}", cats)]
+(ROOT / "mindmap" / "topics.js").write_text(
+    "// scripts/build_hub.py 가 만든다. 직접 고치지 않는다.\nwindow.TOPIC_GROUPS = " + json.dumps(groups, ensure_ascii=False)
+    + ";\nwindow.TOPIC_ANIM = " + json.dumps(anim) + ";\n", encoding="utf-8", newline="\n")
 print("ok", anim)
