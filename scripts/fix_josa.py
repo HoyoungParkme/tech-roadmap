@@ -1,7 +1,7 @@
 # 사용: PYTHONUTF8=1 python scripts/fix_josa.py [--dry] <파일>...
 # 영문·숫자·코드 뒤에 띄어 쓴 조사를 붙인다 ("LoRA 로" → "LoRA로").
 #  - .anim.js: quiz / summary / review 문자열(파일의 `const quiz` 부터 끝까지)만
-#  - .html  : STEPS 의 caption / desc / keyPoint / label 문자열과 window.LESSON 의 wrap
+#  - .html  : STEPS 의 caption / desc / keyPoint / label / title / alert / text / note 문자열과 window.LESSON 의 wrap
 # 코드 블록(CODE)은 건드리지 않는다.
 import pathlib, re, sys
 
@@ -31,7 +31,7 @@ for f in [a for a in sys.argv[1:] if a != "--dry"]:
         body, total = fix_strings(s[i:]); s2 = s[:i] + body
     else:
         s2 = s
-        for key in ("caption", "desc", "keyPoint", "label", "title"):
+        for key in ("caption", "desc", "keyPoint", "label", "title", "alert", "text", "note"):
             # caption: '…' 꼴과 "caption":"…"(JSON) 꼴 모두
             s2, k = re.subn(r"(\"?\b" + key + r"\"?\s*:\s*)(" + STR.pattern + ")", lambda m: m.group(1) + fix_strings(m.group(2))[0], s2)
         s2, _ = re.subn(r'("wrap": )("(?:[^"\\]|\\.)*")', lambda m: m.group(1) + fix_strings(m.group(2))[0], s2)
