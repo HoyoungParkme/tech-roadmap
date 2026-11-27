@@ -143,7 +143,7 @@
       dot([[250, 74], [260, 225], [405, 225], [458, Y4[ri]], [622, Y4[ri]], [712, Y4[ri]]], seg(u, 0.5, 2.0), col, 7);
       if (k === 4) { mono(800, Y4[0] + 46, '받는 경로 /users', { 'text-anchor': 'middle', 'font-size': 14, fill: col, 'font-weight': 800, opacity: fade(u, 1.8) });
         mono(560, 58, 'rewrite-target: /$2', { 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.3) }); }
-      if (k === 3) sub(540, 375, '/api · /admin 에 안 걸리면 / 가 받는다', fade(u, 1.8), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); }
+      if (k === 3) sub(540, 375, '/api · /admin에 안 걸리면 /가 받는다', fade(u, 1.8), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); }
     if (k === 5) { [['/api/users', 0], ['/admin/login', 1], ['/products', 2]].forEach(([p, ri], i) => { const col = SV[routes[ri].service.replace('-svc', '')];
         mono(40, 50 + i * 28, 'GET example.com' + p, { 'font-size': 14.5, fill: col, 'font-weight': 700, opacity: fade(u, 0.2 + i * 0.4) });
         dot([[200, 130], [260, 225], [405, 225], [458, Y4[ri]], [622, Y4[ri]], [712, Y4[ri]]], seg(u, 0.4 + i * 0.4, 1.6 + i * 0.4), col, 7); }); }
@@ -178,14 +178,14 @@
       dot([[CL[0] + 28, 215], [436, 215], [674, Y5[0]]], seg(u, 1.2, 2.5), INFO, 7); }
     if (k === 3) { mono(575, 202, 'HTTP :80 (평문)', { 'text-anchor': 'middle', 'font-size': 14, fill: INK, 'font-weight': 800, opacity: fade(u, 0.3) });
       [0, 1, 2].forEach((i) => dot([[CL[0] + 28, 215], [436, 215], [674, Y5[i]]], seg(u, 0.5 + i * 0.4, 1.7 + i * 0.4), SV[SVN[i]], 6));
-      sub(880, 378, 'Pod 는 인증서를 모른다', fade(u, 1.6), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); }
+      sub(880, 378, 'Pod는 인증서를 모른다', fade(u, 1.6), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); }
     if (k === 4) { // 갱신 시간축 (숫자 없이 순서만)
       const x0 = 60, x1 = 560, y = 360, g3 = E(u, 0.2, 1.2);
       el('line', { x1: x0, y1: y, x2: lerp(x0, x1, g3), y2: y, stroke: MUT, 'stroke-width': 3 });
       [['발급', x0, ACC], ['갱신', 400, GOOD], ['만료', x1, BAD]].forEach(([s, x, col], i) => { const op = fade(u, 0.4 + i * 0.4);
         el('circle', { cx: x, cy: y, r: 7, fill: col, opacity: op }); tx(x, y + 28, s, { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: col, opacity: op }); });
       el('path', { d: `M400,${y - 12} Q230,${y - 70} ${x0 + 10},${y - 14}`, fill: 'none', stroke: GOOD, 'stroke-width': 2.4, 'stroke-dasharray': '6 5', opacity: fade(u, 1.6) });
-      sub(230, y - 52, '만료 전에 cert-manager 가 다시 받는다', fade(u, 1.8), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); return; }
+      sub(230, y - 52, '만료 전에 cert-manager가 다시 받는다', fade(u, 1.8), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); return; }
     status(c, u); }
 
   const quiz = [
@@ -200,7 +200,7 @@
       why: '세 도메인은 모두 같은 IP 203.0.113.42를 가리킨다. Ingress는 Host 헤더를 보고 api-svc, admin-svc, web-svc로 보낸다.' },
     { q: 'example.com/products 요청은 이 Ingress에서 어디로 가는가?',
       o: ['api-svc', 'admin-svc', 'web-svc'], a: 2,
-      why: '/api와 /admin 어느 쪽에도 맞지 않으므로 기본 경로 / 를 맡은 web-svc가 받는다.' },
+      why: '/api와 /admin 어느 쪽에도 맞지 않으므로 기본 경로 /를 맡은 web-svc가 받는다.' },
     { q: 'tls 섹션을 켠 뒤 Ingress에서 api-svc로 가는 구간은 어떤 프로토콜인가?',
       o: ['HTTPS 그대로', '평문 HTTP', 'Pod마다 다른 인증서로 다시 암호화'], a: 1,
       why: 'Ingress가 site-tls 인증서로 TLS를 풀고 ClusterIP에는 평문 HTTP로 넘긴다. Pod는 인증서를 다루지 않는다.' },
@@ -214,13 +214,13 @@
   ];
   const review = [
     { q: 'Ingress를 만들었는데 모든 요청이 404를 돌려준다. 먼저 볼 곳은?',
-      o: ['rules가 비어 있거나 Host·경로가 어느 규칙에도 맞지 않는지', 'LB가 3개인지', 'Pod의 인증서가 만료됐는지'], a: 0,
+      o: ['rules와 요청 Host·경로의 매칭', 'LB 개수가 3개인지', 'Pod 인증서의 만료 여부'], a: 0,
       why: 'ingressClassName만 있고 rules가 비어 있으면 보낼 곳이 없어 404가 난다. 규칙과 요청의 Host·경로를 맞춰 본다.' },
     { q: 'api.example.com과 admin.example.com을 같은 Ingress로 받으려 한다. DNS에는 무엇을 넣는가?',
       o: ['도메인마다 다른 LB IP', '두 도메인 모두 Ingress 앞 LB IP 하나', 'Service의 ClusterIP'], a: 1,
       why: 'A 레코드는 모두 203.0.113.42 하나를 가리키고, 나누는 일은 Ingress가 Host 헤더로 한다.' },
     { q: '/api 규칙으로 보낸 요청을 백엔드가 /api/users 그대로 받아 404를 낸다. 고칠 곳은?',
-      o: ['web-svc의 기본 경로', 'rewrite-target으로 /api 접두사를 떼어 넘기기', 'TLS Secret 이름'], a: 1,
+      o: ['web-svc의 기본 경로 /', 'tls의 Secret 이름', 'rewrite-target 설정'], a: 2,
       why: 'rewrite-target /$2를 쓰면 /api/users가 /users로 바뀌어 넘어간다. 백엔드는 접두사를 몰라도 된다.' },
   ];
 

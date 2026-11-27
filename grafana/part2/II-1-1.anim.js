@@ -130,12 +130,12 @@
     const expr = k === 3 ? 'sum without (instance) (…)' : 'sum by (job, status) (…)';
     if (k === 1) { pill(250, 280, 'sum by (job, status) (…)', GOOD, pop(u, 0.2), { mono: true }); mono(250, 330, '시계열 3 → 2', { 'font-size': 18, 'font-weight': 800, fill: GOOD, 'text-anchor': 'middle', opacity: fade(u, 1.9) }); return; }
     if (k === 2) { pill(250, 280, expr, GOOD, 1, { mono: true });
-      note(60, 336, 'by 목록에 적은 label 만 결과에 남는다', fade(u, 0.5));
+      note(60, 336, 'by 목록에 적은 label만 결과에 남는다', fade(u, 0.5));
       note(60, 364, '나머지는 모두 더해서 접힌다', fade(u, 1.2), { fill: MUT }); return; }
     if (k === 3) { pill(250, 262, 'sum by (job, status) (…)', GOOD, 1, { mono: true, op: 0.55 });
       mono(250, 302, '≡', { 'font-size': 22, 'font-weight': 800, fill: INK, 'text-anchor': 'middle', opacity: fade(u, 0.6) });
       pill(250, 340, expr, ACC, pop(u, 0.9), { mono: true });
-      note(530, 386, 'without 은 버릴 label 만 적는다', fade(u, 1.6), { fill: ACC }); return; }
+      note(530, 386, 'without은 버릴 label만 적는다', fade(u, 1.6), { fill: ACC }); return; }
   }
   function s2ops(t, c) { const { u } = c, p = c.prev || {}, x0 = 40;
     heads(x0, 84, (j) => (j === 1 ? { col: BAD, mark: 'x' } : { col: GOOD, mark: 'v' }));
@@ -188,14 +188,14 @@
     if (k >= 4) legend(580, 266, b.series.map((s) => [s.name, SER[s.color]]));
     else if (k >= 1) legend(580, 266, b.series.map((s) => [s.name, SER[s.color]]), { raw: true, op: () => lineOn });
     if (k === 0) { note(40, 350, '패널 종류 · 제목 · 보낼 데이터소스', fade(u, 1.4)); return; }
-    if (k === 1) { note(40, 350, 'refId A 가 이 쿼리의 이름표다', fade(u, 1.6)); return; }
+    if (k === 1) { note(40, 350, 'refId A가 이 쿼리의 이름표다', fade(u, 1.6)); return; }
     if (k === 2) { // range 와 instant 가 받는 점
       const ax = 60, aw = 400, ay = 386;
       el('line', { x1: ax, y1: ay, x2: ax + aw, y2: ay, stroke: MUT, 'stroke-width': 1.6 });
       mono(ax, ay + 22, 'from', { 'font-size': 13.5, fill: MUT }); mono(ax + aw, ay + 22, 'to', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end' });
       const n = 16, shown = Math.floor(E(u, 0.2, 1.4) * n);
       for (let i = 0; i < shown; i++) el('circle', { cx: ax + (i / (n - 1)) * aw, cy: ay - 14, r: 4.5, fill: INFO });
-      tx(ax - 4, ay - 30, 'range: step 마다 한 점 → 선', { 'font-size': 14, 'font-weight': 700, fill: INFO, opacity: fade(u, 0.3) });
+      tx(ax - 4, ay - 30, 'range: step마다 한 점 → 선', { 'font-size': 14, 'font-weight': 700, fill: INFO, opacity: fade(u, 0.3) });
       el('circle', { cx: ax + aw, cy: ay - 40, r: 7 * pop(u, 1.6), fill: WARN });
       tx(ax + aw - 12, ay - 52, 'instant: 끝 한 점 → Stat', { 'font-size': 14, 'font-weight': 700, fill: WARN, 'text-anchor': 'end', opacity: fade(u, 1.7) });
       return; }
@@ -207,7 +207,7 @@
       mono(x - 88, y + 41, 'api · 200', { 'font-size': 13.5, fill: OFF });
       mono(x + 46, y + 41, u < 1.0 ? '72' : '72 req/s', { 'font-size': 14, 'font-weight': 800, fill: PANEL, 'text-anchor': 'end' });
       pill(250, 360, 'unit: reqps', ACC, pop(u, 0.3), { mono: true });
-      sub(250, 400, '툴팁 값 72 는 예시', fade(u, 1.4)); return; }
+      sub(250, 400, '툴팁 값 72는 예시', fade(u, 1.4)); return; }
     // k5: step 자동 계산 (예시: last 1h, 패널 폭 1000px)
     const chain = [['1h ÷ 1000점', '= 3.6s'], ['반올림', '→ 5s'], ['scrape 최소', '→ 15s']];
     chain.forEach(([a, z], i) => { const x = 90 + i * 150, s = pop(u, 0.3 + i * 0.55);
@@ -243,10 +243,10 @@
       note(560, 192, 'le="+Inf" = 전체 요청 수', fade(u, 2.0), { fill: MUT }); return; }
     if (k === 1) { const m = E(u, 0.4, 1.6); bars(u, { col: m < 0.5 ? OFF : INFO, scale: lerp(1, 1, m) });
       clock(640, 170, 26, E(u, 0.4, 2.2), WARN, '[5m]'); note(690, 176, '→ 초당 증가율', fade(u, 1.2), { fill: WARN });
-      tx(HB.x, HB.y - 30, 'bucket 도 counter → 먼저 rate()', { 'font-size': 15, 'font-weight': 700 }); return; }
+      tx(HB.x, HB.y - 30, 'bucket도 counter → 먼저 rate()', { 'font-size': 15, 'font-weight': 700 }); return; }
     if (k === 2) { const m = E(u, 0.5, 1.8); bars(u, { split: true, merge: m, vals: fade(u, 2.0) });
       [['instance A', INFO], ['instance B', ACC]].forEach(([s, col], i) => { el('rect', { x: 600, y: 150 + i * 28, width: 13, height: 13, rx: 2, fill: col, opacity: 1 - m * 0.6 }); tx(620, 162 + i * 28, s, { 'font-size': 14, opacity: 1 - m * 0.6 }); });
-      note(600, 250, 'le 만 남기고 서버를 더한다', fade(u, 1.0));
+      note(600, 250, 'le만 남기고 서버를 더한다', fade(u, 1.0));
       tx(600, 280, '숫자는 초당 요청 수 (예시)', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.0) });
       tx(HB.x, HB.y - 30, 'le 칸마다 한 막대', { 'font-size': 15, 'font-weight': 700 }); return; }
     if (k === 3) { bars(u, { vals: 1 });
@@ -258,12 +258,12 @@
       const lines = ['0.99 × 1000 = 990번째 요청', '985 < 990 ≤ 998 → 0.5~1초 칸', '0.5 + (990−985)/(998−985) × 0.5', '= 0.69s'];
       lines.forEach((s, i) => mono(560, 130 + i * 34, s, { 'font-size': i === 3 ? 22 : 14.5, 'font-weight': i === 3 ? 800 : 600, fill: i === 3 ? BAD : INK, opacity: fade(u, 0.6 + i * 0.45) }));
       tx(560, 290, '칸 안은 고르게 퍼졌다고 보고 직선으로 잇는다', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.3) });
-      tx(560, 316, '예시 숫자 · python 으로 같은 값 확인', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.4) }); return; }
+      tx(560, 316, '예시 숫자 · python으로 같은 값 확인', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.4) }); return; }
     if (k === 4) { // 순서
       pipe(180, 120, STAGES, 2, { s: (i) => pop(u, 0.2 + i * 0.3) });
       mono(330, 172, 'histogram_quantile(0.99, sum by (le) (rate(…[5m])))', { 'font-size': 14, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 1.0) });
       const wy = 270; card(480, wy, 760, 92, { rx: 12, stroke: BAD, dash: '6 5', s: pop(u, 1.4) });
-      mono(480, wy - 12, 'sum by (le) 을 빼면 → 서버마다 따로 분위수', { 'font-size': 14.5, fill: BAD, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 1.6) });
+      mono(480, wy - 12, 'sum by (le)을 빼면 → 서버마다 따로 분위수', { 'font-size': 14.5, fill: BAD, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 1.6) });
       mono(480, wy + 20, 'rate 없이 counter 그대로 → 누적 전체의 분위수', { 'font-size': 14.5, fill: BAD, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 1.9) });
       note(480, 370, '두 경우 모두 에러 없이 숫자가 나온다', fade(u, 2.3), { fill: BAD, 'text-anchor': 'middle' }); return; }
     // k5: p50 과 p99 를 한 패널에
@@ -292,12 +292,12 @@
       mono(lerp(590, 520, m), 116, m < 0.5 ? long : 'job:http_latency_p99:5m', { 'font-size': 14, 'font-weight': m < 0.5 ? 400 : 800, fill: m < 0.5 ? INK : ACC, 'text-anchor': 'middle', opacity: Math.abs(m - 0.5) * 2 });
       fly(400, 140, 230, 210, seg(u, 1.6, 2.3), 'record', { mono: true });
       ['level', 'metric', 'window'].forEach((s, i) => { const x = 420 + i * 110; tx(x, 200, ['job', 'http_latency_p99', '5m'][i], { 'font-size': 14, class: 'mono', fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1.8 + i * 0.15) }); sub(x, 222, s, fade(u, 1.9 + i * 0.15)); });
-      note(330, 300, '계산은 Prometheus 가 한 번, 조회는 몇 번이든', fade(u, 2.2)); return; }
+      note(330, 300, '계산은 Prometheus가 한 번, 조회는 몇 번이든', fade(u, 2.2)); return; }
     if (k === 2) { tsdb(160, 200, 10, { hot: 9 });
       // 예전: 원본 bucket 을 매번 훑기 / 이제: 저장된 한 줄만 읽기
       frame(560, 40, 360, 140, '예전 패널', { stroke: BAD });
       for (let i = 0; i < 9; i++) dot([[240, 174 + i * 9 - 72 + 0], [560, 110]], ((t * 0.9 + i / 9) % 1), BAD, 4);
-      sub(740, 120, '원본 bucket 을 새로고침마다 훑는다', 1, { fill: BAD, 'font-size': 14 });
+      sub(740, 120, '원본 bucket을 새로고침마다 훑는다', 1, { fill: BAD, 'font-size': 14 });
       frame(560, 230, 360, 150, '지금 패널', { stroke: GOOD, op: fade(u, 0.6) });
       dot([[240, 255], [560, 300]], seg(u, 1.0, 1.6), GOOD, 7);
       mono(740, 296, 'job:http_latency_p99:5m{job="api"}', { 'font-size': 13.5, fill: GOOD, 'text-anchor': 'middle', opacity: fade(u, 1.2) });
@@ -310,7 +310,7 @@
       const q0 = 'job:http_latency_p99:5m{job="$job"}', q1 = 'job:http_latency_p99:5m{job="api"}', m = E(u, 1.4, 2.0);
       qbar(420, 80, 500, m < 0.5 ? q0 : q1, { fs: 14 });
       fly(150, 40, 700, 40, seg(u, 1.1, 1.7), 'api', { mono: true });
-      tx(430, 150, '패널 쿼리 속 $job 이 고른 값으로 바뀐다', { 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 2.0) });
+      tx(430, 150, '패널 쿼리 속 $job이 고른 값으로 바뀐다', { 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 2.0) });
       ['api', 'checkout', 'search'].forEach((s, i) => card(510 + i * 140, 260, 124, 70, { rx: 8, text: '보드 · ' + s, fs: 14, stroke: BAD, dash: '5 5', op: 0.8 * fade(u, 2.2) }));
       ['api', 'checkout', 'search'].forEach((s, i) => cross(560 + i * 140, 232, 10, pop(u, 2.4)));
       sub(650, 330, '서비스마다 보드를 복제할 필요가 없다', fade(u, 2.4), { 'font-size': 14.5 }); return; }
@@ -327,46 +327,46 @@
         el('rect', { x: x0, y: y2, width: Math.max(1, w), height: 18, rx: 3, fill: i === 2 ? BAD : INFO, opacity: 0.8 }); tx(x0, y2 + 36, n, { 'font-size': 13.5, fill: MUT, opacity: fade(u, 1.9 + i * 0.15) }); });
       sub(290, 360, '◆ 점 하나 = 실제 요청 하나의 trace_id (span 이름은 예시)', fade(u, 0.8), { 'font-size': 14 }); return; }
     // k5: 점검 목록
-    const items = [['무거운 쿼리', 'recording rule 로 미리 계산'], ['범례가 중괄호', 'legendFormat 으로 이름 짓기'], ['step 이 안 맞음', '촘촘하면 느리고 성기면 스파이크를 놓친다'], ['30d 원본 쿼리', '타임아웃 → rule 결과를 읽는다']];
+    const items = [['무거운 쿼리', 'recording rule로 미리 계산'], ['범례가 중괄호', 'legendFormat으로 이름 짓기'], ['step이 안 맞음', '촘촘하면 느리고 성기면 스파이크를 놓친다'], ['30d 원본 쿼리', '타임아웃 → rule 결과를 읽는다']];
     tx(480, 50, '대시보드가 느려지거나 못 읽게 되는 네 가지', { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle' });
     items.forEach(([a, z], i) => { const y = 100 + i * 74, s = pop(u, 0.2 + i * 0.4);
       card(480, y, 760, 60, { rx: 10, stroke: i === 3 ? BAD : WARN, s }); tx(130, y + 6, a, { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 0.3 + i * 0.4) });
       tx(330, y + 6, z, { 'font-size': 15, fill: MUT, opacity: fade(u, 0.4 + i * 0.4) }); }); }
 
   const quiz = [
-    { q: 'http_requests_total 을 그대로 그리면 거의 우상향 직선이 된다. 그 까닭은 무엇인가?',
-      o: ['scrape 간격이 너무 길어서', 'counter 는 계속 쌓이기만 하는 누적값이라서', 'legendFormat 을 지정하지 않아서'], a: 1,
-      why: 'counter 는 줄지 않고 커지기만 한다. rate()로 [5m] 창의 초당 증가율로 바꿔야 트래픽 곡선이 된다.' },
+    { q: 'http_requests_total을 그대로 그리면 거의 우상향 직선이 된다. 그 까닭은 무엇인가?',
+      o: ['scrape 간격이 너무 길어서', 'counter는 계속 쌓이기만 하는 누적값이라서', 'legendFormat을 지정하지 않아서'], a: 1,
+      why: 'counter는 줄지 않고 커지기만 한다. rate()로 [5m] 창의 초당 증가율로 바꿔야 트래픽 곡선이 된다.' },
     { q: 'rate(http_requests_total[5m]) 결과가 job·instance·status 조합마다 3줄일 때 sum by (job, status)를 씌우면 몇 줄이 되는가?',
       o: ['1줄', '2줄', '3줄'], a: 1,
-      why: 'by 뒤의 label 만 남고 instance 는 더해서 접힌다. status 200 두 대가 한 줄로 합쳐져 200과 500 두 줄이 남는다.' },
+      why: 'by 뒤의 label만 남고 instance는 더해서 접힌다. status 200 두 대가 한 줄로 합쳐져 200과 500 두 줄이 남는다.' },
     { q: 'Stat 패널처럼 숫자 하나만 보일 때 알맞은 쿼리 모드는 무엇인가?',
       o: ['instant', 'range', 'legendFormat'], a: 0,
-      why: 'instant 는 끝 시점 한 점만 받는다. range 는 from~to 구간을 step 마다 받아 선을 그린다.' },
+      why: 'instant는 끝 시점 한 점만 받는다. range는 from~to 구간을 step마다 받아 선을 그린다.' },
     { q: 'p99 지연을 뽑을 때 histogram_quantile 안쪽에 반드시 있어야 하는 집계는 무엇인가?',
       o: ['sum by (instance)', 'avg by (le)', 'sum by (le)'], a: 2,
-      why: 'bucket 경계 le 만 남겨 서버들을 더해야 분포 하나가 된다. 이 순서를 어겨도 에러 없이 틀린 값이 나온다.' },
-    { q: 'recording rule 을 쓰면 대시보드 새로고침이 빨라지는 까닭은 무엇인가?',
-      o: ['Prometheus 가 미리 계산해 둔 결과 메트릭만 읽으니까', '패널이 브라우저에서 결과를 캐시하니까', '쿼리를 instant 로 바꿔 주니까'], a: 0,
-      why: 'rule 그룹이 30초마다 무거운 식을 계산해 job:http_latency_p99:5m 으로 저장한다. 패널은 그 한 줄만 읽는다.' },
+      why: 'bucket 경계 le만 남겨 서버들을 더해야 분포 하나가 된다. 이 순서를 어겨도 에러 없이 틀린 값이 나온다.' },
+    { q: 'recording rule을 쓰면 대시보드 새로고침이 빨라지는 까닭은 무엇인가?',
+      o: ['Prometheus가 미리 계산해 둔 결과 메트릭만 읽으니까', '패널이 브라우저에서 결과를 캐시하니까', '쿼리를 instant로 바꿔 주니까'], a: 0,
+      why: 'rule 그룹이 30초마다 무거운 식을 계산해 job:http_latency_p99:5m으로 저장한다. 패널은 그 한 줄만 읽는다.' },
   ];
 
   const summary = [
-    'counter 는 쌓이기만 하므로 rate()로 [5m] 창의 초당 증가율로 바꿔 그린다.',
-    'sum by (job, status)는 적은 label 만 남기고 나머지를 더해 선 3개를 2개로 줄인다.',
-    'legendFormat 의 {{label}}과 unit 은 값을 건드리지 않고 읽기만 쉽게 한다.',
+    'counter는 쌓이기만 하므로 rate()로 [5m] 창의 초당 증가율로 바꿔 그린다.',
+    'sum by (job, status)는 적은 label만 남기고 나머지를 더해 선 3개를 2개로 줄인다.',
+    'legendFormat의 {{label}}과 unit은 값을 건드리지 않고 읽기만 쉽게 한다.',
     'p99는 rate, sum by (le), histogram_quantile 순서로 구하고, 무거우면 rule로 미리 계산한다.',
   ];
   const review = [
-    { q: 'p99 패널 값이 서버를 늘린 뒤 이상하게 들쭉날쭉해졌다. 쿼리는 histogram_quantile(0.99, rate(…_bucket[5m])) 이다. 먼저 고칠 곳은?',
-      o: ['rate 창을 [1m] 으로 줄이기', 'rate 결과를 sum by (le) 로 묶고 그 위에 histogram_quantile 을 씌우기', 'legendFormat 에 {{instance}} 넣기'], a: 1,
-      why: 'le 만 남겨 서버들을 더하지 않으면 instance 마다 따로 분위수를 계산한다. 에러가 없어서 놓치기 쉽다.' },
+    { q: 'p99 패널 값이 서버를 늘린 뒤 이상하게 들쭉날쭉해졌다. 쿼리는 histogram_quantile(0.99, rate(…_bucket[5m]))이다. 먼저 고칠 곳은?',
+      o: ['rate 창을 [1m]으로 줄이기', 'rate 결과를 sum by (le)로 묶고 그 위에 histogram_quantile을 씌우기', 'legendFormat에 {{instance}} 넣기'], a: 1,
+      why: 'le만 남겨 서버들을 더하지 않으면 instance마다 따로 분위수를 계산한다. 에러가 없어서 놓치기 쉽다.' },
     { q: '30일 범위로 p99 패널을 열었더니 타임아웃이 난다. 가장 알맞은 대응은?',
-      o: ['recording rule 로 p99 를 미리 저장하고 패널은 그 메트릭을 읽게 한다', '패널 종류를 Stat 으로 바꾼다', 'range 를 끄고 legendFormat 을 지운다'], a: 0,
-      why: '원본 bucket 을 넓은 범위로 훑는 계산이 문제다. 미리 계산한 결과를 읽으면 새로고침마다 다시 계산하지 않는다.' },
-    { q: '회의 화면에 띄운 RPS 그래프 범례가 {job="api", status="200"} 이고 숫자에 단위도 없다. 값은 맞다. 무엇을 바꾸면 되는가?',
-      o: ['쿼리에 sum by 를 하나 더 씌운다', 'rate 창을 [10m] 으로 늘린다', 'legendFormat 을 {{job}} · {{status}} 로, unit 을 reqps 로 둔다'], a: 2,
-      why: '둘 다 표시 설정이라 값은 그대로다. 범례는 사람 말이 되고 축과 툴팁에 req/s 가 붙는다.' },
+      o: ['recording rule로 p99를 미리 저장하고 패널은 그 메트릭을 읽게 한다', '패널 종류를 Stat으로 바꾼다', 'range를 끄고 legendFormat을 지운다'], a: 0,
+      why: '원본 bucket을 넓은 범위로 훑는 계산이 문제다. 미리 계산한 결과를 읽으면 새로고침마다 다시 계산하지 않는다.' },
+    { q: '회의 화면에 띄운 RPS 그래프 범례가 {job="api", status="200"}이고 숫자에 단위도 없다. 값은 맞다. 무엇을 바꾸면 되는가?',
+      o: ['쿼리에 sum by를 하나 더 씌운다', 'rate 창을 [10m]으로 늘린다', 'legendFormat을 {{job}} · {{status}}로, unit을 reqps로 둔다'], a: 2,
+      why: '둘 다 표시 설정이라 값은 그대로다. 범례는 사람 말이 되고 축과 툴팁에 req/s가 붙는다.' },
   ];
 
   R.page({ title: 'Prometheus 쿼리가 패널이 되기까지', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

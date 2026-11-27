@@ -101,7 +101,7 @@
       mono(520, y + 5, `${j}·${r}`, { 'font-size': 15, 'font-weight': 700, fill: JC[j], opacity: g > 0 ? 1 : 0 });
       bar(600, y, v, JC[j], { g: g * 0.62, text: v === 215 ? '215 = 120+95' : String(v), lop: g }); });
     if (k === 3) mono(910, 370, '4개', { 'font-size': 22, 'font-weight': 800, fill: WARN, 'text-anchor': 'end', opacity: k === 3 ? fade(u, 1.8) : 1 });
-    if (k === 2) tx(715, 200, 'job · region 은 그대로', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.2) });
+    if (k === 2) tx(715, 200, 'job · region은 그대로', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.2) });
     if (k === 4) { card(245, 360, 380, 50, { rx: 10, stroke: ACC, fill: PANEL, text: '보고 싶은 차원이 몇 개뿐 → by', fs: 15, color: ACC, s: pop(u, 0.3) });
       card(715, 360, 380, 50, { rx: 10, stroke: WARN, fill: PANEL, text: 'instance 하나만 접고 싶다 → without', fs: 15, color: WARN, s: pop(u, 0.8) }); } }
 

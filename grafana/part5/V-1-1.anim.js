@@ -51,7 +51,7 @@
       sub(300, 398, '자산은 안 따라온다', fade(u, 2.2), { fill: BAD, 'font-weight': 700 }); }
     if (k === 5) { const wl = E(u, 0.1, 0.9); el('line', { x1: 309, y1: 64, x2: 309, y2: 64 + 312 * wl, stroke: BAD, 'stroke-width': 4, 'stroke-dasharray': '8 6' });
       const f = seg(u, 0.9, 1.6); if (f > 0) { dbIcon(lerp(102, 286, E(f, 0, 1)), 260, null, { s: 0.45, op: 0.5 }); if (f >= 1) cross(296, 260, 13); }
-      sub(450, 352, '같은 Prometheus 를 다시 등록', fade(u, 1.8), { fill: ACC, 'font-weight': 700 }); }
+      sub(450, 352, '같은 Prometheus를 다시 등록', fade(u, 1.8), { fill: ACC, 'font-weight': 700 }); }
     if (k >= 4) { const px = lerp(164, 450, sw); mini(px, 398, 0.7, ACC); }
     // 오른쪽 터미널: 이 장면의 호출이 쌓인다
     const L = [['$ GRAFANA=http://admin:admin@', null], ['        localhost:3000', null]];
@@ -62,7 +62,7 @@
     if (k >= 5) L.push(['# 조직 사이 공유는 막혀 있다', 'var(--off)']);
     const prevN = [2, 4, 6, 9, 10, 11][Math.max(0, k - 1)] * (k > 0 ? 1 : 0), shown = lerp(k ? prevN : 0, L.length, E(u, 0.1, 1.2));
     terminal(616, 14, 330, 392, L, shown, { title: 'org-create.sh', fs: 13.5, lh: 23 });
-    if (k === 3) { lock(860, 320, true, WARN, pop(u, 1.4)); tx(860, 360, 'server admin 만', { 'text-anchor': 'middle', 'font-size': 13.5, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.5) }); }
+    if (k === 3) { lock(860, 320, true, WARN, pop(u, 1.4)); tx(860, 360, 'server admin만', { 'text-anchor': 'middle', 'font-size': 13.5, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.5) }); }
  }
 
   // ---------- 2. Team ----------
@@ -93,7 +93,7 @@
       const f = k === 4 ? seg(u, 0.4, 1.3) : 1; if (f < 1) mini(lerp(70, TX + 170, E(f, 0, 1)), lerp(224, TY + 110, E(f, 0, 1)), 0.7, ACC);
       else { mini(TX + 170, TY + 110, 0.75, INK); tx(TX + 170, TY + 150, 'Lee', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700 }); pill(TX + 170, TY + 182, 'member', MUT, 1, { fs: 13.5 }); }
       pill(TX + 70, TY + 182, 'admin', BAD, k === 4 ? pop(u, 1.4) : 1, { fs: 13.5 });
-      if (k === 4) sub(TX + 150, TY + TH + 36, 'admins 의 dana 가 멤버를 직접 넣고 뺀다', fade(u, 1.8), { fill: INK, 'font-weight': 700 }); }
+      if (k === 4) sub(TX + 150, TY + TH + 36, 'admins의 dana가 멤버를 직접 넣고 뺀다', fade(u, 1.8), { fill: INK, 'font-weight': 700 }); }
     if (k === 5) { // 권한은 팀에 걸리고, 사람은 갈아끼운다
       folder(870, 150, 120, 74, 'Team-Platform', { fs: 13.5 }); grow(TX + TW, 150, 806, 150, E(u, 0.1, 0.7), WARN); perm(800, 120, 'Edit', 'Edit', pop(u, 0.6));
       const out = seg(u, 0.9, 1.8); if (out > 0 && out < 1) mini(lerp(TX + 170, TX + 170, out), lerp(TY + 110, 400, E(out, 0, 1)), 0.7, OFF);
@@ -127,7 +127,7 @@
     if (k === 2) { [['1', 'View'], ['2', 'Edit'], ['4', 'Admin']].forEach(([n, lv], i) => { const x = 620 + i * 110; card(x, 346, 96, 40, { rx: 8, stroke: LV[lv], sw: n === '2' ? 3 : 1.5, text: n + ' = ' + lv, fs: 14, mono: true, s: pop(u, 1.4 + i * 0.15) }); }); }
     if (k === 5) { card(750, 340, 370, 52, { rx: 10, stroke: BAD, sw: 2, s: pop(u, 0.4) });
       mono(588, 345, 'userId 9', { 'font-size': 14.5, fill: OFF, 'text-decoration': 'line-through', opacity: fade(u, 0.6) }); tx(690, 345, '개인 부여는 팀·역할로 바꾼다', { 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
-      const f = seg(u, 1.4, 2.2); perm(720, 396, '대시보드에서 Platform View 로 낮추기', 'View', f, { op: f }); if (f >= 1) cross(880, 396, 11); } }
+      const f = seg(u, 1.4, 2.2); perm(720, 396, '대시보드에서 Platform View로 낮추기', 'View', f, { op: f }); if (f >= 1) cross(880, 396, 11); } }
 
   // ---------- 4. 초대 · 역할 ----------
   const ROLES = ['Viewer', 'Editor', 'Admin'];
@@ -157,17 +157,17 @@
       cols.forEach((s, j) => tx(390 + j * 200, 70, s, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: MUT }));
       ROLES.forEach((r, i) => { const y = 130 + i * 80; card(130, y, 150, 56, { rx: 10, text: r, fs: 17, stroke: [INFO, WARN, BAD][i], sw: 2.5 });
         can[i].forEach((v, j) => { const a = pop(u, 0.2 + (i * 3 + j) * 0.12); card(390 + j * 200, y, 150, 56, { rx: 10, stroke: v ? GOOD : GRID, fill: v ? C.GOODBG : PANEL, sw: 1.5, s: a }); if (v) check(390 + j * 200, y, 12, a); else cross(390 + j * 200, y, 9, a); }); });
-      tx(480, 380, 'Editor 도 권한이 열린 폴더 안에서만 편집한다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 2.0) }); return; }
+      tx(480, 380, 'Editor도 권한이 열린 폴더 안에서만 편집한다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 2.0) }); return; }
     // 5. 전원 Editor 의 함정
     dash(480, 160, 200, 110, 'prod 운영 대시보드', { stroke: BAD, sw: 2.5 });
     for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4, x = 480 + Math.cos(a) * 260, y = 160 + Math.sin(a) * 115, f = seg(u, 0.1 + i * 0.08, 0.6 + i * 0.08);
-      mini(x, y, 0.6, INK, f); if (f > 0) pill(x, y + 36, 'Editor', WARN, f, { fs: 13 }); grow(x, y, lerp(x, 480, 0.55), lerp(y, 160, 0.55), seg(u, 0.9, 1.4), BAD, { plain: true }); }
+      mini(x, y, 0.6, INK, f); if (f > 0) pill(x, y + 36, 'Editor', WARN, f, { fs: 13.5 }); grow(x, y, lerp(x, 480, 0.55), lerp(y, 160, 0.55), seg(u, 0.9, 1.4), BAD, { plain: true }); }
     const lk = seg(u, 1.6, 2.2); if (lk > 0) { folder(480, 374, 300, 54, '폴더 권한으로 잠근다', { s: lk, stroke: GOOD, fill: C.GOODBG }); lock(310, 376, true, GOOD, lk); } }
 
   // ---------- 5. 격리냐 공유냐 ----------
   function s5(t, c) { const { k, u } = c;
     // 왼쪽: Organization 격리 (고객사 A / B)
-    tx(240, 36, 'Organization 으로 격리', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: ACC });
+    tx(240, 36, 'Organization으로 격리', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: ACC });
     tx(720, 36, '단일 Org + Team + Folder', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: INK, opacity: k >= 2 ? 1 : 0.35 });
     el('line', { x1: 480, y1: 20, x2: 480, y2: 290, stroke: GRID, 'stroke-width': 1.5 });
     ['고객사 A', '고객사 B'].forEach((n, i) => { const x = 30 + i * 220, a = k === 0 ? pop(u, 0.2 + i * 0.4) : 1;
@@ -196,16 +196,16 @@
 
   const quiz = [
     { q: 'Main Org.에 있는 Prometheus를 새로 만든 Acme Corp 조직에서 쓰려면 무엇을 해야 하나?',
-      o: ['아무것도 안 해도 된다. 같은 서버라 자동으로 보인다', 'Acme Corp 조직에 데이터소스를 다시 등록한다', 'POST /api/user/using/1 로 조직을 바꾼 채 쿼리한다'], a: 1,
+      o: ['아무것도 안 해도 된다. 같은 서버라 자동으로 보인다', 'Acme Corp 조직에 데이터소스를 다시 등록한다', 'POST /api/user/using/1로 조직을 바꾼 채 쿼리한다'], a: 1,
       why: '조직은 완전히 격리된 테넌트라 데이터소스도 따라오지 않는다. 새 조직은 백지에서 시작하므로 조직마다 다시 등록해야 한다.' },
     { q: 'Dana가 Platform 팀에서 On-call 팀으로 옮겼을 때 권한을 팀에 걸어 둔 구조에서 할 일은 무엇인가?',
       o: ['Dana의 팀 멤버십만 바꾼다', '폴더마다 Dana의 개인 권한을 고친다', 'Dana를 다른 조직으로 옮긴다'], a: 0,
       why: '권한은 사람이 아니라 teamId에 걸려 있다. 멤버십만 갈아끼우면 권한이 따라온다.' },
     { q: 'team-platform 폴더의 permissions에 POST로 items 두 개만 보냈다. 원래 있던 세 번째 항목은 어떻게 되나?',
-      o: ['그대로 남는다', '지워진다', '안의 대시보드에만 남는다'], a: 1,
+      o: ['지워진다', '그대로 남는다', '안의 대시보드에만 남는다'], a: 0,
       why: '폴더 권한 POST는 목록을 통째로 바꾼다. 본문에 없는 항목은 지워지므로 남길 항목도 함께 보내야 한다.' },
     { q: '모두를 Editor로 초대한 조직에서 운영 대시보드를 아무나 고치고 있다. 막는 방법은 무엇인가?',
-      o: ['초대 메일을 다시 보낸다', '운영 대시보드가 든 폴더의 권한으로 편집 가능한 팀을 좁힌다', '조직을 하나 더 만든다'], a: 1,
+      o: ['초대 메일을 다시 보낸다', '조직을 하나 더 만든다', '그 폴더 권한에서 편집할 팀을 좁힌다'], a: 2,
       why: '조직 역할은 상한일 뿐이고 실제 편집은 폴더 권한이 정한다. 폴더 단위로 잠가야 Editor도 그 폴더를 못 고친다.' },
     { q: '한 회사 안의 Platform 팀과 Payment 팀이 같은 Prometheus를 보면서 대시보드를 나눠 관리하려 한다. 맞는 구조는?',
       o: ['팀마다 Organization을 하나씩 만든다', '단일 조직에 팀과 팀별 폴더를 둔다', '팀마다 Grafana 서버를 따로 띄운다'], a: 1,
@@ -226,7 +226,7 @@
       o: ['Park의 조직 역할', 'Park이 속한 팀이 그 폴더에 받은 권한', 'Grafana 서버 버전'], a: 1,
       why: '조직 역할은 기본값이고 폴더 권한이 그 위에 얹힌다. Park이 Edit 권한을 받은 팀에 들어 있으면 그 폴더에서는 편집이 된다.' },
     { q: 'Platform 팀 관리자 dana가 휴가를 가 팀원 추가가 막혔다. 조직 Admin에게 매번 부탁하지 않으려면?',
-      o: ['팀원 모두를 조직 Admin으로 올린다', 'PUT /api/teams/{id}/members의 admins에 한 사람을 더 넣는다', '팀을 지우고 새로 만든다'], a: 1,
+      o: ['팀원 모두를 조직 Admin으로 올린다', '팀을 지우고 새로 만든다', '팀 admins 목록에 한 사람을 더 넣는다'], a: 2,
       why: 'admins 목록에 든 사람은 팀 안에서 멤버를 넣고 뺄 수 있다. 다만 이 호출은 목록을 통째로 바꾸므로 기존 멤버도 함께 적는다.' },
   ];
 

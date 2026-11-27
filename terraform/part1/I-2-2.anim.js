@@ -38,7 +38,7 @@
       fly(640, 120, 820, 270, seg(u, 0.9, 1.9), 'terraform', { mono: true });
       zone(560, 220, 360, 110, null, { fill: SOFT, stroke: GRID, sw: 1.5 }); mono(576, 244, 'PATH 안의 bin/', { 'font-size': 13.5, fill: MUT, 'font-weight': 700 });
       if (u > 1.9) binIcon(820, 280, pop(u, 1.9), 'terraform');
-      note('실행 파일 하나가 PATH 에 들어가면 끝', 2.2, u); return; }
+      note('실행 파일 하나가 PATH에 들어가면 끝', 2.2, u); return; }
     if (k === 1) { [['macOS', 'brew', 600], ['Windows', 'choco / zip', 730], ['Linux', 'apt', 860]].forEach(([os, how, x], i) => { const s = pop(u, 0.2 + i * 0.3);
         card(x, 80, 116, 64, { rx: 10, stroke: GRID, sw: 1.8, s }); tx(x, 74, os, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, opacity: s }); mono(x, 96, how, { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: s });
         grow(x, 114, 730, 236, E(u, 0.8 + i * 0.2, 1.4 + i * 0.2), MUT); });
@@ -67,11 +67,11 @@
       mono(R0 + 18, y + 5, a, { 'font-size': 14, 'font-weight': 700, fill: cur ? ACC : INK, opacity: s }); if (b) mono(R0 + RW - 16, y + 5, b, { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', opacity: s }); });
     // 오른쪽 아래: AWS (아직 아무것도 없다)
     if (k >= 1) { region(R0, 226, RW, 150, 'AWS · us-east-1', { op: k === 1 ? fade(u, 0.6) : 1 }); }
-    if (k === 0) { lock(730, 290, true, ACC, pop(u, 0.5)); tx(730, 336, 'init 이 이 조건대로 provider 를 받는다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 1) }); return; }
-    if (k === 1) { tx(730, 316, 'Access Key 는 여기에 적지 않는다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.2) }); return; }
+    if (k === 0) { lock(730, 290, true, ACC, pop(u, 0.5)); tx(730, 336, 'init이 이 조건대로 provider를 받는다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 1) }); return; }
+    if (k === 1) { tx(730, 316, 'Access Key는 여기에 적지 않는다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.2) }); return; }
     const gs = k === 2 ? pop(u, 0.6) : 1; bucket(600, 306, gs, { ghost: true, col: MUT });
     mono(650, 290, BUCKET, { 'font-size': 14, 'font-weight': 700, opacity: gs }); tx(650, 314, '선언만 했다 · 아직 없음', { 'font-size': 14, fill: MUT, opacity: gs });
-    if (k === 3) { pill(690, 350, 'Name = first-bucket', ACC, pop(u, 0.6), { mono: true, fs: 13.5 }); pill(860, 350, 'Env = learning', ACC, pop(u, 0.9), { mono: true, fs: 13.5 }); }
+    if (k === 3) { pill(726, 352, 'Name=first-bucket', ACC, pop(u, 0.6), { mono: true, fs: 13.5 }); pill(874, 352, 'Env=learning', ACC, pop(u, 0.9), { mono: true, fs: 13.5 }); }
     if (k === 4) { grow(640, 344, 820, 344, E(u, 0.4, 1.2), ACC); pill(860, 344, 'bucket_name', ACC, pop(u, 1.1), { mono: true, fs: 13.5 }); note('apply 뒤에 찍을 값을 미리 정해 둔다', 1.6, u); } }
 
   // =========================================================
@@ -84,7 +84,7 @@
   function s3(t, c) { const { k, u } = c; term(c);
     const base = [['main.tf', INK]];
     if (k === 0) { tree(base, 0, u); pill(730, 300, 'backend: local (기본값)', INFO, pop(u, 0.8), { mono: true });
-      note('.tf 가 있는 폴더에서 실행한다', 1.6, u); return; }
+      note('.tf가 있는 폴더에서 실행한다', 1.6, u); return; }
     if (k === 1) { tree(base, 0, u); card(640, 320, 200, 56, { rx: 10, stroke: INK, sw: 2, text: 'registry.terraform.io', fs: 13.5, mono: true });
       fly(640, 292, 730, 110, seg(u, 0.5, 1.6), 'hashicorp/aws v5.62.0', { mono: true, stay: true });
       tx(840, 330, '"~> 5.0" 에 맞는 최신 5.x', { 'font-size': 14, fill: MUT, 'font-weight': 700, opacity: fade(u, 1.6), 'text-anchor': 'middle' });
@@ -95,7 +95,7 @@
     if (k === 2) { doc(730, 330, 300, 90, '.terraform.lock.hcl', ['provider ".../hashicorp/aws" {', '  version = "5.62.0"  (예시)'], { op: fade(u, 1.1) }); return; }
     if (k === 3) { tx(R0 + 34, 290, '커밋', { 'font-size': 14.5, 'font-weight': 800, fill: GOOD, opacity: fade(u, 0.9) }); mono(R0 + 90, 290, '.terraform.lock.hcl', { 'font-size': 14, opacity: fade(u, 0.9) });
       tx(R0 + 34, 322, '제외', { 'font-size': 14.5, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.3) }); mono(R0 + 90, 322, '.terraform/  *.tfstate', { 'font-size': 14, opacity: fade(u, 1.3) });
-      note('플러그인은 다시 받으면 되고, state 에는 비밀값이 든다', 1.8, u); return; }
+      note('플러그인은 다시 받으면 되고, state에는 비밀값이 든다', 1.8, u); return; }
     // k4: 다시 init 이 필요한 때
     ['provider 추가·버전 변경', 'module 추가', 'backend 설정 변경'].forEach((s, i) => pill(R0 + RW / 2, 284 + i * 36, s, ACC, pop(u, 0.3 + i * 0.35), { fs: 14 }));
     note('AWS API 호출은 아직 0회', 1.6, u, INFO); }
@@ -112,12 +112,12 @@
     tx(R0 + 210, 130, '(비어 있음)', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT }); tx(R0 + 355, 130, '(없음)', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT }); }
   function s4(t, c) { const { k, u } = c; term(c);
     if (k <= 2) cols(k, u);
-    if (k === 0) { grow(R0 + 130, 110, R0 + 145, 110, 1, MUT); tx(R0 + 210, 236, '비교: 코드에 있고 state 에 없다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1) });
-      check(R0 + RW / 2 - 110, 300, 9, pop(u, 1.6)); tx(R0 + RW / 2 - 92, 305, 'AWS 에는 쓰기 호출이 없다', { 'font-size': 14.5, 'font-weight': 700, fill: INFO, opacity: fade(u, 1.6) }); return; }
+    if (k === 0) { grow(R0 + 130, 110, R0 + 145, 110, 1, MUT); tx(R0 + 210, 236, '비교: 코드에 있고 state에 없다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1) });
+      check(R0 + RW / 2 - 110, 300, 9, pop(u, 1.6)); tx(R0 + RW / 2 - 92, 305, 'AWS에는 쓰기 호출이 없다', { 'font-size': 14.5, 'font-weight': 700, fill: INFO, opacity: fade(u, 1.6) }); return; }
     if (k === 1) { const rows = [['+ bucket', `"${BUCKET}"`, GOOD], ['+ id', '(known after apply)', MUT], ['+ arn', '(known after apply)', MUT]];
       mono(R0, 222, '+ aws_s3_bucket.demo', { 'font-size': 15, 'font-weight': 800, fill: GOOD, opacity: fade(u, 0.2) });
       rows.forEach(([a, b, col], i) => { const y = 252 + i * 26; mono(R0 + 14, y, a, { 'font-size': 13.5, 'font-weight': 700, fill: GOOD, opacity: fade(u, 0.5 + i * 0.35) }); mono(R0 + 100, y, b, { 'font-size': 13.5, fill: col === MUT ? WARN : INK, opacity: fade(u, 0.5 + i * 0.35) }); });
-      note('id·arn 은 만들어 봐야 안다', 1.8, u); return; }
+      note('id·arn은 만들어 봐야 안다', 1.8, u); return; }
     if (k === 2) { [['to add', 1, GOOD], ['to change', 0, WARN], ['to destroy', 0, BAD]].forEach(([n, v, col], i) => { const x = R0 + 70 + i * 140, s = pop(u, 0.2 + i * 0.3);
         card(x, 266, 126, 72, { rx: 10, stroke: col, sw: v ? 3 : 1.8, fill: v ? C.GOODBG : PANEL, s }); mono(x, 266, String(Math.round(v * E(u, 0.4, 1.2))), { 'text-anchor': 'middle', 'font-size': 26, 'font-weight': 800, fill: col, opacity: s });
         tx(x, 292, n, { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, opacity: s }); });
@@ -145,7 +145,7 @@
       if (Math.floor(t * 2) % 2) el('rect', { x: R0 + 190, y: 292, width: 9, height: 18, fill: INK }); note('승인 전까지는 Ctrl+C 해도 안전하다', 1.6, u); return; }
     if (k === 1) { [['yes', true], ['y', false], ['Y', false]].forEach(([v, ok], i) => { const x = R0 + 80 + i * 130, s = pop(u, 0.3 + i * 0.35);
         card(x, 300, 100, 50, { rx: 10, text: v, fs: 17, mono: true, stroke: ok ? GOOD : BAD, sw: 2.2, fill: ok ? C.GOODBG : PANEL, s }); (ok ? check : cross)(x + 42, 278, 9, s); });
-      note("'yes' 만 승인으로 인정된다", 1.6, u); return; }
+      note("'yes'만 승인으로 인정된다", 1.6, u); return; }
     if (k === 2) { dot([[490, 200], [560, 140]], seg(u, 0.2, 0.9), ACC, 8); mono(R0, 270, 'aws_s3_bucket.demo: Creating...', { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.3) });
       mono(R0, 296, 'Creation complete after 3s (예시)', { 'font-size': 14, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.4) }); note('여기서부터 요금이 나온다', 1.8, u, WARN); return; }
     if (k === 3) { fly(620, 160, R0 + 210, 300, seg(u, 0.3, 1.3), 'bucket_name', { mono: true });

@@ -58,7 +58,7 @@
       if (k === 0) sub(480, 250, '상태 · 마지막 scrape · 소요시간 · 에러', fade(u, 1.6), { 'font-size': 15 });
       if (k === 1) tx(480, 290, '둘 다 40ms 안팎 · 정상 수집 중', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.6) });
       if (k === 2) tx(480, 320, 'Error 열에 실패 사유가 그대로 찍힌다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.6) });
-      if (k === 3) { tx(480, 370, 'https + /probe 라서 180ms로 더 느리다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.6) }); }
+      if (k === 3) { tx(480, 370, 'https + /probe라서 180ms로 더 느리다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.6) }); }
       return; }
     if (k === 4) { [['UNKNOWN', OFF, '아직 한 번도 안 긁었다', '방금 추가된 직후'], ['UP', GOOD, '마지막 scrape 성공', 'up = 1'], ['DOWN', BAD, '마지막 scrape 실패', 'up = 0 + Error 사유']].forEach(([nm, col, a, b], i) => {
         const cx = 170 + i * 310, s = pop(u, 0.3 + i * 0.5); card(cx, 170, 270, 170, { rx: 14, stroke: col, sw: 2.4, s });
@@ -140,7 +140,7 @@
       if (f > 5) el('rect', { x: X(5), y: 240, width: X(f) - X(5), height: 40, rx: 6, fill: BAD, opacity: 0.9 });
       mono(X(2.5), 266, 'pending', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.6) });
       if (f > 5.5) mono(X(6), 266, 'firing', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: PANEL });
-      tx(620, 100, 'up == 0 인 상태가', { 'font-size': 15, opacity: fade(u, 0.3) }); tx(620, 126, '5분 이어져야 발화', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.5) });
+      tx(620, 100, 'up == 0인 상태가', { 'font-size': 15, opacity: fade(u, 0.3) }); tx(620, 126, '5분 이어져야 발화', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.5) });
       sub(480, 380, '재배포 깜빡임은 pending에서 끝난다', fade(u, 2.2), { 'font-size': 15 }); return; }
     if (k === 5) { mono(60, 70, 'labels:      severity: critical', { 'font-size': 15, fill: INK, opacity: fade(u, 0.2) });
       mono(60, 110, 'summary:     "{{ $labels.instance }} 다운"', { 'font-size': 15, fill: INK, opacity: fade(u, 0.5) });

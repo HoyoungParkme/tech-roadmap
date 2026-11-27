@@ -57,7 +57,7 @@
     const pkt = (txt, col) => { for (let i = 0; i < 2; i++) { const pu = ((t * 0.35 + i / 2) % 1); if (k === 1 && u < 1.0) continue; fly(sRm[0][0], sRm[0][1], sRm[1][0], sRm[1][1], pu, txt, { fill: col || INFO, mono: true }); } };
     if (k === 1) { pkt('샘플'); typed(390, 70, 'url: https://mimir.internal/api/v1/push', seg(u, 0.4, 1.6), { 'font-size': 14, 'font-weight': 700, fill: INFO }); return; }
     if (k === 2) { pkt('샘플'); lock(RM[0] - 140, RM[1] + 40, true, INFO, pop(u, 0.3)); mono(390, 70, 'basic_auth: prom-prod', { 'font-size': 14.5, 'font-weight': 700, fill: INFO, opacity: fade(u, 0.6) });
-      sub(560, 280, 'password_file 에서 비밀번호를 읽는다', fade(u, 1.2), { fill: MUT }); return; }
+      sub(560, 280, 'password_file에서 비밀번호를 읽는다', fade(u, 1.2), { fill: MUT }); return; }
     if (k === 3) { pkt('team-payments', WARN); mono(390, 70, 'X-Scope-OrgID: team-payments', { 'font-size': 14.5, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.3) });
       ['team-payments', 'team-search'].forEach((s, i) => pill(RM[0] + (i - 0.5) * 120, RM[1] + 62, s, i === 0 ? WARN : MUT, pop(u, 0.9 + i * 0.3), { mono: true, fs: 13.5 }));
       sub(RM[0], RM[1] + 100, '헤더를 보고 테넌트를 정한다', fade(u, 1.6)); return; }
@@ -86,7 +86,7 @@
   function s3(t, c) { const { k, u } = c;
     remote(RMX, 220, '원격', { w: 160, sub: 'mimir.internal', op: k === 4 ? 1 : 1 });
     if (k === 0) { wal(t, u, true); lanes(1, [0.3 * E(u, 0.6, 2.0)], {}); pill(LANE_X + LANE_W / 2, 110, 'queue_config:', ACC, pop(u, 0.4), { mono: true });
-      sub(480, 380, '곧바로 보내지 않고 WAL 을 읽어 큐에 쌓는다', fade(u, 1.6), { 'font-weight': 700, fill: INK }); return; }
+      sub(480, 380, '곧바로 보내지 않고 WAL을 읽어 큐에 쌓는다', fade(u, 1.6), { 'font-weight': 700, fill: INK }); return; }
     if (k === 1) { wal(t, u, u < 1.8); const f = E(u, 0.2, 1.8); lanes(1, [f], {});
       mono(LANE_X + LANE_W, 140, 'capacity: 10000', { 'font-size': 14.5, 'font-weight': 800, fill: ACC, 'text-anchor': 'end' });
       mono(LANE_X, 140, Math.round(f * 10000).toLocaleString('en-US'), { 'font-size': 14.5, 'font-weight': 700, fill: f >= 0.999 ? BAD : INK });
@@ -111,7 +111,7 @@
       // 2시간 WAL
       const g = E(u, 1.4, 2.6); el('rect', { x: 60, y: 300, width: 640, height: 26, rx: 5, fill: SOFT, stroke: GRID }); el('rect', { x: 60, y: 300, width: 640 * g, height: 26, rx: 5, fill: g >= 0.999 ? BAD : ACC, opacity: 0.7 });
       tx(60, 290, '원격이 막힌 시간', { 'font-size': 13.5, fill: MUT, 'font-weight': 700 }); mono(700, 290, '2h', { 'font-size': 14, 'font-weight': 800, 'text-anchor': 'end' });
-      sub(380, 356, g < 0.999 ? '2시간 안이면 WAL 에 남아 다시 보낸다' : 'WAL 이 정리되며 못 보낸 샘플은 사라진다', 1, { 'font-weight': 700, fill: g < 0.999 ? GOOD : BAD }); return; }
+      sub(380, 356, g < 0.999 ? '2시간 안이면 WAL에 남아 다시 보낸다' : 'WAL이 정리되며 못 보낸 샘플은 사라진다', 1, { 'font-weight': 700, fill: g < 0.999 ? GOOD : BAD }); return; }
     // k5: 감시 지표 — 모양만 (값은 환경마다 다르다)
     const M = [['prometheus_remote_storage_samples_pending', '큐 적체', [0, 0, 1, 2, 4, 7, 9, 10], WARN], ['prometheus_remote_storage_shards', '샤드 수', [1, 1, 1, 3, 3, 6, 6, 6], ACC], ['…_samples_failed_total', '실패 누적', [0, 0, 0, 0, 1, 1, 2, 2], BAD]];
     M.forEach(([n, d, v, col], i) => { const y = 70 + i * 110, s = pop(u, 0.2 + i * 0.4); card(330, y + 20, 600, 88, { rx: 10, stroke: GRID, sw: 1.5, s });
@@ -138,7 +138,7 @@
     if (k === 2) sub(300, 370, '단일 바이너리 · 설정 방식은 같고 경로만 다르다', fade(u, 1.8), { 'font-weight': 700, fill: INK });
     if (k === 3) { card(PX4[0], 110, 120, 34, { rx: 8, text: 'sidecar', fs: 14, stroke: WARN, color: WARN, s: pop(u, 1.0) });
       for (let i = 0; i < 3; i++) fly(PX4[0] + 60, 110, 650, BK[3][1], seg(u, 1.3 + i * 0.35, 2.2 + i * 0.35), '2h 블록', { fill: WARN });
-      sub(300, 370, 'Thanos 기본형은 블록 업로드 (Receive 는 remote_write 수신)', fade(u, 2.0), { 'font-weight': 700, fill: INK }); } }
+      sub(300, 370, 'Thanos 기본형은 블록 업로드 (Receive는 remote_write 수신)', fade(u, 2.0), { 'font-weight': 700, fill: INK }); } }
 
   // ── 5. remote_read 와 함정
   function s5(t, c) { const { k, u } = c;
@@ -176,7 +176,7 @@
     sub(360, 370, '보내기 전에 골라 내는 것이 기본', fade(u, 2.2), { 'font-weight': 700, fill: INK }); }
 
   const quiz = [
-    { q: '로컬 TSDB 만으로 부족한 이유로 이 장에서 든 것은 무엇인가?',
+    { q: '로컬 TSDB만으로 부족한 이유로 이 장에서 든 것은 무엇인가?',
       o: ['원격 저장소보다 질의가 느려서', '수주가 한계이고 노드와 함께 사라져서', '15d를 넘기는 설정이 아예 없어서'], a: 1,
       why: '기본 보관은 15d이고 늘려도 디스크·성능이 막는다. 단일 노드라 노드가 죽으면 그 기간 지표도 같이 없어진다.' },
     { q: 'remote_write를 켜면 로컬 TSDB 저장은 어떻게 되는가?',
@@ -206,9 +206,9 @@
     { q: 'remote_write를 붙인 뒤 원격 요금이 예상보다 크게 나온다. 먼저 손볼 곳은?',
       o: ['write_relabel_configs로 go_*·process_* 같은 지표 걸러 내기', 'min_backoff를 늘리기', 'retention.time을 줄이기'], a: 0,
       why: '요금은 보내는 샘플 수에 비례한다. 필요 없는 지표를 원격 전송에서 떨어뜨리면 로컬은 그대로 두고 비용만 준다.' },
-    { q: 'remote_write 응답이 계속 401이고 prometheus_remote_storage_samples_pending이 쌓인다. 무엇부터 확인하는가?',
+    { q: 'remote_write 응답이 계속 401이고 prometheus_remote_storage_samples_failed_total이 오른다. 무엇부터 확인하는가?',
       o: ['max_shards를 200으로 올린다', 'scrape_interval을 늘린다', 'basic_auth와 X-Scope-OrgID 헤더 설정'], a: 2,
-      why: '401/403은 인증·헤더 누락에서 온다. 샤드를 늘려도 전부 거부되므로 먼저 인증을 고쳐야 큐가 빠진다.' },
+      why: '401/403은 인증·헤더 누락에서 온다. 4xx 응답은 다시 보내지 않고 버리므로 샤드를 늘려도 소용없고 인증부터 고친다.' },
   ];
 
   R.page({ title: 'remote_write — 외부 장기 저장', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

@@ -85,7 +85,7 @@
     if (k <= 3) box(DS[0], DS[1], 'Mimir', INFO);
     if (k === 1) { typed(170, 40, 'remote_write url: http://mimir:8080/api/v1/push', seg(u, 0.3, 1.6), { 'font-size': 14.5, 'font-weight': 700, fill: ACC });
       toD.forEach(([a, b], i) => fly(a[0], a[1], b[0], b[1], ((t * 0.4 + i * 0.33) % 1), '샘플', { fill: ACC })); return; }
-    if (k === 2) { toD.forEach(([a, b], i) => { if (i === 2) return; fly(a[0], a[1], b[0], b[1], ((t * 0.4 + i * 0.33) % 1), 'team-payments', { fill: WARN, mono: true }); });
+    if (k === 2) { toD.forEach(([a, b], i) => { if (i === 2) return; fly(a[0], a[1], b[0], b[1], ((t * 0.4 + i * 0.5) % 1), 'team-payments', { fill: WARN, mono: true }); });
       fly(toD[2][0][0], toD[2][0][1], toD[2][1][0] - 30, toD[2][1][1] + 20, seg(u, 0.4, 1.4), '헤더 없음', { fill: BAD }); if (u > 1.4) { cross(DS[0] - 100, DS[1] + 44, 11, pop(u, 1.4)); pill(DS[0], DS[1] + 80, '수집 거부', BAD, pop(u, 1.5), { fs: 14 }); }
       mono(170, 40, 'X-Scope-OrgID: team-payments', { 'font-size': 14.5, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.2) }); return; }
     if (k === 3) { const n = Math.round(lerp(1, 5, E(u, 0.4, 1.6)));
@@ -106,7 +106,7 @@
     mono(470, 40, 'replication_factor: 3', { 'font-size': 14.5, 'font-weight': 800, fill: INK, opacity: fade(u, 0.3) });
     bucket(S3C[0], S3C[1], 'S3', { s: pop(u, 1.0), sub: 'mimir-blocks' });
     IG.forEach((p, i) => grow(p[0] + 60, p[1], S3C[0] - 62, S3C[1], E(u, 1.2 + i * 0.15, 1.8 + i * 0.15), WARN, {}));
-    sub(480, 398, '최근은 Ingester 메모리, 과거는 S3 블록에서 Querier 가 합친다', fade(u, 2.1), { 'font-weight': 700, fill: INK }); }
+    sub(480, 398, '최근은 Ingester 메모리, 과거는 S3 블록에서 Querier가 합친다', fade(u, 2.1), { 'font-weight': 700, fill: INK }); }
 
   // ── 4. 공통점 — 같은 목적지
   function s4(t, c) { const { k, u } = c, TH = [190, 70], MI = [770, 70], BK = [480, 320];
@@ -137,14 +137,14 @@
         card(330, y, 560, 64, { rx: 10, stroke: on ? col : GRID, sw: on ? 2.5 : 1.5, s }); if (s > 0.6) tx(70, y + 6, cnd, { 'font-size': 15.5, 'font-weight': 700 });
         grow(620, y, 680, y, on ? E(u, 0.8, 1.3) : 1, col, {}); if (!on || u > 1.2) box(790, y, p, col, { s: on ? pop(u, 1.2) : 1, w: 200 }); });
       if (k === 1) sub(330, 380, '사이드카만 얹으면 된다', fade(u, 1.8), { 'font-weight': 700, fill: INK });
-      if (k === 3) sub(330, 380, 'Mimir 는 운영성을 다듬은 Cortex 포크', fade(u, 1.8), { 'font-weight': 700, fill: INK }); return; }
+      if (k === 3) sub(330, 380, 'Mimir는 운영성을 다듬은 Cortex 포크', fade(u, 1.8), { 'font-weight': 700, fill: INK }); return; }
     if (k === 4) { const comps = ['distributor', 'ingester', 'querier', 'store gateway', 'compactor'];
       comps.forEach((s, i) => box(110 + (i % 3) * 170, 90 + Math.floor(i / 3) * 70, s, MUT, { s: pop(u, 0.2 + i * 0.2), fs: 14, mono: true, w: 150 }));
       tx(40, 40, '소규모인데 도입하면', { 'font-size': 16, 'font-weight': 800, fill: BAD, opacity: fade(u, 0.1) });
       bucket(770, 120, 'S3', { s: pop(u, 1.2), sub: '요청·전송 비용' }); const g = E(u, 1.4, 2.4);
       el('rect', { x: 60, y: 290, width: 560, height: 24, rx: 5, fill: SOFT }); el('rect', { x: 60, y: 290, width: 560 * g, height: 24, rx: 5, fill: BAD, opacity: 0.7 });
       tx(60, 280, '다운샘플링 없이 쌓이는 원본', { 'font-size': 14, fill: MUT, 'font-weight': 700 }); sub(340, 352, '상시 운영 부담 + 청구서', fade(u, 2.2), { 'font-weight': 700, fill: BAD }); return; }
-    if (k === 5) { [['1', 'retention time 을 30~90d 로', ACC], ['2', 'remote_write 한 곳만 붙여 검증', INFO], ['3', '글로벌 뷰·멀티테넌트가 진짜 필요할 때 확장', GOOD]].forEach(([n, s, col], i) => {
+    if (k === 5) { [['1', 'retention time을 30~90d로', ACC], ['2', 'remote_write 한 곳만 붙여 검증', INFO], ['3', '글로벌 뷰·멀티테넌트가 진짜 필요할 때 확장', GOOD]].forEach(([n, s, col], i) => {
         const x = 70 + i * 110, y = 300 - i * 90, sc = pop(u, 0.2 + i * 0.5); el('rect', { x, y, width: 820 - i * 110, height: 70, rx: 10, fill: PANEL, stroke: col, 'stroke-width': 2, opacity: Math.min(1, sc) });
         if (sc > 0.6) { mono(x + 22, y + 44, n, { 'font-size': 22, 'font-weight': 800, fill: col }); tx(x + 56, y + 42, s, { 'font-size': 16, 'font-weight': 700 }); } });
       const g = E(u, 0.6, 1.6); el('rect', { x: 560, y: 320, width: 60, height: 30, rx: 4, fill: ACC, opacity: 0.85 }); el('rect', { x: 624, y: 320, width: 240 * g, height: 30, rx: 4, fill: ACC, opacity: 0.4 });

@@ -27,7 +27,7 @@
     if (u >= 1 && s) mono(x + 8, y + 18, s, { 'font-size': 13.5, 'font-weight': 700, fill: PANEL }); }
 
   // ---------- 1. 블록 문법 ----------
-  const HEAD = [['resource', INK, '키워드', 120], ['"aws_s3_bucket"', ACC, '타입: provider 가 정한다', 330], ['"mine"', INFO, '로컬이름: 내가 정한다', 560]];
+  const HEAD = [['resource', INK, '키워드', 120], ['"aws_s3_bucket"', ACC, '타입: provider가 정한다', 330], ['"mine"', INFO, '로컬이름: 내가 정한다', 560]];
   function header(u, k, y) { y = y || 80;
     HEAD.forEach(([s, col, lab, x], i) => { const a = k === 0 ? pop(u, 0.2 + i * 0.45) : 1;
       card(x, y, tw(s, 17) + 28, 44, { rx: 8, text: s, fs: 17, mono: true, fw: 800, stroke: col, color: col, s: a });
@@ -58,7 +58,7 @@
       bucket(630, 130, pop(u, 1.2), GOOD);
       dot([[620, 160], [850, 220]], seg(u, 1.4, 2.0), GOOD, 7);
       stateDoc(640, 230, 300, [['aws_s3_bucket.mine', fade(u, 2.0)], ['  id = "my-team-logs-2026"', fade(u, 2.2)]]);
-      note(40, 300, 'state 까지 적어야 다음 plan 이', fade(u, 2.2), { 'font-size': 15 }); note(40, 326, '"이미 있다" 를 안다', fade(u, 2.3), { 'font-size': 15 }); return; }
+      note(40, 300, 'state까지 적어야 다음 plan이', fade(u, 2.2), { 'font-size': 15 }); note(40, 326, '"이미 있다" 를 안다', fade(u, 2.3), { 'font-size': 15 }); return; }
     if (k === 4) { // 블록 3개 = 버킷 3개
       const B = [['logs', 'team-logs'], ['backup', 'team-backup'], ['static', 'team-static']];
       cloudZone(560, 50, 380, 320, 'AWS');
@@ -79,8 +79,8 @@
     sub(480, 390, '주소 = 타입.로컬이름 이라 둘이 겹치면 가리킬 대상이 하나로 정해지지 않는다', fade(u, 2.3), { fill: INK, 'font-size': 14 }); }
 
   // ---------- 2. 속성 세 종류 ----------
-  const BINS = [['꼭 적는 값', ACC, 140], ['optional (기본값 있음)', INFO, 470], ['computed (apply 뒤 채움)', GOOD, 800]];
-  function bins(op) { BINS.forEach(([s, col, x]) => { el('rect', { x: x - 150, y: 210, width: 300, height: 180, rx: 12, fill: SOFT, stroke: col, 'stroke-width': 2, opacity: op });
+  const BINS = [['꼭 적는 값', ACC, 165], ['optional (기본값 있음)', INFO, 480], ['computed (apply 뒤 채움)', GOOD, 795]];
+  function bins(op) { BINS.forEach(([s, col, x]) => { el('rect', { x: x - 145, y: 210, width: 290, height: 176, rx: 12, fill: SOFT, stroke: col, 'stroke-width': 2, opacity: op });
     tx(x, 236, s, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: col, opacity: op }); }); }
   function chip(x, y, s, col, o) { o = o || {}; const fs = 14.5, w = tw(s, fs) + 22; card(x, y, w, 34, { rx: 7, text: s, fs, mono: true, stroke: col, color: col, s: o.s, op: o.op, fill: o.fill }); }
   function s2(t, c) { const { k, u } = c;
@@ -88,18 +88,18 @@
       bins(1);
       const inBin1 = [['ami = "ami-0c2d3e23e…"', 280], ['instance_type = "t3.micro"', 330]];
       inBin1.forEach(([s, y], i) => { const a = k === 0 ? seg(u, 0.3 + i * 0.5, 1.0 + i * 0.5) : 1; if (a <= 0) return;
-        chip(lerp(260, 140, E(a, 0, 1)), lerp(80 + i * 40, y, E(a, 0, 1)), s, ACC, { fill: PANEL }); });
-      if (k === 0) sub(140, 404, 'launch_template 이 없으면 필요', fade(u, 1.8), { fill: ACC, 'font-weight': 700, 'font-size': 14 });
+        chip(lerp(260, 165, E(a, 0, 1)), lerp(80 + i * 40, y, E(a, 0, 1)), s, ACC, { fill: PANEL }); });
+      if (k === 0) sub(165, 406, 'launch_template이 없으면 필요', fade(u, 1.8), { fill: ACC, 'font-weight': 700, 'font-size': 14 });
       if (k >= 1) { const a = k === 1 ? seg(u, 0.3, 1.0) : 1;
         if (k === 1) { mono(400, 80, 'monitoring', { 'font-size': 14.5, 'font-weight': 700 }); mono(520, 80, 'false', { 'font-size': 14.5, fill: MUT, 'text-decoration': 'line-through', opacity: fade(u, 0.2) });
           mono(580, 80, '→ true', { 'font-size': 14.5, fill: INFO, 'font-weight': 800, opacity: fade(u, 0.6) }); sub(560, 110, '기본값을 바꾸고 싶을 때만 적는다', fade(u, 1.0)); }
-        if (a > 0) { chip(470, 280, 'monitoring = true', INFO, { s: a }); chip(470, 330, 'tags = { Name, Environment }', INFO, { s: k === 1 ? pop(u, 1.4) : 1 }); } }
-      if (k === 2) { chip(690, 280, 'id', GOOD, { s: pop(u, 0.2) }); chip(690, 330, 'arn', GOOD, { s: pop(u, 0.4) });
-        const f = u > 1.6; mono(722, 286, f ? '= "i-0abc…"' : '(known after apply)', { 'font-size': 13.5, fill: f ? GOOD : MUT, opacity: fade(u, 0.6) });
-        mono(728, 336, f ? '= "arn:aws:ec2:…"' : '', { 'font-size': 13.5, fill: GOOD, opacity: fade(u, 1.6) });
-        cloudZone(640, 40, 300, 110, 'AWS'); grow(700, 150, 790, 262, E(u, 1.0, 1.6), GOOD);
+        if (a > 0) { chip(480, 280, 'monitoring = true', INFO, { s: a }); chip(480, 330, 'tags = { Name, Environment }', INFO, { s: k === 1 ? pop(u, 1.4) : 1 }); } }
+      if (k === 2) { chip(700, 280, 'id', GOOD, { s: pop(u, 0.2) }); chip(700, 330, 'arn', GOOD, { s: pop(u, 0.4) });
+        const f = u > 1.6; mono(732, 286, f ? '= "i-0abc…"' : '(known after apply)', { 'font-size': 13.5, fill: f ? GOOD : MUT, opacity: fade(u, 0.6) });
+        mono(738, 336, f ? '= "arn:aws:ec2:…"' : '', { 'font-size': 13.5, fill: GOOD, opacity: fade(u, 1.6) });
+        cloudZone(640, 40, 300, 110, 'AWS'); grow(790, 150, 790, 206, E(u, 1.0, 1.6), GOOD);
         mono(660, 100, 'apply 뒤 응답으로 채워진다', { 'font-size': 14, fill: GOOD, 'font-weight': 700, opacity: fade(u, 0.9) });
-        sub(470, 190, 'aws_instance.web.id 로 읽기만 한다. 코드에 적으면 오류', fade(u, 2.0), { fill: INK, 'font-size': 14.5 }); }
+        sub(470, 190, 'aws_instance.web.id로 읽기만 한다. 코드에 적으면 오류', fade(u, 2.0), { fill: INK, 'font-size': 14.5 }); }
       return; }
     if (k === 3) { // required 누락
       snippet(30, 50, ['resource "aws_iam_role" "broken" {', '  name = "web-role"', '  # assume_role_policy 없음', '}'], { fs: 14.5, w: 380 });
@@ -110,18 +110,18 @@
       cloudZone(700, 300, 240, 100, 'AWS', { op: fade(u, 1.5) });
       grow(630, 140, 800, 300, E(u, 1.5, 2.0), OFF, { dash: '5 5', plain: true });
       if (u > 2.0) cross(780, 270, 12, pop(u, 2.0));
-      sub(230, 330, 'API 를 한 번도 부르지 않고 멈춘다', fade(u, 2.2), { fill: INK, 'font-weight': 700, 'font-size': 15 }); return; }
+      sub(230, 330, 'API를 한 번도 부르지 않고 멈춘다', fade(u, 2.2), { fill: INK, 'font-weight': 700, 'font-size': 15 }); return; }
     // k4 문서 판별
     el('rect', { x: 40, y: 40, width: 880, height: 340, rx: 12, fill: PANEL, stroke: GRID, 'stroke-width': 1.5 });
     mono(60, 68, 'registry.terraform.io / aws / aws_instance', { 'font-size': 13.5, fill: MUT });
     tx(60, 110, 'Argument Reference', { 'font-size': 17, 'font-weight': 800, opacity: fade(u, 0.2) });
-    [['ami', '(Optional) launch_template 이 없으면 필요', ACC], ['instance_type', '(Optional) launch_template 이 없으면 필요', ACC], ['monitoring', '(Optional) 기본 false', INFO]].forEach(([a, b, col], i) => { const y = 148 + i * 36, op = fade(u, 0.4 + i * 0.3);
+    [['ami', '(Optional) launch_template이 없으면 필요', ACC], ['instance_type', '(Optional) launch_template이 없으면 필요', ACC], ['monitoring', '(Optional) 기본 false', INFO]].forEach(([a, b, col], i) => { const y = 148 + i * 36, op = fade(u, 0.4 + i * 0.3);
       mono(70, y, a, { 'font-size': 14.5, 'font-weight': 700, fill: col, opacity: op }); tx(220, y, b, { 'font-size': 14.5, opacity: op }); });
     mono(70, 256, 'assume_role_policy', { 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.4) }); tx(250, 256, '(Required)  aws_iam_role 문서', { 'font-size': 14.5, opacity: fade(u, 1.4) });
     el('line', { x1: 600, y1: 90, x2: 600, y2: 360, stroke: GRID, 'stroke-width': 1.5 });
     tx(630, 110, 'Attributes Reference', { 'font-size': 17, 'font-weight': 800, fill: GOOD, opacity: fade(u, 1.7) });
     ['id', 'arn', 'public_ip'].forEach((a, i) => mono(640, 148 + i * 36, a, { 'font-size': 14.5, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.9 + i * 0.15) }));
-    sub(480, 404, '조건이 붙은 (Optional) 은 그 조건까지 읽는다', fade(u, 2.3), { fill: INK, 'font-size': 14.5 }); }
+    sub(480, 404, '조건이 붙은 (Optional)은 그 조건까지 읽는다', fade(u, 2.3), { fill: INK, 'font-size': 14.5 }); }
 
   // ---------- 3. resource address ----------
   const NB = [260, 120], NV = [700, 120];
@@ -180,7 +180,7 @@
       const conds = k === 1 ? ['most_recent = true', 'owners = ["amazon"]'] : ['most_recent = true', 'owners = ["amazon"]', 'name = "al2023-ami-*-x86_64"'];
       conds.forEach((s, i) => mono(90, 170 + i * 34, s, { 'font-size': 14.5, fill: INFO, 'font-weight': 700, opacity: (k === 1 || i === 2) ? fade(u, 0.2 + i * 0.3) : 1 }));
       grow(400, 110, 610, 140, E(u, 1.2, 1.6), INFO, { dash: '6 5' });
-      sub(270, 340, k === 1 ? '여러 건이면 가장 최신 것 하나를 고른다' : '0건이면 plan 에서 오류', fade(u, 1.8), { fill: INK, 'font-size': 14.5, 'font-weight': 700 }); return; }
+      sub(270, 340, k === 1 ? '여러 건이면 가장 최신 것 하나를 고른다' : '0건이면 plan에서 오류', fade(u, 1.8), { fill: INK, 'font-size': 14.5, 'font-weight': 700 }); return; }
     if (k === 6) { node(480, 150, 'data.aws_caller_identity.current', { col: INFO, dash: '6 4', s: pop(u, 0.2) });
       mono(480, 210, '.account_id → "123456789012"', { 'font-size': 15, 'text-anchor': 'middle', fill: INFO, 'font-weight': 700, opacity: fade(u, 0.8) });
       [['다른 팀이 만든 VPC · IAM', 160], ['자주 바뀌는 최신 AMI', 480], ['계정 · 리전 같은 메타 정보', 800]].forEach(([s, x], i) => pill(x, 320, s, INFO, pop(u, 1.2 + i * 0.3), { fs: 14 }));
@@ -194,7 +194,7 @@
     dn('sg', 'aws_security_group.web_sg', { s: k === 3 ? pop(u, 0.2) : 1, fs: 13.5, op: gone ? 1 - 0.6 * fade(u, 1.0) : 1 });
     grow(270, 90, 412, 90, k === 3 ? E(u, 0.6, 1.2) : 1, ACC);
     if (k === 3) { mono(520, 140, 'vpc_id = data.aws_vpc.default.id', { 'font-size': 14, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 1.0) });
-      sub(480, 300, 'data 를 참조해도 간선이 생긴다: 조회가 먼저, 생성이 나중', fade(u, 1.6), { fill: INK, 'font-size': 14.5 }); }
+      sub(480, 300, 'data를 참조해도 간선이 생긴다: 조회가 먼저, 생성이 나중', fade(u, 1.6), { fill: INK, 'font-size': 14.5 }); }
     if (k >= 4) { dn('web', 'aws_instance.web', { s: k === 4 ? pop(u, 0.6) : 1, op: gone ? 1 - 0.6 * fade(u, 0.6) : 1 });
       grow(340, 290, 690, 230, k === 4 ? E(u, 0.9, 1.4) : 1, ACC); grow(600, 110, 720, 200, k === 4 ? E(u, 0.9, 1.4) : 1, ACC); }
     if (k === 4) { [['1', 170, '조회 2개 (동시)'], ['2', 520, 'sg'], ['3', 760, 'web']].forEach(([n, x, l], i) => { const a = pop(u, 1.5 + i * 0.3);
@@ -202,7 +202,7 @@
     if (k === 5) { mono(480, 36, '$ terraform destroy', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle' });
       cross(760, 220, 18, pop(u, 0.6)); cross(520, 90, 18, pop(u, 1.0));
       [G.vpc, G.ami].forEach(([x, y], i) => check(x + 140, y, 11, pop(u, 1.5 + i * 0.2)));
-      sub(480, 380, '조회한 VPC · AMI 는 그대로 남는다. 남의 것은 건드리지 않는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5, 'font-weight': 700 }); } }
+      sub(480, 380, '조회한 VPC · AMI는 그대로 남는다. 남의 것은 건드리지 않는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5, 'font-weight': 700 }); } }
 
   // ---------- 5. depends_on ----------
   const D = { role: [150, 110], att: [520, 60], lam: [520, 170] };
@@ -214,7 +214,7 @@
       grow(240, 120, 410, 166, k === 2 ? E(u, 0.6, 1.2) : 1, ACC); if (k === 2) mono(270, 176, 'role.arn', { 'font-size': 13.5, fill: ACC, opacity: fade(u, 1.0) }); } }
   function s5(t, c) { const { k, u } = c;
     if (k === 0) { lambdaGraph(k, u); mono(60, 170, 'assume_role_policy = data…assume.json', { 'font-size': 14, fill: INFO, opacity: fade(u, 0.8) });
-      sub(480, 300, 'Role 과 정책은 서로 다른 리소스다. 붙이는 일이 한 번 더 필요하다', fade(u, 1.4), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(480, 300, 'Role과 정책은 서로 다른 리소스다. 붙이는 일이 한 번 더 필요하다', fade(u, 1.4), { fill: INK, 'font-size': 14.5 }); return; }
     if (k <= 4) { lambdaGraph(Math.min(k, 3), u);
       const dep = k === 4; if (dep) { grow(520, 80, 520, 150, E(u, 0.3, 0.9), GOOD, { dash: '6 4' }); mono(540, 120, 'depends_on', { 'font-size': 14, 'font-weight': 800, fill: GOOD, opacity: fade(u, 0.6) }); }
       if (k >= 2) { // 일정표
@@ -223,36 +223,36 @@
         bar(x0, y0, 140, '', INK, a * 3); bar(x0 + 150, y0 + 38, 260, '', ACC, a * 3 - 1);
         bar(dep ? x0 + 420 : x0 + 150, y0 + 76, 110, '', dep ? GOOD : BAD, a * 3 - 1.4);
         el('line', { x1: x0, y1: y0 + 120, x2: x0 + 600, y2: y0 + 120, stroke: MUT, 'stroke-width': 1.5 }); mono(x0 + 610, y0 + 125, '시간', { 'font-size': 13.5, fill: MUT });
-        if (k === 2) sub(640, 230, '참조만 보면 attach 와 Lambda 는 동시에 시작해도 된다', fade(u, 1.8), { fill: INK, 'font-size': 14 });
+        if (k === 2) sub(640, 230, '참조만 보면 attach와 Lambda는 동시에 시작해도 된다', fade(u, 1.8), { fill: INK, 'font-size': 14 });
         if (k === 3) { const ix = x0 + 270; grow(ix, y0 + 130, ix, y0 + 104, E(u, 0.5, 0.9), BAD); mono(ix, y0 + 152, '첫 호출', { 'font-size': 13.5, 'text-anchor': 'middle', fill: BAD, 'font-weight': 700, opacity: fade(u, 0.6) });
           card(780, 120, 230, 50, { rx: 10, text: 'AccessDenied', fs: 16, mono: true, stroke: BAD, color: BAD, fill: BADBG, s: pop(u, 1.1) });
           sub(780, 170, '권한이 아직 안 붙었다', fade(u, 1.4), { fill: BAD, 'font-weight': 700 }); }
-        if (k === 4) sub(780, 230, 'attach 가 끝난 뒤에 Lambda 를 만든다', fade(u, 1.5), { fill: GOOD, 'font-size': 14.5, 'font-weight': 700 }); }
+        if (k === 4) sub(780, 230, 'attach가 끝난 뒤에 Lambda를 만든다', fade(u, 1.5), { fill: GOOD, 'font-size': 14.5, 'font-weight': 700 }); }
       return; }
     if (k === 5) { // 남발
       tx(40, 60, '참조만', { 'font-size': 16, 'font-weight': 800, fill: GOOD }); tx(40, 230, 'depends_on 남발', { 'font-size': 16, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.0) });
       ['A', 'B', 'C', 'D'].forEach((n, i) => { node(260 + i * 120, 100, n, { s: pop(u, 0.1 + i * 0.1) });
         node(260 + i * 160, 270, n, { s: pop(u, 1.0 + i * 0.1), col: BAD }); if (i) grow(260 + (i - 1) * 160 + 24, 270, 260 + i * 160 - 26, 270, E(u, 1.3 + i * 0.1, 1.6 + i * 0.1), BAD); });
       bar(260, 140, 100, '1 물결', GOOD, seg(u, 0.4, 0.9)); bar(260, 310, 400, '4 물결', BAD, seg(u, 1.6, 2.4));
-      sub(480, 400, '의존이 없으면 동시에 만든다 (기본 10개씩). 불필요한 depends_on 은 그 이점을 없앤다', fade(u, 2.2), { fill: INK, 'font-size': 14 }); return; }
+      sub(480, 400, '의존이 없으면 동시에 만든다 (기본 10개씩). 불필요한 depends_on은 그 이점을 없앤다', fade(u, 2.2), { fill: INK, 'font-size': 14 }); return; }
     // k6 정리
     [['resource "타입" "이름" { … }', '가장 작은 단위', INK], ['required · optional · computed', '속성 세 종류', ACC], ['<타입>.<이름>.<속성>', 'address = 자동 의존성', WARN], ['data "타입" "이름" { … }', '조회 전용', INFO], ['depends_on = [ … ]', '추론이 안 될 때만', GOOD]].forEach(([a, b, col], i) => { const y = 60 + i * 70, s = pop(u, 0.2 + i * 0.3);
       card(330, y, 520, 52, { rx: 10, text: a, fs: 15, mono: true, stroke: col, color: col, s }); tx(620, y + 6, b, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.3) }); }); }
 
   const quiz = [
-    { q: 'resource "aws_s3_bucket" "mine" { bucket = "my-team-logs-2026" } 에서 AWS로 전달되지 않는 것은 무엇인가?',
+    { q: 'resource "aws_s3_bucket" "mine" { bucket = "my-team-logs-2026" }에서 AWS로 전달되지 않는 것은 무엇인가?',
       o: ['로컬이름 mine', 'bucket 값 my-team-logs-2026', '타입이 정하는 S3 버킷 API'], a: 0,
       why: '로컬이름은 코드 안에서 이 블록을 가리키는 별명일 뿐이다. 클라우드에는 속성 값만 요청 본문으로 간다.' },
     { q: 'aws_instance의 id와 arn은 어떤 속성인가?',
       o: ['꼭 적어야 하는 required', 'apply 뒤 클라우드가 채우는 computed', '기본값이 있는 optional'], a: 1,
       why: 'id와 arn은 만들어진 뒤에야 정해진다. 코드에 적지 않고 aws_instance.web.id처럼 읽기만 한다.' },
-    { q: 'aws_s3_bucket_versioning 에 bucket = aws_s3_bucket.mine.id 를 적으면 destroy 순서는 어떻게 되나?',
+    { q: 'aws_s3_bucket_versioning에 bucket = aws_s3_bucket.mine.id를 적으면 destroy 순서는 어떻게 되나?',
       o: ['버킷을 먼저 지우고 versioning을 지운다', '둘을 동시에 지운다', 'versioning을 먼저 지우고 버킷을 지운다'], a: 2,
       why: '참조 한 줄로 버킷 → versioning 간선이 생긴다. apply는 그 방향대로, destroy는 거꾸로 진행한다.' },
-    { q: 'data "aws_vpc" "default" 블록이 있는 상태에서 terraform destroy 를 하면 기본 VPC는 어떻게 되나?',
+    { q: 'data "aws_vpc" "default" 블록이 있는 상태에서 terraform destroy를 하면 기본 VPC는 어떻게 되나?',
       o: ['그대로 남는다', '함께 삭제된다', 'state에서만 지워지고 실제로는 삭제된다'], a: 0,
       why: 'data는 GET만 하는 조회 블록이다. 내가 만든 것이 아니므로 destroy도 건드리지 않는다.' },
-    { q: 'Lambda가 role만 참조하는데 정책 attach 가 늦게 끝나 첫 호출이 AccessDenied 였다. 알맞은 해결은?',
+    { q: 'Lambda가 role만 참조하는데 정책 attach가 늦게 끝나 첫 호출이 AccessDenied 였다. 알맞은 해결은?',
       o: ['모든 리소스에 depends_on을 붙인다', 'Lambda에 depends_on = [aws_iam_role_policy_attachment.lambda]를 적는다', 'role 참조를 지운다'], a: 1,
       why: '코드에 참조가 없는 의존은 그래프에 없다. 보이지 않는 그 한 간선만 depends_on으로 더한다.' },
   ];

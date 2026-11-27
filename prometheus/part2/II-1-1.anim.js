@@ -211,7 +211,7 @@
         mono(810, y + 7, n, { 'font-size': 20, 'font-weight': 800, fill: col, 'text-anchor': 'end', opacity: fade(u, 0.6 + i * 0.5) }); });
       tx(480, 380, '레이블 이름을 틀려도 PromQL은 조용히 빈 결과만 돌려준다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 2.1) }); return; }
     tx(480, 70, '세 가지만 지키면 된다', { 'text-anchor': 'middle', 'font-size': 22, 'font-weight': 800, opacity: fade(u, 0.1) });
-    [['range는 언제나 함수의 입력으로', 'rate(x[5m]) 처럼 감싼다'], ['창은 스크레이프 간격의 4배 이상', '15s 간격이면 [1m] 이상'], ['레이블은 이름까지 정확히', '= 정확 일치, =~ 정규식']].forEach(([a, b], i) => {
+    [['range는 언제나 함수의 입력으로', 'rate(x[5m])처럼 감싼다'], ['창은 스크레이프 간격의 4배 이상', '15s 간격이면 [1m] 이상'], ['레이블은 이름까지 정확히', '= 정확 일치, =~ 정규식']].forEach(([a, b], i) => {
       const y = 140 + i * 82, s = pop(u, 0.3 + i * 0.45); card(480, y, 600, 66, { rx: 12, stroke: GOOD, sw: 2, s }); check(222, y, 12, s);
       tx(254, y - 4, a, { 'font-size': 17, 'font-weight': 700, opacity: fade(u, 0.4 + i * 0.45) });
       mono(254, y + 20, b, { 'font-size': 14, fill: MUT, opacity: fade(u, 0.4 + i * 0.45) }); }); }

@@ -52,7 +52,7 @@
     mono(170, 225, 'mychart/', { 'text-anchor': 'middle', 'font-size': 17, 'font-weight': 800, fill: ACC, opacity: s });
     tx(170, 300, '사본 21개 → 디렉토리 1개', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.5) });
     terminal(420, 130, 500, 170, ['$ helm lint ./mychart', ['==> Linting ./mychart', null], ['구조 · 템플릿 문법 검사', 'var(--off)']], 1 + 2 * E(u, 1.6, 2.4), { title: 'zsh', fs: 14 });
-    sub(670, 340, 'Chart 를 쓰기 시작한다', fade(u, 2.2), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
+    sub(670, 340, 'Chart를 쓰기 시작한다', fade(u, 2.2), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
 
   // 2. Chart 구조
   function s2(t, c) { const { k, u } = c, d = c.beat.dataState, pd = c.prev ? c.prev.dataState : { chartFiles: [] };
@@ -63,7 +63,7 @@
     if (k === 0) { paper(cx, cy, cw, 230, { stroke: INFO, sw: 2 }); mono(cx + 18, cy + 30, 'Chart.yaml', { 'font-size': 15, 'font-weight': 800, fill: INFO });
       [['name:', 'web', 'Chart 이름'], ['version:', '1.0.0', 'Chart 자체 버전'], ['appVersion:', 'v1.5.0', '담긴 앱 버전']].forEach(([a, v, n], i) => { const y = cy + 76 + i * 46, op = fade(u, 0.3 + i * 0.4);
         mono(cx + 24, y, a, { 'font-size': 15, fill: MUT, opacity: op }); mono(cx + 160, y, v, { 'font-size': 16, 'font-weight': 800, opacity: op }); tx(cx + 300, y, n, { 'font-size': 14, fill: MUT, opacity: op }); });
-      sub(cx + cw / 2, 320, '차트를 고치면 version, 앱을 바꾸면 appVersion 이 오른다', fade(u, 1.8), { 'font-size': 14.5, fill: INK }); return; }
+      sub(cx + cw / 2, 320, '차트를 고치면 version, 앱을 바꾸면 appVersion이 오른다', fade(u, 1.8), { 'font-size': 14.5, fill: INK }); return; }
     if (k === 1 || k === 2) { const v = d.values, rows = [['image.repository', 'myapp'], ['image.tag', v.tag], ['replicas', String(v.replicas)]];
       if (k === 2) rows.push(['ingress.host', v.host]);
       paper(cx, cy, cw, 300, { stroke: WARN, sw: 2 }); mono(cx + 18, cy + 30, 'values.yaml', { 'font-size': 15, 'font-weight': 800, fill: WARN });
@@ -83,7 +83,7 @@
     paper(cx + 330, cy + 270, 218, 100, { stroke: WARN }); mono(cx + 344, cy + 296, 'values.yaml', { 'font-size': 14, 'font-weight': 700, fill: WARN });
     mono(cx + 344, cy + 322, 'replicas: 3', { 'font-size': 14 }); mono(cx + 344, cy + 348, 'tag: v1.5.0', { 'font-size': 14 });
     grow(cx + 330, cy + 317, cx + 300, cy + 126, E(u, 0.8, 1.5), WARN); grow(cx + 330, cy + 343, cx + 300, cy + 170, E(u, 1, 1.7), WARN);
-    tx(cx + 24, cy + 300, '빈자리를 values 가 채운다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) }); }
+    tx(cx + 24, cy + 300, '빈자리를 values가 채운다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) }); }
 
   // 3. helm install
   const EX = 455, EY = 180;
@@ -114,7 +114,7 @@
       el('rect', { x: 40, y: 300, width: 590, height: 90, rx: 8, fill: INK, opacity: fade(u, 0.2) });
       mono(56, 324, '$ helm list -n production   (출력 예시)', { 'font-size': 13.5, fill: PANEL, opacity: fade(u, 0.3) });
       rows.forEach((r, i) => r.forEach((v, j) => mono(56 + j * 140, 350 + i * 24, v, { 'font-size': 13.5, fill: i ? 'var(--term)' : 'var(--off)', opacity: fade(u, 0.6 + i * 0.4) })));
-      sub(785, 350, 'kubectl 이 아니라 helm 에게 묻는다', fade(u, 1.4), { 'font-size': 14, fill: INK }); } }
+      sub(785, 350, 'kubectl이 아니라 helm에게 묻는다', fade(u, 1.4), { 'font-size': 14, fill: INK }); } }
 
   // 4. helm upgrade — 값만 바꿔 revision 을 쌓는다
   function layers(k, u, d) { const x = 40, w = 300;
@@ -133,7 +133,7 @@
       const rows = [['REVISION', 'STATUS', 'CHART', 'APP VERSION'], ['1', 'superseded', 'web-1.0.0', 'v1.5.0'], ['2', 'deployed', 'web-1.0.0', 'v1.6.0']];
       rows.forEach((r, i) => { const y = 120 + i * 44; if (i) el('rect', { x: 34, y: y - 28, width: 420, height: 38, rx: 6, fill: i === 2 ? 'var(--goodbg)' : SOFT, opacity: fade(u, 0.2 + i * 0.4) });
         r.forEach((v, j) => mono(48 + j * 104, y, v, { 'font-size': 14, 'font-weight': i ? 600 : 700, fill: i === 0 ? MUT : i === 1 && j === 1 ? MUT : INK, opacity: fade(u, 0.2 + i * 0.4) })); });
-      tx(40, 300, '1번은 지워지지 않고 superseded 로 남는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.4) });
+      tx(40, 300, '1번은 지워지지 않고 superseded로 남는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.4) });
       tx(40, 330, '그래서 되돌릴 수 있다', { 'font-size': 15, fill: GOOD, 'font-weight': 700, opacity: fade(u, 1.7) }); }
     // 오른쪽: revision 기록과 Pod
     tx(rx, 60, 'Release myrelease', { 'font-size': 15, 'font-weight': 800 });
@@ -170,7 +170,7 @@
       tx(720, 300, '줄이 줄지 않고 늘어난다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.4) }); return; }
     if (k === 3) { card(480, 300, 600, 76, { rx: 12, stroke: BAD, sw: 2, dash: '7 5', fill: PANEL, s: pop(u, 0.3) });
       mono(480, 296, '# helm uninstall myrelease -n production', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.4) });
-      tx(480, 322, '실행하면 Pod 3개와 history 가 함께 사라진다 (주석으로만 둠)', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 0.8) }); cross(760, 110, 30, pop(u, 1.2)); return; }
+      tx(480, 322, '실행하면 Pod 3개와 history가 함께 사라진다 (주석으로만 둠)', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 0.8) }); cross(760, 110, 30, pop(u, 1.2)); return; }
     // k4: 두 줄 비교
     const x0 = 160, dx = 260;
     tx(40, 120, 'REVISION', { 'font-size': 15, 'font-weight': 800 }); tx(40, 250, '앱 버전', { 'font-size': 15, 'font-weight': 800 });

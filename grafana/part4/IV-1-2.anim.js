@@ -63,7 +63,7 @@
     if (k === 4) { const segs = ['/etc', '/grafana', '/provisioning', '/datasources', '/*.yaml'];
       let x = 120; segs.forEach((s, i) => { const w = tw(s, 17) + 18, op = fade(u, 0.2 + i * 0.35); el('rect', { x, y: 150, width: w, height: 44, rx: 6, fill: i >= 3 ? ACCBG : SOFT, stroke: i >= 3 ? ACC : GRID, opacity: op });
         mono(x + 9, 178, s, { 'font-size': 17, 'font-weight': 700, fill: i >= 3 ? ACC : INK, opacity: op }); x += w + 4; });
-      sub(480, 250, 'Grafana 가 부팅할 때 반드시 훑는 고정 경로', fade(u, 2.0), { 'font-size': 15, fill: INK }); return; }
+      sub(480, 250, 'Grafana가 부팅할 때 반드시 훑는 고정 경로', fade(u, 2.0), { 'font-size': 15, fill: INK }); return; }
     // k5 IaC: Git 이력 + 환경 간 동일
     el('line', { x1: 80, y1: 120, x2: lerp(80, 520, E(u, 0.2, 1.4)), y2: 120, stroke: MUT, 'stroke-width': 3 });
     ['add prometheus', 'add loki', 'tls on'].forEach((s, i) => { const x = 130 + i * 160, op = fade(u, 0.4 + i * 0.35); el('circle', { cx: x, cy: 120, r: 9, fill: ACC, opacity: op }); mono(x, 100, s, { 'font-size': 13.5, 'text-anchor': 'middle', opacity: op }); });
@@ -100,22 +100,22 @@
   function s3(t, c) { const { k, u } = c;
     if (k === 0) { fileCard(150, 120, 'core.yaml', 'Prometheus · Loki', { w: 210 }); fileCard(150, 250, 'postgres.yaml', 'Postgres', { w: 210, s: pop(u, 0.3), stroke: ACC });
       grow(258, 120, 440, 180, E(u, 0.6, 1.3), MUT); grow(258, 250, 440, 190, E(u, 0.8, 1.5), ACC);
-      zone(450, 110, 220, 150, 'datasources/ 폴더', { stroke: INK }); mono(470, 170, '모든 *.yaml', { 'font-size': 15, opacity: fade(u, 1.2) }); mono(470, 200, '→ 합쳐서 로드', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.5) });
+      zone(450, 110, 220, 150, 'datasources/ 폴더', { stroke: INK }); tx(470, 170, '모든 *.yaml', { 'font-size': 15, opacity: fade(u, 1.2) }); tx(470, 200, '→ 합쳐서 로드', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.5) });
       dsList(700, 60, 240, c, { h: 300, rh: 82, compact: true }); return; }
     // 공통: 왼쪽 Postgres 카드, 가운데 두 상자, 오른쪽 Grafana/API
     card(150, 80, 220, 76, { rx: 10, stroke: WARN, sw: 2.2, s: k === 1 ? pop(u, 0.2) : 1 }); tx(56, 70, 'Postgres', { 'font-size': 16, 'font-weight': 800, fill: WARN }); mono(56, 96, 'db:5432 · grafana_ro', { 'font-size': 13.5, opacity: k === 1 ? fade(u, 0.6) : 1 });
-    if (k === 1) { sub(150, 150, 'user 는 노출돼도 되는 값', fade(u, 1.0), { 'font-size': 14.5, fill: INK }); dsList(510, 60, 410, c, { h: 300, rh: 80 }); return; }
+    if (k === 1) { sub(150, 150, 'user는 노출돼도 되는 값', fade(u, 1.0), { 'font-size': 14.5, fill: INK }); dsList(510, 60, 410, c, { h: 300, rh: 80 }); return; }
     const JD = ['database: orders', 'sslmode: require', 'maxOpenConns: 10', 'postgresVersion: 1500', 'timescaledb: false'];
     zone(40, 140, 300, 220, 'jsonData — 평문', { stroke: INFO }); JD.forEach((s, i) => mono(60, 180 + i * 34, s, { 'font-size': 14.5, opacity: k === 2 ? fade(u, 0.3 + i * 0.25) : 1 }));
     if (k >= 3) { zone(370, 140, 260, 220, 'secureJsonData — 비밀', { stroke: BAD }); lock(500, 290, true, BAD, pop(u, k === 3 ? 1.4 : 0));
       const enc = k === 3 ? E(u, 1.0, 1.8) : 1; mono(390, 190, 'password:', { 'font-size': 14.5 }); mono(490, 190, enc < 0.5 ? 'CHANGE_ME' : '●●●●●●', { 'font-size': 14.5, fill: enc < 0.5 ? BAD : MUT });
       if (k === 3) sub(500, 240, '한 번 읽고 암호화 저장', fade(u, 1.8), { fill: INK, 'font-size': 14 }); }
-    if (k === 2) sub(190, 390, 'API 로 그대로 조회되는 값만 둔다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 });
-    if (k >= 4) { const leak = k === 5, L = leak ? ['GET /api/datasources/uid/pg-orders', '"jsonData": {', '  "database": "orders",', '  "password": "CHANGE_ME"', '},'] : ['GET /api/datasources/uid/pg-orders', '"jsonData": {', '  "database": "orders", …', '},', '"secureJsonFields": { "password": true }'];
-      code(650, 60, 290, L, { fs: 13.5, lh: 26, hl: leak ? [3] : [4], hlc: leak ? BADBG : GOODBG, rowOp: (i) => fade(u, 0.2 + i * 0.25) });
-      if (k === 4) sub(795, 230, '값이 아니라 "있다"만 돌려준다', fade(u, 1.6), { fill: GOOD, 'font-weight': 700, 'font-size': 14 });
+    if (k === 2) sub(190, 390, 'API로 그대로 조회되는 값만 둔다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 });
+    if (k >= 4) { const leak = k === 5, L = leak ? ['GET /api/datasources/uid/pg-orders', '"jsonData": {', '  "database": "orders",', '  "password": "CHANGE_ME"', '},'] : ['GET /api/datasources/uid/pg-orders', '"jsonData": {', '  "database": "orders", …', '},', '"secureJsonFields": {', '  "password": true }'];
+      code(650, 60, 290, L, { fs: 13.5, lh: 26, hl: leak ? [3] : [4, 5], hlc: leak ? BADBG : GOODBG, rowOp: (i) => fade(u, 0.2 + i * 0.25) });
+      if (k === 4) sub(795, 262, '값이 아니라 "있다"만 돌려준다', fade(u, 1.6), { fill: GOOD, 'font-weight': 700, 'font-size': 14 });
       if (k === 5) { el('rect', { x: 48, y: 180 + 5 * 34 - 22, width: 284, height: 30, rx: 6, fill: BADBG, stroke: BAD, opacity: fade(u, 0.4) }); mono(60, 180 + 5 * 34, 'password: CHANGE_ME', { 'font-size': 14.5, fill: BAD, 'font-weight': 700, opacity: fade(u, 0.4) });
-        sub(795, 230, '평문이 그대로 새어 나간다', fade(u, 1.6), { fill: BAD, 'font-weight': 700, 'font-size': 14.5 }); }
+        sub(795, 262, '평문이 그대로 새어 나간다', fade(u, 1.6), { fill: BAD, 'font-weight': 700, 'font-size': 14.5 }); }
       return; }
     if (k === 3) { server(800, 200, 'Grafana', { lamp: GOOD }); dot([[630, 190], [740, 200]], seg(u, 0.3, 1.0), BAD, 7); } }
 
@@ -125,20 +125,20 @@
     const yl = ['url: ${PG_HOST}:${PG_PORT}', 'user: ${PG_USER}', 'jsonData:', '  database: ${PG_DB}', '  sslmode: require', 'secureJsonData:', '  password: ${PG_PASSWORD}'];
     if (k <= 4) { const when = [0, 0, 1, 1, 1, 2, 2], hl = k === 0 ? [0, 1] : k === 1 ? [3] : k === 2 ? [6] : [];
       const row = code(40, 50, 420, yl, { fs: 15, lh: 34, hl, rowOp: (i) => (when[i] < k ? 1 : when[i] === k ? fade(u, 0.2 + i * 0.1) : 0.15) });
-      if (k === 2) { const g = E(u, 0.2, 0.9); mono(470, row(6) + 5, 'CHANGE_ME', { 'font-size': 15, fill: BAD, opacity: 1 - g * 0.7, 'text-decoration': 'line-through' }); sub(240, 330, 'YAML 에는 변수 이름만 남는다', fade(u, 1.2), { fill: INK, 'font-size': 15, 'font-weight': 700 }); }
-      if (k === 1) sub(240, 330, 'sslmode 는 어디서나 같아 상수로 둔다', fade(u, 1.0), { fill: INK, 'font-size': 14.5 });
+      if (k === 2) { const g = E(u, 0.2, 0.9); mono(470, row(6) + 5, 'CHANGE_ME', { 'font-size': 15, fill: BAD, opacity: 1 - g * 0.7, 'text-decoration': 'line-through' }); sub(240, 330, 'YAML에는 변수 이름만 남는다', fade(u, 1.2), { fill: INK, 'font-size': 15, 'font-weight': 700 }); }
+      if (k === 1) sub(240, 330, 'sslmode는 어디서나 같아 상수로 둔다', fade(u, 1.0), { fill: INK, 'font-size': 14.5 });
       if (k === 0) sub(240, 330, '환경마다 다른 값은 변수로 뺀다', fade(u, 1.0), { fill: INK, 'font-size': 14.5 });
       if (k >= 3) { zone(560, 46, 360, 230, 'compose environment', { stroke: INK }); VARS.forEach(([n, v], i) => { const op = k === 3 ? fade(u, 0.3 + i * 0.25) : 1, y = 92 + i * 38;
           mono(580, y, n + ':', { 'font-size': 14.5, 'font-weight': 700, opacity: op }); mono(730, y, v, { 'font-size': 14.5, fill: i === 4 ? WARN : INK, opacity: op }); });
         if (k === 3) sub(740, 306, '값은 런타임이 안다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 }); }
-      if (k === 4) { const res = ['url: db:5432', 'user: grafana_ro', 'database: orders', 'password: ●●●●●● (.env 에서)'];
+      if (k === 4) { const res = ['url: db:5432', 'user: grafana_ro', 'database: orders', 'password: ●●●●●● (.env에서)'];
         [[0, 0], [1, 0], [2, 1], [3, 3], [4, 6]].forEach(([vi, li], j) => grow(560, 92 + vi * 38 - 5, 462, row(li), E(u, 0.2 + j * 0.2, 0.6 + j * 0.2), ACC));
         zone(560, 290, 360, 118, '치환된 결과', { stroke: GOOD, op: fade(u, 1.4) }); res.forEach((s, i) => mono(580, 330 + i * 22, s, { 'font-size': 14, fill: i === 3 ? MUT : INK, opacity: fade(u, 1.5 + i * 0.2) })); }
       return; }
     if (k === 5) { zone(60, 80, 330, 200, '호스트', { stroke: INK }); fileCard(225, 170, './provisioning/', 'datasources/*.yaml', { w: 250 });
       zone(570, 80, 340, 200, 'grafana 컨테이너', { stroke: ACC }); el('rect', { x: 590, y: 145, width: 300, height: 50, rx: 8, fill: ACCBG, stroke: ACC, opacity: fade(u, 1.2) }); mono(604, 176, '/etc/grafana/provisioning', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 1.2) });
       grow(352, 170, 588, 170, E(u, 0.4, 1.2), ACC); pill(470, 140, 'volumes', ACC, pop(u, 0.4), { mono: true, fs: 14 });
-      sub(480, 340, '이 마운트가 없으면 Grafana 는 yaml 을 보지 못한다', fade(u, 1.6), { fill: INK, 'font-size': 15 }); return; }
+      sub(480, 340, '이 마운트가 없으면 Grafana는 yaml을 보지 못한다', fade(u, 1.6), { fill: INK, 'font-size': 15 }); return; }
     // k6 공개 저장소 vs secret store
     zone(60, 60, 380, 260, 'Git 저장소 (공개해도 안전)', { stroke: GOOD }); fileCard(250, 150, 'postgres.yaml', 'password: ${PG_PASSWORD}', { w: 300 }); check(250, 240, 14, pop(u, 0.8));
     sub(250, 290, '비밀이 한 글자도 없다', fade(u, 0.9), { fill: GOOD, 'font-weight': 700, 'font-size': 14.5 });
@@ -147,7 +147,7 @@
 
   // 5. 부팅 시 자동 로드
   function s5(t, c) { const { k, u } = c;
-    zone(40, 46, 420, 330, 'grafana:11.3.0  ·  3000:3000', { stroke: k >= 3 ? GOOD : INK });
+    zone(40, 46, 420, 300, 'grafana:11.3.0  ·  3000:3000', { stroke: k >= 3 ? GOOD : INK });
     // env 칸
     VARS.forEach(([n], i) => { const show = k >= 1, op = k === 1 ? fade(u, 0.2 + i * 0.2) : show ? 1 : 0.12; card(110 + (i % 3) * 120, 100 + Math.floor(i / 3) * 40, 112, 30, { rx: 6, text: n, fs: 13.5, mono: true, stroke: show ? INK : GRID, color: show ? INK : MUT, sw: 1.4, op }); });
     // 마운트
@@ -156,11 +156,11 @@
     // 부팅 막대
     const bp = k === 3 ? E(u, 0.2, 1.8) : k > 3 ? 1 : 0; el('rect', { x: 60, y: 270, width: 380, height: 16, rx: 8, fill: SOFT }); el('rect', { x: 60, y: 270, width: 380 * bp, height: 16, rx: 8, fill: GOOD });
     mono(60, 312, k < 3 ? (k === 0 ? 'docker compose up -d 전' : '부팅 대기') : 'datasources/*.yaml 읽음', { 'font-size': 14, fill: k >= 3 ? GOOD : MUT, 'font-weight': 700 });
-    if (k === 0) sub(250, 350, '정의만으로는 아무것도 등록되지 않는다', fade(u, 0.6), { fill: INK, 'font-size': 14 });
+    if (k === 0) sub(250, 334, '정의만으로는 아무것도 등록되지 않는다', fade(u, 0.6), { fill: INK, 'font-size': 14 });
     dsList(500, 46, 420, c, { h: 290, rh: 80 });
     if (k === 4) { card(710, 375, 400, 40, { rx: 10, text: '파일 수정 → 재시작 또는 POST …/datasources/reload', fs: 14, stroke: WARN, s: pop(u, 0.3) });
       card(250, 395, 400, 34, { rx: 10, text: 'isDefault: true 둘 → 로드 실패', fs: 14, stroke: BAD, color: BAD, s: pop(u, 1.0) }); }
-    if (k === 5) { card(710, 378, 400, 40, { rx: 10, text: 'url 은 ${ENV} · editable: false', fs: 14.5, mono: true, stroke: GOOD, s: pop(u, 0.3) }); lock(250, 392, true, GOOD, pop(u, 0.8)); } }
+    if (k === 5) { card(710, 378, 400, 40, { rx: 10, text: 'url은 ${ENV} · editable: false', fs: 14.5, mono: true, stroke: GOOD, s: pop(u, 0.3) }); lock(250, 392, true, GOOD, pop(u, 0.8)); } }
 
   const quiz = [
     { q: 'UI에서 Save & test로 등록한 데이터소스 설정은 어디에만 남나?',
@@ -182,7 +182,7 @@
 
   const summary = [
     'UI에서 클릭으로 등록한 데이터소스는 grafana.db에만 남아 재현도 리뷰도 안 된다.',
-    'datasources/*.yaml에 name, type, uid, url, access: proxy를 적으면 부팅 때 자동 등록된다.',
+    'datasources/*.yaml에 이름과 타입, 주소, access: proxy를 적어 두면 부팅 때 자동 등록된다.',
     '평문 설정은 jsonData, 비밀번호는 secureJsonData에 두고 값은 ${PG_PASSWORD} 같은 환경변수로 넣는다.',
     '파일을 고치면 재시작이나 reload API가 필요하고, isDefault는 조직마다 하나만 둔다.',
   ];

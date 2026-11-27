@@ -57,7 +57,7 @@
       const n = Math.round(70000000 * sw);
       mono(480, 136, n.toLocaleString('en-US'), { 'font-size': 30, 'font-weight': 800, 'text-anchor': 'middle', fill: sw >= 1 ? BAD : INK });
       sub(480, 160, '이번 호출 한 번이 훑는 샘플 (약 7천만)', 1, { 'font-size': 14.5 });
-      note(70, 376, '[7d] 가 들어간 rate 는 호출마다 일주일치를 처음부터 읽는다', fade(u, 2.3), { fill: BAD }); return; }
+      note(70, 376, '[7d]가 들어간 rate는 호출마다 일주일치를 처음부터 읽는다', fade(u, 2.3), { fill: BAD }); return; }
     if (k === 3) { // 7천만 → 1개
       for (let i = 0; i < 120; i++) { const q = i % 12, r = Math.floor(i / 12); el('circle', { cx: 70 + q * 20, cy: 120 + r * 20, r: 3.2, fill: INFO, opacity: 0.25 + 0.6 * (1 - E(u, 0.4, 1.4) * (q / 12)) }); }
       note(70, 344, '샘플 약 7천만', 1, { 'font-size': 14.5 });
@@ -76,7 +76,7 @@
       [0, 15, 30, 45, 60].forEach((s) => mono(bx + bw * s / 60, 306, s + 's', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }));
       mono(bx + bw * f - 8, 273, Math.round(f * 60) + 's', { 'font-size': 15, 'font-weight': 800, fill: PANEL, 'text-anchor': 'end', opacity: f > 0.1 ? 1 : 0 });
       note(120, 238, '1분 = 60초 중 이 쿼리가 차지하는 시간', fade(u, 1.5), { 'font-size': 14, fill: MUT });
-      banner(480, 360, '코어 하나가 80% 를 이 쿼리에만 쓴다', pop(u, 2.4)); return; }
+      banner(480, 360, '코어 하나가 80%를 이 쿼리에만 쓴다', pop(u, 2.4)); return; }
     // k5: 증상
     const L = [['p99 latency', 1.2], ['error rate', 0.8], ['qps', 0.9]];
     note(450, 110, '쿼리 하나의 비용', 1, { fill: MUT, 'font-size': 14 });
@@ -107,7 +107,7 @@
       for (let m = 0; m <= 5; m++) { const x = lerp(x0, x1, m / 5), on = sw * 5 >= m - 0.02;
         el('circle', { cx: x, cy: y, r: on ? 8 : 5, fill: on ? ACC : OFF }); mono(x, y + 28, m ? m + 'm' : '0', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }); }
       note(500, 330, '1분마다 그룹 안 룰을 위에서부터 차례로 평가', fade(u, 1.2), { 'font-size': 14.5 });
-      sub(X, 370, 'interval 을 빼면 global.evaluation_interval 을 따른다', fade(u, 1.8)); return; }
+      sub(X, 370, 'interval을 빼면 global.evaluation_interval을 따른다', fade(u, 1.8)); return; }
     if (k === 2 || k === 8) { const parts = [['job', '집계 레벨', INFO], ['checkout_api_p99', '메트릭', INK], ['5m', '연산·창', ACC]];
       let x = 510; const y = k === 8 ? 140 : 200;
       parts.forEach(([s, n, col], i) => { const w = tw(s, 20), sc = k === 2 ? pop(u, 0.3 + i * 0.4) : 1;
@@ -131,11 +131,11 @@
       mono(910, 222, '[5m]', { 'font-size': 16, 'font-weight': 800, fill: ACC, 'text-anchor': 'end', opacity: fade(u, 1.5) });
       mono(510, 276, '10,080 ÷ 5 = 2,016', { 'font-size': 20, 'font-weight': 800, opacity: fade(u, 1.7) });
       note(510, 306, '읽는 구간이 2,016분의 1로 줄어든다', fade(u, 1.9), { 'font-size': 14.5 });
-      sub(705, 370, '창이 다르면 다른 값이다. 이름 끝 :5m 이 그 표시', fade(u, 2.3)); return; }
+      sub(705, 370, '창이 다르면 다른 값이다. 이름 끝 :5m이 그 표시', fade(u, 2.3)); return; }
     if (k === 5) { mono(510, 140, 'job:checkout_api_p99:5m', { 'font-size': 16, 'font-weight': 800 });
       mono(510, 168, '{service="checkout-api",', { 'font-size': 15 });
       card(512 + tw(' sli_type="latency"}', 15) / 2, 190, tw(' sli_type="latency"}', 15) + 12, 28, { rx: 6, fill: ACCBG, stroke: ACC, sw: 1.5, text: 'sli_type="latency"}', fs: 15, fw: 800, color: ACC, mono: true, s: pop(u, 0.4) });
-      const ax = R.axes(520, 250, 380, 100, { x: [0, 6], y: [0, 1] }); tx(520, 240, 'TSDB 에 쌓이는 새 시계열', { 'font-size': 14, fill: MUT, 'font-weight': 600 });
+      const ax = R.axes(520, 250, 380, 100, { x: [0, 6], y: [0, 1] }); tx(520, 240, 'TSDB에 쌓이는 새 시계열', { 'font-size': 14, fill: MUT, 'font-weight': 600 });
       const n = Math.floor(E(u, 0.9, 2.5) * 7); const V = [0.55, 0.5, 0.62, 0.48, 0.58, 0.52, 0.6];
       for (let i = 0; i < n; i++) el('circle', { cx: ax.X(i), cy: ax.Y(V[i]), r: 5, fill: ACC });
       mono(900, 380, '1분에 점 하나', { 'font-size': 14, fill: MUT, 'text-anchor': 'end', opacity: fade(u, 1.5) }); return; }
@@ -154,7 +154,7 @@
     el('line', { x1: 510, y1: 200, x2: 910, y2: 200, stroke: INK, 'stroke-width': 2.5, opacity: fade(u, 1.0) });
     mono(510, 232, 'sum(rate(…[5m]))  전체', { 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 1.1) });
     el('rect', { x: 510, y: 244, width: 400 * E(u, 1.1, 1.8), height: 26, rx: 4, fill: INFO, opacity: 0.6 });
-    note(510, 320, '분자·분모 모두 rate 로 맞춰야 비율이 된다', fade(u, 1.9), { 'font-size': 14.5 });
+    note(510, 320, '분자·분모 모두 rate로 맞춰야 비율이 된다', fade(u, 1.9), { 'font-size': 14.5 });
     sub(710, 360, '결과는 0~1 사이 에러 비율', fade(u, 2.2)); }
 
   // ---------- 3. 등록·검사·reload ----------
@@ -177,7 +177,7 @@
       grow(640, 180, 280, 180, E(u, 0.3, 0.9), INFO, { dash: '6 5' });
       for (let i = 0; i < 4; i++) dot([[262, 230], [656, 230]], seg(u, 0.9 + i * 0.4, 1.6 + i * 0.4), INFO, 6);
       mono(460, 258, '…_bucket{le="…"}', { 'font-size': 14, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.0) });
-      note(300, 340, 'Prometheus 가 15초마다 당겨 간다 (pull)', fade(u, 1.8), { 'font-size': 15 });
+      note(300, 340, 'Prometheus가 15초마다 당겨 간다 (pull)', fade(u, 1.8), { 'font-size': 15 });
       sub(480, 372, '룰이 계산할 원본 메트릭은 여기서 들어온다', fade(u, 2.2)); return; }
     if (k === 3) { terminal(120, 110, 720, 170, ['$ promtool check rules recording-rules.yml', 'Checking recording-rules.yml', '  SUCCESS: 2 rules found'], lerp(0, 3, E(u, 0.2, 2.0)), { title: 'bash' });
       check(480, 340, 18, pop(u, 2.1)); note(510, 346, '문법·라벨·이름을 배포 전에 걸러 낸다', fade(u, 2.1)); return; }
@@ -189,11 +189,11 @@
     if (k === 5) { prom(640, 210, { lamp: u > 1.4 ? GOOD : WARN });
       fly(140, 150, 300, 150, seg(u, 0.2, 1.1), 'POST /-/reload', { mono: true, stay: true }); grow(390, 165, 570, 195, E(u, 1.0, 1.4), ACC);
       mono(200, 260, 'kill -HUP <pid>', { 'font-size': 14.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 0.6) }); tx(200, 236, '또는', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 0.6) });
-      ['checkout-api-aggregates', 'alert-rules.yml 의 그룹'].forEach((s, i) => { const y = 150 + i * 40; check(760, y, 9, pop(u, 1.5 + i * 0.3)); tx(778, y + 5, s, { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 1.5 + i * 0.3) }); });
+      ['checkout-api-aggregates', 'alert-rules.yml의 그룹'].forEach((s, i) => { const y = 150 + i * 40; check(760, y, 9, pop(u, 1.5 + i * 0.3)); tx(778, y + 5, s, { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 1.5 + i * 0.3) }); });
       note(470, 340, '프로세스는 그대로, 룰만 새것으로', fade(u, 1.9));
-      sub(480, 372, 'HTTP reload 는 --web.enable-lifecycle 로 띄웠을 때만 열린다', fade(u, 2.2)); return; }
+      sub(480, 372, 'HTTP reload는 --web.enable-lifecycle로 띄웠을 때만 열린다', fade(u, 2.2)); return; }
     terminal(120, 100, 720, 160, ['$ curl -s prometheus:9090/api/v1/rules \\', '    | jq ".data.groups[].name"', '"checkout-api-aggregates"'], lerp(0, 3, E(u, 0.2, 1.8)), { title: 'bash' });
-    [['rule_files 등록', 0], ['promtool check', 1], ['reload', 2], ['API 로 확인', 3]].forEach(([s, i]) => { const x = 180 + i * 200; card(x, 330, 170, 40, { rx: 20, text: s, fs: 14.5, stroke: GOOD, color: INK, s: pop(u, 1.9 + i * 0.15) }); }); }
+    [['rule_files 등록', 0], ['promtool check', 1], ['reload', 2], ['API로 확인', 3]].forEach(([s, i]) => { const x = 180 + i * 200; card(x, 330, 170, 40, { rx: 20, text: s, fs: 14.5, stroke: GOOD, color: INK, s: pop(u, 1.9 + i * 0.15) }); }); }
 
   // ---------- 4. 효과 ----------
   function s4(t, c) { const { k, u } = c;
@@ -207,7 +207,7 @@
       tx(120, 168, '이전 쿼리', { 'font-size': 15, 'font-weight': 700 }); R.hbar(250, 152, 560, 1.2, 1.2, { col: BAD, text: '1.2s', h: 26 });
       tx(120, 238, 'record 조회', { 'font-size': 15, 'font-weight': 700 }); R.hbar(250, 222, 560, a, 1.2, { col: GOOD, text: Math.round(a * 1000) + 'ms', h: 26 });
       mono(480, 320, '1.2s ÷ 0.05s = 24배', { 'font-size': 24, 'font-weight': 800, 'text-anchor': 'middle', fill: GOOD, opacity: fade(u, 1.9) });
-      sub(480, 352, '평균 50ms · instant query 로 값 하나를 읽는다', fade(u, 2.2)); return; }
+      sub(480, 352, '평균 50ms · instant query로 값 하나를 읽는다', fade(u, 2.2)); return; }
     if (k === 2) { const ax = R.axes(360, 150, 240, 120, { x: [0, 6], y: [0, 1] }); tx(360, 140, 'job:checkout_api_p99:5m', { 'font-size': 14.5, 'font-weight': 800, class: 'mono', fill: ACC });
       R.line(ax, [[0, 0.4], [1, 0.45], [2, 0.38], [3, 0.5], [4, 0.44], [5, 0.48], [6, 0.42]], E(u, 0.2, 0.9), ACC, { sw: 3 });
       panel(150, 210, 150, 100, { line: ACC }); lbl(150, 290, 'Grafana 패널');
@@ -226,7 +226,7 @@
       mono(ax.X(14), ax.Y(0.2) + 20, '0.2s', { 'font-size': 13.5, fill: BAD, 'text-anchor': 'end' }); ex(110, 400, fade(u, 1.2));
       pill(640, 392, 'summary: p99 > 200ms', WARN, pop(u, 2.2), { fs: 13.5, mono: true }); return; }
     if (k === 4) { const rows = [['이전', 48, BAD, '40호출 × 1.2s'], ['이후', 3.2, GOOD, '1.2s + 40 × 0.05s']];
-      tx(120, 110, '1분에 Prometheus 가 쓰는 계산 시간', { 'font-size': 15, 'font-weight': 700, fill: MUT });
+      tx(120, 110, '1분에 Prometheus가 쓰는 계산 시간', { 'font-size': 15, 'font-weight': 700, fill: MUT });
       rows.forEach(([n, v, col, f], i) => { const y = 140 + i * 80; tx(120, y + 20, n, { 'font-size': 16, 'font-weight': 800 });
         R.hbar(190, y, 560, v, 48, { col, text: v + 's', h: 28, u: E(u, 0.2 + i * 0.5, 1.0 + i * 0.5) }); mono(190, y + 52, f, { 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.6 + i * 0.5) }); });
       [['무거운 계산 40/분 → 1/분', 260], ['첫 로드 5~7초 → 0.5초', 520], ['CPU 80% → 약 5%', 760]].forEach(([s, x], i) => pill(x, 360, s, GOOD, pop(u, 1.8 + i * 0.2), { fs: 14 })); return; }

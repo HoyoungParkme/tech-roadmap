@@ -75,7 +75,7 @@
       person(x, 170, null, {}); const inside = x > 320;
       mono(x, 230, inside ? 'TF_VAR_… 로드됨' : '값 없음', { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'middle', fill: inside ? GOOD : MUT });
       if (inside) key(x + 40, 140, 1, WARN);
-      note(700, 140, 'cd 로 들어가면 로드', fade(u, 0.8)); note(700, 172, '나오면 자동 unset', fade(u, 1.8));
+      note(700, 140, 'cd로 들어가면 로드', fade(u, 0.8)); note(700, 172, '나오면 자동 unset', fade(u, 1.8));
       note(300, 330, '값이 사는 범위를 디렉터리 하나로 줄인다', fade(u, 2.2)); return; }
     if (k === 4) { card(150, 140, 220, 90, { rx: 12, stroke: INFO, sw: 2.2, fill: INFOBG, text: 'GitHub\nsecrets', fs: 16, color: INFO }); lock(150, 82, true, INFO, 0.9);
       fly(260, 140, 420, 140, seg(u, 0.3, 1.0), 'DB_PASSWORD', { mono: true, fill: INFO });
@@ -142,7 +142,7 @@
       note(620, 110, '키 이름은 그대로', fade(u, 1.6)); note(620, 142, '값만 AES256-GCM 암호문', fade(u, 1.9)); note(620, 190, 'diff로 어떤 키가 늘었는지는 보인다', fade(u, 2.2), { fill: MUT }); return; }
     if (k === 3) { fileCard(24, 50, 560, 'providers.tf', [{ s: 'sops = { source  = "carlpett/sops"' }, { s: '         version = "~> 1.0" }', hi: 'acc' }]);
       card(760, 120, 220, 80, { rx: 12, stroke: ACC, sw: 2.4, text: 'sops provider\n복호화 담당', fs: 15, color: ACC, s: pop(u, 0.8), fill: ACCBG });
-      note(24, 230, '개발자가 sops -d 를 직접 칠 일이 없다', fade(u, 1.6)); return; }
+      note(24, 230, '개발자가 sops -d를 직접 칠 일이 없다', fade(u, 1.6)); return; }
     if (k === 4) { chip(130, 120, 'secrets.enc.yaml', GOOD, 1); grow(220, 120, 340, 120, E(u, 0.2, 0.6), MUT);
       card(430, 120, 160, 70, { rx: 12, stroke: WARN, sw: 2.2, text: 'AWS KMS', fs: 16, s: pop(u, 0.4) }); lock(430, 70, u < 1.0, WARN, pop(u, 0.5));
       grow(510, 120, 620, 120, E(u, 1.0, 1.4), ACC); fly(620, 120, 800, 120, seg(u, 1.3, 2.0), 'data["db_password"]', { mono: true, fill: ACC, stay: true });
@@ -196,7 +196,7 @@
       [0, 30].forEach((d, i) => { el('line', { x1: X(d), y1: 290, x2: X(d), y2: 310, stroke: INK, 'stroke-width': 2 }); mono(X(d), 334, `${d}일`, { 'font-size': 14, 'text-anchor': 'middle', fill: MUT }); });
       const sw = seg(u, 0.6, 1.8); dot([[X(0), 300], [X(30), 300]], sw < 1 ? sw : 0.999, ACC, 8);
       smBox(480, 140, [['v1', 1, sw < 1], ['v2 (회전)', pop(u, 1.8), sw >= 1]]);
-      chip(780, 300, 'automatically_after_days = 30', ACC, pop(u, 0.4)); note(90, 390, 'rotation Lambda가 새 비밀번호를 만들고 RDS도 같이 바꾼다', fade(u, 2.1)); return; }
+      chip(780, 262, 'automatically_after_days = 30', ACC, pop(u, 0.4)); note(90, 390, 'rotation Lambda가 새 비밀번호를 만들고 RDS도 같이 바꾼다', fade(u, 2.1)); return; }
     // k === 7: 대가
     [['secret 하나', '월 $0.40'], ['API 호출', '호출당 과금'], ['이식성', 'AWS 밖으로는 못 간다']].forEach(([a, b], i) => {
       const y = 80 + i * 64, s = pop(u, 0.2 + i * 0.3); card(250, y, 420, 50, { rx: 10, stroke: i === 2 ? WARN : INK, sw: 2, s });

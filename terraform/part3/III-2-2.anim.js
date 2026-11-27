@@ -63,9 +63,9 @@
     if (k === 1) { dot([[UA[0] + 30, UA[1] + 10], [LK[0] - 110, LK[1] - 20]], seg(u, 0.5, 1.5), ACC, 8); dot([[UB[0] + 30, UB[1]], [LK[0] - 110, LK[1]]], seg(u, 0.5, 1.5), INFO, 8);
       chip(UA, 'PutItem', ACC, pop(u, 0.3)); chip(UB, 'PutItem', INFO, pop(u, 0.3)); sub(LK[0], LK[1] + 72, '조건: 항목이 비어 있을 때만', fade(u, 1.5), { fill: INK, 'font-weight': 700 }); }
     if (k === 2) { chip(UA, '잠금 획득', ACC, pop(u, 0.3)); dot([[UB[0] + 30, UB[1]], [LK[0] - 110, LK[1]], [UB[0] + 40, UB[1] + 20]], seg(u, 0.5, 1.6), INFO, 8);
-      cross(LK[0] - 130, LK[1], 12, pop(u, 1.0)); chip(UB, 'ConditionalCheckFailed', BAD, pop(u, 1.4)); }
-    if (k === 3) { terminal(24, 22, 556, 200, [['Error: Error acquiring the state lock', '#f87171'], ['  ID:        a3f1-9c22-4e7b-bc01-…', null], ['  Path:      team-tfstate/prod/terraform.tfstate', null], ['  Operation: OperationTypeApply', null], ['  Who:       alice@team', null]], E(u, 0.2, 1.6) * 5, { fs: 13.5, title: 'Bob 의 터미널' });
-      pill(LK[0] - 120, 220, 'LOCK_ID 를 적어 둔다', WARN, pop(u, 1.9), { fs: 13.5 }); }
+      cross(LK[0] - 130, LK[1], 12, pop(u, 1.0)); pill(UB[0] + 140, UB[1] + 80, 'ConditionalCheckFailed', BAD, pop(u, 1.4), { fs: 13.5 }); }
+    if (k === 3) { terminal(24, 22, 556, 200, [['Error: Error acquiring the state lock', '#f87171'], ['  ID:        a3f1-9c22-4e7b-bc01-…', null], ['  Path:      team-tfstate/prod/terraform.tfstate', null], ['  Operation: OperationTypeApply', null], ['  Who:       alice@team', null]], E(u, 0.2, 1.6) * 5, { fs: 13.5, title: 'Bob의 터미널' });
+      pill(LK[0] - 120, 220, 'LOCK_ID를 적어 둔다', WARN, pop(u, 1.9), { fs: 13.5 }); }
     if (k === 4) { // 기본 0s vs -lock-timeout
       chip(UB, '-lock-timeout=5m', INFO, pop(u, 0.3));
       const rt = [[UB[0] + 30, UB[1] + 30], [LK[0] - 110, LK[1] + 30]];
@@ -79,13 +79,13 @@
     users(b, { crashPop: k === 0 ? pop(u, 0.5) : 1 }); evlog(b.events, u, {}); bucket(ST[0], ST[1], 'state', {});
     lockSlot(b.lock, {});
     if (k === 0) { chip(UA, '노트북 멈춤', BAD, pop(u, 0.8)); grow(UA[0] + 20, UA[1] + 40, LK[0] - 110, LK[1] - 30, 1 - E(u, 1.0, 1.6), OFF, { dash: '5 5', plain: true });
-      sub(LK[0], LK[1] + 72, 'DeleteItem 을 부를 프로세스가 없다', fade(u, 1.6), { fill: BAD, 'font-weight': 700 }); }
+      sub(LK[0], LK[1] + 72, 'DeleteItem을 부를 프로세스가 없다', fade(u, 1.6), { fill: BAD, 'font-weight': 700 }); }
     if (k === 1) { clock(LK[0] + 140, LK[1] - 120, 26, 0, OFF, ''); tx(LK[0] + 140, LK[1] - 80, 'TTL 없음', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.6) });
       pill(LK[0], LK[1] + 72, 'STALE (좀비 잠금)', WARN, pop(u, 1.0), { fs: 14 }); }
     if (k === 2) { clock(LK[0] + 140, LK[1] - 120, 26, E(u, 0.2, 1.4) * 0.5, WARN, '30분'); dot([[UB[0] + 30, UB[1]], [LK[0] - 110, LK[1]]], seg(u, 1.0, 1.6), INFO, 7); cross(LK[0] - 130, LK[1], 12, pop(u, 1.6));
-      chip(UB, '또 거절', BAD, pop(u, 1.8)); sub(LK[0], LK[1] + 72, 'Created 가 30분 전이면 stale 의심', fade(u, 2.0), { fill: INK, 'font-weight': 700 }); }
-    if (k === 3) { ['콘솔에서 직접 삭제', '-lock=false 우회'].forEach((s, i) => { const y = 180 + i * 50; card(LK[0] - 10, y - 0, 220, 40, { rx: 8, text: s, fs: 14, stroke: BAD, color: BAD, s: pop(u, 0.3 + i * 0.5) }); cross(LK[0] + 116, y, 10, pop(u, 0.6 + i * 0.5)); });
-      sub(LK[0], 400 - 4, '실제 작업자의 state 를 깨뜨린다', fade(u, 1.6), { fill: BAD, 'font-weight': 700 }); }
+      chip(UB, '또 거절', BAD, pop(u, 1.8)); sub(LK[0], LK[1] + 72, 'Created가 30분 전이면 stale 의심', fade(u, 2.0), { fill: INK, 'font-weight': 700 }); }
+    if (k === 3) { ['콘솔에서 직접 삭제', '-lock=false 우회'].forEach((s, i) => { const y = 190 + i * 46; card(LK[0] - 10, y - 0, 220, 40, { rx: 8, text: s, fs: 14, stroke: BAD, color: BAD, s: pop(u, 0.3 + i * 0.5) }); cross(LK[0] + 116, y, 10, pop(u, 0.6 + i * 0.5)); });
+      sub(LK[0], 400 - 4, '실제 작업자의 state를 깨뜨린다', fade(u, 1.6), { fill: BAD, 'font-weight': 700 }); }
     if (k === 4) { pill(LK[0], 196, 'terraform force-unlock <ID>', GOOD, pop(u, 0.3), { mono: true, fs: 13.5 });
       pill(LK[0], LK[1] + 72, '먼저 보유자 본인에게 확인', GOOD, pop(u, 0.9), { fs: 14 }); } }
 
@@ -102,15 +102,15 @@
       terminal(130, 186, 440, 70, [['$ terraform force-unlock "$LOCK_ID"', null]], E(u, 0.1, 0.8), { fs: 14 });
       sub(LK[0], LK[1] + 72, 'DynamoDB 항목을 직접 지운다', fade(u, 1.8), { fill: INK, 'font-weight': 700 }); return; }
     lockSlot(b.lock, {});
-    if (k === 3) { terminal(24, 165, 556, 94, [['Do you really want to force-unlock?', '#fbbf24'], ['Enter a value: yes', null], ['Terraform state has been successfully unlocked!', 'var(--good)']], E(u, 0.2, 1.6) * 3, { fs: 13.5, lh: 18, title: '출력 예시' });
-      pill(LK[0], LK[1] + 72, '-force 를 붙이면 묻지 않는다', WARN, pop(u, 2.0), { fs: 13.5 }); return; }
+    if (k === 3) { terminal(150, 165, 430, 94, [['Do you really want to force-unlock?', '#fbbf24'], ['Enter a value: yes', null], ['Terraform state has been successfully unlocked!', 'var(--good)']], E(u, 0.2, 1.6) * 3, { fs: 13.5, lh: 18, title: '출력 예시' });
+      pill(LK[0], LK[1] + 72, '-force를 붙이면 묻지 않는다', WARN, pop(u, 2.0), { fs: 13.5 }); return; }
     if (k === 4) { pill(210, 210, 'terraform plan', ACC, pop(u, 0.2), { mono: true, fs: 14 });
       ['state', '실제'].forEach((s, i) => { card(340 + i * 140, 220, 110, 36, { rx: 8, text: s, fs: 14, stroke: GOOD, s: pop(u, 0.6 + i * 0.3) }); });
       grow(395, 220, 425, 220, E(u, 1.2, 1.5), GOOD, { plain: true });
-      sub(LK[0], LK[1] + 72, 'Alice 가 어디까지 적용했는지 본다', fade(u, 1.6), { fill: INK, 'font-weight': 700 }); return; }
+      sub(LK[0], LK[1] + 72, 'Alice가 어디까지 적용했는지 본다', fade(u, 1.6), { fill: INK, 'font-weight': 700 }); return; }
     // k === 5
     chip(UB, 'apply 재시작', GOOD, pop(u, 0.3)); dot([[UB[0] + 30, UB[1]], [LK[0] - 110, LK[1]]], seg(u, 0.4, 1.2), GOOD, 7);
-    pill(330, 210, 'ID 가 틀리면: lock id does not match', BAD, pop(u, 1.5), { fs: 13.5 }); }
+    pill(330, 210, 'ID가 틀리면: lock id does not match', BAD, pop(u, 1.5), { fs: 13.5 }); }
 
   // ---------- 5. 예방 ----------
   function s5(t, c) { const { k, u } = c;
@@ -119,11 +119,11 @@
       server(720, 200, 'CI runner', { lamp: GOOD });
       pill(270, 120, 'plan', INK, 1, { mono: true }); pill(270, 300, 'plan', INK, 1, { mono: true });
       if (k === 0) { grow(320, 120, 650, 190, E(u, 0.5, 1.2), OFF, { dash: '5 5' }); cross(480, 155, 12, pop(u, 1.2)); pill(480, 110, '로컬 apply 금지', BAD, pop(u, 1.0), { fs: 14 });
-        pill(720, 300, 'apply 는 CI 만', GOOD, pop(u, 1.6), { fs: 15 }); return; }
+        pill(720, 300, 'apply는 CI만', GOOD, pop(u, 1.6), { fs: 15 }); return; }
       [['사람 user', 's3:PutObject', BAD, 120], ['CI role', 's3:PutObject · dynamodb:PutItem', GOOD, 300]].forEach(([a, p, col, y], i) => {
         card(470, y, 260, 64, { rx: 10, stroke: col, sw: 2, s: pop(u, 0.3 + i * 0.6) }); tx(352, y - 6, a, { 'font-size': 15, 'font-weight': 700, fill: col, opacity: fade(u, 0.4 + i * 0.6) });
         mono(352, y + 18, p, { 'font-size': 13.5, opacity: fade(u, 0.4 + i * 0.6) }); });
-      cross(590, 120, 12, pop(u, 0.9)); check(590, 300, 12, pop(u, 1.5)); sub(720, 380, '규칙은 문서가 아니라 IAM 으로 강제한다', fade(u, 2.0), { fill: INK, 'font-weight': 700 }); return; }
+      cross(590, 120, 12, pop(u, 0.9)); check(590, 300, 12, pop(u, 1.5)); sub(720, 380, '규칙은 문서가 아니라 IAM으로 강제한다', fade(u, 2.0), { fill: INK, 'font-weight': 700 }); return; }
     if (k === 1) { lbl(480, 46, 'concurrency: prod-apply', 1, { class: 'mono', fill: ACC });
       const run = Math.floor(clamp(u / 0.9, 0, 2.99));
       ['PR #12 merge', 'PR #13 merge', 'PR #14 merge'].forEach((s, i) => { const x = 230 + i * 250, on = i === run, done = i < run;
@@ -139,11 +139,11 @@
       [['atlantis', 'plan 결과 댓글', INFO], ['리뷰어', '승인 · atlantis apply', ACC], ['atlantis', 'apply 완료', GOOD]].forEach(([w, m, col], i) => { const y = 140 + i * 66, s = pop(u, 0.3 + i * 0.5);
         card(250, y, 260, 52, { rx: 10, stroke: col, sw: 1.8, s }); tx(134, y - 4, w, { 'font-size': 13.5, 'font-weight': 800, fill: col, opacity: s }); tx(134, y + 16, m, { 'font-size': 14, opacity: s }); });
       lock(560, 190, true, ACC, 1.4 * pop(u, 1.6)); lbl(700, 196, 'PR 단위 잠금', fade(u, 1.7), { fill: ACC });
-      sub(700, 230, '기록이 PR 에 남는다', fade(u, 2.0)); return; }
+      sub(700, 230, '기록이 PR에 남는다', fade(u, 2.0)); return; }
     // k === 5
     [['작은 팀', 'Actions + concurrency'], ['큰 팀 · 여러 stack', 'Atlantis 또는 HCP Terraform']].forEach(([a, b2], i) => { const x = 260 + i * 440, s = pop(u, 0.2 + i * 0.5);
       card(x, 170, 380, 130, { rx: 14, stroke: ACC, sw: 2.5, s }); lbl(x, 150, a, fade(u, 0.3 + i * 0.5), { 'font-size': 18 }); mono(x, 186, b2, { 'text-anchor': 'middle', 'font-size': 15, fill: ACC, opacity: fade(u, 0.4 + i * 0.5) }); });
-    banner(480, 320, '공통: 로컬 apply 금지', pop(u, 1.4)); sub(480, 370, 'force-unlock 을 쓸 일이 거의 없어진다', fade(u, 1.8), { 'font-size': 15 }); }
+    banner(480, 320, '공통: 로컬 apply 금지', pop(u, 1.4)); sub(480, 370, 'force-unlock을 쓸 일이 거의 없어진다', fade(u, 1.8), { 'font-size': 15 }); }
 
   const quiz = [
     { q: '잠금 없이 Alice와 Bob이 같은 v7 state를 읽고 차례로 썼다. 결과는 무엇인가?',

@@ -32,10 +32,10 @@
       if (k <= 3) grow(310, 155 + i * 25, 508, y, k === 1 ? E(u, 0.6 + i * 0.3, 1.1 + i * 0.3) : 1, GRID, { plain: true });
       if (k >= 2 && k <= 3) pill(760, y, 'env=prod', WARN, k === 2 ? pop(u, 0.6 + i * 0.2) : 1, { mono: true, fs: 13 }); });
     if (k === 0) note(470, 330, '설정 파일이 타깃까지 갖는다', fade(u, 1.2));
-    if (k === 2) note(470, 330, 'labels 는 이 그룹의 모든 시계열에 붙는다', fade(u, 1.4));
+    if (k === 2) note(470, 330, 'labels는 이 그룹의 모든 시계열에 붙는다', fade(u, 1.4));
     if (k === 3) { card(600, 260, 180, 44, { rx: 8, text: '10.0.1.14', fs: 14.5, mono: true, stroke: BAD, dash: '6 4', s: pop(u, 0.2) });
       tx(700, 266, '?', { 'font-size': 22, 'font-weight': 800, fill: BAD, opacity: 1 - fade(u, 1.6) });
-      person(420, 360, null, { s: pop(u, 0.9) }); note(450, 352, 'yml 을 고치고', fade(u, 1.2));
+      person(420, 360, null, { s: pop(u, 0.9) }); note(450, 352, 'yml을 고치고', fade(u, 1.2));
       pill(690, 352, 'POST /-/reload', ACC, pop(u, 2.0), { mono: true, fs: 14 }); note(450, 400, '리로드해야 그제야 긁힌다', fade(u, 2.2), { fill: BAD }); return; }
     if (k === 4) { // 뜨고 지는 인스턴스, 쌓이는 수정·리로드
       const slots = [[540, 90], [700, 90], [860, 90], [540, 160], [700, 160], [860, 160], [540, 230], [700, 230], [860, 230]];
@@ -58,14 +58,14 @@
         fill: k >= 2 && i === 0 ? (Math.floor(t * 3) % 2 ? WARNBG : PANEL) : PANEL });
       if (k === 1) { if (m) check(760, y, 8, pop(u, 0.6 + i * 0.2)); else cross(760, y, 8, pop(u, 1.2)); } });
     if (k === 1) { clock(860, 300, 26, (u / 3), WARN); mono(860, 350, '30s', { 'font-size': 15, 'font-weight': 800, fill: WARN, 'text-anchor': 'middle', opacity: fade(u, 1.4) });
-      note(30, 330, 'glob 에 맞는 파일만 읽는다 (마지막 경로 조각의 * 하나)', fade(u, 1.0), { 'font-size': 14.5 });
-      note(30, 360, 'refresh_interval 은 감시가 놓쳤을 때를 위한 재확인 주기', fade(u, 1.8), { 'font-size': 14.5, fill: MUT }); }
+      note(30, 330, 'glob에 맞는 파일만 읽는다 (마지막 경로 조각의 * 하나)', fade(u, 1.0), { 'font-size': 14.5 });
+      note(30, 360, 'refresh_interval은 감시가 놓쳤을 때를 위한 재확인 주기', fade(u, 1.8), { 'font-size': 14.5, fill: MUT }); }
     if (k >= 2) { server(860, 330, null, { lamp: GOOD, s: 0.8 });
       if (k === 2) { const g = E(u, 0.4, 1.0);
         fly(760, 110, 820, 300, seg(u, 0.3, 1.1), '변경 감지', { fill: ACC });
         ['10.0.1.11:9100', '10.0.1.12:9100', '10.0.1.14:9100'].forEach((a, i) => tgtRow(470, 300 + i * 40, a, { s: i === 2 ? pop(u, 1.3) : 1, stroke: i === 2 ? GOOD : GRID, col: i === 2 ? GOOD : INK }));
         el('rect', { x: 30, y: 310, width: 380 * E(u, 0, 2.8), height: 12, rx: 6, fill: GOOD, opacity: 0.8 });
-        note(30, 350, 'Prometheus 는 계속 떠 있다 — 재시작 없음', fade(u, 1.6), { fill: GOOD }); note(30, 300, '프로세스 가동 중', g, { fill: MUT, 'font-size': 14 }); }
+        note(30, 350, 'Prometheus는 계속 떠 있다 — 재시작 없음', fade(u, 1.6), { fill: GOOD }); note(30, 300, '프로세스 가동 중', g, { fill: MUT, 'font-size': 14 }); }
       if (k === 3) { note(30, 330, '정책(yml)은 고정', fade(u, 0.4), { fill: INK }); note(30, 362, '자주 바뀌는 목록(json)만 따로 움직인다', fade(u, 0.9), { fill: ACC });
         tx(860, 400, 'Prometheus', { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'middle' }); } } }
 
@@ -118,13 +118,13 @@
     card(720, 70, 230, 40, { rx: 6, text: 'api-prod.json', fs: 14, mono: true, fw: 700, stroke: mv > 0.99 ? GOOD : GRID, color: mv > 0.99 ? GOOD : MUT, s: at(c, 1) });
     if (mv < 0.99) card(720, lerp(130, 70, mv), 230, 40, { rx: 6, text: 'api-prod.json.$$', fs: 14, mono: true, fw: 700, stroke: WARN, fill: WARNBG, s: at(c, 1, 0.5) });
     if (k === 1) { note(600, 190, 'OUT = targets/api-prod.json', fade(u, 0.8), { class: 'mono', 'font-size': 14 }); note(600, 220, 'TMP = 같은 디렉터리의 임시 파일', fade(u, 1.2), { 'font-size': 14 });
-      note(600, 250, '.json 으로 안 끝나 glob 에 안 걸린다', fade(u, 1.6), { 'font-size': 14, fill: MUT }); return; }
+      note(600, 250, '.json으로 안 끝나 glob에 안 걸린다', fade(u, 1.6), { 'font-size': 14, fill: MUT }); return; }
     // 클라우드
     zone(16, 150, 330, 250, '클라우드 API', { stroke: GRID, sw: 1.5 });
     INST.forEach(([ip, tm, run], i) => { const y = 190 + i * 40, keep = tm === 'api' && run, g = k === 2 ? E(u, 0.6 + i * 0.15, 1.0 + i * 0.15) : 1;
       card(120, y, 150, 32, { rx: 6, text: ip, fs: 13.5, mono: true, stroke: run ? INK : OFF, dash: run ? null : '4 4', color: run ? INK : MUT, op: keep || k < 2 ? 1 : 1 - 0.6 * g });
       mono(205, y + 5, tm + (run ? '' : ' · stopped'), { 'font-size': 13.5, fill: keep ? GOOD : MUT, opacity: keep || k < 2 ? 1 : 1 - 0.6 * g }); });
-    if (k === 2) { note(380, 190, 'team=api 이고 running 인 것만', fade(u, 0.4), { 'font-size': 14.5 });
+    if (k === 2) { note(380, 190, 'team=api이고 running인 것만', fade(u, 0.4), { 'font-size': 14.5 });
       ['10.0.1.11', '10.0.1.12', '10.0.1.14'].forEach((ip, i) => fly(300, 190 + [0, 1, 3][i] * 40, 450, 250 + i * 34, seg(u, 1.2 + i * 0.2, 2.0 + i * 0.2), ip, { mono: true, fill: INFO, stay: true }));
       return; }
     if (k === 3) { // jq 변환
@@ -138,13 +138,13 @@
       mono(384, 222, '[{"targets": ["10.0.1', { 'font-size': 14, opacity: fade(u, 0.5) }); mono(384, 254, '→ JSON 오류', { 'font-size': 14, fill: BAD, 'font-weight': 800, opacity: fade(u, 0.9) });
       cross(610, 180, 10, pop(u, 1.0));
       el('rect', { x: 660, y: 160, width: 280, height: 150, rx: 10, fill: GOODBG, stroke: GOOD, 'stroke-width': 1.5, opacity: fade(u, 1.2) });
-      tx(674, 186, 'rename(mv) 은 한 번에', { 'font-size': 14.5, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.2) });
+      tx(674, 186, 'rename(mv)은 한 번에', { 'font-size': 14.5, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.2) });
       tx(674, 222, '옛 파일 아니면 새 파일', { 'font-size': 14, opacity: fade(u, 1.5) }); tx(674, 254, '중간 상태가 없다', { 'font-size': 14, opacity: fade(u, 1.8) });
-      note(370, 350, '같은 디렉터리 안이어야 rename 이 원자적이다', fade(u, 2.3), { 'font-size': 14.5 }); return; }
+      note(370, 350, '같은 디렉터리 안이어야 rename이 원자적이다', fade(u, 2.3), { 'font-size': 14.5 }); return; }
     // k5: 1분마다 실행 → 타깃 추가·제거
     const x0 = 380, w = 540; el('line', { x1: x0, y1: 186, x2: x0 + w, y2: 186, stroke: MUT, 'stroke-width': 1.8 });
     for (let m = 0; m <= 4; m++) { const x = x0 + (w * m) / 4, s = pop(u, 0.2 + m * 0.2, 0.4); el('circle', { cx: x, cy: 186, r: 7 * s, fill: ACC }); mono(x, 210, m + 'm', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }); }
-    tx(x0, 166, 'cron · systemd timer 로 1분마다', { 'font-size': 14.5, 'font-weight': 700 });
+    tx(x0, 166, 'cron · systemd timer로 1분마다', { 'font-size': 14.5, 'font-weight': 700 });
     tx(400, 250, 'Prometheus 타깃', { 'font-size': 14, 'font-weight': 700, fill: MUT });
     [['10.0.1.11:9100', 0], ['10.0.1.12:9100', 0], ['10.0.1.13:9100', -1], ['10.0.1.14:9100', 1]].forEach(([a, st], i) => { const y = 276 + i * 34;
       const g = st ? E(u, 1.2, 1.9) : 0;
@@ -156,7 +156,7 @@
   const T5 = [['10.0.1.11:9100', ''], ['10.0.1.12:9100', ''], ['10.0.1.14:9100', 'canary']];
   function s5(t, c) { const { k, u } = c;
     if (k <= 2) {
-      tx(30, 40, 'file SD 가 넘겨준 타깃과 라벨 (relabel 전)', { 'font-size': 14, 'font-weight': 700, fill: MUT });
+      tx(30, 40, 'file SD가 넘겨준 타깃과 라벨 (relabel 전)', { 'font-size': 14, 'font-weight': 700, fill: MUT });
       const H = ['__address__', '__meta_filepath', 'tier', 'sd_file'];
       H.forEach((h, j) => mono([30, 220, 520, 640][j], 78, h, { 'font-size': 14, 'font-weight': 800, fill: j === 3 ? ACC : MUT, opacity: j === 3 ? fa(c, 1, 0.6) : 1 }));
       T5.forEach(([a, tier], i) => { const y = 124 + i * 56, drop = tier && k >= 2, g = k === 2 ? E(u, 0.8, 1.6) : drop ? 1 : 0;
@@ -168,20 +168,20 @@
           else mono(640, y + 4, '"targets/api-prod.json"', { 'font-size': 14, fill: ACC, opacity: 1 - 0.5 * g }); }
         if (drop && g > 0) el('line', { x1: 24, y1: y, x2: 24 + 912 * g, y2: y, stroke: BAD, 'stroke-width': 2.5 }); });
       if (k === 0) note(30, 330, '__meta_filepath: 이 타깃이 어느 파일에서 왔는지', fade(u, 1.2));
-      if (k === 1) note(30, 330, '__ 로 시작하는 메타 라벨은 곧 사라지므로 남길 값은 옮겨 둔다', fade(u, 1.8));
-      if (k === 2) { note(30, 330, 'tier="canary" 에 regex 가 맞으면 drop — 아예 긁지 않는다', fade(u, 1.4), { fill: BAD }); mono(30, 370, '타깃 3 → 2', { 'font-size': 18, 'font-weight': 800, fill: ACC, opacity: fade(u, 1.9) }); }
+      if (k === 1) note(30, 330, '__로 시작하는 메타 라벨은 곧 사라지므로 남길 값은 옮겨 둔다', fade(u, 1.8));
+      if (k === 2) { note(30, 330, 'tier="canary" 에 regex가 맞으면 drop — 아예 긁지 않는다', fade(u, 1.4), { fill: BAD }); mono(30, 370, '타깃 3 → 2', { 'font-size': 18, 'font-weight': 800, fill: ACC, opacity: fade(u, 1.9) }); }
       return; }
     if (k === 3) { // 형식 오류 · 권한
       el('rect', { x: 20, y: 30, width: 440, height: 220, rx: 10, fill: INK });
       ['[{', '  "targets": ["10.0.1.11:9100",', '              "10.0.1.15:9100",],', '  "labels": {"env": "prod"}', '}]'].forEach((s, i) => mono(36, 64 + i * 28, s, { 'font-size': 14.5, fill: i === 2 ? 'var(--bad)' : 'var(--term)', opacity: fade(u, 0.1 + i * 0.1) }));
       el('rect', { x: 290, y: 106, width: 22, height: 24, rx: 4, fill: 'none', stroke: BAD, 'stroke-width': 2.5, opacity: fade(u, 0.8) });
       tx(36, 230, '쉼표 하나 → 이 변경은 통째로 무시', { 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.0) });
-      tx(500, 60, 'Prometheus 의 타깃 목록', { 'font-size': 14, 'font-weight': 700, fill: MUT });
+      tx(500, 60, 'Prometheus의 타깃 목록', { 'font-size': 14, 'font-weight': 700, fill: MUT });
       ['10.0.1.11:9100', '10.0.1.12:9100'].forEach((a, i) => tgtRow(500, 100 + i * 44, a, {}));
       tgtRow(500, 188, '10.0.1.15:9100', { dash: '5 4', col: MUT, stroke: OFF, op: fade(u, 1.2) });
       note(500, 236, '옛 목록이 그대로 남는다', fade(u, 1.5), { fill: WARN });
       lock(50, 310, true, BAD, pop(u, 1.8)); note(80, 318, '권한·경로 문제로 못 읽으면 에러 로그만 남는다', fade(u, 1.9));
-      note(80, 352, '처음부터 못 읽었다면 타깃은 0개', fade(u, 2.2), { fill: BAD }); note(80, 386, 'promtool check config 로 먼저 검증', fade(u, 2.5), { fill: GOOD, 'font-size': 14.5 }); return; }
+      note(80, 352, '처음부터 못 읽었다면 타깃은 0개', fade(u, 2.2), { fill: BAD }); note(80, 386, 'promtool check config로 먼저 검증', fade(u, 2.5), { fill: GOOD, 'font-size': 14.5 }); return; }
     // k4: 갱신 지연 · 레이블 키
     tx(30, 44, '파일이 바뀐 뒤 반영되기까지', { 'font-size': 15, 'font-weight': 700 });
     const x0 = 60, w = 820, X = (s) => x0 + (s / 120) * w;
@@ -192,11 +192,11 @@
     el('circle', { cx: X(5), cy: 120, r: 8, fill: ACC, opacity: fade(u, 0.8) }); tx(X(5), 94, '파일 교체', { 'font-size': 13.5, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.8) });
     el('line', { x1: X(5), y1: 128, x2: X(5) + (X(30) - X(5)) * E(u, 1.0, 1.5), y2: 128, stroke: BAD, 'stroke-width': 4 });
     tx(X(17), 172, '감시가 놓치면 최대 한 주기 늦다', { 'font-size': 14, fill: BAD, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 1.4) });
-    note(30, 216, '생성 주기(1분)와 refresh_interval 을 함께 정한다', fade(u, 1.6), { 'font-size': 14.5 });
+    note(30, 216, '생성 주기(1분)와 refresh_interval을 함께 정한다', fade(u, 1.6), { 'font-size': 14.5 });
     el('line', { x1: 20, y1: 244, x2: 940, y2: 244, stroke: GRID, 'stroke-width': 1.5, opacity: fade(u, 1.8) });
     [['env', GOOD], ['environment', BAD], ['stage', BAD]].forEach(([kk, col], i) => pill(120 + i * 200, 290, kk + '="prod"', col, pop(u, 1.9 + i * 0.15), { mono: true, fs: 14 }));
     note(30, 350, '같은 뜻의 키가 셋이면 쿼리·알림이 셋으로 갈라진다', fade(u, 2.3), { fill: BAD });
-    note(30, 384, 'env · team · region 처럼 키 규칙을 하나로', fade(u, 2.5), { fill: GOOD }); }
+    note(30, 384, 'env · team · region처럼 키 규칙을 하나로', fade(u, 2.5), { fill: GOOD }); }
 
   const quiz = [
     { q: 'static_configs로 관리할 때 인스턴스 10.0.1.14가 새로 뜨면 무엇을 해야 긁히는가?',

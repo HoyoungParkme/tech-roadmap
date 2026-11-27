@@ -36,13 +36,13 @@
       const a = seg(u, 0.6, 1.2); if (a > 0 && a < 1) fly(450, gy - 16, gx - 10, gy - 16, a, 't3.small', { mono: true, fill: GOOD });
       if (u > 1.2) { fly(gx + 10, gy - 16, MOD.x + 40, gy - 16, seg(u, 1.2, 1.6), 't3.small', { mono: true, fill: GOOD, stay: true }); }
       const b = seg(u, 1.4, 2.0); if (b > 0) { const x = b < 0.7 ? lerp(450, gx - 14, b / 0.7) : lerp(gx - 14, 470, (b - 0.7) / 0.3); card(x, gy + 22, 92, 26, { rx: 13, text: 'm5.large', fs: 13.5, mono: true, fill: BAD, stroke: 'none', color: PANEL }); }
-      card(MOD.x + MOD.w / 2, 300, 270, 54, { rx: 10, text: 'plan 에서 바로 실패\nerror_message 출력', fs: 14, stroke: BAD, color: BAD, fill: BADBG, s: pop(u, 2.0) }); }
+      card(MOD.x + MOD.w / 2, 300, 270, 54, { rx: 10, text: 'plan에서 바로 실패\nerror_message 출력', fs: 14, stroke: BAD, color: BAD, fill: BADBG, s: pop(u, 2.0) }); }
     if (k === 3) { [['env', '"dev"']].forEach(([a, b], i) => { mono(MOD.x + 40, MOD.y + 130, 'var.tags["env"]', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.0) });
         mono(MOD.x + 40, MOD.y + 160, '→ "dev"', { 'font-size': 15, fill: ACC, 'font-weight': 800, opacity: fade(u, 1.4) }); });
       sub(MOD.x + MOD.w / 2, MOD.y + 230, '슬롯 하나에 여러 값을 묶는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 }); }
     if (k === 4) { terminal(MOD.x + 10, MOD.y + 90, MOD.w - 20, 120, ['$ terraform plan', ['var.admin_email', '#fbbf24'], '  운영자 이메일 (알림 수신)', '  Enter a value: _'], Math.min(4, 4 * seg(u, 0.6, 1.8)), { fs: 13.5 });
-      mono(MOD.x + MOD.w / 2, MOD.y + 250, '(예시) -input=false 면 바로 실패', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 2.0) });
-      tx(MOD.x + MOD.w / 2, MOD.y + 280, 'default 가 없으면 필수값', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: fade(u, 2.2) }); } }
+      mono(MOD.x + MOD.w / 2, MOD.y + 250, '(예시) -input=false면 바로 실패', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 2.0) });
+      tx(MOD.x + MOD.w / 2, MOD.y + 280, 'default가 없으면 필수값', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: fade(u, 2.2) }); } }
 
   // ---------- 값의 층 (S2·S3 공용) ----------
   const COLS = [['region', 190, 150], ['instance_type', 348, 120], ['tags', 476, 250], ['admin_email', 734, 196]];
@@ -74,12 +74,12 @@
       layers.push({ name: 'terraform.tfvars', vals: tf, col: ACC, enter: k === 0 ? E(u, 0.2, 0.9) : 1, mono: true });
       layers.push({ name: 'default', vals: DEF, col: MUT });
       stack(layers, { fop: k === 0 ? fade(u, 1.2) : 1, strike: k === 1, y0: 150 });
-      if (k === 0) sub(480, 370, '이름이 terraform.tfvars 면 옵션 없이 읽혀 default 를 덮는다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 });
+      if (k === 0) sub(480, 370, '이름이 terraform.tfvars면 옵션 없이 읽혀 default를 덮는다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 });
       if (k === 1) { const y = 330; mono(120, y + 40, '{env=dev}', { 'font-size': 15, fill: MUT, opacity: fade(u, 0.6) }); mono(220, y + 40, '+', { 'font-size': 15, opacity: fade(u, 0.7) });
         mono(250, y + 40, '{env=stg, team=be}', { 'font-size': 15, fill: ACC, opacity: fade(u, 0.8) }); mono(430, y + 40, '=', { 'font-size': 15, opacity: fade(u, 1.0) });
         mono(460, y + 40, '{env=stg, team=be}', { 'font-size': 15, fill: ACC, 'font-weight': 800, opacity: fade(u, 1.3) });
         tx(660, y + 40, '합쳐지지 않고 통째로 바뀐다', { 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.7) }); }
-      if (k === 2) sub(480, 370, 'JSON 도 자동으로 읽힌다. 같은 값이면 결과도 같다', fade(u, 1.4), { fill: INK, 'font-size': 14.5 });
+      if (k === 2) sub(480, 370, 'JSON도 자동으로 읽힌다. 같은 값이면 결과도 같다', fade(u, 1.4), { fill: INK, 'font-size': 14.5 });
       return; }
     if (k === 3) { // *.auto.tfvars 사전순
       const F = ['99-secrets.auto.tfvars', '01-common.auto.tfvars', '02-network.auto.tfvars'], order = [1, 2, 0];
@@ -100,7 +100,7 @@
       mono(480, 380, '$ terraform apply -var-file=prod.tfvars', { 'font-size': 15, 'font-weight': 800, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1.6) });
       grow(600, 362, 700, 182, E(u, 1.9, 2.4), ACC, { dash: '6 5' }); return; }
     // k5 폴더 구조
-    const T = [['infra/', 0, INK], ['main.tf', 1, INK], ['variable.tf', 1, INK], ['terraform.tfvars', 1, ACC, '공통 기본값'], ['secrets.auto.tfvars', 1, WARN, '.gitignore'], ['envs/', 1, INK], ['dev.tfvars', 2, INFO, '-var-file 로'], ['prod.tfvars', 2, INFO, '-var-file 로'], ['.gitignore', 1, INK]];
+    const T = [['infra/', 0, INK], ['main.tf', 1, INK], ['variable.tf', 1, INK], ['terraform.tfvars', 1, ACC, '공통 기본값'], ['secrets.auto.tfvars', 1, WARN, '.gitignore'], ['envs/', 1, INK], ['dev.tfvars', 2, INFO, '-var-file로'], ['prod.tfvars', 2, INFO, '-var-file로'], ['.gitignore', 1, INK]];
     T.forEach(([n, d, col, mm], i) => { const y = 40 + i * 40, x = 80 + d * 40, op = fade(u, 0.1 + i * 0.18);
       if (d) el('path', { d: `M${x - 26},${y - 30} V${y - 5} H${x - 6}`, fill: 'none', stroke: GRID, 'stroke-width': 1.8, opacity: op });
       mono(x, y, n, { 'font-size': 15, 'font-weight': 700, fill: col, opacity: op });
@@ -122,7 +122,7 @@
       stack(layers, { hiCol, strike, y0: 130 });
       tx(16, 110, '높음', { 'font-size': 13.5, fill: MUT }); tx(16, 352, '낮음', { 'font-size': 13.5, fill: MUT }); el('line', { x1: 22, y1: 116, x2: 22, y2: 336, stroke: GRID, 'stroke-width': 2 });
       if (k === 3) { const x = COLS[3][1]; el('rect', { x: x - 4, y: 226, width: 196, height: 46, rx: 8, fill: 'none', stroke: BAD, 'stroke-width': 2.2, opacity: fade(u, 1.4) });
-        tx(x + 92, 296, 'tfvars 에 밀린다', { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.6) }); }
+        tx(x + 92, 296, 'tfvars에 밀린다', { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.6) }); }
       return; }
     if (k === 5) { // CI
       card(150, 90, 230, 60, { rx: 10, text: 'GitHub Actions\ninputs.env = prod', fs: 14, stroke: INK });
@@ -131,8 +131,8 @@
       grow(266, 90, 668, 165, E(u, 0.3, 1.0), ACC); mono(330, 110, '-var-file=envs/prod.tfvars', { 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.8) });
       grow(266, 270, 668, 198, E(u, 0.8, 1.5), WARN); mono(330, 280, 'TF_VAR_admin_email (env)', { 'font-size': 14, fill: WARN, 'font-weight': 700, opacity: fade(u, 1.2) });
       sub(780, 260, '명령줄에 비밀이 남지 않는다', fade(u, 1.6), { fill: GOOD, 'font-weight': 700, 'font-size': 14.5 });
-      note(480, 370, 'prod.tfvars 에도 admin_email 이 있으면 파일 값이 이긴다', fade(u, 2.1), { 'text-anchor': 'middle', fill: BAD });
-      note(480, 400, 'env 로 넣을 키는 tfvars 에서 빼 둔다', fade(u, 2.3), { 'text-anchor': 'middle' }); return; }
+      note(480, 370, 'prod.tfvars에도 admin_email이 있으면 파일 값이 이긴다', fade(u, 2.1), { 'text-anchor': 'middle', fill: BAD });
+      note(480, 400, 'env로 넣을 키는 tfvars에서 빼 둔다', fade(u, 2.3), { 'text-anchor': 'middle' }); return; }
     // k6: plan -out 으로 고정
     mono(30, 50, '$ terraform plan -out=tfplan -var-file=envs/prod.tfvars', { 'font-size': 14.5, 'font-weight': 800 });
     const fx = 300, fy = 180; card(fx, fy, 300, 150, { rx: 12, stroke: ACC, sw: 2.4, s: pop(u, 0.3) });
@@ -158,7 +158,7 @@
       if (k === 0) { mono(360, 340, 'value = aws_vpc.main.id', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.8) });
         sub(600, 390, 'output 하나 = 밖으로 내보내는 값 하나', fade(u, 1.4), { fill: INK, 'font-size': 14.5 }); }
       if (k === 1) { if (u > 1.4) { el('rect', { x: 345, y: 172, width: 160, height: 32, rx: 6, fill: GOOD, opacity: 0.18 * (1 - fade(u, 2.2)) }); }
-        sub(600, 390, 'apply 가 끝나야 정해지는 값도 그대로 내보낸다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 }); }
+        sub(600, 390, 'apply가 끝나야 정해지는 값도 그대로 내보낸다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 }); }
       if (k === 2) { const a = seg(u, 0.4, 1.4);
         [['address', 560, 340], ['port', 760, 340]].forEach(([s, x, y], i) => { if (a < 1) card(lerp(x, 520 + i * 160, a), lerp(y, 266, a), 120, 34, { rx: 8, text: s, fs: 14, mono: true, stroke: ACC, color: ACC }); });
         mono(360, 330, '"${…address}:${…port}"', { 'font-size': 14.5, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.4) }); }
@@ -168,7 +168,7 @@
         mono(576, 246, 'terraform.tfstate', { 'font-size': 13.5, fill: MUT, 'font-weight': 700, opacity: fade(u, 1.4) });
         mono(576, 280, 'db_password: 평문 그대로', { 'font-size': 14.5, fill: BAD, 'font-weight': 800, opacity: fade(u, 1.7) });
         lock(900, 240, false, BAD, pop(u, 1.9));
-        sub(745, 360, 'state 는 따로 암호화 · 접근 제어해야 한다', fade(u, 2.1), { fill: BAD, 'font-weight': 700, 'font-size': 14 }); }
+        sub(745, 360, 'state는 따로 암호화 · 접근 제어해야 한다', fade(u, 2.1), { fill: BAD, 'font-weight': 700, 'font-size': 14 }); }
       return; }
     if (k === 4) { // depends_on
       tx(40, 60, 'depends_on 없이', { 'font-size': 15, 'font-weight': 800, fill: BAD }); tx(40, 230, 'depends_on = [aws_lb_listener.https]', { 'font-size': 15, 'font-weight': 800, fill: GOOD, class: 'mono', opacity: fade(u, 1.2) });
@@ -176,17 +176,17 @@
           el('rect', { x: 200 + x0, y, width: w * a, height: 30, rx: 5, fill: cc, opacity: 0.75 * op }); if (a >= 1) mono(208 + x0, y + 21, s, { 'font-size': 13.5, fill: PANEL, 'font-weight': 700, opacity: op }); });
         const p = pop(u, outAt); card(outAt < 1 ? 470 : 700, outAt < 1 ? y - 22 : y + 15, 170, 30, { rx: 15, text: 'ready_endpoint', fs: 13.5, mono: true, stroke: col, color: col, s: p, op }); };
       row(90, 0.7, BAD, 1); row(260, 1.1, GOOD, fade(u, 1.2));
-      sub(470, 160, '리스너가 붙기 전에 DNS 를 내보낸다', fade(u, 1.0), { fill: BAD, 'font-weight': 700 });
-      sub(480, 390, '참조로 안 드러나는 순서만 depends_on 으로 건다', fade(u, 2.0), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(470, 160, '리스너가 붙기 전에 DNS를 내보낸다', fade(u, 1.0), { fill: BAD, 'font-weight': 700 });
+      sub(480, 390, '참조로 안 드러나는 순서만 depends_on으로 건다', fade(u, 2.0), { fill: INK, 'font-size': 14.5 }); return; }
     if (k === 5) { // for 로 목록
       [0, 1, 2].forEach((i) => { const y = 110 + i * 90; vm(100, y, pop(u, 0.1 + i * 0.15)); mono(140, y + 5, `aws_instance.worker[${i}]`, { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.2 + i * 0.15) });
         fly(380, y, 640, 200 + (i - 1) * 0, seg(u, 0.9 + i * 0.3, 1.5 + i * 0.3), '.public_ip', { mono: true, fill: ACC }); });
       card(760, 200, 250, 60, { rx: 10, text: '[ ip, ip, ip ]', fs: 17, mono: true, stroke: GOOD, color: GOOD, s: pop(u, 2.0) });
       mono(480, 380, '[for i in aws_instance.worker : i.public_ip]', { 'font-size': 15, 'text-anchor': 'middle', fill: ACC, 'font-weight': 700, opacity: fade(u, 0.5) }); return; }
     if (k === 6) { terminal(140, 50, 680, 260, ['$ terraform apply', '…', 'Apply complete!', '', 'Outputs:', '', 'vpc_id      = "vpc-0a1b2c3d4e5f"', 'public_ip   = "13.124.xxx.xxx"', ['db_password = <sensitive>', '#fca5a5']], Math.min(9, 9 * seg(u, 0.2, 2.0)), { fs: 14 });
-      sub(480, 350, '(예시 · 일부) sensitive 를 붙인 값만 가려진다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(480, 350, '(예시 · 일부) sensitive를 붙인 값만 가려진다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
     if (k === 7) { terminal(60, 40, 840, 300, ['$ terraform output vpc_id', '"vpc-0a1b2c3d4e5f"', '', '$ terraform output -json | jq .public_ip.value', '"13.124.xxx.xxx"', '', '$ terraform output -raw db_password', ['(평문이 그대로 나온다)', '#fca5a5']], Math.min(8, 8 * seg(u, 0.2, 2.2)), { fs: 14.5 });
-      sub(480, 380, '값은 state 에 남아 있어 apply 뒤에도 언제든 다시 꺼낸다 (예시 출력)', fade(u, 2.3), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(480, 380, '값은 state에 남아 있어 apply 뒤에도 언제든 다시 꺼낸다 (예시 출력)', fade(u, 2.3), { fill: INK, 'font-size': 14.5 }); return; }
     // k8 모듈 → 모듈
     card(200, 200, 260, 140, { rx: 14, stroke: INK, fill: SOFT }); tx(200, 150, 'module "network"', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, class: 'mono' });
     card(760, 200, 260, 140, { rx: 14, stroke: INK, fill: SOFT, s: pop(u, 0.4) }); tx(760, 150, 'module "app"', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, class: 'mono', opacity: fade(u, 0.5) });
@@ -225,40 +225,40 @@
       el('rect', { x: 560, y: 190, width: 320, height: 150, rx: 12, fill: SOFT, stroke: BAD, 'stroke-width': 2 }); tx(576, 214, 'prod', { 'font-size': 15, 'font-weight': 800, fill: BAD });
       for (let i = 0; i < 6; i++) vm(610 + (i % 3) * 110, 250 + Math.floor(i / 3) * 46, pop(u, 1.2 + i * 0.12), BAD);
       mono(720, 334, 't3.large × 6', { 'font-size': 14, 'text-anchor': 'middle', opacity: fade(u, 1.9) });
-      sub(480, 395, '명령은 파일 이름만 다르다. plan 을 먼저 보고 apply', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
-    if (k === 6) { snippet(40, 60, ['terraform {', '  backend "s3" {', '    bucket = "my-tfstate"', '    region = "ap-northeast-2"', '    # key 는 비워 둔다', '  }', '}'], { fs: 14.5, w: 360 });
+      sub(480, 395, '명령은 파일 이름만 다르다. plan을 먼저 보고 apply', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
+    if (k === 6) { snippet(40, 60, ['terraform {', '  backend "s3" {', '    bucket = "my-tfstate"', '    region = "ap-northeast-2"', '    # key는 비워 둔다', '  }', '}'], { fs: 14.5, w: 360 });
       card(620, 120, 300, 54, { rx: 10, text: 'key = var.env  ← 불가', fs: 15, mono: true, stroke: BAD, color: BAD, fill: BADBG, s: pop(u, 0.6) });
-      sub(620, 172, 'backend 블록은 variable 을 읽지 못한다', fade(u, 1.0), { fill: BAD, 'font-weight': 700, 'font-size': 14 });
+      sub(620, 172, 'backend 블록은 variable을 읽지 못한다', fade(u, 1.0), { fill: BAD, 'font-weight': 700, 'font-size': 14 });
       card(620, 270, 300, 54, { rx: 10, text: 'partial config', fs: 15, mono: true, stroke: GOOD, color: GOOD, s: pop(u, 1.6) });
-      sub(620, 320, 'key 는 init 할 때 넣는다', fade(u, 1.9), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(620, 320, 'key는 init 할 때 넣는다', fade(u, 1.9), { fill: INK, 'font-size': 14.5 }); return; }
     if (k === 7) { mono(30, 50, '$ terraform init -backend-config="key=dev/terraform.tfstate"', { 'font-size': 14, 'font-weight': 700, fill: INFO, opacity: fade(u, 0.1) });
       mono(30, 80, '$ terraform init -backend-config="key=prod/terraform.tfstate" -reconfigure', { 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
       el('rect', { x: 260, y: 120, width: 440, height: 240, rx: 14, fill: SOFT, stroke: INK, 'stroke-width': 2 }); mono(280, 148, 's3://my-tfstate', { 'font-size': 15, 'font-weight': 800 });
       [['dev/terraform.tfstate', INFO, 0.4], ['prod/terraform.tfstate', BAD, 1.1]].forEach(([f, col, a], i) => fileIc(320, 210 + i * 80, f, { col, s: pop(u, a) }));
-      sub(480, 400, 'state 까지 갈라야 환경끼리 서로를 덮어쓰지 않는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(480, 400, 'state까지 갈라야 환경끼리 서로를 덮어쓰지 않는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 }); return; }
     // k8 비밀
     fileIc(110, 120, 'prod.tfvars', { col: INK }); mono(80, 186, 'db_password = "…"', { 'font-size': 14.5, fill: BAD, 'font-weight': 700, 'text-decoration': u > 0.8 ? 'line-through' : null });
-    cross(330, 160, 16, pop(u, 0.8)); sub(180, 230, 'tfvars 는 커밋되는 파일', fade(u, 0.9), { fill: BAD, 'font-weight': 700 });
+    cross(330, 160, 16, pop(u, 0.8)); sub(180, 230, 'tfvars는 커밋되는 파일', fade(u, 0.9), { fill: BAD, 'font-weight': 700 });
     card(560, 100, 260, 50, { rx: 10, text: 'Secrets Manager · Vault', fs: 14.5, stroke: WARN, color: WARN, s: pop(u, 1.1) });
     card(560, 200, 260, 50, { rx: 10, text: 'CI 시크릿', fs: 14.5, stroke: WARN, color: WARN, s: pop(u, 1.3) });
     grow(690, 125, 790, 250, E(u, 1.5, 2.0), WARN); grow(690, 200, 780, 260, E(u, 1.5, 2.0), WARN);
     card(830, 300, 220, 50, { rx: 10, text: 'TF_VAR_db_password', fs: 14, mono: true, stroke: ACC, color: ACC, s: pop(u, 2.0) });
-    sub(480, 395, '같은 키를 tfvars 에 두지 않아야 env 값이 쓰인다', fade(u, 2.3), { fill: INK, 'font-size': 14.5 }); }
+    sub(480, 395, '같은 키를 tfvars에 두지 않아야 env 값이 쓰인다', fade(u, 2.3), { fill: INK, 'font-size': 14.5 }); }
 
   const quiz = [
-    { q: 'variable "admin_email" 에 default 가 없으면 어떻게 되나?',
+    { q: 'variable "admin_email" 에 default가 없으면 어떻게 되나?',
       o: ['빈 문자열로 처리된다', '필수값이 되어, 값을 주지 않으면 plan이 묻거나 실패한다', 'apply 단계에서만 오류가 난다'], a: 1,
       why: 'default가 있으면 선택값, 없으면 필수값이다. 어디서도 값이 오지 않으면 plan이 대화형으로 묻고, -input=false면 실패한다.' },
-    { q: 'default 가 { env = "dev" } 인 tags에 terraform.tfvars 가 { env = "stg", team = "be" } 를 주면 최종 값은?',
+    { q: 'default가 { env = "dev" }인 tags에 terraform.tfvars가 { env = "stg", team = "be" }를 주면 최종 값은?',
       o: ['{ env = "dev", team = "be" }', '{ env = "stg", team = "be" }', '{ env = "dev" }'], a: 1,
       why: 'map과 list는 합쳐지지 않고 통째로 바뀐다. tfvars에 적은 map이 그대로 최종 값이 된다.' },
-    { q: 'terraform.tfvars 에 admin_email = "ops@example.com" 이 있고 TF_VAR_admin_email=sre@example.com 을 export 했다. plan 이 쓰는 값은?',
+    { q: 'terraform.tfvars에 admin_email = "ops@example.com" 이 있고 TF_VAR_admin_email=sre@example.com을 export 했다. plan이 쓰는 값은?',
       o: ['sre@example.com', '둘 다 쓰여 오류가 난다', 'ops@example.com'], a: 2,
       why: '환경변수는 default 바로 위 4위다. terraform.tfvars가 더 높아서 ops@example.com이 남는다.' },
-    { q: 'sensitive = true 를 붙인 output 에 대해 맞는 설명은?',
-      o: ['콘솔에서는 가려지지만 state 파일에는 평문으로 남는다', 'state 파일에서도 암호화된다', 'terraform output 으로 절대 꺼낼 수 없다'], a: 0,
+    { q: 'sensitive = true를 붙인 output에 대해 맞는 설명은?',
+      o: ['콘솔에서는 가려지지만 state 파일에는 평문으로 남는다', 'state 파일에서도 암호화된다', 'terraform output으로 절대 꺼낼 수 없다'], a: 0,
       why: 'sensitive는 화면 노출만 막는다. state는 따로 암호화하고 접근을 막아야 하며, -raw나 이름 지정으로는 값을 꺼낼 수 있다.' },
-    { q: 'dev와 prod 를 같은 코드로 운영할 때 tfvars 만 나누고 빠뜨리면 사고가 나는 것은?',
+    { q: 'dev와 prod를 같은 코드로 운영할 때 tfvars만 나누고 빠뜨리면 사고가 나는 것은?',
       o: ['main.tf를 환경마다 복사하는 것', 'backend의 key를 환경별로 나누는 것', 'variable.tf를 환경마다 다르게 쓰는 것'], a: 1,
       why: 'state가 하나면 dev와 prod가 같은 state를 덮어쓴다. key를 비워 두고 init의 -backend-config로 환경마다 다른 key를 준다.' },
   ];
@@ -270,10 +270,10 @@
     '환경은 코드 한 벌에 tfvars만 바꿔 끼우고, state도 backend key로 따로 나눈다.',
   ];
   const review = [
-    { q: 'envs/prod.tfvars 를 만들어 두고 terraform apply 만 실행했더니 운영 사양이 아닌 값으로 만들어졌다. 원인은?',
-      o: ['prod.tfvars 같은 일반 이름은 -var-file 로 주지 않으면 읽히지 않는다', 'prod.tfvars 보다 default 가 우선이다', 'envs/ 폴더 안 파일은 JSON 이어야 한다'], a: 0,
+    { q: 'envs/prod.tfvars를 만들어 두고 terraform apply만 실행했더니 운영 사양이 아닌 값으로 만들어졌다. 원인은?',
+      o: ['prod.tfvars 같은 일반 이름은 -var-file로 주지 않으면 읽히지 않는다', 'prod.tfvars보다 default가 우선이다', 'envs/ 폴더 안 파일은 JSON 이어야 한다'], a: 0,
       why: '자동으로 읽히는 것은 terraform.tfvars와 *.auto.tfvars뿐이다. 환경 파일은 일부러 일반 이름을 써서 -var-file=envs/prod.tfvars로 골라 넣는다.' },
-    { q: 'terraform plan -out=tfplan 으로 검토를 마친 뒤 apply tfplan 에 -var 를 붙였더니 오류가 났다. 이유는?',
+    { q: 'terraform plan -out=tfplan으로 검토를 마친 뒤 apply tfplan에 -var를 붙였더니 오류가 났다. 이유는?',
       o: ['-var는 plan에서만 쓸 수 있는 옵션이라서', '저장한 계획에는 변수가 이미 고정되어 있어서', 'tfplan 파일이 깨져서'], a: 1,
       why: '저장한 plan은 검토한 값 그대로 적용하는 것이 목적이다. 값을 바꾸려면 plan부터 다시 만든다.' },
     { q: 'network 모듈이 만든 VPC ID를 app 모듈에 넘기려 한다. 알맞은 연결은?',

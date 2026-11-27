@@ -63,7 +63,7 @@
     if (k === 3) { tx(655, 330, '③ 에서 실패했다면 ①② 는 그대로 남는다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.8) }); }
     if (k === 5) { const s = pop(u, 0.9); zone(800, 50, 126, 240, null, { fill: C.BADBG, stroke: BAD, sw: 2.5, dash: '6 4', op: s });
       mono(863, 160, 'vpc-bbb', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 800, fill: BAD, opacity: s }); tx(863, 184, '중복', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: s });
-      tx(725, 332, '다시 돌리면 VPC 가 또 생긴다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.6) }); }
+      tx(725, 332, '다시 돌리면 VPC가 또 생긴다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.6) }); }
     // 위험 목록
     const risks = c.beat.imperative.risks, pr = c.prev ? c.prev.imperative.risks.length : 0;
     risks.forEach((r, i) => { if (k === 3 || k === 5) return; tx(940, 334 + i * 24, r, { 'text-anchor': 'end', 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: i >= pr ? fade(u, 2) : 1 }); }); }
@@ -100,7 +100,7 @@
     if (k >= 3) { gnode('sub', sh(3), { col: k === 3 ? ACC : INK }); gedge('vpc', 'sub', k === 3 ? E(u, 0.7, 1.5) : 1, k === 3 ? ACC : MUT); }
     if (k >= 4) { gnode('sg', sh(4), { col: k === 4 ? ACC : INK }); gedge('vpc', 'sg', k === 4 ? E(u, 0.7, 1.5) : 1, k === 4 ? ACC : MUT); }
     if (k >= 5) { gnode('ec2', sh(5), { col: k === 5 ? ACC : INK }); gedge('sub', 'ec2', k === 5 ? E(u, 0.7, 1.4) : 1, k === 5 ? ACC : MUT); gedge('sg', 'ec2', k === 5 ? E(u, 1.0, 1.7) : 1, k === 5 ? ACC : MUT); }
-    if (k === 3) sub(700, 300, '참조 aws_vpc.main.id 가 화살표가 된다', fade(u, 1.5), { 'font-size': 14.5, fill: INK, 'font-weight': 600 });
+    if (k === 3) sub(700, 300, '참조 aws_vpc.main.id가 화살표가 된다', fade(u, 1.5), { 'font-size': 14.5, fill: INK, 'font-weight': 600 });
     if (k === 6) { // 실행 순서: 의존이 끝난 것끼리 동시에
       [['vpc'], ['sub', 'sg'], ['ec2']].forEach((wave, i) => { const a = 0.3 + i * 0.7;
         wave.forEach((id) => { const [x, y] = GN[id]; card(x - gw(id) / 2 - 2, y - 22, 28, 28, { rx: 14, fill: ACC, stroke: 'none', text: String(i + 1), fs: 14, fw: 800, color: PANEL, s: pop(u, a) }); }); });
@@ -123,7 +123,7 @@
       col3(335, 'terraform.tfstate', '알고 있는 상태', [null, null, null, 't3.micro'], { hi: k >= 2 ? 3 : null, s: (i) => (k === 0 ? pop(u, 0.6 + i * 0.25) : 1) });
       col3(650, '실제 AWS', '현재 상태', [null, null, null, 't3.micro'], { op: k === 1 ? 1 : 0.45, stroke: k === 1 ? INFO : 'none' });
       if (k === 1) { for (let i = 0; i < 4; i++) dot([[660, 112 + i * 46], [622, 112 + i * 46]], seg(u, 0.3 + i * 0.3, 0.9 + i * 0.3), INFO, 6);
-        tx(640, 330, 'refresh: state 에 적힌 자원만 다시 읽는다 (쓰기 없음)', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: INFO, opacity: fade(u, 1.5) }); }
+        tx(640, 330, 'refresh: state에 적힌 자원만 다시 읽는다 (쓰기 없음)', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: INFO, opacity: fade(u, 1.5) }); }
       if (k === 0) tx(480, 330, '입력은 코드와 state, 두 개', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.4) });
       if (k >= 2) { [0, 1, 2, 3].forEach((i) => { const y = 112 + i * 46, same = i < 3, s = k === 2 ? pop(u, 0.3 + i * 0.35) : 1;
           card(322, y, 30, 30, { rx: 15, fill: same ? PANEL : C.WARNBG, stroke: same ? GOOD : WARN, sw: 2, text: same ? '=' : '≠', fs: 16, fw: 800, color: same ? GOOD : WARN, s }); }); }
@@ -140,8 +140,8 @@
       const s = fade(u, 2); el('rect', { x: 60, y: 300, width: 840, height: 54, rx: 10, fill: 'none', stroke: BAD, 'stroke-width': 2.2, 'stroke-dasharray': '6 4', opacity: s });
       tx(480, 400, '-/+ 가 보이면 지웠다 다시 만드는 동안 끊길 수 있다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: s }); return; }
     // k5: bash 와 비교
-    tx(240, 50, 'bash 를 다시 돌리면', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800 });
-    tx(720, 50, 'terraform plan 은', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800 });
+    tx(240, 50, 'bash를 다시 돌리면', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800 });
+    tx(720, 50, 'terraform plan은', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800 });
     CMD.forEach((s, i) => { const y = 100 + i * 56, sc = pop(u, 0.2 + i * 0.25); card(240, y, 360, 42, { rx: 8, stroke: BAD, sw: 1.8, text: s, fs: 14, mono: true, s: sc }); });
     tx(240, 352, '지금 상태를 모르니 전부 다시 실행', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.5) });
     RS.forEach((r, i) => { const y = 100 + i * 56, d = i === 3, sc = pop(u, 0.4 + i * 0.25);
@@ -156,7 +156,7 @@
     if (k === 0) { tx(480, 120, 'f(f(x)) = f(x)', { 'text-anchor': 'middle', 'font-size': 44, 'font-weight': 800, class: 'mono', opacity: fade(u, 0.2, 0.6) });
       [['x', 200], ['f(x)', 480], ['f(f(x))', 760]].forEach(([s, x], i) => { const sc = pop(u, 0.8 + i * 0.4);
         card(x, 250, 150, 60, { rx: 10, text: s, fs: 17, mono: true, stroke: i ? ACC : INK, sw: 2.2, s: sc }); if (i) { grow(x - 205, 250, x - 80, 250, E(u, 0.6 + i * 0.4, 1.1 + i * 0.4), ACC); mono(x - 142, 236, 'apply', { 'text-anchor': 'middle', 'font-size': 14, fill: ACC, opacity: fade(u, 0.9 + i * 0.4) }); } });
-      tx(620, 320, '두 번째 apply 는 아무것도 바꾸지 않는다', { 'text-anchor': 'middle', 'font-size': 15, fill: MUT, opacity: fade(u, 2) }); return; }
+      tx(620, 320, '두 번째 apply는 아무것도 바꾸지 않는다', { 'text-anchor': 'middle', 'font-size': 15, fill: MUT, opacity: fade(u, 2) }); return; }
     if (k <= 4) { // 왼쪽 bash, 오른쪽 terraform
       tx(240, 40, 'bash 스크립트', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: k <= 2 ? INK : MUT });
       tx(720, 40, 'terraform apply', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: k >= 3 ? INK : MUT });
@@ -170,32 +170,33 @@
       // terraform
       region(520, 66, 400, 230, 'AWS', { stroke: k >= 3 ? INFO : GRID });
       if (k >= 3) { RS.forEach((r, i) => { const s = k === 3 ? pop(u, 0.4 + i * 0.25) : 1; card(720, 110 + i * 44, 300, 34, { rx: 7, text: r, fs: 13.5, mono: true, s, stroke: GOOD, sw: 1.8 }); });
-        const line = k === 3 ? 'Apply: 4 added, 0 changed, 0 destroyed.' : 'No changes. 0 to add, 0 to change, 0 to destroy.';
-        mono(540, 330, `$ terraform apply   (${k - 2}회차)`, { 'font-size': 14.5, 'font-weight': 700 });
-        mono(540, 360, line, { 'font-size': 13.5, 'font-weight': 700, fill: k === 3 ? GOOD : INFO, opacity: fade(u, 1.4) });
-        if (k === 4) { tx(720, 392, 'state 와 코드가 같으니 할 일이 없다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: INFO, opacity: fade(u, 2) }); } }
+        const lines = k === 3 ? ['Apply complete! Resources:', '4 added, 0 changed, 0 destroyed.'] : ['No changes. Your infrastructure', 'matches the configuration.'];
+        mono(540, 324, `$ terraform apply   (${k - 2}회차)`, { 'font-size': 14.5, 'font-weight': 700 });
+        lines.forEach((s, i) => mono(540, 348 + i * 20, s, { 'font-size': 13.5, 'font-weight': 700, fill: k === 3 ? GOOD : INFO, opacity: fade(u, 1.4 + i * 0.2) }));
+        if (k === 4) { tx(720, 402, 'state와 코드가 같으니 할 일이 없다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: INFO, opacity: fade(u, 2) }); } }
       else sub(720, 186, '(아직 실행 전)', 1);
       return; }
-    if (k === 5) { tx(480, 50, 'CI 가 몇 번을 돌려도', { 'text-anchor': 'middle', 'font-size': 17, 'font-weight': 800 });
+    if (k === 5) { tx(480, 50, 'CI가 몇 번을 돌려도', { 'text-anchor': 'middle', 'font-size': 17, 'font-weight': 800 });
       ['4 added', 'No changes', 'No changes', 'No changes', 'No changes'].forEach((s, i) => { const x = 110 + i * 185, sc = pop(u, 0.2 + i * 0.35);
-        card(x, 150, 160, 92, { rx: 12, stroke: i ? INFO : GOOD, sw: 2, s: sc }); mono(x, 136, `run #${i + 1}`, { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: sc });
+        card(x, 150, 140, 92, { rx: 12, stroke: i ? INFO : GOOD, sw: 2, s: sc }); mono(x, 136, `run #${i + 1}`, { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: sc });
         mono(x, 164, s, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: i ? INFO : GOOD, opacity: sc });
-        if (i) grow(x - 172, 150, x - 82, 150, E(u, 0.1 + i * 0.35, 0.4 + i * 0.35), MUT); });
+        if (i) grow(x - 112, 150, x - 74, 150, E(u, 0.1 + i * 0.35, 0.4 + i * 0.35), MUT); });
       [['중간에 멈춰도', '다시 돌리면 된다'], ['동료가 돌려도', '같은 결과']].forEach(([a, b], i) => { const x = 300 + i * 360, s = pop(u, 1.8 + i * 0.3);
         card(x, 310, 300, 70, { rx: 10, stroke: GOOD, sw: 2, fill: C.GOODBG, s }); tx(x, 304, a, { 'text-anchor': 'middle', 'font-size': 15.5, 'font-weight': 700, opacity: s }); tx(x, 328, b, { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: s }); });
       return; }
     // k6: 멱등성을 깨는 코드
     tx(480, 46, '이런 코드는 매번 바뀐다', { 'text-anchor': 'middle', 'font-size': 17, 'font-weight': 800, fill: BAD });
-    [['provisioner "local-exec"', 'useradd 같은 비멱등 명령'], ['timestamp() · 난수', '실행할 때마다 값이 다르다'], ['null_resource + triggers', '매번 다시 실행되게 묶음']].forEach(([a, b], i) => { const y = 112 + i * 94, s = pop(u, 0.3 + i * 0.45);
+    tx(745, 80, '다시 돌리면', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: MUT, opacity: fade(u, 0.9) });
+    [['provisioner "local-exec"', 'useradd 같은 비멱등 명령', '다시 만들 때 또 실행, 실패', BAD], ['timestamp()', '실행할 때마다 값이 다르다', '매번 ~ 1 update', WARN], ['null_resource + triggers', '트리거 값이 매번 바뀌게 묶음', '매번 -/+ 1 replace', BAD]].forEach(([a, b, r, col], i) => { const y = 132 + i * 94, s = pop(u, 0.3 + i * 0.45);
       card(300, y, 440, 74, { rx: 10, stroke: BAD, sw: 2, s }); mono(100, y - 6, a, { 'font-size': 15, 'font-weight': 800, opacity: s }); tx(100, y + 20, b, { 'font-size': 14, fill: MUT, opacity: s });
-      [0, 1, 2].forEach((j) => { const x = 610 + j * 104; card(x, y, 90, 40, { rx: 8, stroke: WARN, sw: 1.8, fill: C.WARNBG, text: '~ 1', fs: 14.5, mono: true, color: WARN, s: pop(u, 0.8 + i * 0.45 + j * 0.2) }); });
-    });
-    tx(620, 64, 'run #1        #2        #3', { 'text-anchor': 'start', 'font-size': 13.5, fill: MUT, class: 'mono', style: 'white-space:pre', opacity: fade(u, 0.9) }); }
+      const g = E(u, 0.8 + i * 0.45, 1.2 + i * 0.45); grow(522, y, 576, y, g, col);
+      card(745, y, 330, 48, { rx: 8, stroke: col, sw: 1.8, fill: col === WARN ? C.WARNBG : C.BADBG, text: r, fs: 14.5, color: col, s: pop(u, 1.1 + i * 0.45) });
+    }); }
 
   // =========================================================
   // 5. 협업 + git — PR 로 리뷰하고 머지 때 apply
   // =========================================================
-  const LOG = [['a3f1c2b', 'web 인스턴스 t3.small 로', '#42'], ['8b7d9e1', '0.0.0.0/0 SSH 차단', '#41'], ['5c2a4f8', '2c 가용영역 추가', '#40'], ['1f9b3a7', '초기 VPC 와 EC2 1대', '#1']];
+  const LOG = [['a3f1c2b', 'web 인스턴스 t3.small로', '#42'], ['8b7d9e1', '0.0.0.0/0 SSH 차단', '#41'], ['5c2a4f8', '2c 가용영역 추가', '#40'], ['1f9b3a7', '초기 VPC와 EC2 1대', '#1']];
   function s5(t, c) { const { k, u } = c;
     if (k === 0) { mono(60, 50, '$ git log --oneline terraform/', { 'font-size': 15, 'font-weight': 700 });
       el('line', { x1: 90, y1: 90, x2: 90, y2: lerp(90, 370, E(u, 0.2, 1.6)), stroke: INK, 'stroke-width': 3 });
@@ -203,7 +204,7 @@
         el('circle', { cx: 90, cy: y, r: 10 * s, fill: i ? PANEL : ACC, stroke: ACC, 'stroke-width': 3 });
         mono(120, y + 5, h, { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: s }); tx(220, y + 5, m, { 'font-size': 16, 'font-weight': 600, opacity: s });
         pill(560, y, 'PR ' + pr, INFO, s, { fs: 13.5, mono: true }); });
-      tx(760, 230, '누가 · 언제 · 왜', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800, opacity: fade(u, 1.8) }); tx(760, 256, '커밋과 PR 에 남는다', { 'text-anchor': 'middle', 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.9) }); return; }
+      tx(760, 230, '누가 · 언제 · 왜', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800, opacity: fade(u, 1.8) }); tx(760, 256, '커밋과 PR에 남는다', { 'text-anchor': 'middle', 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.9) }); return; }
     if (k <= 2) { // 브랜치 → PR → 리뷰 → 머지 → apply
       el('line', { x1: 40, y1: 300, x2: 920, y2: 300, stroke: INK, 'stroke-width': 4 }); mono(40, 330, 'main', { 'font-size': 15, 'font-weight': 700 });
       const bu = k === 1 ? E(u, 0.2, 1.0) : 1; el('path', { d: 'M120,300 C160,300 160,180 220,180 H' + lerp(220, 520, bu), fill: 'none', stroke: ACC, 'stroke-width': 4 });
@@ -212,22 +213,22 @@
       card(560, 90, 220, 50, { rx: 10, text: 'PR #42', fs: 17, fw: 800, stroke: INFO, sw: 2.2, s: k === 1 ? pop(u, 0.9) : 1 });
       const bub = k === 1 ? fade(u, 1.6) : 1; el('rect', { x: 690, y: 40, width: 250, height: 66, rx: 10, fill: C.WARNBG, stroke: WARN, 'stroke-width': 1.8, opacity: bub });
       tx(704, 62, 'CI bot · terraform plan', { 'font-size': 13.5, fill: MUT, 'font-weight': 700, opacity: bub }); mono(704, 88, '~ 1 to change', { 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: bub });
-      if (k === 2) { person(470, 110, null, { s: pop(u, 0.2) }); check(510, 92, 9, pop(u, 0.6)); tx(470, 160, '리뷰어 승인', { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.6) });
+      if (k === 2) { person(400, 96, null, { s: pop(u, 0.2) }); check(436, 74, 9, pop(u, 0.6)); tx(364, 102, '리뷰어 승인', { 'text-anchor': 'end', 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.6) });
         const mu = E(u, 0.9, 1.7); el('path', { d: `M520,180 C580,180 580,300 ${lerp(600, 640, mu)},300`, fill: 'none', stroke: ACC, 'stroke-width': 4, opacity: mu });
         el('circle', { cx: 640, cy: 300, r: 11 * mu, fill: ACC });
         grow(640, 312, 640, 372, E(u, 1.7, 2.3), GOOD); pill(640, 392, 'CD · terraform apply', GOOD, pop(u, 2.2), { fs: 14, mono: true }); }
       return; }
     if (k <= 4) { // GitHub Actions 두 job
       mono(40, 50, 'on: pull_request (terraform/**) · push (main)', { 'font-size': 14.5, 'font-weight': 700, fill: MUT });
-      const jobs = [['plan', 280, ['init', 'plan -no-color'], 'PR · main 둘 다'], ['apply', 680, ['init', 'apply -auto-approve'], 'main 에서만']];
+      const jobs = [['plan', 280, ['init', 'plan -no-color'], 'PR · main 둘 다'], ['apply', 680, ['init', 'apply -auto-approve'], 'main에서만']];
       jobs.forEach(([n, x, steps, cond], i) => { if (i === 1 && k < 4) return; const s = (k === 3 && i === 0) || (k === 4 && i === 1) ? pop(u, 0.3) : 1, hot = (k === 3 && i === 0) || (k === 4 && i === 1);
         card(x, 210, 280, 190, { rx: 12, stroke: hot ? ACC : GRID, sw: hot ? 2.5 : 1.8, s });
         mono(x - 120, 146, `job: ${n}`, { 'font-size': 16, 'font-weight': 800, fill: hot ? ACC : INK, opacity: s }); tx(x + 120, 146, cond, { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', 'font-weight': 700, opacity: s });
         steps.forEach((st, j) => { const sy = 196 + j * 48, ss = (k === 3 && i === 0) || (k === 4 && i === 1) ? pop(u, 0.8 + j * 0.4) : 1;
           card(x, sy, 240, 36, { rx: 7, fill: SOFT, stroke: GRID, sw: 1.2, text: 'terraform ' + st, fs: 14, mono: true, s: ss }); }); });
       if (k === 4) { grow(422, 210, 538, 210, E(u, 0.9, 1.6), ACC); mono(480, 196, 'needs', { 'text-anchor': 'middle', 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.2) });
-        tx(480, 360, 'plan 이 성공해야 apply 가 시작된다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.8) }); }
-      else tx(680, 220, 'PR 에서는 plan 까지만', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: MUT, opacity: fade(u, 1.4) });
+        tx(480, 360, 'plan이 성공해야 apply가 시작된다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.8) }); }
+      else tx(680, 220, 'PR에서는 plan까지만', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: MUT, opacity: fade(u, 1.4) });
       return; }
     if (k === 5) { // apply 로 실제 반영
       pill(170, 80, 'terraform apply -auto-approve', GOOD, pop(u, 0.2), { fs: 14.5, mono: true });
@@ -237,7 +238,7 @@
       stateDoc(830, 140, 210, 130, ['backend "s3"', 'aws_instance.web', '  t3.small'], { s: 1, op: fade(u, 1.6) }); lock(910, 200, true, ACC, pop(u, 2.0));
       tx(830, 238, 'S3 + lock', { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, fill: ACC, opacity: fade(u, 2) });
       tx(480, 330, '사람 확인은 PR 리뷰에서 이미 끝났다', { 'text-anchor': 'middle', 'font-size': 15.5, 'font-weight': 700, opacity: fade(u, 2.2) }); return; }
-    [['콘솔에서 손으로 클릭', '코드 수정 + PR'], ['"누가 바꿨지?" 추적 불가', 'git blame 으로 바로'], ['환경 수동 동기화', '같은 코드, 변수만'], ['장애 복구는 기억에 의존', '코드 다시 apply']].forEach(([a, b], i) => { const y = 70 + i * 82, s = pop(u, 0.2 + i * 0.4);
+    [['콘솔에서 손으로 클릭', '코드 수정 + PR'], ['"누가 바꿨지?" 추적 불가', 'git blame으로 바로'], ['환경 수동 동기화', '같은 코드, 변수만'], ['장애 복구는 기억에 의존', '코드 다시 apply']].forEach(([a, b], i) => { const y = 70 + i * 82, s = pop(u, 0.2 + i * 0.4);
       card(250, y, 340, 58, { rx: 10, stroke: BAD, sw: 1.8, fill: C.BADBG, text: a, fs: 15, s }); grow(425, y, 525, y, E(u, 0.5 + i * 0.4, 0.9 + i * 0.4), GOOD);
       card(710, y, 340, 58, { rx: 10, stroke: GOOD, sw: 2, fill: C.GOODBG, text: b, fs: 15, fw: 700, s: pop(u, 0.8 + i * 0.4) }); }); }
 
@@ -252,7 +253,7 @@
       o: ['git의 이전 커밋과 지금 커밋', '.tf 코드와 refresh된 state', 'AWS 콘솔 화면과 CloudTrail'], a: 1,
       why: 'plan은 state에 적힌 자원을 실제 API로 다시 읽은 뒤 코드와 비교한다. 그 결과 0 add, 1 change, 0 destroy가 나온다.' },
     { q: '같은 코드로 terraform apply를 두 번째 돌렸을 때 결과는 무엇인가?',
-      o: ['VPC가 하나 더 생긴다', '4개 자원을 지우고 다시 만든다', 'No changes. 0 to add, 0 to change, 0 to destroy'], a: 2,
+      o: ['VPC가 하나 더 생긴다', '4개 자원을 지우고 다시 만든다', 'No changes. Your infrastructure matches the configuration.'], a: 2,
       why: '첫 apply 결과가 state에 남아 있어 두 번째에는 코드와 state가 같다. 그래서 할 일이 없다.' },
     { q: '이 장의 GitHub Actions에서 apply job이 돌기 위한 조건은 무엇인가?',
       o: ['main에 push되고 plan job이 성공했을 때', 'PR이 열리기만 하면 언제나', '리뷰어가 댓글로 apply라고 적었을 때'], a: 0,

@@ -51,7 +51,7 @@
     else sub(715, 112, '아직 비어 있다', 1);
     // 오른쪽 아래: 남는 기록
     zone(500, 204, 430, 196, '남는 기록', { fill: SOFT });
-    const recs = [[0, true, '작업자 김주임'], [0, true, '작업 시각 14:23'], [1, false, 'region·type 을 고른 이유'], [2, false, 'SSH 를 전체 공개한 이유'], [4, false, '같은 환경을 다시 만들 명세']];
+    const recs = [[0, true, '작업자 김주임'], [0, true, '작업 시각 14:23'], [1, false, 'region·type을 고른 이유'], [2, false, 'SSH를 전체 공개한 이유'], [4, false, '같은 환경을 다시 만들 명세']];
     recs.forEach(([at, ok, s], i) => { if (k < at) return; const op = k === at ? fade(u, 0.3 + (at === 0 ? i * 0.3 : 0.6)) : 1;
       recRow(530, 246 + i * 32, ok, s, op, k === at ? pop(u, 0.3 + (at === 0 ? i * 0.3 : 0.6)) : 1); }); }
 
@@ -110,7 +110,7 @@
       TRAIL.forEach(([f, v], i) => { const y = 64 + i * 30, op = k === 1 ? fade(u, 0.3 + i * 0.35) : 1;
         mono(380, y, f, { 'font-size': 14, fill: MUT, opacity: op }); mono(500, y, v, { 'font-size': 14, 'font-weight': 700, opacity: op });
         check(900, y - 5, 7, k === 1 ? pop(u, 0.5 + i * 0.35) : 1); }); }
-    else { tx(648, 110, 'CloudTrail 에 무엇이 남았을까?', { 'text-anchor': 'middle', 'font-size': 16, fill: MUT, opacity: fade(u, 1.2) }); }
+    else { tx(648, 110, 'CloudTrail에 무엇이 남았을까?', { 'text-anchor': 'middle', 'font-size': 16, fill: MUT, opacity: fade(u, 1.2) }); }
     // 오른쪽 아래: 빈칸들
     const by = 206;
     if (k === 2) { tx(360, by + 16, '판단에 필요한 칸', { 'font-size': 15, 'font-weight': 700 });
@@ -208,7 +208,7 @@
         mono(700, y + 10, '22/tcp ← 0.0.0.0/0', { 'font-size': 14, fill: BAD, opacity: fade(u, 0.4), 'text-decoration': 'line-through' });
         mono(700, y + 36, '22/tcp ← 203.0.113.0/24', { 'font-size': 14, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.1) }); }
       if (k >= 6) { node('ec2', sh(6), { hot: true }); edge('type', 'ec2', E(u, 0.8, 1.6)); edge('sg', 'ec2', E(u, 1.2, 2.0));
-        sub(800, 360, '참조가 곧 순서: SG 를 먼저, 인스턴스를 나중에', fade(u, 2), { 'font-size': 14, fill: INK, 'font-weight': 600 }); }
+        sub(800, 360, '참조가 곧 순서: SG를 먼저, 인스턴스를 나중에', fade(u, 2), { 'font-size': 14, fill: INK, 'font-weight': 600 }); }
       if (k >= 1 && k <= 3) sub(540, 330, ['', '드롭다운 대신 기본값이 적힌 변수', '즉흥 대신 기본값 t3.small', '환경 차이는 변수 값 한 곳'][k], fade(u, 1), { 'font-size': 14.5, fill: INK, 'font-weight': 600 });
       return; }
     if (k === 7) { // 같은 코드 + workspace 둘 → 같은 모양 두 벌
@@ -221,7 +221,7 @@
         grow(x + 105, 162, x + 105, 188, s, MUT);
         card(x + 105, 300, 180, 56, { rx: 6, fill: SOFT, stroke: GRID, s }); mono(x + 105, 296, 'state', { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, opacity: s });
         mono(x + 105, 316, env, { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: s }); });
-      tx(680, 392, 'state 는 환경마다 따로, 모양은 같다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2) }); return; }
+      tx(680, 392, 'state는 환경마다 따로, 모양은 같다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2) }); return; }
     // k8: 네 함정 → 해결
     [['환경 차이', 'variables'], ['변경 추적', 'git log · PR'], ['안전', 'terraform plan'], ['재현·복구', 'terraform apply']].forEach(([a, b], i) => { const y = 80 + i * 78, s = pop(u, 0.2 + i * 0.4);
       card(530, y, 190, 54, { rx: 10, stroke: BAD, sw: 2, fill: C.BADBG, text: a, fs: 16, fw: 700, s });

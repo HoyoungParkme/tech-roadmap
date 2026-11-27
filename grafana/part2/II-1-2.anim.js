@@ -64,7 +64,7 @@
         logRow(30, y, { ...l, text: l.text.replace(/^level=\w+ /, '') }, { n: 76, hi: done && hit ? 'traceID=' + hit[1] : null, noApp: true, op: k === 3 && i !== 1 ? 0.45 : 1 });
         if (done && hit) { const s = k === 2 ? pop(u, 0.5 + i * 0.27) : 1; card(800, y - 4, 150, 26, { rx: 13, text: 'TraceID ' + hit[1], fs: 13.5, mono: true, stroke: ACC, color: ACC, fill: ACCBG, s }); } });
       if (k === 2) { el('rect', { x: 22, y: 84 + Math.min(scan, 5.6) * 34 - 20, width: 650, height: 4, fill: ACC, opacity: 0.5 });
-        note(30, 310, 'traceID 가 있는 줄만 링크가 생긴다', fade(u, 2.2)); return; }
+        note(30, 310, 'traceID가 있는 줄만 링크가 생긴다', fade(u, 2.2)); return; }
       // k3: 링크 → Tempo
       grow(800, 128, 800, 268, E(u, 0.3, 0.8), ACC);
       el('rect', { x: 560, y: 270, width: 380, height: 140, rx: 10, fill: PANEL, stroke: ACC, 'stroke-width': 2, opacity: fade(u, 0.6) });
@@ -83,9 +83,9 @@
     // k5: 고카디널리티 라벨이면 스트림이 폭발한다
     zone(40, 50, 400, 290, '라벨 = app, env, level', { fill: GOODBG, color: GOOD });
     [0, 1, 2, 3].forEach((i) => card(140 + (i % 2) * 200, 130 + Math.floor(i / 2) * 90, 170, 60, { rx: 8, text: ['api · info', 'api · error', 'api · warn', 'web · info'][i], fs: 14, mono: true, stroke: GOOD, s: pop(u, 0.2 + i * 0.1) }));
-    zone(500, 50, 420, 290, '라벨에 user_id 를 넣으면', { fill: BADBG, color: BAD });
+    zone(500, 50, 420, 290, '라벨에 user_id를 넣으면', { fill: BADBG, color: BAD });
     const n = Math.floor(E(u, 0.8, 2.4) * 120); for (let i = 0; i < n; i++) el('rect', { x: 520 + (i % 15) * 26, y: 80 + Math.floor(i / 15) * 30, width: 20, height: 22, rx: 3, fill: BAD, opacity: 0.6 });
-    tx(480, 380, 'user_id·request_id 는 본문에 두고 쿼리할 때 파싱한다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.2) }); }
+    tx(480, 380, 'user_id·request_id는 본문에 두고 쿼리할 때 파싱한다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.2) }); }
 
   // ================= 2. 스트림 셀렉터 =================
   const DR = [
@@ -108,7 +108,7 @@
         if (d.key === 'worker') return k >= 2 ? { show: k === 2 ? fade(u, 0.4) : 1, open: true, m: k === 2 ? m : 1 } : { show: 0 };
         if (d.key === 'canary') return k === 3 ? { show: fade(u, 0.4), x: pop(u, 1.4) } : { show: 0 }; };
       DR.forEach((d, i) => drawer(i, d, rule(d), u));
-      const msg = ['= : app 과 env 가 정확히 같아야 열린다', '!= : dev 만 빼고 나머지는 모두 남는다', '=~ : 정규식에 맞는 서랍을 함께 연다', '!~ : 정규식에 맞는 서랍을 뺀다'][k];
+      const msg = ['= : app과 env가 정확히 같아야 열린다', '!= : dev만 빼고 나머지는 모두 남는다', '=~ : 정규식에 맞는 서랍을 함께 연다', '!~ : 정규식에 맞는 서랍을 뺀다'][k];
       note(40, 404, msg, fade(u, 1.8), { fill: ACC }); return; }
     if (k === 4) { [['=', '같음'], ['!=', '다름'], ['=~', '정규식 일치'], ['!~', '정규식 불일치']].forEach(([op, ko], i) => { const x = 140 + i * 226, s = pop(u, 0.2 + i * 0.3);
         card(x, 200, 200, 130, { rx: 12, stroke: ACC, s }); mono(x, 196, op, { 'font-size': 40, 'font-weight': 800, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 0.3 + i * 0.3) });
@@ -176,7 +176,7 @@
           tx(x + 8, y0 + 40, kk, { 'font-size': 13.5, fill: MUT, opacity: s > 0.3 ? 1 : 0 }); mono(x + 8, y0 + 60, short(v, 15), { 'font-size': 14, 'font-weight': 700, fill: hot ? ACC : INK, opacity: s > 0.3 ? 1 : 0 }); });
         if (k === 1 && !fs.find((f) => f[0] === 'status')) { card(840, y0 + 46, 110, 46, { rx: 6, text: 'status 없음', fs: 13.5, stroke: BAD, color: BAD, dash: '5 4', s: pop(u, 0.6) }); cross(905, y0 - 4, 9, pop(u, 1.0)); }
         if (k === 1 && fs.find((f) => f[0] === 'status')) check(905, y0 - 4, 9, pop(u, 0.8)); });
-      note(30, 404, k === 0 ? '파서는 줄을 거르지 않고 key=value 를 필드로 만든다' : 'status >= 500 은 숫자로 비교한다', fade(u, 1.8)); return; }
+      note(30, 404, k === 0 ? '파서는 줄을 거르지 않고 key=value를 필드로 만든다' : 'status >= 500은 숫자로 비교한다', fade(u, 1.8)); return; }
     if (k === 2) { const fs = fields(L2.text), want = ['method', 'path', 'status'];
       logRow(30, 90, L2, { noApp: true, n: 100 });
       mono(60, 170, 'line_format "{{.method}} {{.path}} status={{.status}}"', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.2) });
@@ -196,7 +196,7 @@
       mono(30, 160, '<ip> - - <_> "<method> <path>"', { 'font-size': 16, fill: ACC, 'font-weight': 800, opacity: fade(u, 0.5) });
       [['ip', '10.0.0.7'], ['method', 'GET'], ['path', '/orders']].forEach(([kk, v], j) => { const s = pop(u, 1.0 + j * 0.25); card(140 + j * 220, 230, 190, 50, { rx: 6, stroke: ACC, s }); tx(56 + j * 220, 224, kk, { 'font-size': 13.5, fill: MUT, opacity: s > 0.3 ? 1 : 0 }); mono(56 + j * 220, 246, v, { 'font-size': 15, 'font-weight': 800, opacity: s > 0.3 ? 1 : 0 }); });
       note(30, 330, '자리로 뽑는다. <_> 는 버리는 자리', fade(u, 1.8));
-      note(30, 366, '셀렉터가 {app="nginx"} 라 지금 api 스트림에서는 0줄', fade(u, 2.2), { fill: BAD }); return; }
+      note(30, 366, '셀렉터가 {app="nginx"}라 지금 api 스트림에서는 0줄', fade(u, 2.2), { fill: BAD }); return; }
     if (k === 5) { // 추출 필드는 쿼리 시점에만 있다
       zone(40, 70, 300, 250, '저장된 인덱스', { fill: INFOBG, color: INFO });
       ['app', 'env', 'level'].forEach((s, i) => mono(64, 124 + i * 36, s, { 'font-size': 16, 'font-weight': 700, fill: INFO }));
@@ -222,7 +222,7 @@
       rows.forEach((r, i) => { const y = 180 + i * 50; mono(80, y + 16, r.level, { 'font-size': 15, 'font-weight': 700 });
         el('rect', { x: 200, y, width: 560 * (r.value / 900) * E(u, 0.6 + i * 0.3, 1.6 + i * 0.3) + 2, height: 24, rx: 4, fill: i ? INFO : WARN });
         mono(200 + 560 * (r.value / 900) + 12, y + 18, r.value + ' ms', { 'font-size': 15, 'font-weight': 800, opacity: fade(u, 1.5 + i * 0.3) }); });
-    note(80, 320, 'latency_ms 가 없는 error 줄은 latency_ms != "" 에서 먼저 빠진다', fade(u, 2.0), { fill: MUT });
+    note(80, 320, 'latency_ms가 없는 error 줄은 latency_ms != "" 에서 먼저 빠진다', fade(u, 2.0), { fill: MUT });
     tx(80, 350, 'path 별 평균 ms · 예시 줄의 값', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.2) }); }
   function s5(t, c) { const { k, u, beat: b } = c;
     qline(30, 18, 900, short(b.query, 104), { fs: 13.5 });
@@ -253,7 +253,7 @@
     const st = n < 13 ? 0 : n < 22 ? 1 : 2, names = [['Normal', GOOD], ['Pending · for 2m', WARN], ['Firing', BAD]];
     names.forEach(([s, col], i) => card(170 + i * 230, 320, 200, 46, { rx: 23, text: s, fs: 15, stroke: col, color: i === st ? PANEL : col, fill: i === st ? col : PANEL }));
     if (n >= 13) { const x0 = AX.x + 12 / 29 * AX.w, x1 = AX.x + 21 / 29 * AX.w; el('rect', { x: x0, y: AX.y + AX.h + 6, width: Math.min(x1, AX.x + (n - 1) / 29 * AX.w) - x0, height: 10, rx: 5, fill: WARN }); mono(x0, AX.y + AX.h + 36, 'for 2m', { 'font-size': 14, 'font-weight': 700, fill: WARN }); }
-    tx(720, 120, '잠깐 튀면', { 'font-size': 14, fill: MUT }); tx(720, 142, 'Pending 에서 멈춘다', { 'font-size': 14, fill: MUT }); }
+    tx(720, 120, '잠깐 튀면', { 'font-size': 14, fill: MUT }); tx(720, 142, 'Pending에서 멈춘다', { 'font-size': 14, fill: MUT }); }
 
   // ================= 6. Grafana 로그 패널 · 라이브 · 트레이스 =================
   const TIMES = ['10:00:07', '10:00:03'];
@@ -302,24 +302,24 @@
     note(480, 390, '로그 · 메트릭 · 트레이스를 한 화면에서 오간다', fade(u, 2.2), { 'text-anchor': 'middle' }); }
 
   const quiz = [
-    { q: 'Loki 가 Elasticsearch 보다 인덱스가 가볍고 저장 비용이 싼 까닭은 무엇인가?',
+    { q: 'Loki가 Elasticsearch보다 인덱스가 가볍고 저장 비용이 싼 까닭은 무엇인가?',
       o: ['로그 본문을 모두 단어 단위로 인덱싱해서', '라벨만 인덱싱하고 본문은 압축 청크로 쌓아서', '오래된 로그를 자동으로 지워서'], a: 1,
       why: '인덱스에는 app·env·level 같은 라벨만 있다. 본문은 압축해 두고, 고른 스트림만 풀어서 grep 한다.' },
-    { q: '{app="api", env!="dev"} 에서 != 매처가 하는 일은 무엇인가?',
-      o: ['env 라벨이 있는 스트림만 남긴다', 'dev 를 포함한 모든 env 를 연다', 'env 가 dev 인 스트림만 빼고 나머지는 남긴다'], a: 2,
-      why: '!= 는 값 하나만 뺀다. 지금 스트림은 모두 prod 라 결과가 = 를 쓸 때와 같다.' },
+    { q: '{app="api", env!="dev"}에서 != 매처가 하는 일은 무엇인가?',
+      o: ['env 라벨이 있는 스트림만 남긴다', 'dev를 포함한 모든 env를 연다', 'env가 dev인 스트림만 빼고 나머지는 남긴다'], a: 2,
+      why: '!= 는 값 하나만 뺀다. 지금 스트림은 모두 prod라 결과가 = 를 쓸 때와 같다.' },
     { q: '{app="api"} |= "error" != "timeout" |~ "5[0-9][0-9]" 의 결과가 0줄인 까닭은 무엇인가?',
-      o: ['필터를 왼쪽부터 차례로 거쳐 남는 줄이 없어서', '정규식 필터는 셀렉터 뒤에 쓸 수 없어서', 'maxLines 가 0이라서'], a: 0,
-      why: 'error 두 줄 중 하나는 timeout 에서 빠지고, 남은 한 줄은 5xx 숫자가 없어 마지막 필터에서 빠진다.' },
-    { q: '| logfmt | status >= 500 에서 status 필드가 없는 줄은 어떻게 되는가?',
-      o: ['status 를 0으로 보고 통과시킨다', '조건에서 탈락한다', '쿼리 전체가 에러로 멈춘다'], a: 1,
-      why: '파서가 만든 필드로 숫자를 비교한다. "DB connection refused" 줄에는 status 가 없어 걸러진다.' },
+      o: ['필터를 왼쪽부터 차례로 거쳐 남는 줄이 없어서', '정규식 필터는 셀렉터 뒤에 쓸 수 없어서', 'maxLines가 0이라서'], a: 0,
+      why: 'error 두 줄 중 하나는 timeout에서 빠지고, 남은 한 줄은 5xx 숫자가 없어 마지막 필터에서 빠진다.' },
+    { q: '| logfmt | status >= 500에서 status 필드가 없는 줄은 어떻게 되는가?',
+      o: ['status를 0으로 보고 통과시킨다', '조건에서 탈락한다', '쿼리 전체가 에러로 멈춘다'], a: 1,
+      why: '파서가 만든 필드로 숫자를 비교한다. "DB connection refused" 줄에는 status가 없어 걸러진다.' },
     { q: '같은 [5m] 창에서 error 줄이 27개일 때 rate 결과는 얼마인가?',
       o: ['27', '0.09', '5.4'], a: 1,
-      why: 'rate 는 초당 값이라 27 ÷ 300초 = 0.09 다. count_over_time 이 27을 낸다.' },
+      why: 'rate는 초당 값이라 27 ÷ 300초 = 0.09다. count_over_time이 27을 낸다.' },
     { q: '로그 패널의 TraceID 링크가 Tempo 트레이스로 이어지게 하는 설정은 무엇인가?',
-      o: ['Loki 데이터 소스의 derivedFields', '패널의 sortOrder', 'Explore 의 Live 버튼'], a: 0,
-      why: 'derivedFields 가 본문에서 traceID=(\\w+) 를 뽑아 datasourceUid tempo 로 가는 링크를 만든다.' },
+      o: ['Loki 데이터 소스의 derivedFields', '패널의 sortOrder', 'Explore의 Live 버튼'], a: 0,
+      why: 'derivedFields가 본문에서 traceID=(\\w+)를 뽑아 datasourceUid tempo로 가는 링크를 만든다.' },
   ];
 
   const summary = [
@@ -330,15 +330,15 @@
   ];
   const review = [
     { q: '7일 범위로 {env="prod"} |~ "error" 를 돌렸더니 한참 걸린다. 먼저 바꿀 것은?',
-      o: ['셀렉터에 app="api" 를 더하고 |~ 를 |= 로 바꾼다', '라벨에 request_id 를 추가한다', 'maxLines 를 크게 늘린다'], a: 0,
+      o: ['셀렉터에 app="api" 를 더하고 |~ 를 |= 로 바꾼다', '라벨에 request_id를 추가한다', 'maxLines를 크게 늘린다'], a: 0,
       why: '훑는 양은 열린 스트림과 시간 범위로 정해진다. 셀렉터를 좁히고 고정 문자열은 |= 로 찾는 편이 빠르다.' },
-    { q: '팀원이 사용자별로 보려고 user_id 를 Loki 라벨로 넣자고 한다. 알맞은 답은?',
-      o: ['좋다. 라벨이 많을수록 검색이 빨라진다', '라벨 대신 본문에 남기고 | logfmt | user_id="…" 로 거른다', 'user_id 를 정규식 셀렉터로만 쓴다'], a: 1,
+    { q: '팀원이 사용자별로 보려고 user_id를 Loki 라벨로 넣자고 한다. 알맞은 답은?',
+      o: ['좋다. 라벨이 많을수록 검색이 빨라진다', '라벨 대신 본문에 남기고 | logfmt | user_id="…" 로 거른다', 'user_id를 정규식 셀렉터로만 쓴다'], a: 1,
       why: '값 종류가 많은 라벨은 스트림 수를 폭발시킨다. 파싱으로 만든 필드는 쿼리 시점에만 있어 인덱스가 커지지 않는다.' },
-    { q: 'error 로그 급증 알림을 count_over_time([5m]) 기준 임계값 0.5 로 만들었더니 계속 울린다. 원인은?',
-      o: ['for 를 두지 않아서', 'Loki 가 라벨을 인덱싱하지 않아서', '0.5 는 초당 값 기준인데 구간 누적 개수와 비교해서'], a: 2,
-      why: 'count_over_time 은 5분 누적 개수(예: 27)를 낸다. 초당 값으로 잡은 임계값이면 rate 를 써야 한다.' },
+    { q: 'error 로그 급증 알림을 count_over_time([5m]) 기준 임계값 0.5로 만들었더니 계속 울린다. 원인은?',
+      o: ['for를 두지 않아서', 'Loki가 라벨을 인덱싱하지 않아서', '0.5는 초당 값 기준인데 구간 누적 개수와 비교해서'], a: 2,
+      why: 'count_over_time은 5분 누적 개수(예: 27)를 낸다. 초당 값으로 잡은 임계값이면 rate를 써야 한다.' },
   ];
 
-  R.page({ title: 'LogQL 이 로그를 거르고 세는 과정', scenes: [s1, s2, s3, s4, s5, s6], quiz, summary, review });
+  R.page({ title: 'LogQL이 로그를 거르고 세는 과정', scenes: [s1, s2, s3, s4, s5, s6], quiz, summary, review });
 })();

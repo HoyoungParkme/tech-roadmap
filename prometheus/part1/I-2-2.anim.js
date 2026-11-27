@@ -71,7 +71,7 @@
   const PODS = [['api-7f8', 'prod', 'true'], ['worker-2c1', 'prod', 'false'], ['coredns-5d9', 'kube-system', 'true']];
   // 라벨 카드: rows [[k, v, o]] o = {hi, add, gone}
   function labels(x, y, rows, o) { o = o || {}; el('rect', { x, y, width: 560, height: 30 + rows.length * 30, rx: 10, fill: PANEL, stroke: GRID, 'stroke-width': 1.5 });
-    tx(x + 14, y + 20, o.title || 'target api-7f8 의 라벨', { 'font-size': 13.5, 'font-weight': 700, fill: MUT });
+    tx(x + 14, y + 20, o.title || 'target api-7f8의 라벨', { 'font-size': 13.5, 'font-weight': 700, fill: MUT });
     rows.forEach(([kk, v, ro], i) => { ro = ro || {}; const yy = y + 30 + i * 30, s = ro.s ?? 1; if (s <= 0) return;
       if (ro.hi || ro.add) el('rect', { x: x + 6, y: yy + 2, width: 548 * clamp(s), height: 26, rx: 5, fill: ro.add ? C.GOODBG : ACCBG });
       spans(x + 14, yy + 21, [[kk, { fill: ro.gone ? OFF : ro.add ? GOOD : kk.startsWith('__') ? MUT : INK, 'font-weight': ro.add || !kk.startsWith('__') ? 700 : 400 }], ['=' + v, { fill: ro.gone ? OFF : INFO }]], { 'font-size': 13.5, opacity: s, 'text-decoration': ro.gone ? 'line-through' : null }); }); }
@@ -97,7 +97,7 @@
       labels(40, 40, rows, { title: 'relabel 전 → 회색 줄은 저장되지 않는다' });
       labels(40, 250, fin.map(([a, b, o], i) => [a, b, { ...o, s: E(u, 0.8 + i * 0.25, 1.2 + i * 0.25) }]), { title: '저장되는 라벨 (instance는 __address__에서 온다)' }); return; }
     labels(40, 40, rows.concat(add));
-    const rule = { 1: ['kubernetes_sd_configs', '라벨 __meta_* 가 딸려 온다', MUT], 2: ['① action: keep  regex: "true"', 'scrape=false 인 Pod는 통째로 버린다', ACC], 3: ['② replace → target_label: ns', 'namespace 값을 ns로 복사', GOOD],
+    const rule = { 1: ['kubernetes_sd_configs', '라벨 __meta_* 가 딸려 온다', MUT], 2: ['① action: keep  regex: "true"', 'scrape=false인 Pod는 통째로 버린다', ACC], 3: ['② replace → target_label: ns', 'namespace 값을 ns로 복사', GOOD],
       4: ['③ action 생략 = replace → pod', 'pod 이름이 pod 라벨로', GOOD], 5: ['④ labelmap  __meta_kubernetes_pod_label_(.+)', '캡처한 이름 그대로 app 라벨', GOOD], 6: ['⑤ source_labels: [ns]  drop', '②가 만든 ns를 다시 읽어 kube-system 제외', BAD] }[k];
     mono(40, 330, rule[0], { 'font-size': 15, 'font-weight': 800, fill: rule[2], opacity: fade(u, 0.2) });
     tx(40, 360, rule[1], { 'font-size': 15, fill: INK, opacity: fade(u, 0.6) }); }

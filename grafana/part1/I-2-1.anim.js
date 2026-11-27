@@ -63,7 +63,7 @@
     const data = k === 4 ? SERIES.map((v, i) => (i === 5 || i === 6 ? null : v)) : SERIES;
     tsLine(data, 1, { fill: fillOp, sw: k === 3 ? lerp(2.5, 3, fade(u, 0.5)) : 2.5 });
     if (k === 2) { const i = 7, x = PX(i, n), y = PY(SERIES[i]); el('circle', { cx: x, cy: y, r: 6, fill: ACC, opacity: fade(u, 1.0) }); pill(x, y - 28, '420 ms', ACC, pop(u, 1.1), { mono: true, fs: 14 });
-      card(780, 140, 230, 60, { rx: 10, text: 'unit "s"\n0.42 → 420 ms', fs: 15, mono: true, stroke: ACC, color: ACC, s: pop(u, 0.3) }); sub(780, 210, '1초 미만은 ms 로 바꿔 쓴다', fade(u, 1.6), { 'font-size': 14.5 }); return; }
+      card(780, 140, 230, 60, { rx: 10, text: 'unit "s"\n0.42 → 420 ms', fs: 15, mono: true, stroke: ACC, color: ACC, s: pop(u, 0.3) }); sub(780, 210, '1초 미만은 ms로 바꿔 쓴다', fade(u, 1.6), { 'font-size': 14.5 }); return; }
     if (k === 3) { [['drawStyle', 'line'], ['lineWidth', '2'], ['fillOpacity', '10']].forEach(([a, v], i) => { card(780, 110 + i * 56, 230, 42, { rx: 8, stroke: ACC, s: pop(u, 0.3 + i * 0.35) });
         mono(680, 116 + i * 56, a, { 'font-size': 14.5, fill: MUT, opacity: fade(u, 0.4 + i * 0.35) }); mono(880, 116 + i * 56, v, { 'font-size': 15, 'font-weight': 800, fill: ACC, 'text-anchor': 'end', opacity: fade(u, 0.4 + i * 0.35) }); });
       sub(780, 300, '선 아래 10% 채움이 추세를 살린다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
@@ -108,7 +108,7 @@
       sub(560, 230, '배경색은 멀리서도, 뒤의 흐름은 가까이서', fade(u, 1.6), { 'font-size': 14.5, 'text-anchor': 'start' }); return; }
     if (k === 4) { [['decimals 0', '1K req/s', BAD], ['decimals 2', '1.24K req/s', GOOD]].forEach(([a, bb, col], i) => { const y = 130 + i * 80; card(700, y, 300, 58, { rx: 10, stroke: col, s: pop(u, 0.3 + i * 1.1) });
         mono(570, y + 6, a, { 'font-size': 15, fill: MUT, opacity: fade(u, 0.4 + i * 1.1) }); mono(830, y + 6, bb, { 'font-size': 17, 'font-weight': 800, fill: col, 'text-anchor': 'end', opacity: fade(u, 0.4 + i * 1.1) }); });
-      sub(700, 300, 'reqps 는 1000 을 넘으면 K 를 붙인다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(700, 300, 'reqps는 1000을 넘으면 K를 붙인다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k === 5) { const x0 = 520, W = 400, X = (v) => x0 + (v / 2500) * W, y = 160, g = E(u, 0.2, 1.0);
       el('rect', { x: x0, y, width: (X(2000) - x0) * g, height: 22, fill: GOOD, opacity: 0.85 }); el('rect', { x: X(2000), y, width: (X(2500) - X(2000)) * clamp(g * 2 - 1), height: 22, fill: BAD, opacity: 0.85 });
       [0, 1000, 2000, 2500].forEach((v) => mono(X(v), y + 44, String(v), { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 0.8) }));
@@ -122,12 +122,12 @@
   function s3(t, c) { const { k, u } = c, CX = 300, CY = 300, RR = 150;
     if (k === 0) { const f = E(u, 0.4, 1.5); mono(CX, 200, '67', { 'font-size': 60, 'font-weight': 800, 'text-anchor': 'middle', opacity: 1 - f });
       if (f > 0) gauge(CX, CY, RR, 67, { fillTo: 67 * f, needle: 67 * f });
-      sub(720, 160, 'stat 은 값, gauge 는 범위 안 위치', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(720, 160, 'stat은 값, gauge는 범위 안 위치', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     const marks = k >= 2 ? (k === 2 ? E(u, 0.3, 1.5) : 1) : 0, nd = k === 3 ? 67 * E(u, 0.4, 1.4) : 67;
     if (k === 5) { gauge(CX, CY, RR, 0, { needle: 96 });
       mono(CX - RR - 10, CY + 30, '?', { 'font-size': 26, 'font-weight': 800, fill: BAD, 'text-anchor': 'middle' }); mono(CX + RR + 10, CY + 30, '?', { 'font-size': 26, 'font-weight': 800, fill: BAD, 'text-anchor': 'middle' });
       mono(CX, CY + 56, '67%', { 'font-size': 34, 'font-weight': 800, 'text-anchor': 'middle' });
-      note(560, 150, 'min / max 가 없으면', fade(u, 0.4)); note(560, 186, '바늘 위치를 해석할 수 없다', fade(u, 0.9), { fill: BAD }); sub(700, 250, '눈금 없는 계기판', fade(u, 1.6), { 'font-size': 15 }); return; }
+      note(560, 150, 'min / max가 없으면', fade(u, 0.4)); note(560, 186, '바늘 위치를 해석할 수 없다', fade(u, 0.9), { fill: BAD }); sub(700, 250, '눈금 없는 계기판', fade(u, 1.6), { 'font-size': 15 }); return; }
     const P = gauge(CX, CY, RR, 67, { fillTo: nd, fillCol: GOOD, needle: nd, marks });
     mono(CX, CY + 56, Math.round(nd) + '%', { 'font-size': 34, 'font-weight': 800, 'text-anchor': 'middle', fill: GOOD, opacity: k === 1 ? fade(u, 1.0) : 1 });
     if (k === 1) { mono(560, 140, 'avg(rate(process_cpu_seconds_total[5m]))', { 'font-size': 14, opacity: fade(u, 0.3) }); mono(560, 166, '  * 100', { 'font-size': 15, 'font-weight': 800, fill: ACC, opacity: fade(u, 0.7) });
@@ -135,10 +135,10 @@
     if (k === 2) { mono(560, 140, 'showThresholdMarkers: true', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 0.3) }); mono(560, 170, 'showThresholdLabels: false', { 'font-size': 15, fill: MUT, opacity: fade(u, 0.7) });
       sub(560, 220, '바깥 띠만 보고도 위험 구간 거리가 읽힌다', fade(u, 1.6), { 'font-size': 14.5, 'text-anchor': 'start' }); return; }
     if (k === 3 || k === 4) { mono(CX - RR, CY + 30, '0', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle' }); mono(CX + RR, CY + 30, '100', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle' }); }
-    if (k === 3) { note(560, 150, 'min 0 · max 100 = 눈금', fade(u, 0.3)); sub(560, 196, '67 은 3분의 2 지점', fade(u, 1.5), { 'font-size': 15, 'text-anchor': 'start' }); return; }
+    if (k === 3) { note(560, 150, 'min 0 · max 100 = 눈금', fade(u, 0.3)); sub(560, 196, '67은 3분의 2 지점', fade(u, 1.5), { 'font-size': 15, 'text-anchor': 'start' }); return; }
     // k4: 70·90 경계
     [[70, '70', WARN], [90, '90', BAD]].forEach(([v, s0, col], i) => { const [x, y] = P(v, RR + 42); mono(x, y, s0, { 'font-size': 15, 'font-weight': 800, fill: col, 'text-anchor': 'middle', opacity: fade(u, 0.3 + i * 0.3) }); });
-    note(560, 150, '70 부터 노랑, 90 부터 빨강', fade(u, 0.5)); note(560, 196, '67 은 초록, 노랑 문턱 바로 아래', fade(u, 1.4), { fill: GOOD }); }
+    note(560, 150, '70부터 노랑, 90부터 빨강', fade(u, 0.5)); note(560, 196, '67은 초록, 노랑 문턱 바로 아래', fade(u, 1.4), { fill: GOOD }); }
 
   // ========== 4. Bar chart ==========
   const ALPHA = ['/cart', '/home', '/login', '/pay', '/search'];   // 정렬 전 순서(이름순)
@@ -165,7 +165,7 @@
       sub(780, 230, '긴 이름도 안 잘린다', fade(u, 1.6), { 'font-size': 14.5 }); return; }
     if (k === 4) { card(800, 160, 220, 60, { rx: 10, text: 'unit "s"\n0.42 → 420 ms', fs: 15, mono: true, stroke: ACC, color: ACC, s: pop(u, 0.3) }); sub(800, 230, '길이로 비교, 숫자로 확인', fade(u, 1.5), { 'font-size': 15 }); return; }
     // k5 정렬 + 파이 배제
-    sub(800, 110, 'Sort by 내림차순', fade(u, 0.3), { 'font-size': 15, fill: INK, 'font-weight': 700 }); sub(800, 140, '가장 느린 /pay 가 맨 위', fade(u, 1.6), { 'font-size': 14.5, fill: BAD });
+    sub(800, 110, 'Sort by 내림차순', fade(u, 0.3), { 'font-size': 15, fill: INK, 'font-weight': 700 }); sub(800, 140, '가장 느린 /pay가 맨 위', fade(u, 1.6), { 'font-size': 14.5, fill: BAD });
     const pc = [800, 260]; let a0 = -Math.PI / 2; const tot = CAT.reduce((s0, x) => s0 + x[1], 0);
     CAT.forEach(([, v], i) => { const a1 = a0 + (v / tot) * Math.PI * 2, r = 50; el('path', { d: `M${pc[0]},${pc[1]} L${pc[0] + r * Math.cos(a0)},${pc[1] + r * Math.sin(a0)} A${r},${r} 0 0 1 ${pc[0] + r * Math.cos(a1)},${pc[1] + r * Math.sin(a1)} Z`, fill: [BAD, WARN, ACC, INFO, GOOD][i], opacity: 0.5 * fade(u, 1.8), stroke: PANEL }); a0 = a1; });
     cross(pc[0], pc[1], 20, pop(u, 2.1)); sub(800, 340, '각도 비교는 어렵다', fade(u, 2.2), { 'font-size': 14.5 }); }
@@ -174,7 +174,7 @@
   function s5(t, c) { const { k, u } = c;
     const X0 = 60, CW = [150, 120, 110, 110], H = ['route', 'Value', 'p99', 'err%'], H2 = ['Endpoint', 'RPS', 'p99', 'err%'];
     const ncol = k <= 1 ? 2 : 4, ren = k >= 3 ? (k === 3 ? E(u, 0.4, 1.2) : 1) : 0;
-    if (k === 5) { [['여러 컬럼을 한 행씩', INK], ['transform 으로 합치고 정리', ACC], ['override 로 한 컬럼만 강조', BAD]].forEach(([s0, col], i) => { card(480, 110 + i * 90, 520, 66, { rx: 12, stroke: col, sw: 2.2, text: s0, fs: 18, color: col, s: pop(u, 0.3 + i * 0.5) }); });
+    if (k === 5) { [['여러 컬럼을 한 행씩', INK], ['transform으로 합치고 정리', ACC], ['override로 한 컬럼만 강조', BAD]].forEach(([s0, col], i) => { card(480, 110 + i * 90, 520, 66, { rx: 12, stroke: col, sw: 2.2, text: s0, fs: 18, color: col, s: pop(u, 0.3 + i * 0.5) }); });
       sub(480, 390, '숫자 하나로 못 줄이는 데이터: 로그·배포 목록·알림 이력', fade(u, 2.0), { 'font-size': 15 }); return; }
     let x = X0; H.forEach((h, j) => { if (j >= ncol) return; const show = j < 2 ? 1 : k === 2 ? E(u, 0.4 + (j - 2) * 0.4, 1.0 + (j - 2) * 0.4) : 1; const w = CW[j];
       if (show <= 0.02) { x += w; return; }
@@ -188,12 +188,12 @@
     if (k === 0) { sub(310, 380, '컬럼이 여러 개인 원시 데이터 (예시)', fade(u, 0.4), { 'font-size': 15 }); pill(RX + 150, 140, 'type: table', ACC, pop(u, 0.3), { mono: true, fs: 15 }); sub(RX + 150, 190, '차트로 뭉개면 사라지는 컬럼을 그대로', fade(u, 1.2), { 'font-size': 14.5 }); return; }
     if (k === 1) { mono(RX, 140, 'sum by (route) (rate(', { 'font-size': 14.5, opacity: fade(u, 0.2) }); mono(RX, 164, '  http_requests_total[1m]))', { 'font-size': 14.5, opacity: fade(u, 0.2) });
       mono(RX, 200, 'format table · instant', { 'font-size': 14.5, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.7) }); sub(RX + 150, 250, '엔드포인트마다 한 행', fade(u, 1.5), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
-    if (k === 2) { pill(RX + 150, 140, '{ "id": "merge" }', ACC, pop(u, 0.2), { mono: true, fs: 14.5 }); sub(RX + 150, 190, '다른 쿼리의 p99 · err% 가 옆에 붙는다', fade(u, 1.5), { 'font-size': 14.5 }); return; }
+    if (k === 2) { pill(RX + 150, 140, '{ "id": "merge" }', ACC, pop(u, 0.2), { mono: true, fs: 14.5 }); sub(RX + 150, 190, '다른 쿼리의 p99 · err%가 옆에 붙는다', fade(u, 1.5), { 'font-size': 14.5 }); return; }
     if (k === 3) { mono(RX, 150, 'route → Endpoint', { 'font-size': 16, 'font-weight': 700, fill: ACC, opacity: fade(u, 0.4) }); mono(RX, 184, 'Value → RPS', { 'font-size': 16, 'font-weight': 700, fill: ACC, opacity: fade(u, 0.8) });
       sub(RX + 150, 234, 'organize.renameByName', fade(u, 1.4), { class: 'mono', 'font-size': 14 }); return; }
     // k4
     mono(RX, 140, 'overrides: byName "err%"', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.2) }); mono(RX, 170, 'cellOptions color-background', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.6) });
-    sub(RX + 150, 220, '임계값 0.5 로 둔 예시', fade(u, 1.2), { 'font-size': 14.5 }); sub(RX + 150, 250, '/pay 0.8 이 표 안에서 튄다', fade(u, 1.8), { 'font-size': 15, fill: BAD, 'font-weight': 700 }); }
+    sub(RX + 150, 220, '임계값 0.5로 둔 예시', fade(u, 1.2), { 'font-size': 14.5 }); sub(RX + 150, 250, '/pay 0.8이 표 안에서 튄다', fade(u, 1.8), { 'font-size': 15, fill: BAD, 'font-weight': 700 }); }
 
   // ========== 6. Heatmap + 고르는 법 ==========
   const BKT = ['100 ms', '250 ms', '500 ms', '1 s'];   // 아래 → 위 (예시 버킷 경계)
@@ -221,7 +221,7 @@
       const RX = 700;
       if (k === 3) { el('rect', { x: RX - 20, y: 80, width: 260, height: 150, rx: 8, fill: PANEL, stroke: GRID }); spark(RX, 100, 220, 110, SERIES, 0, 0.5, E(u, 0.3, 1.5), ACC); sub(RX + 110, 260, '시간축이 있으면 이것부터', fade(u, 1.6), { 'font-size': 14.5 }); }
       if (k === 4) { card(RX + 10, 150, 120, 80, { rx: 8, text: '67', fs: 34, mono: true, s: pop(u, 0.3) }); gauge(RX + 170, 190, 50, 67, { fillTo: 67 * E(u, 0.8, 1.6), needle: 67 * E(u, 0.8, 1.6) });
-        sub(RX + 90, 260, '둘을 가르는 건 max 의 유무', fade(u, 1.6), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
+        sub(RX + 90, 260, '둘을 가르는 건 max의 유무', fade(u, 1.6), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
       if (k === 5) { CAT.slice(0, 4).forEach(([n, v], i) => el('rect', { x: RX - 20, y: 300 + i * 18 - 200, width: 200 * (v / 0.45) * E(u, 0.3 + i * 0.1, 0.9 + i * 0.1), height: 14, rx: 3, fill: ACC, opacity: 0.85 }));
         for (let r = 0; r < 4; r++) el('line', { x1: RX - 20, y1: 210 + r * 14, x2: RX + 200, y2: 210 + r * 14, stroke: INK, 'stroke-width': 1.5, opacity: fade(u, 1.0) });
         { let a0 = -Math.PI / 2; CAT.forEach(([, v], i) => { const a1 = a0 + (v / 1.36) * Math.PI * 2, r = 34, cx = RX + 220, cy = 300; el('path', { d: `M${cx},${cy} L${cx + r * Math.cos(a0)},${cy + r * Math.sin(a0)} A${r},${r} 0 0 1 ${cx + r * Math.cos(a1)},${cy + r * Math.sin(a1)} Z`, fill: [BAD, WARN, ACC, INFO, GOOD][i], opacity: 0.5 * fade(u, 1.2), stroke: PANEL }); a0 = a1; }); }

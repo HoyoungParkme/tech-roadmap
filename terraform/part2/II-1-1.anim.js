@@ -68,7 +68,7 @@
         [['azurerm ~> 3.0', 3, 4, 0], ['aws · google ~> 5.0', 5, 6, 1]].forEach(([s, a, b, i]) => { const g = E(u, 1.0 + i * 0.4, 1.8 + i * 0.4), y = y0 - 34 - i * 0;
           el('rect', { x: ax(a), y, width: (ax(b) - ax(a) - 6) * g, height: 20, rx: 5, fill: ACC, opacity: 0.8 });
           mono(ax(a), y - 8, s, { 'font-size': 13.5, 'font-weight': 700, fill: ACC, opacity: fade(u, 1.2 + i * 0.4) }); });
-        sub(260, y0 + 52, '~> 5.0 은 5.x 안에서만 올라간다 (6.0은 받지 않음)', fade(u, 2.0), { fill: INK, 'font-size': 14 }); }
+        sub(260, y0 + 52, '~> 5.0은 5.x 안에서만 올라간다 (6.0은 받지 않음)', fade(u, 2.0), { fill: INK, 'font-size': 14 }); }
       if (k === 3) { // provider 블록 = 접속 설정
         const cfg = ['region = "ap-northeast-2"', 'project = "my-gcp-project"', 'features {}'];
         cfg.forEach((s, i) => { const [px, py] = PG(i), a = pop(u, 0.4 + i * 0.35);
@@ -89,7 +89,7 @@
       else plug(160, y, n, null, { w: 150, h: 42 });
       key(260, y, pop(u, 1.0 + i * 0.2)); if (u > 1.0 + i * 0.2) grow(276, y, 640, y, E(u, 1.5 + i * 0.15, 2.1 + i * 0.15), INFO); });
     ['AWS', 'GCP', 'Azure'].forEach((n, i) => { const y = 150 + i * 78; cloudZone(660, y - 30, 250, 60, n + ' API', { op: fade(u, 1.4 + i * 0.15) }); });
-    sub(480, 400, '인증이 붙기 전에는 plan 도 API 를 부르지 못한다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); }
+    sub(480, 400, '인증이 붙기 전에는 plan도 API를 부르지 못한다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); }
 
   // ---------- 2. AWS 인증 탐색 순서 ----------
   const RUNG = [['① provider 블록 인자', 'access_key / secret_key'], ['② 환경변수', 'AWS_ACCESS_KEY_ID …'], ['③ ~/.aws/credentials', '[profile] 섹션'], ['④ 컨테이너 · 인스턴스 Role', '메타데이터가 임시 키 발급']];
@@ -111,7 +111,7 @@
       if (k === 1) mono(PV[0] - 118, PV[1] + 44, 'profile = "dev"', { 'font-size': 14, fill: ACC, 'font-weight': 700 });
       const ka = seg(u, stop + 0.2, stop + 1.0); if (ka > 0) { const kx = lerp(470, PV[0] - 150, E(ka, 0, 1)), ky = lerp(RY(f), PV[1], E(ka, 0, 1)); key(kx, ky, 1); }
       if (k === 0) { snippet(560, 230, ['$ export AWS_ACCESS_KEY_ID=AKIA…', '$ export AWS_SECRET_ACCESS_KEY=…', '$ export AWS_REGION=ap-northeast-2'], { fs: 13.5, op: fade(u, 1.6) });
-        sub(760, 360, 'CI 시크릿이 env 로 넣어 주는 방식', fade(u, 2.1), { fill: INK }); }
+        sub(760, 360, 'CI 시크릿이 env로 넣어 주는 방식', fade(u, 2.1), { fill: INK }); }
       if (k === 1) { el('rect', { x: 570, y: 190, width: 330, height: 180, rx: 10, fill: SOFT, stroke: GRID, 'stroke-width': 1.5, opacity: fade(u, 1.4) });
         mono(586, 216, '~/.aws/credentials', { 'font-size': 13.5, fill: MUT, 'font-weight': 700, opacity: fade(u, 1.4) });
         [['[default]', 0], ['aws_access_key_id = AKIA…', 0], ['[dev]', 1], ['aws_access_key_id = AKIA…', 1]].forEach(([s, d], i) => { const y = 248 + i * 30, hot = d === 1;
@@ -123,7 +123,7 @@
         sub(760, 392, '서버 안에 키 파일이 아예 없다', fade(u, 2.2), { fill: GOOD, 'font-weight': 700, 'font-size': 14.5 }); }
       return; }
     if (k === 3) { // assume_role
-      zone(40, 60, 380, 300, 'Terraform 을 돌리는 계정', { fill: SOFT });
+      zone(40, 60, 380, 300, 'Terraform을 돌리는 계정', { fill: SOFT });
       zone(540, 60, 380, 300, '대상 계정 123456789012', { fill: SOFT, stroke: INFO, color: INFO });
       key(140, 160, 1); tx(170, 166, '기본 자격증명', { 'font-size': 15, 'font-weight': 700 }); sub(230, 196, '(env · 파일 · Role 중 하나)');
       card(730, 170, 300, 56, { rx: 10, text: 'role/TerraformExec', fs: 15, mono: true, stroke: INFO, color: INFO, s: pop(u, 0.3) });
@@ -173,7 +173,7 @@
       const d = seg(u, 1.2, 1.9); if (d > 0) fileIc(lerp(300, 520, E(d, 0, 1)), 210, d >= 1 ? 'ADC 파일' : null, { tag: '{ }', col: INFO });
       mono(330, 310, '~/.config/gcloud/application_default_credentials.json', { 'font-size': 13.5, fill: INFO, opacity: fade(u, 1.8) });
       grow(542, 210, GP[0] - 140, GP[1], E(u, 1.9, 2.4), INFO, { dash: '6 5' });
-      sub(480, 380, '내 계정 권한으로 돈다: 혼자 실습에는 편하고 CI 에는 쓰지 않는다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(480, 380, '내 계정 권한으로 돈다: 혼자 실습에는 편하고 CI에는 쓰지 않는다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
     if (k === 4) { el('rect', { x: 470, y: 80, width: 460, height: 270, rx: 14, fill: SOFT, stroke: INK, 'stroke-width': 2 });
       tx(486, 106, 'GCE · GKE · Cloud Run 인스턴스', { 'font-size': 14.5, 'font-weight': 700 });
       plug(720, 230, 'provider "google"', null, { w: 240 });
@@ -202,7 +202,7 @@
       ['$ az login', '$ az account set --subscription <ID>', '$ az account show'].forEach((s, i) => mono(150, 170 + i * 30, s, { 'font-size': 14, 'font-weight': i === 0 ? 800 : 400, opacity: fade(u, 0.3 + i * 0.35) }));
       card(330, 320, 200, 50, { rx: 10, text: 'az CLI 세션', fs: 15, stroke: INFO, color: INFO, s: pop(u, 1.4) });
       grow(430, 320, AZ[0] - 60, AZ[1] + 36, E(u, 1.7, 2.3), INFO);
-      sub(700, 300, 'provider 가 세션을 그대로 쓴다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(700, 300, 'provider가 세션을 그대로 쓴다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); return; }
     if (k === 1) { mono(40, 56, '$ az ad sp create-for-rbac --name "terraform-sp" \\', { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.1) });
       mono(40, 80, '      --role "Contributor" --scopes "/subscriptions/<SUB_ID>"', { 'font-size': 14, opacity: fade(u, 0.3) });
       const g = R.G(200, 220, pop(u, 0.6)); el('rect', { x: -26, y: -26, width: 52, height: 44, rx: 8, fill: PANEL, stroke: INK, 'stroke-width': 2.5 }, g);
@@ -219,7 +219,7 @@
         mono(54, y + 5, n, { 'font-size': 14.5, 'font-weight': 700, fill: a >= 1 ? ACC : INK });
         if (a > 0) fly(470, y, 320, y, a, v, { mono: true, fill: WARN, stay: true }); });
       [0, 1, 2, 3].forEach((i) => grow(310, 120 + i * 66, AZ[0] - 160, AZ[1] + 20, E(u, 2.0, 2.5), ACC, { plain: i > 0, op: 0.7 }));
-      sub(700, 300, '네 값이 env 에 있으면 provider 는 features {} 만으로 인증된다', fade(u, 2.3), { fill: INK, 'font-size': 14 }); return; }
+      sub(700, 300, '네 값이 env에 있으면 provider는 features {} 만으로 인증된다', fade(u, 2.3), { fill: INK, 'font-size': 14 }); return; }
     if (k === 3) { el('rect', { x: 430, y: 60, width: 490, height: 300, rx: 14, fill: SOFT, stroke: INK, 'stroke-width': 2 });
       tx(446, 86, 'Azure VM · App Service · AKS', { 'font-size': 14.5, 'font-weight': 700 });
       snippet(500, 120, ['provider "azurerm" {', '  features {}', '  use_msi = true', '}'], { fs: 14.5, w: 330 });
@@ -242,7 +242,7 @@
     card(790, 120, 230, 60, { rx: 10, text: 'soft-delete 보관\n(복구 가능 기간)', fs: 13.5, stroke: WARN, color: WARN, s: pop(u, 1.2) });
     card(790, 320, 230, 52, { rx: 10, text: '영구 삭제 (purge)', fs: 14.5, stroke: BAD, color: BAD, s: pop(u, 1.6) });
     grow(720, 220, 760, 152, E(u, 1.2, 1.6), WARN); grow(790, 152, 790, 292, E(u, 1.8, 2.3), BAD);
-    sub(600, 392, 'features 는 리소스별 동작 스위치다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); }
+    sub(600, 392, 'features는 리소스별 동작 스위치다', fade(u, 2.2), { fill: INK, 'font-size': 14.5 }); }
 
   // ---------- 5. 멀티 provider ----------
   const MP = [['aws', 'ap-northeast-2 (default)', 100, ACC], ['aws.tokyo', 'ap-northeast-1 (alias)', 180, ACC], ['google', 'asia-northeast3', 260, INFO], ['azurerm', 'features {}', 340, WARN]];
@@ -261,7 +261,7 @@
       plug(150, y, n, s2, { w: 230, col, s: fresh ? pop(u, 0.2 + (i - 2 >= 0 && k === 3 ? (i - 2) * 0.3 : 0)) : 1 });
       const [zn, zy] = ZN[i]; cloudZone(700, zy - 30, 230, 60, zn, { op: fresh ? fade(u, 0.6) : 1, stroke: col, fill: SOFT });
       if (k <= 3) grow(268, y, 690, zy, fresh ? E(u, 0.8, 1.5) : 1, col, { dash: '5 5', op: 0.7 }); });
-    if (k === 2) sub(480, 400, '같은 계정 · 다른 리전에 alias 로 이름을 붙인다', fade(u, 1.8), { fill: INK, 'font-size': 15 });
+    if (k === 2) sub(480, 400, '같은 계정 · 다른 리전에 alias로 이름을 붙인다', fade(u, 1.8), { fill: INK, 'font-size': 15 });
     if (k === 3) sub(480, 400, '클라우드가 늘어도 provider 블록만 늘어난다', fade(u, 1.8), { fill: INK, 'font-size': 15 });
     if (k >= 4) { const shown = k === 4 ? 2 : 4;
       RES.slice(0, shown).forEach(([addr, pi, ic], i) => { const y = MP[pi][2], fresh = (k === 4) || (k === 5 && i >= 2), a = fresh ? seg(u, 0.3 + (i % 2) * 0.5, 1.0 + (i % 2) * 0.5) : 1;
@@ -270,7 +270,7 @@
         grow(268, y, 690, y, a, col); });
       if (k === 4) { mono(480, 222, 'provider = aws.tokyo', { 'font-size': 14, 'text-anchor': 'middle', fill: ACC, 'font-weight': 800, opacity: fade(u, 1.4) });
         mono(480, 128, '(provider 생략 → default)', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.0) }); }
-      if (k === 5) sub(480, 400, '타입 접두사 aws_ · google_ · azurerm_ 이 소속 provider 를 말해 준다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 });
+      if (k === 5) sub(480, 400, '타입 접두사 aws_ · google_ · azurerm_이 소속 provider를 말해 준다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 });
       if (k === 6) { RES.forEach(([a, pi, ic], i) => { const y = MP[pi][2], ap = seg(u, 0.8, 1.8);
           dot([[268, y], [690, y]], ap, MP[pi][3], 6); if (ap >= 1) (ic === 'b' ? bucket : (x, yy, s) => card(x, yy, 34, 26, { rx: 4, stroke: MP[pi][3], s }))(890, y + 4, pop(u, 1.8), MP[pi][3]); });
         card(480, 22, 360, 32, { rx: 16, text: 'Plan: 4 to add, 0 to change, 0 to destroy.', fs: 13.5, mono: true, fill: PANEL, stroke: GOOD, color: GOOD, s: pop(u, 0.3) });
@@ -281,8 +281,8 @@
     { q: 'required_providers 블록과 provider 블록이 맡는 일은 각각 무엇인가?',
       o: ['둘 다 인증 정보를 적는 곳이다', 'required_providers는 받을 플러그인과 버전, provider 블록은 리전·계정 같은 접속 설정이다', 'required_providers는 리소스 목록, provider 블록은 플러그인 다운로드 주소다'], a: 1,
       why: 'init은 required_providers의 source와 version을 보고 플러그인을 받는다. region이나 project처럼 어떻게 접속할지는 provider 블록에 적는다.' },
-    { q: 'AWS_ACCESS_KEY_ID 환경변수가 비어 있고 ~/.aws/credentials 에 [dev] 프로파일이 있다. provider에 profile = "dev"를 적으면 어디서 키를 얻나?',
-      o: ['~/.aws/credentials 의 [dev] 섹션', 'EC2 메타데이터 서비스', 'provider 블록의 access_key'], a: 0,
+    { q: 'AWS_ACCESS_KEY_ID 환경변수가 비어 있고 ~/.aws/credentials에 [dev] 프로파일이 있다. provider에 profile = "dev"를 적으면 어디서 키를 얻나?',
+      o: ['~/.aws/credentials의 [dev] 섹션', 'EC2 메타데이터 서비스', 'provider 블록의 access_key'], a: 0,
       why: '탐색 순서에서 환경변수 칸이 비어 있으므로 다음 칸인 공유 자격증명 파일로 내려가고, profile 이름으로 [dev] 섹션을 고른다.' },
     { q: 'GCP 인증에서 가장 권장되는 방식은 무엇인가?',
       o: ['provider 블록에 credentials = file("…json")을 적는다', 'JSON 키를 저장소에 함께 커밋한다', 'GOOGLE_APPLICATION_CREDENTIALS 환경변수에 키 파일 경로를 준다'], a: 2,
@@ -306,7 +306,7 @@
       o: ['provider "aws" 블록에 access_key를 적어 커밋한다', 'CI 시크릿을 AWS_ACCESS_KEY_ID 같은 환경변수로 넣는다', '~/.aws/credentials 파일을 저장소에 함께 올린다'], a: 1,
       why: '환경변수는 탐색 순서 두 번째 칸이라 provider 블록에는 region만 남는다. 키가 코드나 저장소에 남지 않는다.' },
     { q: '팀원 PC마다 plan이 "파일을 찾을 수 없다"며 실패한다. provider "google" 블록에서 먼저 의심할 것은?',
-      o: ['required_providers의 version', 'project 이름의 오타', 'credentials = file("~/.gcp/…") 처럼 박아 둔 경로'], a: 2,
+      o: ['required_providers의 version', 'project 이름의 오타', 'credentials = file("~/.gcp/…")처럼 박아 둔 경로'], a: 2,
       why: '경로가 코드에 있으면 사람마다 파일 위치가 달라 깨진다. 경로는 GOOGLE_APPLICATION_CREDENTIALS로 각자 주는 편이 낫다.' },
     { q: 'init을 다시 했더니 aws provider가 6.0으로 올라가지 않았다. 이유로 맞는 것은?',
       o: ['version = "~> 5.0"이라 5.x 안에서만 고르기 때문이다', '레지스트리에 6.0이 없기 때문이다', 'provider 블록에 region이 있어서다'], a: 0,

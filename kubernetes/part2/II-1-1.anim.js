@@ -168,7 +168,7 @@
       o: ['Deployment·ReplicaSet·Pod 세 종류', 'Deployment 한 종류', 'Pod 한 종류'], a: 1,
       why: '사용자는 Deployment 파일 하나만 apply한다. ReplicaSet과 Pod 3개는 컨트롤러가 연쇄로 만든다.' },
     { q: 'Pod 하나를 kubectl delete pod로 지운 뒤 새 Pod가 뜨는 이유는 무엇인가?',
-      o: ['kubelet이 같은 컨테이너를 다시 시작해서', 'ReplicaSet이 desired 3과 actual 2의 차이를 보고 template대로 하나를 만들어서', 'Deployment 파일이 자동으로 다시 apply되어서'], a: 1,
+      o: ['kubelet이 같은 컨테이너를 다시 시작해서', 'Deployment 파일이 자동으로 다시 apply되어서', 'ReplicaSet이 desired 3과 actual 2의 차이를 보고 template대로 하나를 만들어서'], a: 2,
       why: '조정 루프는 세고, 비교하고, 모자라면 만든다. actual이 2로 떨어지자 새 Pod bb4가 생겼다.' },
     { q: 'replicas를 3에서 5로 올리면 기존 Pod 3개는 어떻게 되는가?',
       o: ['그대로 두고 2개만 새로 만든다', '모두 지우고 5개를 새로 만든다', '재시작한 뒤 2개를 더한다'], a: 0,

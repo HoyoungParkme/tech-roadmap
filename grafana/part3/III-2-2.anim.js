@@ -1,5 +1,5 @@
 /* III-2-2 Silence & Mute — 장면 5개 (../../anim/engine.js 규칙을 따른다)
- * 알람 목록·억제 여부는 페이지 STEPS 의 alerts(name · labels · muted · reason) 를 읽는다. */
+ * 알람 목록·억제 여부는 페이지 STEPS의 alerts(name · labels · muted · reason)를 읽는다. */
 (function () {
   const R = window.RA, { C, el, tx, E, lerp, clamp, seg, pop, fade, tw, card, mono, sub, lbl, pill, banner, grow, fly, dot, zone, cross, check, clock, terminal } = R;
   const { INK, MUT, OFF, GRID, SOFT, PANEL, ACC, ACCBG, BAD, BADBG, GOOD, GOODBG, WARN, WARNBG, INFO, INFOBG } = C;
@@ -39,11 +39,11 @@
     if (k === 1) sub(640, 320, '묶어도 통지 자체는 막지 못한다', fade(u, 1.4), { 'font-size': 15 });
     if (k === 2) { el('rect', { x: 543, y: 38, width: 94, height: 64, rx: 12, fill: 'none', stroke: BAD, 'stroke-width': 2.6, opacity: fade(u, 0.3) });
       tx(590, 128, '비어 있음', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.5) });
-      tx(560, 300, 'firing 은 전부 그대로 나간다', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 1.0) });
-      tx(560, 330, 'mute timing 은 루트가 아닌 자식 경로에만', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.6) }); }
+      tx(560, 300, 'firing은 전부 그대로 나간다', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 1.0) });
+      tx(560, 330, 'mute timing은 루트가 아닌 자식 경로에만', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.6) }); }
     if (k === 4) { dot([[90, 100], [250, 100], [410, 100], [590, 100], [720, 100]], seg(u, 0.2, 2.0), BAD, 8);
       const m = E(u, 1.9, 2.3); if (m > 0) { card(820, 80, 190, 30, { rx: 6, text: 'HighCPU firing', fs: 13.5, stroke: BAD, color: BAD, s: m }); }
-      card(800, 360, 260, 40, { rx: 8, text: '해소되면 resolved 도 한 번 더', fs: 14.5, stroke: GOOD, color: GOOD, s: pop(u, 2.3) }); }
+      card(800, 360, 260, 40, { rx: 8, text: '해소되면 resolved도 한 번 더', fs: 14.5, stroke: GOOD, color: GOOD, s: pop(u, 2.3) }); }
     if (k === 5) { const n = Math.floor(E(u, 0.2, 2.0) * 9); for (let i = 0; i < n; i++) { const real = i === 6;
         card(820, 150 + i * 28, 210, 24, { rx: 5, text: real ? 'DiskFull firing' : '배포 중 firing', fs: 13.5, stroke: real ? BAD : GRID, color: real ? BAD : MUT, fill: real ? BADBG : PANEL }); }
       tx(600, 330, '점검 소음 사이에', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) }); tx(600, 356, '진짜 알람이 묻힌다', { 'font-size': 15, 'font-weight': 800, fill: BAD, opacity: fade(u, 2.0) }); } }
@@ -65,7 +65,7 @@
     if (k >= 2) { mono(40, 210, 'startsAt  14:00Z', { 'font-size': 14, opacity: k === 2 ? fade(u, 0.3) : 1 }); mono(40, 234, 'endsAt    16:00Z', { 'font-size': 14, 'font-weight': 800, opacity: k === 2 ? fade(u, 0.6) : 1 }); }
     if (k >= 3) { mono(40, 262, 'createdBy oncall@corp.io', { 'font-size': 13.5, opacity: k === 3 ? fade(u, 0.3) : 1 }); mono(40, 284, 'comment   DB 마이그레이션 · JIRA-1234', { 'font-size': 13.5, opacity: k === 3 ? fade(u, 0.6) : 1 }); }
     const RX = 430;
-    if (k === 0) { sub(680, 200, 'Silence 는 API 로 만드는 임시 규칙', fade(u, 0.9), { 'font-size': 15 }); return; }
+    if (k === 0) { sub(680, 200, 'Silence는 API로 만드는 임시 규칙', fade(u, 0.9), { 'font-size': 15 }); return; }
     if (k === 1) { alertRow(RX, 110, { name: 'HighCPU', labels: 'team=platform', muted: false }, { w: 480, bell: false });
       [['alertname ✓', 0.9], ['team ✓', 1.3]].forEach(([s, a], i) => tagL(RX + 40 + i * 150, 170, s, GOOD, { fs: 14, s: pop(u, a) }));
       sub(670, 230, '두 매처가 모두 맞아야 대상 (AND)', fade(u, 1.8), { 'font-size': 15 }); return; }
@@ -97,7 +97,7 @@
     mono(30 + BW, 296, days > 1 ? Math.round(days) + '일' : '2시간', { 'font-size': 15, 'font-weight': 800, 'text-anchor': 'end', fill: days > 1 ? BAD : INFO });
     if (k === 1) { card(175, 345, 300, 44, { rx: 8, fill: WARNBG, stroke: WARN, sw: 2, text: 'comment: "그냥 시끄러워서"', fs: 14, s: pop(u, 0.8) }); }
     // 오른쪽: 알람 목록 + 그물
-    if (k === 5) { ['alertname 은 거의 항상 넣는다', 'instance · pod 로 범위를 좁힌다', 'isRegex 는 신중히', '기간은 작업 시간 + 버퍼'].forEach((s, i) => { check(RX + 16, 70 + i * 56, 10, pop(u, 0.2 + i * 0.3)); tx(RX + 40, 76 + i * 56, s, { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.3) }); });
+    if (k === 5) { ['alertname은 거의 항상 넣는다', 'instance · pod로 범위를 좁힌다', 'isRegex는 신중히', '기간은 작업 시간 + 버퍼'].forEach((s, i) => { check(RX + 16, 70 + i * 56, 10, pop(u, 0.2 + i * 0.3)); tx(RX + 40, 76 + i * 56, s, { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.3) }); });
       mono(RX + 16, 320, 'team=~".*"', { 'font-size': 16, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.6) }); cross(RX + 150, 314, 10, pop(u, 1.8)); tx(RX + 175, 320, '= 전부 끄기', { 'font-size': 15, fill: BAD, 'font-weight': 700, opacity: fade(u, 1.9) }); return; }
     al.forEach((a, i) => { const y = 70 + i * 70, s = k === 0 ? pop(u, 0.4 + i * 0.3) : 1; alertRow(RX, y, a, { w: 470, op: s, hot: !a.muted || (k === 2 && i > 0), hotCol: a.muted ? BAD : GOOD }); });
     const top = mY[0] - 32, bot = (narrow ? 70 : 70 + 70 * (al.length - 1)) + 32;
@@ -117,12 +117,12 @@
     [0, 6, 12, 18, 24].forEach((h) => mono(GX + h * CW, GY - 10, String(h).padStart(2, '0'), { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' })); }
   function s4(t, c) { const { k, u } = c, RX = 560;
     const mk = (r, h) => (k >= 1 && wkend(r) ? WARN : null) || (k >= 2 && night(r, h) && (k > 2 || E(u, 0.9, 1.6) > 0.5) ? INFO : null);
-    // UTC 로 해석하면: 22–08 UTC = 한국 07–17 시
+    // UTC로 해석하면: 22–08 UTC = 한국 07–17 시
     const ghost = k === 3 ? (r, h) => r === 0 && h >= 7 && h < 17 && fade(u, 1.0) > 0.5 : null;
     week(k === 0 ? E(u, 0.2, 2.0) : 1, mk, ghost);
     if (k === 0) { mono(RX, 60, 'muteTimes:', { 'font-size': 15, 'font-weight': 800, opacity: fade(u, 0.3) }); tagL(RX, 100, 'weekends-and-nights', INFO, { mono: true, s: pop(u, 0.8) });
-      sub(750, 180, 'Silence 와 달리 설정 파일에 남는다', fade(u, 1.6), { 'font-size': 15 }); return; }
-    if (k === 1) { mono(RX, 70, '- weekdays: [saturday, sunday]', { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.3) }); sub(750, 130, 'times 를 빼면 그날 전체', fade(u, 1.0), { 'font-size': 15 }); return; }
+      sub(750, 180, 'Silence와 달리 설정 파일에 남는다', fade(u, 1.6), { 'font-size': 15 }); return; }
+    if (k === 1) { mono(RX, 70, '- weekdays: [saturday, sunday]', { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.3) }); sub(750, 130, 'times를 빼면 그날 전체', fade(u, 1.0), { 'font-size': 15 }); return; }
     if (k === 2) { const x0 = RX, w = 360, H = (h) => x0 + (w * (h - 18)) / 16, g = E(u, 0.2, 0.9), sp = E(u, 0.9, 1.5);
       tx(x0, 70, '평일 22:00 → 다음 날 08:00', { 'font-size': 15, 'font-weight': 700 });
       el('rect', { x: H(22) - sp * 6, y: 90, width: (H(24) - H(22)) * g, height: 26, rx: 5, fill: INFO, opacity: 0.85 }); el('rect', { x: H(24) + sp * 6, y: 90, width: (H(32) - H(24)) * clamp(g * 2 - 1), height: 26, rx: 5, fill: INFO, opacity: 0.85 });
@@ -130,7 +130,7 @@
       mono(x0, 180, '22:00–24:00', { 'font-size': 15, 'font-weight': 800, fill: INFO, opacity: fade(u, 1.4) }); mono(x0 + 160, 180, '00:00–08:00', { 'font-size': 15, 'font-weight': 800, fill: INFO, opacity: fade(u, 1.6) });
       sub(750, 230, '자정을 넘는 구간은 두 개로 쪼갠다', fade(u, 2.0), { 'font-size': 15 }); return; }
     if (k === 3) { mono(RX, 70, 'location: Asia/Seoul', { 'font-size': 15, 'font-weight': 800, fill: GOOD, opacity: fade(u, 0.3) });
-      tx(RX, 120, '빼면 UTC 로 계산된다', { 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.0) });
+      tx(RX, 120, '빼면 UTC로 계산된다', { 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.0) });
       tx(RX, 146, '22–08 UTC = 한국 07–17시', { 'font-size': 15, fill: BAD, opacity: fade(u, 1.3) }); tx(RX, 172, '→ 월요일 낮에 알림이 꺼진다', { 'font-size': 15, fill: BAD, opacity: fade(u, 1.6) }); return; }
     // 정책 연결
     mono(RX, 50, 'policies:', { 'font-size': 14, fill: MUT, 'font-weight': 700 });
@@ -144,7 +144,7 @@
       bell(RX + 360, 210, pop(u, 0.8), MUT, true); tx(RX + 330, 216, 'HighLatency', { 'font-size': 14, 'text-anchor': 'end', fill: MUT, opacity: fade(u, 0.8) });
       bell(RX + 360, 360, 1 + R.bump(u, 1.4), BAD); tx(RX + 330, 366, 'ServiceDown', { 'font-size': 14, 'text-anchor': 'end', fill: BAD, 'font-weight': 700, opacity: fade(u, 1.4) }); }
     if (k === 6) { el('rect', { x: RX - 10, y: 200, width: 390, height: 200, rx: 10, fill: PANEL });
-      [['critical 까지 mute → 야간 장애 놓침', 0.2], ['location 누락 → 9시간 어긋남', 0.6], ['end_time "24:00" = 자정', 1.0]].forEach(([s, a], i) => { const y = 230 + i * 54; (i < 2 ? cross : check)(RX + 10, y, 9, pop(u, a)); tx(RX + 32, y + 6, s, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, a + 0.1) }); }); } }
+      [['critical까지 mute → 야간 장애 놓침', 0.2], ['location 누락 → 9시간 어긋남', 0.6], ['end_time "24:00" = 자정', 1.0]].forEach(([s, a], i) => { const y = 230 + i * 54; (i < 2 ? cross : check)(RX + 10, y, 9, pop(u, a)); tx(RX + 32, y + 6, s, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, a + 0.1) }); }); } }
 
   // ---------- 5. 만료 관리 ----------
   function s5(t, c) { const { k, u } = c;
@@ -161,7 +161,7 @@
       if (k === 2) tx(645, 250, '주기적으로 목록을 본다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 1.4) });
       return; }
     if (k === 3) { tx(480, 46, '운영 체크리스트', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800 });
-      ['모든 silence 에 endsAt (무기한 금지)', 'comment 에 사유 + 티켓 번호', '점검 끝나면 즉시 expire', 'mute timing 은 warning 급만', 'location(TZ) 명시 · end_time 경계 확인'].forEach((s, i) => { const y = 96 + i * 58; card(480, y, 560, 46, { rx: 23, stroke: GOOD, sw: 2, s: pop(u, 0.2 + i * 0.3) }); check(230, y, 9, pop(u, 0.3 + i * 0.3)); tx(256, y + 6, s, { 'font-size': 15.5, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.3) }); }); return; }
+      ['모든 silence에 endsAt (무기한 금지)', 'comment에 사유 + 티켓 번호', '점검 끝나면 즉시 expire', 'mute timing은 warning 급만', 'location(TZ) 명시 · end_time 경계 확인'].forEach((s, i) => { const y = 96 + i * 58; card(480, y, 560, 46, { rx: 23, stroke: GOOD, sw: 2, s: pop(u, 0.2 + i * 0.3) }); check(230, y, 9, pop(u, 0.3 + i * 0.3)); tx(256, y + 6, s, { 'font-size': 15.5, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.3) }); }); return; }
     // k4: 비교
     const rows = c.beat.summary ? c.beat.summary.rows : [];
     tx(330, 46, 'Silence', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800, fill: INFO }); tx(680, 46, 'Mute Timing', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800, fill: WARN });

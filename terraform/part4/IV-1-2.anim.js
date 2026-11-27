@@ -38,19 +38,19 @@
     if (k === 1) { grow(190, 180, 190, 236, E(u, 0.1, 0.5), MUT);
       const sp = E(u, 0.7, 1.7); ['dev', 'staging', 'prod'].forEach((e, i) => stateDoc(lerp(190, 120 + i * 140, sp), 290, sp > 0.9 ? e : null, { op: i === 1 ? 1 : clamp(sp * 3) }));
       tx(520, 120, '코드는 공유한다', { 'font-size': 17, 'font-weight': 800, opacity: fade(u, 0.3) });
-      tx(520, 290, 'state 만 workspace 마다 나눈다', { 'font-size': 17, 'font-weight': 800, fill: INFO, opacity: fade(u, 1.6) });
+      tx(520, 290, 'state만 workspace마다 나눈다', { 'font-size': 17, 'font-weight': 800, fill: INFO, opacity: fade(u, 1.6) });
       tx(520, 320, '전환하면 다른 디렉토리에서 실행하는 것처럼 동작', { 'font-size': 14, fill: MUT, opacity: fade(u, 2.1) });
       return; }
-    if (k === 2) { zone(400, 40, 530, 240, 'local backend 의 저장 위치', { fill: SOFT });
+    if (k === 2) { zone(400, 40, 530, 240, 'local backend의 저장 위치', { fill: SOFT });
       const L = ['terraform.tfstate.d/', '├── dev/terraform.tfstate', '├── staging/terraform.tfstate', '└── prod/terraform.tfstate'];
       L.forEach((l, i) => { const s = seg(u, 0.2 + i * 0.4, 0.6 + i * 0.4); mono(424, 96 + i * 40, l.slice(0, Math.round(l.length * s)), { 'font-size': 15, fill: i ? INK : INFO, 'font-weight': i ? 500 : 800 }); });
-      tx(424, 262, '아직 workspace 를 만들기 전 · 예시', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.0) });
+      tx(424, 262, '아직 workspace를 만들기 전 · 예시', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.0) });
       ['dev', 'staging', 'prod'].forEach((e, i) => stateDoc(120 + i * 110, 300, e, { s: 0.75, op: 0.35 }));
       return; }
     if (k === 3) { slot(420, 70, 500, 'default', 'terraform.tfstate', { on: true, op: fade(u, 0.2) }); star(400, 108, fade(u, 0.6));
       stateDoc(190, 300, 'terraform.tfstate', { s: pop(u, 0.4) });
-      tx(420, 170, 'default 는 처음부터 있다', { 'font-size': 17, 'font-weight': 800, opacity: fade(u, 1.0) });
-      tx(420, 200, '다른 workspace 를 만들기 전까지 늘 활성이고, 지울 수 없다', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.6) });
+      tx(420, 170, 'default는 처음부터 있다', { 'font-size': 17, 'font-weight': 800, opacity: fade(u, 1.0) });
+      tx(420, 200, '다른 workspace를 만들기 전까지 늘 활성이고, 지울 수 없다', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.6) });
       return; }
     // k = 4: workspace 와 디렉토리 분리 비교
     const side = (x0, title, codes, s) => { tx(x0 + 200, 50, title, { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle', opacity: clamp(s * 2) });
@@ -80,7 +80,7 @@
       slot(500, y, 440, n, pathOf(n), { on: ACT[k] === i, op: gone ? 1 - 0.7 * fade(u, 1.6) : op, gone: gone && u > 1.6 }); });
     const yA = (i) => 50 + i * 76 + 34, py = tween(c.prev ? yA(ACT[k - 1]) : null, yA(ACT[k]), u, 0.8);
     star(484, py + 4);
-    if (k === 3) tx(720, 360, 'list 는 default 다음에 이름순으로 찍는다', { 'font-size': 14, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
+    if (k === 3) tx(720, 360, 'list는 default 다음에 이름순으로 찍는다', { 'font-size': 14, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
     if (k === 5) { [['지금 활성인 workspace', 0], ['리소스가 남은 workspace (-force 없이)', 1]].forEach(([s, i]) => { const y = 358 + i * 30;
         cross(512, y - 5, 8, pop(u, 1.8 + i * 0.3)); tx(530, y, s + ' 는 못 지운다', { 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.8 + i * 0.3) }); }); } }
 
@@ -110,7 +110,7 @@
         mono(tx0 + 8, y + 24, e, { 'font-size': 14.5, 'font-weight': 700, opacity: fa(c, 1, 0.2 + i * 0.2) });
         mono(tx0 + 130, y + 24, '"' + ty + '"', { 'font-size': 14.5, fill: hi ? ACC : INK, opacity: fa(c, 1, 0.5 + i * 0.3) }); }
       if (k >= 2) mono(tx0 + 280, y + 24, String(n), { 'font-size': 16, 'font-weight': 800, fill: hi ? ACC : INK, opacity: fa(c, 2, 0.4 + i * 0.3) }); });
-    if (k === 2) tx(tx0, 352, 'prod 만 4대', { 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.8) });
+    if (k === 2) tx(tx0, 352, 'prod만 4대', { 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.8) });
     // 오른쪽: 실제로 생기는 인스턴스
     if (k >= 3) { const s = k === 3 ? E(u, 0.8, 1.8) : 1; grow(470, 260, 560, 200, k === 3 ? E(u, 0.3, 0.8) : 1, ACC);
       for (let i = 0; i < 2; i++) server(640 + i * 150, 170, null, { s: 0.55 * clamp(s * 2 - i), lamp: ACC });
@@ -133,7 +133,7 @@
         el('line', { x1: 376, y1: 105, x2: lerp(376, 740, E(u, 1.0, 1.6)), y2: 105, stroke: BAD, 'stroke-width': 2.4 });
         mono(376, 150, 'instance_type = var.instance_type', { 'font-size': 14, fill: ACC, opacity: fade(u, 1.7) });
         mono(376, 176, 'count         = var.instance_count', { 'font-size': 14, fill: ACC, opacity: fade(u, 1.9) });
-        tx(640, 270, '환경이 늘어도 main.tf 는 그대로', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.2) });
+        tx(640, 270, '환경이 늘어도 main.tf는 그대로', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.2) });
         return; }
       // 변수 선언과 값 칸
       tx(360, 52, 'variables.tf — 선언만', { 'font-size': 15, 'font-weight': 800 });
@@ -147,8 +147,8 @@
           const s = kk === k ? seg(u, 0.3 + i * 0.4, 0.9 + i * 0.4) : 1;
           if (kk === k && s < 1) fly(x + 60, 30, x + 60, y + 24, s, VAL[e][i], { mono: true, fill: col });
           else pill(x + 60, y + 24, VAL[e][i], col, kk === k ? pop(u, 0.9 + i * 0.4) : 1, { mono: true, fs: 13.5 }); }); });
-      if (k === 1) tx(360, 330, '값이 없으면 apply 가 값을 묻고, 입력이 없는 CI 에서는 실패한다', { 'font-size': 14.5, fill: BAD, 'font-weight': 700, opacity: fade(u, 1.8) });
-      if (k >= 2) tx(360, 330, 'staging.tfvars 도 같은 변수 이름에 값만 다르다', { 'font-size': 14.5, fill: MUT, opacity: fa(c, 2, 2.0) });
+      if (k === 1) tx(360, 330, '값이 없으면 apply가 값을 묻고, 입력이 없는 CI에서는 실패한다', { 'font-size': 14.5, fill: BAD, 'font-weight': 700, opacity: fade(u, 1.8) });
+      if (k >= 2) tx(360, 330, 'staging.tfvars도 같은 변수 이름에 값만 다르다', { 'font-size': 14.5, fill: MUT, opacity: fa(c, 2, 2.0) });
       return; }
     if (k === 4) { // state 선택과 값 선택이 짝이 맞아야 한다
       const row = (y, ws, vf, ok, s) => { card(150, y, 220, 50, { rx: 9, text: 'select ' + ws, fs: 15, mono: true, fw: 800, stroke: INFO, color: INFO, s });
@@ -159,7 +159,7 @@
       row(240, 'prod', 'envs/dev.tfvars', false, pop(u, 1.0)); cross(620, 240, 14, pop(u, 1.4));
       card(800, 240, 240 * 0.9, 120, { rx: 10, stroke: BAD, sw: 2, fill: BADBG, s: pop(u, 1.6) });
       ['prod state (4 × m5.large)', '+ dev 값 (1 × t3.micro)', '~ 1 change', '- 3 destroy'].forEach((l, i) => mono(704, 206 + i * 24, l, { 'font-size': 13.5, 'font-weight': i > 1 ? 800 : 500, fill: i === 2 ? WARN : i === 3 ? BAD : INK, opacity: fade(u, 1.8 + i * 0.15) }));
-      tx(800, 330, '어긋나면 이런 plan 이 나온다 (예시)', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.3) });
+      tx(800, 330, '어긋나면 이런 plan이 나온다 (예시)', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.3) });
       return; }
     // k = 5: CI matrix
     mono(40, 60, 'matrix.env = [dev, staging, prod]', { 'font-size': 16, 'font-weight': 800, fill: ACC });
@@ -170,7 +170,7 @@
       mono(300, y + 12, 'workspace select ' + e, { 'font-size': 14, opacity: clamp(s * 2 - 0.5) });
       mono(300, y + 34, 'apply -var-file=envs/' + e + '.tfvars', { 'font-size': 14, opacity: clamp(s * 2 - 0.8) }); });
     tx(700, 210, '환경 이름 하나가', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.9) });
-    tx(700, 238, 'state 와 값을 함께 고른다', { 'font-size': 16, 'font-weight': 700, fill: GOOD, opacity: fade(u, 2.1) }); }
+    tx(700, 238, 'state와 값을 함께 고른다', { 'font-size': 16, 'font-weight': 700, fill: GOOD, opacity: fade(u, 2.1) }); }
 
   // ---------- 5. 한계와 권장 구조 ----------
   function bucket(cx, cy, name, o) { o = o || {}; const g = R.G(cx, cy, o.s ?? 1, o.op ?? 1), col = o.col || WARN;
@@ -181,8 +181,8 @@
     if (k === 0) { card(480, 130, 820, 120, { rx: 12, stroke: INK, sw: 2, s: pop(u, 0.2) });
       tx(100, 118, '"Workspaces are not appropriate for system decomposition', { 'font-size': 17, 'font-style': 'italic', opacity: fade(u, 0.5) });
       tx(100, 148, ' or deployments requiring separate credentials and access controls."', { 'font-size': 17, 'font-style': 'italic', opacity: fade(u, 0.7) });
-      tx(860, 178, 'HashiCorp, Terraform CLI 문서', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', opacity: fade(u, 0.9) });
-      tx(480, 270, '자격 증명과 접근 권한이 달라야 하는 배포에는 workspace 를 쓰지 않는다', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 1.6) });
+      tx(860, 178, 'HashiCorp, Terraform 문서 (State: Workspaces)', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', opacity: fade(u, 0.9) });
+      tx(480, 270, '자격 증명과 접근 권한이 달라야 하는 배포에는 workspace를 쓰지 않는다', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 1.6) });
       tx(480, 310, '아래 세 한계를 차례로 본다', { 'font-size': 15, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.1) });
       return; }
     if (k === 1) { bucket(620, 150, 's3://같은 버킷', { s: pop(u, 0.2) });
@@ -191,7 +191,7 @@
       dot([[170, 150], [450, 150], [690, 178]], seg(u, 1.0, 2.0), BAD, 7);
       grow(170, 150, 548, 150, E(u, 1.0, 1.6), BAD);
       pill(330, 330, 'workspace select prod && destroy', BAD, pop(u, 2.0), { mono: true, fs: 13.5 });
-      tx(620, 262, 'S3 backend 는 workspace state 를 env:/ 아래에 둔다', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.2) });
+      tx(620, 262, 'S3 backend는 workspace state를 env:/ 아래에 둔다', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.2) });
       return; }
     if (k === 2) { [['dev 계정', 230, INFO], ['prod 계정', 730, WARN]].forEach(([n, x, col], i) => { zone(x - 170, 60, 340, 220, n, { fill: SOFT, stroke: col, op: fade(u, 0.2 + i * 0.3) });
         server(x - 90, 130, null, { s: 0.5 * pop(u, 0.4 + i * 0.3), lamp: col }); mono(x - 90, 166, i ? '계정 B' : '계정 A', { 'font-size': 13.5, 'text-anchor': 'middle', fill: col, opacity: fade(u, 0.5 + i * 0.3) }); });
@@ -210,13 +210,13 @@
       return; }
     if (k === 4) { const T = [['infra/', 0], ['modules/', 1], ['web-app/  재사용 모듈', 2, ACC], ['envs/', 1], ['dev/      main.tf · backend.tf · terraform.tfvars', 2], ['staging/  main.tf · backend.tf · terraform.tfvars', 2], ['prod/     main.tf · backend.tf · terraform.tfvars', 2, WARN]];
       T.forEach(([s, d, col], i) => mono(60 + d * 36, 70 + i * 40, (d ? '└ ' : '') + s, { 'font-size': 15, 'font-weight': d < 2 ? 800 : 600, fill: col || INK, opacity: fade(u, 0.2 + i * 0.22) }));
-      tx(60, 370, '본체는 modules/ 한 곳, 환경 폴더는 module 호출과 backend 만', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.1) });
+      tx(60, 370, '본체는 modules/ 한 곳, 환경 폴더는 module 호출과 backend만', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.1) });
       return; }
     if (k === 5) { bucket(260, 160, 'dev 버킷', { col: INFO, fill: INFOBG, s: pop(u, 0.2) }); bucket(700, 160, 'prod 버킷', { s: pop(u, 0.5) });
       lock(700, 260, true, WARN, pop(u, 0.9)); mono(700, 300, 'prod 전용 IAM', { 'font-size': 14, 'font-weight': 800, 'text-anchor': 'middle', fill: WARN, opacity: fade(u, 1.0) });
       R.person(80, 330, 'dev 권한', {}); grow(110, 320, 230, 220, E(u, 1.0, 1.5), INFO);
       grow(110, 330, lerp(110, 620, E(u, 1.5, 2.1)), 300, 1, BAD, { plain: true }); if (u > 2.1) cross(620, 300, 14, pop(u, 2.1));
-      tx(480, 400, '권한 경계를 디렉토리와 backend 로 긋는다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.3) });
+      tx(480, 400, '권한 경계를 디렉토리와 backend로 긋는다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.3) });
       return; }
     if (k === 6) { const L = [['pr-123', 0.2, 1.5], ['feature-login', 0.6, 2.2], ['ci-${BUILD_ID}', 1.0, 1.7], ['dev-alice', 1.4, 2.9]];
       el('line', { x1: 260, y1: 340, x2: 920, y2: 340, stroke: MUT, 'stroke-width': 2 }); tx(920, 366, '시간', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end' });
@@ -227,7 +227,7 @@
       tx(260, 396, '수명이 짧고 권한이 같은 슬롯에 맞는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.2) });
       return; }
     // k = 7: 결론표
-    const rows = [['dev / staging / prod 분리', '디렉토리 분리', GOOD], ['PR 미리보기 · 임시 검증', 'workspace', ACC], ['AWS 계정이 갈린다', '디렉토리 + backend 분리', GOOD], ['학습 · 실습', 'workspace 로 시작', ACC]];
+    const rows = [['dev / staging / prod 분리', '디렉토리 분리', GOOD], ['PR 미리보기 · 임시 검증', 'workspace', ACC], ['AWS 계정이 갈린다', '디렉토리 + backend 분리', GOOD], ['학습 · 실습', 'workspace로 시작', ACC]];
     rows.forEach(([a, b, col], i) => { const y = 70 + i * 74, s = pop(u, 0.2 + i * 0.35);
       card(250, y, 420, 56, { rx: 10, text: a, fs: 16, fw: 700, stroke: GRID, s }); grow(465, y, 560, y, seg(u, 0.4 + i * 0.35, 0.8 + i * 0.35), MUT);
       card(740, y, 340, 56, { rx: 28, text: b, fs: 16, fw: 800, stroke: col, color: col, s: pop(u, 0.6 + i * 0.35) }); }); }
@@ -268,5 +268,5 @@
       why: 'workspace는 backend와 provider 설정을 공유한다. 권한 경계는 환경 디렉토리마다 backend를 따로 두어 긋는다.' },
   ];
 
-  R.page({ title: 'workspace 와 state 슬롯', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
+  R.page({ title: 'workspace와 state 슬롯', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

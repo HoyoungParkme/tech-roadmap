@@ -37,7 +37,7 @@
       dot([[148, 190], [214, 190]], seg(u, 1.2, 1.8), INFO, 6); return; }
     if (k === 2 || k === 3) { mono(30, 330, 'role: ' + role, { 'font-size': 18, 'font-weight': 800, fill: ACC });
       mono(30, 366, '대상 ' + cnt + '개', { 'font-size': 18, 'font-weight': 800, fill: INK, opacity: k === 2 ? fade(u, 1.8) : 1 });
-      if (k === 3) note(30, 398, 'role 을 바꾸면 발견 단위가 통째로 바뀐다', fade(u, 0.4), { 'font-size': 14 }); return; }
+      if (k === 3) note(30, 398, 'role을 바꾸면 발견 단위가 통째로 바뀐다', fade(u, 0.4), { 'font-size': 14 }); return; }
     if (k === 4) { fly(90, 250, 300, 230, seg(u, 0.4, 1.4), 'serviceaccount token', { mono: true, fill: INFO });
       note(30, 320, '클러스터 안에서 돌면', fade(u, 0.4)); note(30, 350, 'API 주소·토큰이 자동으로 채워진다', fade(u, 1.2), { fill: INFO });
       mono(30, 384, '/var/run/secrets/kubernetes.io/…', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 1.6) }); return; }
@@ -55,7 +55,7 @@
     tx(30, 54, 'deployment.yaml', { 'font-size': 14, 'font-weight': 800, class: 'mono' });
     M.forEach(([s, col, op, k0], i) => mono(30, 88 + i * 30, s, { 'font-size': 13.5, fill: col, opacity: op, 'font-weight': k === k0 ? 800 : 500 }));
     // 오른쪽: 파드들
-    tx(470, 46, 'API 서버가 준 파드 (IP 는 예시)', { 'font-size': 14, 'font-weight': 700, fill: MUT });
+    tx(470, 46, 'API 서버가 준 파드 (IP는 예시)', { 'font-size': 14, 'font-weight': 700, fill: MUT });
     PODS.forEach(([n, ns, sc, port, ip], i) => { const y = 84 + i * 62, pay = n.startsWith('payment');
       const gone = k >= 2 && !sc, gOp = gone ? 1 - 0.65 * (k === 2 ? E(u, 0.8, 1.4) : 1) : 1;
       card(705, y, 470, 52, { rx: 10, stroke: k === 0 ? INFO : sc && k >= 2 ? ACC : GRID, sw: k >= 2 && sc ? 2.2 : 1.5, op: gOp, s: k === 0 ? pop(u, 0.3 + i * 0.15) : 1 });
@@ -69,15 +69,15 @@
         else mono(700, y - 4, '/metrics', { 'font-size': 13.5, fill: MUT }); }
       if (k >= 2 && !sc) mono(920, y + 5, 'drop', { 'font-size': 13.5, fill: BAD, 'text-anchor': 'end', 'font-weight': 700, opacity: k === 2 ? fade(u, 1.4) : 0.5 }); });
     if (k === 0) note(30, 380, '아직 아무 표시가 없다 — 다섯 파드 모두 후보', fade(u, 1.4));
-    if (k === 1) note(30, 380, 'Deployment 가 아니라 파드 템플릿에 달아야 파드에 붙는다', fade(u, 1.4), { 'font-size': 14.5 });
+    if (k === 1) note(30, 380, 'Deployment가 아니라 파드 템플릿에 달아야 파드에 붙는다', fade(u, 1.4), { 'font-size': 14.5 });
     if (k === 2) note(30, 380, '앱이 스스로 "나를 긁어라"를 선언한다', fade(u, 1.6));
-    if (k === 3) note(30, 380, 'IP 는 API 서버가, 포트는 앱만 안다', fade(u, 1.6));
-    if (k === 4) note(30, 380, '/metrics 가 아닌 앱은 경로를 직접 알린다', fade(u, 1.4));
+    if (k === 3) note(30, 380, 'IP는 API 서버가, 포트는 앱만 안다', fade(u, 1.6));
+    if (k === 4) note(30, 380, '/metrics가 아닌 앱은 경로를 직접 알린다', fade(u, 1.4));
     if (k === 5) { el('rect', { x: 16, y: 344, width: 420, height: 66, rx: 10, fill: BADBG, stroke: BAD, 'stroke-width': 1.5, opacity: fade(u, 0.8) });
       mono(30, 370, 'port: "8080"  ≠  containerPort: 9090', { 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.0) });
       tx(30, 396, '대상은 잡히는데 연결이 안 된다 → up = 0 (예시)', { 'font-size': 14, fill: BAD, opacity: fade(u, 1.5) }); }
     if (k === 6) { card(226, 375, 300, 52, { rx: 10, stroke: WARN, dash: '6 5', s: pop(u, 0.3) });
-      tx(226, 382, '읽어 줄 relabel 이 아직 없다', { 'font-size': 15, 'text-anchor': 'middle', 'font-weight': 700, fill: WARN, opacity: fade(u, 0.5) });
+      tx(226, 382, '읽어 줄 relabel이 아직 없다', { 'font-size': 15, 'text-anchor': 'middle', 'font-weight': 700, fill: WARN, opacity: fade(u, 0.5) });
       tx(470, 398, '어노테이션은 그냥 문자열이다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.3) }); } }
 
   // ---------- 3. relabel_configs ----------
@@ -95,7 +95,7 @@
     if (k <= 1) PODS.forEach(([nm, , sc], i) => { const x = 150 + i * 34, fall = k === 1 && !sc ? E(u, 0.8, 1.6) : 0;
       el('circle', { cx: x, cy: 386 + fall * 20, r: 9, fill: sc ? ACC : BAD, opacity: k === 0 ? fade(u, 0.5 + i * 0.1) : 1 - fall * 0.8 }); });
     // 오른쪽: payment-api-7c9f-aa 의 라벨 표
-    tx(370, 40, 'payment-api-7c9f-aa 의 라벨', { 'font-size': 14, 'font-weight': 700, fill: MUT });
+    tx(370, 40, 'payment-api-7c9f-aa의 라벨', { 'font-size': 14, 'font-weight': 700, fill: MUT });
     const fin = k === 4 ? E(u, 1.6, 2.4) : 0;
     const rows = [['__meta_…_prometheus_io_scrape', '"true"', 'm'], ['__meta_…_prometheus_io_path', '"/actuator/prometheus"', 'm'], ['__meta_…_prometheus_io_port', '"8080"', 'm'],
       ['__meta_kubernetes_namespace', '"payment"', 'm'], ['__address__', '', 'a'], ['__metrics_path__', '', 'p'], ['namespace', '', 'n'], ['pod', '', 'o']];
@@ -116,7 +116,7 @@
       spans(374, 380, [['10.244.1.7', { fill: 'var(--info)', 'font-weight': 700 }], [':8080', { fill: OFF }], [';', { fill: 'var(--warn)', 'font-weight': 800 }], ['8080', { fill: 'var(--good)', 'font-weight': 700 }]], { 'font-size': 14.5, opacity: fade(u, 0.4) });
       mono(374, 402, '([^:]+)(?::\\d+)?;(\\d+)', { 'font-size': 13.5, fill: 'var(--term)', opacity: fade(u, 1.0) });
       spans(700, 391, [['→ $1:$2 = ', { fill: 'var(--term)' }], ['10.244.1.7', { fill: 'var(--info)', 'font-weight': 700 }], [':8080', { fill: 'var(--good)', 'font-weight': 700 }]], { 'font-size': 14.5, opacity: fade(u, 1.6) }); }
-    if (k === 4) { tx(370, 404, '__ 로 시작하는 라벨은 스크랩 뒤 사라진다 — 남길 값은 승격', { 'font-size': 14, fill: MUT, 'font-weight': 600, opacity: fade(u, 2.0) }); } }
+    if (k === 4) { tx(370, 404, '__로 시작하는 라벨은 스크랩 뒤 사라진다 — 남길 값은 승격', { 'font-size': 14, fill: MUT, 'font-weight': 600, opacity: fade(u, 2.0) }); } }
 
   // ---------- 4. 동적 반영 ----------
   const SL = ['aa', 'bb', 'cc', 'dd', 'abcde'];
@@ -155,8 +155,8 @@
       el('line', { x1: st, y1: y, x2: e, y2: y, stroke: i === 4 && k >= 4 ? BAD : i >= 3 ? GOOD : ACC, 'stroke-width': 4, 'stroke-linecap': 'round' });
       if (i === 4 && k >= 4) { const sx = 300 + 140 * 4.2; mono(sx + 10, y + 5, 'stale', { 'font-size': 14, 'font-weight': 800, fill: BAD, opacity: k === 4 ? fade(u, 1.2) : 1 }); } });
     mono(nowX, 400, 'now', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle' });
-    if (k === 1) note(470, 160, '다음 scrape 부터 새 파드 2개가 들어온다', fade(u, 1.8), { 'font-size': 14.5, fill: GOOD });
-    if (k === 4) note(470, 160, '대상에서 빠지고 시계열은 stale 로 끊긴다', fade(u, 1.4), { 'font-size': 14.5, fill: BAD }); }
+    if (k === 1) note(470, 160, '다음 scrape부터 새 파드 2개가 들어온다', fade(u, 1.8), { 'font-size': 14.5, fill: GOOD });
+    if (k === 4) note(470, 160, '대상에서 빠지고 시계열은 stale로 끊긴다', fade(u, 1.4), { 'font-size': 14.5, fill: BAD }); }
 
   // ---------- 5. Operator · ServiceMonitor ----------
   function s5(t, c) { const { k, u } = c;
@@ -167,7 +167,7 @@
     L.forEach(([s, col, k0], i) => mono(30, 88 + i * 29, s, { 'font-size': 13.5, fill: col, opacity: fa(c, k0, 0.2 + i * 0.05), 'font-weight': k === k0 ? 800 : 500 }));
     card(470, 190, 160, 60, { rx: 30, text: 'Operator', fs: 16, fw: 800, stroke: INFO, fill: INFOBG, color: INFO, s: at(c, 0, 0.6) });
     if (k === 0) { fly(200, 100, 470, 160, seg(u, 0.9, 1.7), 'kubectl apply', { mono: true, fill: INK });
-      note(560, 120, 'relabel 대신 쿠버네티스 리소스', fade(u, 1.6)); note(560, 150, 'Git 으로 관리한다 (GitOps)', fade(u, 2.0), { fill: MUT }); return; }
+      note(560, 120, 'relabel 대신 쿠버네티스 리소스', fade(u, 1.6)); note(560, 150, 'Git으로 관리한다 (GitOps)', fade(u, 2.0), { fill: MUT }); return; }
     if (k === 1) { mono(600, 60, 'serviceMonitorSelector:', { 'font-size': 14, 'font-weight': 700, fill: INFO, opacity: fade(u, 0.2) });
       mono(620, 86, 'release: kube-prometheus-stack', { 'font-size': 14, fill: ACC, opacity: fade(u, 0.4) });
       card(720, 200, 300, 50, { rx: 8, text: 'SM payment-api  (release ✓)', fs: 14, stroke: GOOD, s: pop(u, 0.8) }); check(890, 200, 10, pop(u, 1.1));
@@ -177,16 +177,16 @@
       tx(720, 150, 'app=payment-api', { 'font-size': 13.5, 'text-anchor': 'middle', class: 'mono', fill: ACC, opacity: fade(u, 0.6) });
       grow(550, 190, 610, 120, E(u, 0.3, 0.7), ACC);
       ['aa', 'bb', 'cc'].forEach((s, i) => { const x = 640 + i * 80; grow(720, 135, x, 230, E(u, 1.0 + i * 0.2, 1.4 + i * 0.2), GRID, { plain: true }); podCard(x, 250, s, { w: 64, s: pop(u, 1.3 + i * 0.2) }); });
-      note(560, 320, '파드가 아니라 Service 를 고르고', fade(u, 1.8)); note(560, 350, '그 뒤 엔드포인트가 대상이 된다', fade(u, 2.1)); return; }
+      note(560, 320, '파드가 아니라 Service를 고르고', fade(u, 1.8)); note(560, 350, '그 뒤 엔드포인트가 대상이 된다', fade(u, 2.1)); return; }
     if (k === 3) { el('rect', { x: 560, y: 60, width: 380, height: 150, rx: 10, fill: PANEL, stroke: GRID, 'stroke-width': 1.5 });
-      tx(576, 86, 'Service payment-api 의 ports', { 'font-size': 14, 'font-weight': 700, fill: MUT });
+      tx(576, 86, 'Service payment-api의 ports', { 'font-size': 14, 'font-weight': 700, fill: MUT });
       mono(576, 120, '- name: http-metrics', { 'font-size': 14.5, 'font-weight': 700, fill: GOOD, opacity: fade(u, 0.3) }); mono(596, 146, 'port: 8080', { 'font-size': 14.5, opacity: fade(u, 0.4) });
       card(650, 270, 180, 46, { rx: 8, text: 'port: http-metrics', fs: 14, mono: true, stroke: GOOD, s: pop(u, 0.9) }); check(760, 270, 10, pop(u, 1.2));
       card(860, 270, 150, 46, { rx: 8, text: 'port: 8080', fs: 14, mono: true, stroke: BAD, s: pop(u, 1.5) }); cross(950 - 10, 248, 9, pop(u, 1.8));
-      note(560, 350, 'port 는 숫자가 아니라 Service 포트의 이름', fade(u, 2.0)); return; }
+      note(560, 350, 'port는 숫자가 아니라 Service 포트의 이름', fade(u, 2.0)); return; }
     // k4: 설정 생성·주입
     el('rect', { x: 600, y: 60, width: 340, height: 250, rx: 10, fill: INK });
-    tx(614, 84, 'Prometheus 설정 (Operator 가 생성)', { 'font-size': 13.5, fill: OFF, 'font-weight': 700 });
+    tx(614, 84, 'Prometheus 설정 (Operator가 생성)', { 'font-size': 13.5, fill: OFF, 'font-weight': 700 });
     ['- job_name: serviceMonitor/', '    payment/payment-api/0', '  kubernetes_sd_configs: …', '  relabel_configs:', '    (keep · 주소 · 경로 · 라벨', '     규칙 자동 생성)'].forEach((s, i) =>
       mono(614, 116 + i * 30, s, { 'font-size': 13.5, fill: 'var(--term)', opacity: fade(u, 0.8 + i * 0.25) }));
     for (let i = 0; i < 4; i++) dot([[550, 190], [600, 190]], (u * 0.8 + i / 4) % 1, ACC, 5);
@@ -200,7 +200,7 @@
         zone(x, y, 290, 150, 'ns ' + ns, { stroke: k === 1 && keep ? ACC : GRID, sw: k === 1 && keep ? 2.5 : 1.2, op });
         for (let i = 0; i < 12; i++) { const px = x + 30 + (i % 6) * 44, py = y + 60 + Math.floor(i / 6) * 44, hit = k === 0 ? E(u, 0.3 + (j * 12 + i) * 0.02, 0.5 + (j * 12 + i) * 0.02) : 0;
           el('circle', { cx: px, cy: py, r: 10, fill: k === 0 ? (hit > 0.5 ? BAD : OFF) : keep ? ACC : OFF, opacity: op }); } });
-      if (k === 0) banner(480, 396, 'keep 이 없으면 72개 파드 전부가 대상 (예시)', pop(u, 2.0));
+      if (k === 0) banner(480, 396, 'keep이 없으면 72개 파드 전부가 대상 (예시)', pop(u, 2.0));
       if (k === 1) banner(480, 396, 'namespaces: [prod, payment] — 발견 자체를 줄인다', pop(u, 1.6));
       return; }
     if (k === 5) return churn(t, c);
@@ -213,14 +213,14 @@
     if (k === 3 || k === 4) { const L = ['kind: ClusterRole', 'name: prometheus', 'resources: pods, services,', '           endpoints, nodes', 'verbs: get, list, watch'];
       el('rect', { x: 40, y: 250, width: 420, height: 160, rx: 10, fill: SOFT, stroke: ACC, 'stroke-width': 1.8, opacity: fa(c, 3) });
       L.forEach((s, i) => mono(56, 278 + i * 28, s, { 'font-size': 14, 'font-weight': i === 4 ? 800 : 500, fill: i === 4 ? (k === 4 ? GOOD : MUT) : INK, opacity: k === 3 ? fade(u, 0.3 + i * 0.3) : 1 }));
-      if (k === 3) { note(520, 300, '네임스페이스를 가로질러 보므로', fade(u, 1.6)); note(520, 330, 'Role 이 아니라 ClusterRole', fade(u, 1.9), { fill: ACC }); return; }
+      if (k === 3) { note(520, 300, '네임스페이스를 가로질러 보므로', fade(u, 1.6)); note(520, 330, 'Role이 아니라 ClusterRole', fade(u, 1.9), { fill: ACC }); return; }
       grow(170, 160, 334, 160, E(u, 0.2, 0.6), GOOD);
       fly(334, 190, 170, 190, seg(u, 0.6, 1.2), 'list', { mono: true, fill: INFO });
       for (let i = 0; i < 3; i++) fly(334, 130, 170, 130, seg(u, 1.3 + i * 0.35, 1.8 + i * 0.35), 'watch', { mono: true, fill: GOOD });
       el('rect', { x: 600, y: 80, width: 330, height: 160, rx: 10, fill: PANEL, stroke: GRID, 'stroke-width': 1.5 });
       tx(616, 106, 'Status → Targets', { 'font-size': 14, 'font-weight': 700, fill: MUT });
       mono(765, 170, String(Math.round(lerp(0, 3, E(u, 0.8, 1.6)))), { 'font-size': 40, 'font-weight': 800, 'text-anchor': 'middle', fill: GOOD });
-      note(520, 300, 'list 로 처음 목록을, watch 로 변화를', fade(u, 2.0)); note(520, 330, '하나만 빠져도 동적 반영이 죽는다', fade(u, 2.3), { fill: BAD }); return; }
+      note(520, 300, 'list로 처음 목록을, watch로 변화를', fade(u, 2.0)); note(520, 330, '하나만 빠져도 동적 반영이 죽는다', fade(u, 2.3), { fill: BAD }); return; }
   }
   function churn(t, c) { const { u } = c;   // k5: 고유값 승격과 시계열 churn (예시)
     const ax = R.axes(110, 60, 520, 260, { x: [0, 10], y: [0, 16000], xt: [0, 2, 4, 6, 8, 10], yt: [0, 5000, 10000, 15000], xl: '하루 배포 횟수', grid: true });
@@ -231,7 +231,7 @@
     const L = [['파드 3개 × 500 시계열', 0.4], ['= 배포 한 번에 1500 새로', 0.9], ['배포 10번 = 15000', 1.6]];
     L.forEach(([s, a], i) => mono(670, 110 + i * 34, s, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, a) }));
     note(670, 250, '파드마다 다른 값은 재배포마다', fade(u, 2.0), { 'font-size': 14.5 }); note(670, 278, '시계열을 새로 만든다', fade(u, 2.1), { 'font-size': 14.5 });
-    note(670, 320, 'pod 하나면 충분 — pod_ip 는 올리지 않는다', fade(u, 2.4), { fill: GOOD, 'font-size': 14 }); }
+    note(670, 320, 'pod 하나면 충분 — pod_ip는 올리지 않는다', fade(u, 2.4), { fill: GOOD, 'font-size': 14 }); }
   const line = R.line;
 
   const quiz = [
@@ -262,7 +262,7 @@
     'watch로 대상이 바로 바뀌지만 RBAC가 없으면 0개이고, 고유값 레이블은 시계열을 불린다.',
   ];
   const review = [
-    { q: '새 앱에 prometheus.io/scrape="true" 를 달았는데 대상 화면에 up=0 으로만 보인다. 먼저 의심할 것은?',
+    { q: '새 앱에 prometheus.io/scrape="true" 를 달았는데 대상 화면에 up=0으로만 보인다. 먼저 의심할 것은?',
       o: ['port 어노테이션과 containerPort가 어긋났다', 'RBAC 권한이 없다', 'role을 node로 골랐다'], a: 0,
       why: '대상으로 잡혔다는 것은 발견과 keep은 됐다는 뜻이다. 조립된 주소의 포트가 실제 컨테이너 포트와 다르면 연결이 안 된다.' },
     { q: 'keep 규칙을 지웠더니 Prometheus 메모리와 scrape 부하가 크게 늘었다. 가장 알맞은 대응은?',

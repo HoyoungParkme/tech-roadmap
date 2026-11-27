@@ -49,11 +49,11 @@
     if (k === 0) { pill(BX + BW / 2, BY + BH + 34, '저장 (Save)', ACC, pop(u, 1.0), { fs: 14 }); dot([[BX + BW, BY + 140], [500, BY + 140]], seg(u, 1.1, 1.7), ACC, 7); }
     if (k === 1) [['제목', 1], ['영구 식별자', 2], ['모델 버전', 3], ['저장마다 +1', 4]].forEach(([s, i], j) => pill(842, row(i), s, INFO, pop(u, 0.3 + j * 0.3), { fs: 13.5 }));
     if (k === 2) { grow(500, row(5), BX + BW - 10, BY + 120, E(u, 0.2, 0.9), ACC);
-      grow(500, row(6), BX + BW - 140, BY + 17, E(u, 0.9, 1.6), ACC); grow(500, row(7), BX + BW - 70, BY + 30, E(u, 1.6, 2.3), ACC);
+      grow(500, row(6), BX + BW - 150, BY + 40, E(u, 0.9, 1.6), ACC); grow(500, row(7), BX + BW - 50, BY + 40, E(u, 1.6, 2.3), ACC);
       sub(470, BY + BH + 40, '보이는 모든 것은 이 세 필드에서 나온다', fade(u, 2.2), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
     if (k === 3) { [['⚙ Settings › JSON Model', 0.2], ['Share › Export', 0.9]].forEach(([s, a], j) => { const y = BY + BH + 30 + j * 0; pill(150 + j * 220, y + 8, s, INK, pop(u, a), { fs: 14 }); });
       fly(BX + BW / 2, BY + 140, 715, BY + 140, seg(u, 1.4, 2.4), 'dashboard.json', { mono: true }); }
-    if (k === 4) { [['diff', '− 0.05  + 0.02', BAD], ['리뷰', 'PR 에 댓글', INFO], ['롤백', 'git revert', GOOD]].forEach(([a, b, col], j) => {
+    if (k === 4) { [['diff', '− 0.05  + 0.02', BAD], ['리뷰', 'PR에 댓글', INFO], ['롤백', 'git revert', GOOD]].forEach(([a, b, col], j) => {
         const cx = 560 + j * 130, s = pop(u, 0.3 + j * 0.4); card(cx, 375, 120, 54, { rx: 10, stroke: col, sw: 2.2, s });
         tx(cx, 370, a, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: col, opacity: fade(u, 0.4 + j * 0.4) });
         mono(cx, 391, b, { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.4 + j * 0.4) }); });
@@ -72,7 +72,7 @@
     // 오른쪽: 24칸 격자 위의 대시보드
     const GX = 500, GY = 56, GW = 420, col = GW / 24, rowH = 17;
     board(GX, GY, GW, 300, 'Service Health', { right: '/d/service-health' });
-    if (k === 0) sub(GX + GW / 2, GY + 170, 'panels 가 아직 비어 있다', fade(u, 0.8), { 'font-size': 14.5 });
+    if (k === 0) sub(GX + GW / 2, GY + 170, 'panels가 아직 비어 있다', fade(u, 0.8), { 'font-size': 14.5 });
     if (k >= 1) { const by = GY + 100; el('line', { x1: GX + 10, y1: by - 12, x2: GX + GW - 10, y2: by - 12, stroke: GRID, 'stroke-width': 1.5 });
       [0, 12, 24].forEach((v) => { el('line', { x1: GX + v * col, y1: by - 17, x2: GX + v * col, y2: by - 7, stroke: MUT, 'stroke-width': 1.5 }); mono(GX + v * col + (v === 24 ? -4 : v === 0 ? 4 : 0), by - 22, String(v), { 'font-size': 13.5, fill: MUT, 'text-anchor': v === 24 ? 'end' : v === 0 ? 'start' : 'middle' }); });
       const gw = k === 1 ? lerp(1, 12, E(u, 0.3, 1.4)) : 12, gh = k === 1 ? lerp(1, 8, E(u, 0.3, 1.4)) : 8;
@@ -85,7 +85,7 @@
       mono(GX + 14, GY + 290, 'histogram_quantile(0.99, … [5m])', { 'font-size': 13.5, fill: INFO, opacity: fade(u, 0.9) }); }
     if (k >= 3) { const op = k === 3 ? fade(u, 0.2) : 1; card(GX + 62, GY + 54, 110, 26, { rx: 6, text: 'env: prod ▾', fs: 13.5, mono: true, stroke: k === 3 ? ACC : GRID, sw: 1.8, op });
       if (k === 3) ['prod', 'staging', 'dev'].forEach((s, i) => card(GX + 166 + i * 88, GY + 54, 80, 26, { rx: 4, text: s, fs: 13.5, mono: true, stroke: GRID, sw: 1.2, fill: i === 0 ? ACCBG : PANEL, s: pop(u, 0.6 + i * 0.25) }));
-      if (k === 3) mono(GX + 14, GY + 290, 'expr 안의 $env → prod', { 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.6) }); }
+      if (k === 3) mono(GX + 14, GY + 290, '{env="$env"} → {env="prod"}', { 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.6) }); }
     if (k >= 4) { const op = k === 4 ? fade(u, 0.2) : 1; card(GX + 360, GY + 54, 96, 26, { rx: 6, text: 'now-6h', fs: 13.5, mono: true, stroke: k === 4 ? ACC : GRID, sw: 1.8, op });
       if (k === 4) { const x0 = GX + 20, x1 = GX + GW - 20, yy = GY + 290; el('line', { x1: x0, y1: yy, x2: lerp(x0, x1, E(u, 0.4, 1.6)), y2: yy, stroke: ACC, 'stroke-width': 4, 'stroke-linecap': 'round' });
         mono(x0, yy - 12, 'now-6h', { 'font-size': 13.5, fill: MUT }); mono(x1, yy - 12, 'now', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', opacity: fade(u, 1.5) }); } }
@@ -104,6 +104,9 @@
       const bg = d.sign === '+' ? GOODBG : d.sign === '-' ? BADBG : PANEL, fc = d.sign === '+' ? GOOD : d.sign === '-' ? BAD : MUT;
       el('rect', { x: DX, y, width: DW * o, height: 34, fill: bg, stroke: GRID, 'stroke-width': 1 });
       if (o > 0.6) mono(DX + 10, y + 22, (d.sign + ' ' + d.text.trim()).replace(/\s+/g, ' '), { 'font-size': 13.5, fill: fc, 'font-weight': d.sign === ' ' ? 400 : 700 }); });
+    if (k === 1) { panel(616, 50, 304, 150, 'Error Rate (stat)', 'stat', { stroke: ACC, sw: 2.2, s: pop(u, 0.6) });
+      mono(768, 182, 'id 3 · type stat', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1.0) });
+      grow(DX + DW, DY + 61, 612, 125, E(u, 1.2, 1.9), ACC); }
     if (k === 2) ['fieldConfig', 'defaults', 'thresholds', 'steps'].forEach((s, i) => pill(DX + 70 + i * 132, DY + 186, s, INFO, pop(u, 0.9 + i * 0.25), { mono: true, fs: 13.5 }));
     // 오른쪽: Error Rate stat 패널의 색 임계값
     if (k >= 2 && k <= 3) { const PX = 616, PY = 50, PW = 304, thr = k === 3 ? tween(0.05, 0.02, u) : 0.05, X = (v) => PX + 20 + (v / 0.06) * (PW - 40);
@@ -142,7 +145,7 @@
       if (k === 3) { pill(440, 400, 'curl -H "Authorization: Bearer $GRAFANA_TOKEN"', INK, pop(u, 0.2), { mono: true, fs: 13.5 });
         dot([[630, 260], [655, 260], [680, 262]], seg(u, 0.6, 1.5), ACC, 7); check(898, 216, 10, pop(u, 2.0)); sub(800, 330, '사람이 클릭할 자리가 없다', fade(u, 2.1), { 'font-size': 14, fill: INK }); }
       return; }
-    if (k === 4) { tx(40, 46, 'Import 할 때 uid 가 정하는 결과', { 'font-size': 16, 'font-weight': 800 });
+    if (k === 4) { tx(40, 46, 'Import 할 때 uid가 정하는 결과', { 'font-size': 16, 'font-weight': 800 });
       [['같은 uid + overwrite:true', '기존 보드를 덮어쓴다', 'service-health', GOOD], ['새 uid', '보드가 하나 더 생긴다', 'service-health-v2', INFO], ['uid 생략', '랜덤 uid → 환경마다 다름', 'uid ?', BAD]].forEach(([a, b2, uid, col], i) => {
         const y = 100 + i * 96, s = pop(u, 0.2 + i * 0.6); card(200, y, 300, 56, { rx: 10, text: a, fs: 15, mono: true, stroke: col, sw: 2.2, s });
         grow(356, y, 520, y, E(u, 0.5 + i * 0.6, 1.0 + i * 0.6), col === BAD ? BAD : col === GOOD ? ACC : MUT);
@@ -175,7 +178,7 @@
       card(720, 150, 360, 120, { rx: 12, stroke: BAD, sw: 2.5, s: pop(u, 0.9) });
       tx(720, 130, 'Cannot save provisioned dashboard', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.1) });
       tx(720, 160, 'allowUiUpdates: false', { 'text-anchor': 'middle', 'font-size': 14, class: 'mono', fill: INK, opacity: fade(u, 1.3) });
-      tx(720, 186, 'JSON 을 복사해 파일에 반영하라', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 1.5) }); return; }
+      tx(720, 186, 'JSON을 복사해 파일에 반영하라', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 1.5) }); return; }
     if (k === 2) { fileCard(140, 150, 'platform/*.json', '/etc/grafana/dashboards', { w: 230 });
       clock(480, 150, 40, E(u, 0.2, 2.6), ACC, 'updateIntervalSeconds: 30'); grow(258, 150, 432, 150, E(u, 0.2, 0.7), MUT); grow(528, 150, 690, 150, E(u, 0.7, 1.2), ACC);
       board(700, 92, 220, 120, 'Team-Platform', {}); [0, 1].forEach((i) => panel(712 + i * 102, 136, 94, 66, i ? 'Error' : 'p99', i ? 'stat' : 'line', { s: pop(u, 1.3 + i * 0.2) }));
@@ -187,7 +190,7 @@
       tx(720, 46, 'uid 충돌', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: BAD });
       fileCard(620, 110, 'checkout.json', 'uid: board-1', { w: 170 }); fileCard(820, 110, 'refund.json', 'uid: board-1', { w: 170 });
       grow(620, 144, 710, 200, E(u, 0.9, 1.5), BAD); grow(820, 144, 730, 200, E(u, 0.9, 1.5), BAD); card(720, 222, 130, 40, { rx: 8, stroke: BAD, sw: 2.2, text: '보드 한 칸', fs: 14, s: pop(u, 1.6) });
-      sub(720, 270, '복붙한 uid 는 서로를 덮어쓴다 (예시)', fade(u, 1.9), { 'font-size': 13.5, fill: INK }); return; }
+      sub(720, 270, '복붙한 uid는 서로를 덮어쓴다 (예시)', fade(u, 1.9), { 'font-size': 13.5, fill: INK }); return; }
     if (k === 4) { fileCard(140, 120, 'old.json', 'schemaVersion 낮음', { w: 200 }); grow(244, 120, 380, 120, E(u, 0.2, 0.8), ACC);
       card(470, 120, 160, 56, { rx: 10, stroke: ACC, sw: 2, text: '자동 마이그레이션', fs: 14, s: pop(u, 0.7) }); grow(552, 120, 680, 120, E(u, 1.0, 1.5), ACC);
       fileCard(790, 120, 'Export', 'schemaVersion 39', { w: 200, s: pop(u, 1.4) });
@@ -197,9 +200,9 @@
     if (k === 5) { const L = ['{', '  "title": "Error Rate"', '  "type": "stat",', '}'];
       code(80, 70, 380, L, { fs: 15, lh: 32, hl: [1], hlc: BADBG });
       mono(312, 128, '← , 빠짐', { 'font-size': 15, 'font-weight': 800, fill: BAD, opacity: fade(u, 0.6) });
-      card(700, 100, 300, 50, { rx: 10, text: 'UI 에서 편집', fs: 15, stroke: GOOD, sw: 2, s: pop(u, 1.0) }); grow(700, 126, 700, 176, E(u, 1.3, 1.7), ACC);
+      card(700, 100, 300, 50, { rx: 10, text: 'UI에서 편집', fs: 15, stroke: GOOD, sw: 2, s: pop(u, 1.0) }); grow(700, 126, 700, 176, E(u, 1.3, 1.7), ACC);
       card(700, 200, 300, 50, { rx: 10, text: 'Export → 파일 덮어쓰기', fs: 15, stroke: GOOD, sw: 2, s: pop(u, 1.6) });
-      sub(270, 250, 'JSON 을 손으로 고치면 괄호·쉼표가 깨지기 쉽다', fade(u, 0.9), { fill: INK, 'font-size': 14 }); return; }
+      sub(270, 250, 'JSON을 손으로 고치면 괄호·쉼표가 깨지기 쉽다', fade(u, 0.9), { fill: INK, 'font-size': 14 }); return; }
     // k6: 진실은 Git
     const P = [[170, 160, 'UI 편집'], [400, 80, 'Export'], [630, 160, 'Git (진실)'], [400, 260, 'provisioning']];
     P.forEach(([x, y, s], i) => card(x, y, 170, 52, { rx: 26, text: s, fs: 15, stroke: i === 2 ? ACC : INK, color: i === 2 ? ACC : INK, sw: i === 2 ? 3 : 2, fill: i === 2 ? ACCBG : PANEL, s: pop(u, 0.2 + i * 0.3) }));
@@ -227,7 +230,7 @@
 
   const summary = [
     'UI에서 패널을 끌고 저장하는 일은 대시보드 JSON 한 장을 고치는 일이다.',
-    'JSON을 열면 uid, panels(targets·gridPos), templating, time부터 본다.',
+    'JSON을 열면 uid와 panels를 먼저 보고, 쿼리는 targets, 자리는 gridPos에서 찾는다.',
     'JSON을 Git에 두면 임계값 0.05를 0.02로 바꾼 한 줄도 PR에서 리뷰된다.',
     '같은 uid로 Import하면 어느 환경이든 같은 보드가 되고, UI 저장은 allowUiUpdates:false로 막는다.',
   ];

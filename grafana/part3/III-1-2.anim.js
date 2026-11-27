@@ -33,7 +33,7 @@
       card(840, 170, 150, 60, { rx: 10, text: '#ops', fs: 18, fw: 800, stroke: ACC, color: ACC, s: pop(u, 0.4) });
       grow(510, 170, 765, 170, E(u, 0.6, 1.4), ACC); dot([[510, 170], [765, 170]], seg(u, 1.4, 2.4), ACC, 7);
       mono(640, 150, 'url: $SLACK_WEBHOOK_OPS', { 'font-size': 14, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 0.9) });
-      tx(640, 226, 'Slack App 의 Incoming Webhook', { 'font-size': 14, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.2) });
+      tx(640, 226, 'Slack App의 Incoming Webhook', { 'font-size': 14, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.2) });
       mono(840, 230, 'recipient · username', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.8) }); }
     if (k === 3) { msg(460, 90, 420, 170, ACC, pop(u, 0.2));
       [['title', 'slack.default.title', 130], ['text', 'slack.default.text', 200]].forEach(([f, n, y], i) => { mono(484, y, f + ':', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.5 + i * 0.4) });
@@ -41,13 +41,13 @@
       sub(670, 300, '메시지 모양은 수신자가 아니라 템플릿이 정한다', fade(u, 2.0), { 'font-size': 15 }); }
     if (k === 4) { ['mentionGroups', 'mentionUsers', 'mentionChannel'].forEach((f, i) => { const y = 110 + i * 50; mono(440, y, f + ': ""', { 'font-size': 15, opacity: fade(u, 0.2 + i * 0.25) }); });
       card(820, 160, 150, 56, { rx: 10, text: '@channel', fs: 17, fw: 800, stroke: MUT, color: MUT, s: pop(u, 1.1) }); cross(820, 160, 26, pop(u, 1.5));
-      sub(640, 290, '지금은 아무도 호출하지 않는다 · 멘션은 critical 에만', fade(u, 1.9), { 'font-size': 15 }); }
+      sub(640, 290, '지금은 아무도 호출하지 않는다 · 멘션은 critical에만', fade(u, 1.9), { 'font-size': 15 }); }
     if (k === 5) { card(640, 150, 320, 110, { rx: 12, stroke: INFO, sw: 2.5, s: pop(u, 0.4) }); env(530, 150, pop(u, 0.8), INFO);
       mono(570, 140, 'email-oncall', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 0.9) }); mono(570, 168, 'type: email', { 'font-size': 14, fill: INFO, opacity: fade(u, 1.1) }); }
     if (k === 6) { const g = E(u, 0.9, 2.0); env(440, 170, 1.2, INFO);
       mono(440, 210, 'singleEmail: false', { 'font-size': 14, 'text-anchor': 'middle', 'font-weight': 700, fill: INFO });
       [['oncall@example.com', 110], ['dev-lead@example.com', 230]].forEach(([a, y]) => { env(lerp(440, 640, g), lerp(170, y, g), 1, INFO); mono(670, y + 5, a, { 'font-size': 14.5, opacity: fade(u, 1.8) }); });
-      sub(640, 310, '주소마다 메일이 한 통씩 · true 면 한 통에 두 주소', fade(u, 2.2), { 'font-size': 15 }); }
+      sub(640, 310, '주소마다 메일이 한 통씩 · true면 한 통에 두 주소', fade(u, 2.2), { 'font-size': 15 }); }
     if (k === 7) { card(470, 170, 150, 60, { rx: 10, text: 'Grafana', fs: 16, fw: 800, s: pop(u, 0.2) });
       grow(545, 170, 730, 170, E(u, 0.5, 1.2), BAD); mono(640, 150, 'integrationKey', { 'font-size': 14, 'text-anchor': 'middle', 'font-weight': 700, fill: BAD, opacity: fade(u, 0.7) });
       const g = R.G(820, 170, pop(u, 1.2)); el('rect', { x: -26, y: -40, width: 52, height: 80, rx: 9, fill: PANEL, stroke: BAD, 'stroke-width': 2.6 }, g); el('rect', { x: -18, y: -30, width: 36, height: 40, rx: 4, fill: BADBG }, g);
@@ -103,7 +103,7 @@
       tx(CX + NW / 2 + 14, 299, '자식 없음 · 여기서 끝', { 'font-size': 14, fill: MUT, opacity: fade(u, 1.8) }); }
     if (k === 7) { tagL(CX + NW / 2 + 14, 368, 'group_interval 30m · repeat 24h', INFO, { mono: true, fs: 13.5, s: pop(u, 1.0) });
       tx(CX + NW / 2 + 14, 334, '급하지 않은 것은 메일로 모은다', { 'font-size': 14, fill: MUT, opacity: fade(u, 1.6) }); }
-    if (k === 8) { ['① 안쪽(자식)까지 내려간다', '② 형제 중 첫 매칭에서 멈춘다', '③ continue: true 면 다음 형제도 본다'].forEach((s, i) => tx(690, 300 + i * 30, s, { 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.5) })); } }
+    if (k === 8) { ['① 안쪽(자식)까지 내려간다', '② 형제 중 첫 매칭에서 멈춘다', '③ continue: true면 다음 형제도 본다'].forEach((s, i) => tx(690, 300 + i * 30, s, { 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.5) })); } }
 
   // ---------- 3. Template ----------
   const EX = { name: 'API 5xx 비율 높음', sum: '5xx 비율이 5%를 5분 이상 넘었다' };
@@ -113,26 +113,26 @@
     [['slack.custom.title', 1], ['slack.custom.text', 2], ['email.custom.subject', 5]].forEach(([n, at], i) => { const y = 80 + i * 56, on = k >= at, hot = (k === at) || (at === 2 && k >= 2 && k <= 4) || (k === 8 && i < 2);
       card(170, y, 280, 42, { rx: 8, stroke: on ? (hot ? ACC : INK) : GRID, sw: hot ? 2.8 : 1.6, dash: on ? null : '6 6', fill: on ? PANEL : 'none', s: k === 0 ? pop(u, 0.3 + i * 0.25) : k === at ? pop(u, 0.2) : 1 });
       if (on) mono(44, y + 5, 'define "' + n + '"', { 'font-size': 13.5, 'font-weight': 700, fill: hot ? ACC : INK }); });
-    if (k === 0) { sub(620, 200, '이름 붙은 템플릿을 등록하고', fade(u, 1.2), { 'font-size': 16 }); sub(620, 230, 'Contact Point 에서 이름으로 불러 쓴다', fade(u, 1.6), { 'font-size': 16 }); return; }
+    if (k === 0) { sub(620, 200, '이름 붙은 템플릿을 등록하고', fade(u, 1.2), { 'font-size': 16 }); sub(620, 230, 'Contact Point에서 이름으로 불러 쓴다', fade(u, 1.6), { 'font-size': 16 }); return; }
     if (k <= 4) { pill(870, 30, '예시 값', MUT, 1, { fs: 13.5 });
       msg(350, 52, 590, k >= 2 ? 340 : 120, k === 4 ? BAD : ACC, k === 1 ? pop(u, 0.2) : 1);
       const title = '🔥 [FIRING] ' + EX.name;
       tx(374, 90, title, { 'font-size': 17, 'font-weight': 800, opacity: k === 1 ? fade(u, 0.6) : 1 });
       if (k === 1) { tx(374, 140, '✅ [RESOLVED] ' + EX.name, { 'font-size': 17, 'font-weight': 800, fill: GOOD, opacity: fade(u, 1.6) });
-        sub(645, 210, '.Status 가 firing 이면 🔥, 아니면 ✅', fade(u, 2.0), { 'font-size': 15 }); return; }
+        sub(645, 210, '.Status가 firing이면 🔥, 아니면 ✅', fade(u, 2.0), { 'font-size': 15 }); return; }
       [['Severity', k === 4 ? 'critical' : 'warning'], ['Team', 'backend'], ['Service', 'api']].forEach(([a, b], i) => { const op = k === 2 ? fade(u, 0.3 + i * 0.3) : 1;
         tx(374, 128 + i * 26, a + ':', { 'font-size': 14.5, 'font-weight': 800, opacity: op }); el('rect', { x: 450, y: 113 + i * 26, width: tw(b, 13.5) + 14, height: 21, rx: 4, fill: SOFT, opacity: op }); mono(457, 128 + i * 26, b, { 'font-size': 13.5, fill: BAD, opacity: op }); });
-      if (k === 2) { sub(645, 300, '공통 라벨은 .CommonLabels 에서 꺼낸다', fade(u, 1.6), { 'font-size': 15 }); return; }
+      if (k === 2) { sub(645, 300, '공통 라벨은 .CommonLabels에서 꺼낸다', fade(u, 1.6), { 'font-size': 15 }); return; }
       [0, 1].forEach((i) => { const y = 222 + i * 62, op = k === 3 ? fade(u, 0.5 + i * 0.8) : 1;
         tx(374, y, '• ' + EX.sum, { 'font-size': 14.5, 'font-weight': 700, opacity: op }); tx(390, y + 24, 'Grafana에서 보기   📖 Runbook', { 'font-size': 14, fill: INFO, opacity: op }); });
       if (k === 3) { const p = el('path', { d: 'M 925 230 C 960 250, 960 300, 925 315', fill: 'none', stroke: ACC, 'stroke-width': 2.4, opacity: fade(u, 0.4) }); mono(918, 210, 'range .Alerts', { 'font-size': 13.5, fill: ACC, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 0.4) }); }
       if (k === 4) { card(645, 370, 200, 34, { rx: 6, fill: BADBG, stroke: BAD, sw: 1.8, text: '<!channel> 즉시 대응', fs: 14, color: BAD, s: pop(u, 0.8) });
-        tx(910, 375, 'critical 일 때만', { 'font-size': 14, fill: BAD, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 1.4) }); }
+        tx(910, 375, 'critical일 때만', { 'font-size': 14, fill: BAD, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 1.4) }); }
       return; }
     if (k === 5) { card(650, 200, 520, 150, { rx: 10, stroke: INFO, sw: 2, s: pop(u, 0.2) }); env(430, 160, pop(u, 0.4), INFO);
       tx(470, 166, '제목', { 'font-size': 14, fill: MUT, opacity: fade(u, 0.6) });
       const s = '[FIRING CRITICAL] ' + EX.name; tx(420, 214, s.slice(0, Math.round(s.length * E(u, 0.7, 1.9))), { 'font-size': 17, 'font-weight': 800 });
-      sub(650, 320, 'toUpper 로 상태와 severity 를 대문자로', fade(u, 2.0), { 'font-size': 15 }); pill(870, 30, '예시 값', MUT, 1, { fs: 13.5 }); }
+      sub(650, 320, 'toUpper로 상태와 severity를 대문자로', fade(u, 2.0), { 'font-size': 15 }); pill(870, 30, '예시 값', MUT, 1, { fs: 13.5 }); }
     if (k === 6) { card(400, 210, 60, 60, { rx: 30, text: '.', fs: 30, fw: 800, stroke: ACC, color: ACC, s: pop(u, 0.2) });
       ['.Status', '.Alerts', '.CommonLabels', '.CommonAnnotations', '.GroupLabels', '.ExternalURL'].forEach((f, i) => { const y = 70 + i * 56, s = pop(u, 0.4 + i * 0.25);
         edge(430, 210, 560, y, E(u, 0.3 + i * 0.25, 0.8 + i * 0.25), ACC); tagL(565, y, f, INK, { mono: true, fs: 14, s }); });
@@ -157,7 +157,7 @@
     if (k === 0) { sub(760, 160, '이름 붙은 시간대를 먼저 정의하고', fade(u, 1.4), { 'font-size': 15 }); sub(760, 186, '정책에서 이름으로 부른다', fade(u, 1.8), { 'font-size': 15 }); return; }
     if (k === 1) { tagL(RX, 90, 'nightly-maintenance', INFO, { mono: true, s: pop(u, 0.4) }); mono(RX, 132, '월~금 02:00–04:00', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.7) });
       for (let r = 0; r < 5; r++) el('rect', { x: GX + 11 * CW, y: GY + r * CH, width: 2 * CW - 2, height: CH - 3, rx: 2, fill: 'none', stroke: BAD, 'stroke-width': 1.8, 'stroke-dasharray': '4 3', opacity: fade(u, 1.5) });
-      tx(RX, 190, 'location 을 빼면 UTC 기준', { 'font-size': 14.5, fill: BAD, 'font-weight': 700, opacity: fade(u, 1.6) });
+      tx(RX, 190, 'location을 빼면 UTC 기준', { 'font-size': 14.5, fill: BAD, 'font-weight': 700, opacity: fade(u, 1.6) });
       tx(RX, 214, '→ 한국 시간 11~13시가 꺼진다', { 'font-size': 14.5, fill: BAD, opacity: fade(u, 1.9) }); }
     if (k === 2) { tagL(RX, 90, 'weekend-batch', WARN, { mono: true, s: pop(u, 0.4) }); mono(RX, 132, '토·일 00:00–06:00', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.7) });
       sub(GX + 210, 320, '예정된 배치 소음은 시간대로 미리 막는다', fade(u, 1.6), { 'font-size': 15 }); }
@@ -175,12 +175,12 @@
       card(RX + 180, 250, 300, 56, { rx: 10, stroke: BAD, sw: 2.4 }); mono(RX + 44, 245, 'severity = critical → pagerduty', { 'font-size': 13.5, 'font-weight': 700, fill: BAD }); mono(RX + 44, 268, 'mute 없음', { 'font-size': 13.5 });
       el('circle', { cx: GX + 3 * CW + CW / 2, cy: GY + 1 * CH + 11, r: 8, fill: k === 5 ? INFO : BAD }); tx(GX + 3 * CW + 16, GY + 1 * CH - 4, '화 03시', { 'font-size': 13.5, 'font-weight': 700 }); }
     if (k === 5) { [['nightly', 0], ['weekend', 1], ['holiday', 2]].forEach(([n, i]) => tagL(RX + 120 + i * 100, 150, n, INFO, { mono: true, fs: 13.5, s: pop(u, 0.2 + i * 0.2) }));
-      bell(RX + 180, 330, pop(u, 1.4), INFO, true); tx(RX + 210, 336, 'info 는 조용히', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) }); }
-    if (k === 6) { bell(RX + 180, 330, 1 + R.bump(u, 0.8), BAD); tx(RX + 210, 336, 'critical 은 새벽에도 울린다', { 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
+      bell(RX + 180, 330, pop(u, 1.4), INFO, true); tx(RX + 210, 336, 'info는 조용히', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) }); }
+    if (k === 6) { bell(RX + 180, 330, 1 + R.bump(u, 0.8), BAD); tx(RX + 210, 336, 'critical은 새벽에도 울린다', { 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
       dot([[GX + 3 * CW + CW / 2, GY + CH + 11], [RX + 30, 250]], seg(u, 0.2, 1.4), BAD, 7); }
     if (k === 7) { [['critical', '항상 통지', BAD, 0], ['warning', '야간만 mute', WARN, 1], ['info', '야간·주말 mute', INFO, 2]].forEach(([a, b, col, i]) => { const y = 110 + i * 80;
         pill(RX + 70, y, a, col, pop(u, 0.2 + i * 0.4), { fs: 15 }); tx(RX + 150, y + 6, b, { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 0.4 + i * 0.4) }); }); }
-    if (k === 8) { ['전체 mute → 진짜 사고도 못 받음', 'mute 후 해제 잊음 → 영구 무음', 'location 미지정 → UTC 로 동작'].forEach((s, i) => { const y = 110 + i * 70; cross(RX + 14, y, 9, pop(u, 0.2 + i * 0.4)); tx(RX + 36, y + 6, s, { 'font-size': 15, 'font-weight': 600, opacity: fade(u, 0.3 + i * 0.4) }); }); } }
+    if (k === 8) { ['전체 mute → 진짜 사고도 못 받음', 'mute 후 해제 잊음 → 영구 무음', 'location 미지정 → UTC로 동작'].forEach((s, i) => { const y = 110 + i * 70; cross(RX + 14, y, 9, pop(u, 0.2 + i * 0.4)); tx(RX + 36, y + 6, s, { 'font-size': 15, 'font-weight': 600, opacity: fade(u, 0.3 + i * 0.4) }); }); } }
 
   // ---------- 5. 전체 파이프라인 ----------
   const PN = [{ n: 'Rule', s: 'Firing', x: 80 }, { n: 'Policy', s: '라우팅', x: 265 }, { n: 'Mute', s: '시간대', x: 450 }, { n: 'Template', s: '메시지', x: 635 }, { n: 'Contact', s: '발송', x: 835 }];
@@ -210,14 +210,14 @@
       el('rect', { x: x0, y: MY - 10, width: w, height: 30, rx: 6, fill: SOFT });
       el('rect', { x: H(22), y: MY - 10, width: (H(24) - H(22)) * g, height: 30, rx: 4, fill: INFO, opacity: 0.85 }); el('rect', { x: H(0), y: MY - 10, width: (H(8) - H(0)) * g, height: 30, rx: 4, fill: INFO, opacity: 0.85 });
       [0, 8, 22, 24].forEach((h) => mono(H(h), MY + 40, String(h).padStart(2, '0') + ':00', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT }));
-      tx(480, MY - 26, '자정을 넘는 구간은 22–24 와 00–08 두 개로', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.4) }); }
+      tx(480, MY - 26, '자정을 넘는 구간은 22–24와 00–08 두 개로', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.4) }); }
     if (k === 6 || k === 7) { msg(250, MY - 70, 460, k === 7 ? 150 : 60, ACC, k === 6 ? pop(u, 0.3) : 1); tx(274, MY - 32, '[FIRING] API 5xx 비율 높음', { 'font-size': 16, 'font-weight': 800, opacity: k === 6 ? fade(u, 0.8) : 1 });
       pill(870, 30, '예시 값', MUT, 1, { fs: 13.5 });
       if (k === 7) { [0, 1].forEach((i) => tx(274, MY + 6 + i * 30, '• 5xx 비율이 5%를 5분 이상 넘었다', { 'font-size': 14.5, opacity: fade(u, 0.4 + i * 0.7) })); mono(700, MY + 66, 'range .Alerts', { 'font-size': 13.5, fill: ACC, 'text-anchor': 'end', 'font-weight': 700, opacity: fade(u, 0.3) }); } }
     if (k === 8) { const rows = [['a. severity = critical → pagerduty', '✓ 매칭 · continue', GOOD, 0.3], ['b. severity = warning → slack-ops', '✗ 안 맞음', MUT, 0.9], ['c. 루트 slack-ops', '자식이 맞았으니 안 감', MUT, 1.5]];
       pill(130, 150, '{severity=critical}', BAD, pop(u, 0.1), { mono: true, fs: 13.5 });
       rows.forEach(([a, b, col, at], i) => { const y = 200 + i * 40; mono(250, y, a, { 'font-size': 14, 'font-weight': 700, opacity: fade(u, at) }); tx(930, y, b, { 'font-size': 14, 'font-weight': 700, fill: col, 'text-anchor': 'end', opacity: fade(u, at + 0.2) }); });
-      banner(480, 330, 'PagerDuty 만 받는다', pop(u, 2.0)); } }
+      banner(480, 330, 'PagerDuty만 받는다', pop(u, 2.0)); } }
 
   const quiz = [
     { q: 'email-oncall에 주소 두 개와 singleEmail: false를 두면 알람 하나에 메일은 어떻게 나가나?',

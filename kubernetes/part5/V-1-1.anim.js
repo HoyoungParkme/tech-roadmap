@@ -54,9 +54,9 @@
       mono(rx + 10, 222, 'server: https://…', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.7) }); mono(rx + 10, 242, 'token:  ••••••', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.9) });
       sub(790, 300, 'GET 요청 하나만 간다', fade(u, 1.2), { 'font-size': 14, fill: INK, 'font-weight': 700 }); }
     if (k === 1) { ['인증', '인가 (RBAC)'].forEach((s, i) => pill(240 + i * 96, 104, s, GOOD, pop(u, 0.5 + i * 0.25), { fs: 13.5 }));
-      tx(rx, 168, 'etcd 에서 읽은 키', { 'font-size': 13.5, fill: INFO, 'font-weight': 700, opacity: fade(u, 1) });
+      tx(rx, 168, 'etcd에서 읽은 키', { 'font-size': 13.5, fill: INFO, 'font-weight': 700, opacity: fade(u, 1) });
       o.rows.forEach((r, i) => mono(rx, 196 + i * 26, '/registry/pods/default/' + r[0].replace(/^.*-/, '…'), { 'font-size': 13.5, fill: INK, opacity: fade(u, 1.1 + i * 0.2) }));
-      tx(rx, 318, 'kubelet 은 거치지 않는다', { 'font-size': 14, fill: MUT, 'font-weight': 600, opacity: fade(u, 2) }); }
+      tx(rx, 318, 'kubelet은 거치지 않는다', { 'font-size': 14, fill: MUT, 'font-weight': 600, opacity: fade(u, 2) }); }
     if (k === 2) { [['-A', '모든 namespace'], ['-o wide', 'NODE · Pod IP 추가'], ['-w', '변화를 계속 지켜봄']].forEach(([f, d], i) => {
         const y = 186 + i * 56, s = pop(u, 0.3 + i * 0.3); pill(rx + 46, y, f, ACC, s, { mono: true, fs: 14 }); tx(rx + 104, y + 5, d, { 'font-size': 14, opacity: fade(u, 0.4 + i * 0.3) }); });
       el('rect', { x: 40 + 16 + 51 * 8.4 - 4, y: 146 + 44 + 2 * 22 - 18, width: 60, height: 22 * (o.rows.length + 1) + 6, rx: 4, fill: 'none', stroke: ACC, 'stroke-width': 2, opacity: fade(u, 1.2) }); }
@@ -83,7 +83,7 @@
     rows.forEach(([a, v, col], i) => { const nw = (k === 1 && i >= 2) || (k === 2 && i >= 4) || (k === 0 && i < 2) || k === 4, op = nw ? fade(u, 0.3 + i * 0.2) : 1;
       mono(50, 190 + i * 28, a, { 'font-size': 14.5, fill: MUT, opacity: op * sw }); mono(190, 190 + i * 28, v, { 'font-size': 14.5, fill: col, 'font-weight': 700, opacity: op * sw }); });
     if (k === 2 || k === 3) { const y = 190 + 6 * 28; card(330, y - 5, 200, 30, { rx: 15, stroke: BAD, sw: 2, fill: PANEL, text: '137 = 128 + 9 (SIGKILL)', fs: 13.5, color: BAD, s: k === 2 ? pop(u, 1.4) : 1, mono: true }); }
-    if (k === 0) sub(245, 392, 'Pod 와 Event, 두 종류를 etcd 에서 같이 읽는다', fade(u, 1.2), { 'font-size': 14 });
+    if (k === 0) sub(245, 392, 'Pod와 Event, 두 종류를 etcd에서 같이 읽는다', fade(u, 1.2), { 'font-size': 14 });
     // 오른쪽: Events 목록
     tx(490, 160, 'Events (시간순)', { 'font-size': 15, 'font-weight': 700 });
     const prevMsgs = new Set(((po && k !== 4) ? po.events : []).map((e) => e.reason + e.msg));
@@ -150,7 +150,7 @@
       pill(170, 380, '--rm: 나가면 지워짐', MUT, pop(u, 1.2), { fs: 13.5 }); }
     if (k === 5) { card(170, 230, 200, 60, { rx: 10, stroke: BAD, sw: 2, text: 'distroless 이미지', fs: 15, color: BAD });
       tx(170, 300, 'bash · sh 없음', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
-      sub(170, 340, '흔적은 Audit log 를 켜야 남는다', fade(u, 1.4), { 'font-size': 13.5 }); }
+      sub(170, 340, '흔적은 Audit log를 켜야 남는다', fade(u, 1.4), { 'font-size': 13.5 }); }
     // 오른쪽: 셸
     const cmd = ['$ kubectl exec web-aa1 -- ls /app', '$ kubectl exec -it web-aa1 -- bash', '$ kubectl exec -it web-aa1 -c app -- sh', '$ kubectl exec -it web-aa1 -- bash', '$ kubectl run tmp --rm -it --image=busybox -- sh', '$ kubectl exec -it web-prod -- bash'][k];
     const lines = [cmd];
@@ -178,7 +178,7 @@
       tx(720, 200, 'etcd', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: MUT }); el('rect', { x: 620, y: 214, width: 200, height: 110, rx: 12, fill: 'none', stroke: GRID, 'stroke-width': 2, 'stroke-dasharray': '6 5' });
       tx(720, 274, '아직 그대로', { 'text-anchor': 'middle', 'font-size': 15, fill: MUT, opacity: fade(u, 1) }); return; }
     if (k === 1) { fly(100, 200, 452, 110, seg(u, 0.2, 1.5), 'deployment.yaml', { mono: true });
-      zone(300, 160, 600, 220, 'etcd 의 Deployment web', { fill: SOFT });
+      zone(300, 160, 600, 220, 'etcd의 Deployment web', { fill: SOFT });
       tx(330, 218, 'spec (원하는 상태)', { 'font-size': 15, 'font-weight': 700, fill: ACC }); tx(630, 218, 'status (지금 상태)', { 'font-size': 15, 'font-weight': 700, fill: MUT });
       mono(330, 256, 'image: myapp:v2', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.4) }); mono(330, 286, 'replicas: 3', { 'font-size': 15, opacity: fade(u, 1.5) });
       mono(630, 256, 'v1 Pod 3개 Running', { 'font-size': 15, fill: MUT }); el('line', { x1: 600, y1: 196, x2: 600, y2: 360, stroke: GRID, 'stroke-width': 2 });
@@ -192,12 +192,12 @@
     rsBox(440, 190, 'web-7d9f8c5b', 'v1', st[0], st[0], { col: INK, op: k === 5 ? 0.5 : 1 });
     rsBox(440, 290, 'web-5b6c8d9f', 'v2', st[1], st[2], { col: ACC, op: newOp });
     const mx = 620;
-    if (k === 2) { pill(mx + 150, 200, 'maxSurge = ceil(3 × 25%) = 1', ACC, pop(u, 1.2), { mono: true, fs: 13.5 }); tx(mx + 20, 250, 'Pod 는 최대 4개까지', { 'font-size': 14.5, opacity: fade(u, 1.6) });
-      tx(mx + 20, 276, '새 Pod 1개가 Pending 으로', { 'font-size': 14.5, opacity: fade(u, 1.9) }); }
+    if (k === 2) { pill(mx + 150, 200, 'maxSurge = ceil(3 × 25%) = 1', ACC, pop(u, 1.2), { mono: true, fs: 13.5 }); tx(mx + 20, 250, 'Pod는 최대 4개까지', { 'font-size': 14.5, opacity: fade(u, 1.6) });
+      tx(mx + 20, 276, '새 Pod 1개가 Pending으로', { 'font-size': 14.5, opacity: fade(u, 1.9) }); }
     if (k === 3) { const nx = 760; ['node-1', 'node-2', 'node-3'].forEach((n, i) => { const y = 166 + i * 54; card(nx, y, 230, 44, { rx: 8, stroke: i === 2 ? ACC : GRID, sw: 2 }); mono(nx - 100, y + 5, n, { 'font-size': 14, 'font-weight': 700 }); });
       fly(340, 342, nx + 50, 274, seg(u, 0.3, 1.4), 'Pod dd4', { mono: true, stay: true });
       el('rect', { x: nx - 100, y: 306, width: 200, height: 10, rx: 5, fill: SOFT }); el('rect', { x: nx - 100, y: 306, width: 200 * E(u, 1.4, 2.5), height: 10, rx: 5, fill: ACC });
-      mono(nx, 336, 'kubelet: pull myapp:v2', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.4) }); tx(nx, 362, 'scheduler 가 nodeName 을 채움', { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.6) }); }
+      mono(nx, 336, 'kubelet: pull myapp:v2', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.4) }); tx(nx, 362, 'scheduler가 nodeName을 채움', { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.6) }); }
     if (k === 4) { const tot = st[0] + st[1];
       mono(mx + 20, 190, `v1 ${st[0]} · v2 ${st[1]} (Ready ${st[2]})`, { 'font-size': 15, 'font-weight': 700 });
       mono(mx + 20, 220, `전체 ${tot} ≤ 4,  가용 ${st[0] + st[2]} ≥ 3`, { 'font-size': 14.5, fill: tot > 4 || st[0] + st[2] < 3 ? BAD : GOOD });
@@ -206,7 +206,7 @@
       el('rect', { x: 40, y: 368, width: 880, height: 34, rx: 6, fill: INK });
       mono(56, 390, '$ kubectl rollout status · ' + msg, { 'font-size': 13.5, fill: st[0] === 0 ? 'var(--term)' : PANEL }); }
     if (k === 5) { pill(mx + 140, 200, 'unchanged', MUT, pop(u, 0.4), { mono: true, fs: 14 }); tx(mx + 20, 250, '다시 apply 해도 차이가 없으면', { 'font-size': 14.5, opacity: fade(u, 0.8) });
-      tx(mx + 20, 276, '아무것도 만들지 않는다', { 'font-size': 14.5, opacity: fade(u, 1) }); sub(mx + 130, 316, '옛 ReplicaSet 은 0개로 남아 롤백에 쓰인다', fade(u, 1.5), { 'font-size': 13.5 }); } }
+      tx(mx + 20, 276, '아무것도 만들지 않는다', { 'font-size': 14.5, opacity: fade(u, 1) }); sub(mx + 130, 316, '옛 ReplicaSet은 0개로 남아 롤백에 쓰인다', fade(u, 1.5), { 'font-size': 13.5 }); } }
 
   // 6. delete — 정중한 종료
   function s6(t, c) { const { k, u } = c, tl = c.beat.output.timeline;
@@ -220,7 +220,7 @@
     const alive = k <= 2 || (k === 3 && u < 1.2) || (k === 5 && u < 1.6), state = k === 0 ? 'Running' : alive ? 'Terminating' : '삭제됨';
     card(170, 200, 210, 64, { rx: 12, stroke: k === 0 ? GOOD : alive ? WARN : OFF, sw: 2.5, dash: alive ? null : '6 4', text: 'web-aa1\n' + state, fs: 15, color: alive ? INK : MUT });
     if (k >= 1 && k !== 4) { mono(70, 252, 'deletionTimestamp: now', { 'font-size': 13.5, fill: WARN, 'font-weight': 700, opacity: k === 1 ? fade(u, 0.5) : 1 }); }
-    zone(330, 148, 250, 150, 'Service web 의 endpoints', { fill: SOFT });
+    zone(330, 148, 250, 150, 'Service web의 endpoints', { fill: SOFT });
     ['10.1.2.11 (aa1)', '10.1.3.12 (bb2)', '10.1.1.13 (cc3)'].forEach((ip, i) => { const out = i === 0 && k >= 1, y = 196 + i * 32;
       mono(350, y, ip, { 'font-size': 14, fill: out ? OFF : INK, 'text-decoration': out ? 'line-through' : null, opacity: out && k === 1 ? 1 - 0.4 * E(u, 0.6, 1.2) : 1 }); });
     if (k === 1) tx(455, 292, '새 트래픽이 끊긴다', { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.2) });
@@ -232,7 +232,7 @@
       tx(sx - 120, 246, '처리 중인 요청', { 'font-size': 14, fill: MUT }); mono(sx + 60, 246, String(n) + '건', { 'font-size': 16, 'font-weight': 800, fill: n === 0 ? GOOD : INK });
       for (let i = 0; i < n; i++) el('circle', { cx: sx - 110 + (i % 12) * 20, cy: 272, r: 6, fill: INFO }); }
     if (k === 3) { pill(sx, 190, 'SIGKILL', BAD, pop(u, 0.3), { mono: true }); fly(sx, 230, 170, 200, seg(u, 0.4, 1.2), '강제 종료', { fill: BAD });
-      card(sx - 40, 274, 210, 56, { rx: 12, stroke: GOOD, sw: 2.5, text: '새 Pod\nReplicaSet 이 복구', fs: 14, s: pop(u, 1.8) }); }
+      card(sx - 40, 274, 210, 56, { rx: 12, stroke: GOOD, sw: 2.5, text: '새 Pod\nReplicaSet이 복구', fs: 14, s: pop(u, 1.8) }); }
     if (k === 4) { pill(sx, 190, '--grace-period=0 --force', BAD, pop(u, 0.2), { mono: true, fs: 13.5 }); tx(sx, 240, '확인 없이 객체부터 지운다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
       tx(sx, 266, '앱은 정리할 틈이 없다', { 'text-anchor': 'middle', 'font-size': 14.5, opacity: fade(u, 1.1) }); }
     // 시간 막대

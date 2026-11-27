@@ -158,7 +158,7 @@
       mono(580, 210, `length = 1 → ${u > 1.0 ? 'false' : '?'}`, { 'font-size': 16, 'font-weight': 800, fill: BAD, opacity: fade(u, 0.6) });
       gate(800, 300, false, pop(u, 1.2)); return; }
     // k === 5: 위반 메시지
-    terminal(30, 240, 600, 160, ['🛑 차단: aws_instance.web instance_type = t3.large', '   사유: 비용 큰 인스턴스는 prod 에서 금지', ['   예외 신청: #infra-policy 슬랙 채널', '#fbbf24']], 3 * E(u, 0.2, 1.8), { title: 'Sentinel 출력 (예시)' });
+    terminal(30, 240, 600, 160, ['🛑 차단: aws_instance.web instance_type = t3.large', '   사유: 비용 큰 인스턴스는 prod에서 금지', ['   예외 신청: #infra-policy 슬랙 채널', '#fbbf24']], 3 * E(u, 0.2, 1.8), { title: 'Sentinel 출력 (예시)' });
     gate(800, 300, false, 1); note(660, 140, '이유를 말해 주지 않으면 우회만 는다', fade(u, 2.2)); }
 
   // ================= 5. CI 정기 점검 =================
@@ -239,11 +239,11 @@
       o: ['exit 2에서 set -e가 스크립트를 바로 끝냈다', 'webhook URL이 secrets에 없다', 'state lock이 걸려 있었다'], a: 0,
       why: 'set -e는 0이 아닌 종료 코드에서 멈춘다. plan 줄 뒤에 || EXIT=$? 를 붙이거나 set +e로 감싸야 exit 2 분기까지 간다.' },
     { q: '긴급 상황에서 콘솔로 t3.large로 키웠고 이 값을 유지하기로 했다. 순서로 맞는 것은?',
-      o: ['terraform apply로 바로 반영한다', 'refresh-only로 state를 맞추고 main.tf를 t3.large로 고쳐 PR을 올린다', 'state 파일을 열어 값을 직접 고친다'], a: 1,
+      o: ['terraform apply로 바로 반영한다', 'refresh-only로 state를 맞추고 main.tf도 고친다', 'state 파일을 열어 값을 직접 고친다'], a: 1,
       why: '그냥 apply하면 t3.small로 되돌아간다. state는 refresh-only로, 코드는 PR로 맞춰야 다음 plan이 깨끗하다.' },
-    { q: 'prod에서 t3.large를 금지하는 정책이 있는데, 누군가 콘솔에서 바꾼 t3.large를 코드로 흡수하려는 PR을 올렸다. 어떻게 되는가?',
-      o: ['plan의 after 값이 t3.large라 정책 검사에서 막힌다', 'refresh-only라 정책이 적용되지 않는다', '이미 실제가 t3.large라 통과한다'], a: 0,
-      why: '정책은 계획의 after 값을 본다. drift를 코드로 흡수하는 변경도 같은 정책을 통과해야 한다.' },
+    { q: '새벽 점검이 exit 2를 냈고 내용은 instance_type "t3.large" -> "t3.small"이었다. 팀이 콘솔 변경을 버리기로 했다면 할 일은?',
+      o: ['refresh-only로 state를 t3.large로 맞춘다', '금지 목록에서 t3.large를 뺀다', 'plan을 검토하고 apply해 t3.small로 되돌린다'], a: 2,
+      why: '코드가 맞는 쪽이면 일반 apply가 실제를 main.tf 값으로 되돌린다. refresh-only는 콘솔 변경을 받아들일 때 쓴다.' },
   ];
 
   R.page({ title: 'drift 감지와 정책', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });

@@ -22,7 +22,7 @@
   // ── 1. 단일 Prometheus 의 벽
   function s1(t, c) { const { k, u } = c;
     DC.forEach((d, i) => { const cnt = k === 0 ? lerp(0, d.detail, E(u, 0.3 + i * 0.2, 1.6 + i * 0.2)) : d.detail; dcBox(d, { s: k === 0 ? pop(u, 0.1 + i * 0.2) : 1, cnt }); pods(d, k === 0 ? fade(u, 0.8) : 1, k === 1); });
-    sub(480, 412, 'DC 마다 상세 지표를 로컬에서 수집 (규모는 예시)', k === 0 ? fade(u, 1.8) : 0.9);
+    sub(480, 412, 'DC마다 상세 지표를 로컬에서 수집 (규모는 예시)', k === 0 ? fade(u, 1.8) : 0.9);
     if (k === 0) { globalBox({ dash: '7 5', fill: PANEL, stroke: MUT, name: '글로벌 뷰 없음', s: pop(u, 1.6) }); return; }
     if (k === 1) { const g = E(u, 0.2, 1.2); globalBox({ fill: BADBG, stroke: BAD, name: '한 서버가 직접 긁으면', sub: fmt(lerp(0, TOTAL, E(u, 0.6, 2.0))) + ' 시계열', subCol: BAD });
       DC.forEach((d) => { for (let i = 0; i < 8; i += 2) { const x = d.x - 84 + i * 24; el('line', { x1: 480, y1: GY + 34, x2: lerp(480, x, g), y2: lerp(GY + 34, 372, g), stroke: BAD, 'stroke-width': 1.2, opacity: 0.55 }); } });
@@ -64,11 +64,11 @@
       mono(760, 190, '200 OK · 빈 응답', { 'text-anchor': 'middle', 'font-size': 14, fill: BAD, opacity: fade(u, 2.1) }); }
     if (k === 3) { DC.forEach((d, i) => mono(d.x, DY + 58, d.id + '-prometheus:9090', { 'font-size': 13.5, 'text-anchor': 'middle', fill: ACC, 'font-weight': 700, opacity: fade(u, 0.6 + i * 0.2) }));
       lines.forEach(([a, b], i) => { if (u > 1.0) dot([b, a], ((t * 0.55 + i * 0.33) % 1), ACC, 6); });
-      sub(480, 412, '하위도 HTTP 로 지표를 내놓는 평범한 타깃이다', fade(u, 1.6), { 'font-weight': 700, fill: INK }); }
+      sub(480, 412, '하위도 HTTP로 지표를 내놓는 평범한 타깃이다', fade(u, 1.6), { 'font-weight': 700, fill: INK }); }
     if (k === 4) { lines.forEach(([a, b], i) => dot([b, a], ((t * 0.55 + i * 0.33) % 1), ACC, 5));
-      card(480, 172, 470, 110, { rx: 10, stroke: GRID, sw: 1.5, fill: PANEL });
-      DC.forEach((d, i) => typed(262, 150 + i * 26, `up{job="api", …, tier="dc"}  ← ${d.id}`, seg(u, 0.3 + i * 0.4, 1.1 + i * 0.4), { 'font-size': 14, fill: INK }));
-      pill(480, 246, 'tier="dc" = 상위가 붙인 출처 라벨', GOOD, pop(u, 1.9), { fs: 13.5 }); } }
+      card(480, 164, 470, 110, { rx: 10, stroke: GRID, sw: 1.5, fill: PANEL });
+      DC.forEach((d, i) => typed(262, 142 + i * 26, `up{job="api", …, tier="dc"}  ← ${d.id}`, seg(u, 0.3 + i * 0.4, 1.1 + i * 0.4), { 'font-size': 14, fill: INK }));
+      pill(480, 238, 'tier="dc" = 상위가 붙인 출처 라벨', GOOD, pop(u, 1.9), { fs: 13.5 }); } }
 
   // ── 3. match[] — 집계된 소수만
   const RAW = ['pod-1', 'pod-2', 'pod-3', 'pod-4', 'pod-5', 'pod-6', 'pod-7', 'pod-8'];
@@ -94,7 +94,7 @@
     if (k >= 2) { const v = k === 3 ? lerp(FED, TOTAL, E(u, 0.8, 2.2)) : FED, hot = k === 3;
       mono(748, 250, fmt(v), { 'font-size': 30, 'font-weight': 800, fill: hot ? BAD : ACC, 'text-anchor': 'middle' }); sub(748, 276, hot ? '상위 시계열 (DC 3곳 전부 복제)' : '상위 시계열 (DC 3곳 × 6, 예시)', 1, { fill: hot ? BAD : MUT, 'font-weight': 700 });
       if (hot && u > 2.2) pill(748, 318, 'OOM', BAD, pop(u, 2.2), { fs: 15 }); }
-    if (k === 4) { mono(250, 400 - 14, '512,000 은 여기 남는다', { 'font-size': 14, 'font-weight': 700, fill: INFO, 'text-anchor': 'middle', opacity: fade(u, 0.6) }); } }
+    if (k === 4) { mono(250, 400 - 14, '512,000은 여기 남는다', { 'font-size': 14, 'font-weight': 700, fill: INFO, 'text-anchor': 'middle', opacity: fade(u, 0.6) }); } }
 
   // ── 4. honor_labels — 라벨 충돌
   const ROWS = ['job', 'instance', 'exported_job', 'exported_instance', 'region', 'tier'];
@@ -105,7 +105,7 @@
     el('rect', { x: 100, y: 352, width: 760, height: 44, rx: 10, fill: INFOBG, stroke: INFO, 'stroke-width': 2, opacity: k === 0 ? fade(u, 0.1) : 1 });
     tx(116, 379, 'dc-a', { 'font-size': 14, 'font-weight': 800, fill: INFO });
     typed(170, 380, 'job:http_requests:rate5m{job="api", instance="pod-7"}  42.1', k === 0 ? seg(u, 0.2, 1.4) : 1, { 'font-size': 14.5, 'font-weight': 700, fill: INK });
-    if (k === 0) { grow(480, 350, 480, 300, E(u, 1.6, 2.2), ACC, {}); sub(492, 324, '/federate 로 올라간다', fade(u, 2.0), { 'text-anchor': 'start', 'font-weight': 700, fill: ACC }); return; }
+    if (k === 0) { grow(480, 350, 480, 300, E(u, 1.6, 2.2), ACC, {}); sub(492, 324, '/federate로 올라간다', fade(u, 2.0), { 'text-anchor': 'start', 'font-weight': 700, fill: ACC }); return; }
     // 표 머리
     tx(x0, y0, '라벨', { 'font-size': 14, 'font-weight': 700, fill: MUT }); tx(xf, y0, 'honor_labels: false (기본)', { 'font-size': 15, 'font-weight': 800, fill: WARN });
     if (k >= 2) tx(xt, y0, 'honor_labels: true', { 'font-size': 15, 'font-weight': 800, fill: GOOD, opacity: k === 2 ? fade(u, 0.2) : 1 });
@@ -116,11 +116,11 @@
       const [vf, cf] = COLF[r], [vt, ct] = COLT[r];
       const of = k === 1 ? fade(u, 0.4 + i * 0.3) : rowOp; mono(xf, y, vf, { 'font-size': 14, fill: cf, 'font-weight': 700, opacity: of });
       if (k >= 2) { const ot = k === 2 ? fade(u, 0.5 + i * 0.3) : rowOp; mono(xt, y, vt, { 'font-size': 14, fill: ct, 'font-weight': 700, opacity: ot }); } });
-    if (k === 1) { grow(500, y0 + 32, 500, y0 + 38 + 2 * rh - 10, E(u, 1.4, 2.0), MUT, {}); sub(510, y0 + 38 + rh * 1.5, '원래 값은 exported_ 로 밀려난다', fade(u, 1.9), { 'text-anchor': 'start', fill: WARN, 'font-weight': 700 }); }
+    if (k === 1) { grow(500, y0 + 32, 500, y0 + 38 + 2 * rh - 10, E(u, 1.4, 2.0), MUT, {}); sub(510, y0 + 38 + rh * 1.5, '원래 값은 exported_로 밀려난다', fade(u, 1.9), { 'text-anchor': 'start', fill: WARN, 'font-weight': 700 }); }
     if (k === 2) { check(xt - 20, y0 + 33, 8, pop(u, 1.0)); check(xt - 20, y0 + 33 + rh, 8, pop(u, 1.2)); }
     if (k === 3) { card(760, 300, 250, 46, { rx: 8, stroke: GOOD, sw: 2, s: pop(u, 0.2) }); typed(650, 306, 'honor_labels: true', seg(u, 0.4, 1.2), { 'font-size': 15, 'font-weight': 800, fill: GOOD });
       sub(380, 306, '빠뜨려도 에러는 없다. 라벨만 조용히 바뀐다', fade(u, 1.5), { fill: BAD, 'font-weight': 700 }); }
-    if (k === 4) sub(380, 306, 'region·tier 는 하위에 없던 이름이라 충돌 없이 붙는다', fade(u, 1.5), { fill: GOOD, 'font-weight': 700 }); }
+    if (k === 4) sub(380, 306, 'region·tier는 하위에 없던 이름이라 충돌 없이 붙는다', fade(u, 1.5), { fill: GOOD, 'font-weight': 700 }); }
 
   // ── 5. 스케일 전략과 한계
   function node(x, y, s, col, sc) { card(x, y, tw(s, 14) + 26, 36, { rx: 8, text: s, fs: 14, mono: true, stroke: col || INK, s: sc }); }
@@ -138,7 +138,7 @@
       if (g > 0.9) mono((X(30) + X(60)) / 2, 388, '최대 30s 늦다', { 'font-size': 15, 'font-weight': 800, fill: BAD, 'text-anchor': 'middle' }); }
     if (k === 4) { ['Thanos', 'Cortex', 'Mimir'].forEach((s, i) => card(300 + i * 180, 296, 150, 52, { rx: 10, text: s, fs: 16, fw: 800, stroke: ACC, s: pop(u, 0.3 + i * 0.25) }));
       sub(480, 352, '장기 저장 · 전역 원본 쿼리가 필요할 때 (V-2-2)', fade(u, 1.3), { 'font-weight': 700, fill: INK });
-      sub(480, 392, 'Federation 은 요약을 모으는 데까지', fade(u, 1.8), { fill: MUT }); } }
+      sub(480, 392, 'Federation은 요약을 모으는 데까지', fade(u, 1.8), { fill: MUT }); } }
 
   const quiz = [
     { q: 'DC 세 곳의 모든 타깃을 글로벌 서버 한 대가 직접 긁으면 어떻게 되는가?',
@@ -150,7 +150,7 @@
     { q: 'match[]에 {__name__=~".+"}를 넣으면 어떻게 되는가?',
       o: ['job: 접두 지표만 골라 온다', '응답이 비어 아무것도 안 온다', '하위 전체가 올라와 글로벌이 다시 폭발한다'], a: 2,
       why: '모든 이름에 맞으므로 18개면 될 상위가 1,540,000개를 복제하게 된다. match[]에는 recording rule 결과처럼 집계된 지표만 넣는다.' },
-    { q: 'honor_labels를 기본값(false)으로 두면 하위의 job="api" 는 어떻게 되는가?',
+    { q: 'honor_labels를 기본값(false)으로 두면 하위의 job="api"는 어떻게 되는가?',
       o: ['그대로 job="api"로 남는다', 'exported_job="api"로 밀려나고 job은 federate가 된다', '시계열이 통째로 버려진다'], a: 1,
       why: '충돌하면 상위 쪽 값이 이기고 원래 값은 exported_ 접두 라벨로 옮겨진다. Federation에서는 honor_labels: true로 원본을 지킨다.' },
     { q: '상위 Prometheus에서 pod-7의 원시 요청 수를 찾을 수 없는 까닭은 무엇인가?',

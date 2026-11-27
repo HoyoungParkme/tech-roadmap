@@ -81,7 +81,7 @@
       if (k === 1) { fileCard(560, 70, 340, 230, 'live/dev/vpc/', {});
         fileCard(590, 120, 280, 140, '.terragrunt-cache/', { stroke: MUT, color: MUT, dash: '5 4' });
         const s = pop(u, 1.0); card(730, 212, 170, 48, { rx: 8, text: 'backend.tf', fs: 15, mono: true, fw: 800, stroke: GOOD, color: GOOD, fill: GOODBG, s });
-        mono(730, 290, 'Terragrunt 가 써 준다', { 'font-size': 14, fill: GOOD, 'text-anchor': 'middle', opacity: fade(u, 1.5) }); }
+        mono(730, 290, 'Terragrunt가 써 준다', { 'font-size': 14, fill: GOOD, 'text-anchor': 'middle', opacity: fade(u, 1.5) }); }
       if (k === 2) { bucket(640, 150, 'mycompany-tfstate', { s: pop(u, 0.5) });
         card(840, 150, 150, 70, { rx: 10, stroke: INFO, fill: INFOBG, s: pop(u, 1.0) }); lock(840, 145, true, INFO, pop(u, 1.2));
         mono(840, 212, 'tfstate-lock', { 'font-size': 14, 'font-weight': 800, 'text-anchor': 'middle', fill: INFO, opacity: fade(u, 1.2) });
@@ -101,7 +101,7 @@
         mono(x, y, n, { 'font-size': 16, 'font-weight': 800 }); mono(x + 70, y, note, { 'font-size': 14, fill: i === 0 ? GOOD : MUT, 'font-weight': 700, opacity: i === 2 ? 1 : fade(u, i === 1 ? 1.0 : 1.7) }); });
       dot([[650, 266], [610, 186], [570, 106]], seg(u, 0.4, 1.8), ACC, 8);
       if (u > 1.8) check(540, 104, 10, pop(u, 1.8));
-      tx(24, 260, '부모 폴더로 올라가며 terragrunt.hcl 을 찾는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.0) });
+      tx(24, 260, '부모 폴더로 올라가며 terragrunt.hcl을 찾는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.0) });
       tx(24, 288, '자식에는 backend 설정이 한 줄도 없다', { 'font-size': 15, fill: MUT, opacity: fade(u, 2.2) });
       return; }
     if (k === 5) { snippet(24, 40, ['terraform {', '  source = "../../../modules//vpc"', '}', 'inputs = {', '  vpc_cidr = "10.10.0.0/16"', '  name     = "dev-vpc"', '}'], { fs: 14 });
@@ -127,12 +127,12 @@
   function s3(t, c) { const { k, u } = c;
     layer(0, at(c, 0, 0.1));
     if (k === 0) { chip(110, 92, 'local.company', MUT, pop(u, 0.5)); chip(270, 92, 'local.region', MUT, pop(u, 0.7));
-      tx(560, 100, 'locals 는 파일 안에서 계산용', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.2) });
+      tx(560, 100, 'locals는 파일 안에서 계산용', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.2) });
       tx(560, 130, '이것만으로는 모듈에 전달되지 않는다', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) }); return; }
     // 루트 inputs
     ['company', 'region'].forEach((n, i) => chip(80 + i * 105, 92, n, INFO, at(c, 1, 0.3 + i * 0.2)));
     chip(345, 92, 'tags{ManagedBy, Owner}', INFO, at(c, 1, 0.8), { fs: 13.5 });
-    if (k === 1) { tx(560, 100, 'inputs 에 담아야 모듈로 간다', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.2) });
+    if (k === 1) { tx(560, 100, 'inputs에 담아야 모듈로 간다', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.2) });
       tx(560, 130, '공통 태그도 여기서 한 번만', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) }); return; }
     layer(1, at(c, 2, 0.2));
     if (k === 2) { grow(240, 150, 240, 110, E(u, 0.8, 1.3), BAD, { dash: '5 4' }); if (u > 1.3) cross(260, 128, 12, pop(u, 1.3));
@@ -146,7 +146,7 @@
         [['ManagedBy', INFO], ['Owner', INFO], ['Environment', WARN]].forEach(([kk, col], j) => { const kept = deep || j === 2;
           mono(540, y + 32 + j * 26, (kept ? '' : '') + kk, { 'font-size': 14.5, 'font-weight': 700, fill: kept ? col : OFF, 'text-decoration': kept ? null : 'line-through', opacity: op }); });
         (deep ? check : cross)(720, y + 56, 14, pop(u, 1.2 + i * 0.6)); });
-      tx(560, 400, 'tags 같은 맵은 merge_strategy 에 달렸다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.3) }); return; }
+      tx(560, 400, 'tags 같은 맵은 merge_strategy에 달렸다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.3) }); return; }
     layer(2, at(c, 4, 0.2));
     if (k >= 4) { const g = gr(c, 4, 0.6, 1.4);
       el('path', { d: 'M440,300 C490,300 490,85 462,85', fill: 'none', stroke: INFO, 'stroke-width': 2.4, 'stroke-dasharray': `${g * 300} 300` });
@@ -156,7 +156,7 @@
     if (k === 4) { tx(560, 330, '위 두 파일을 블록 둘로 받는다', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.8) }); return; }
     chip(110, 366, 'vpc_cidr', ACC, at(c, 5, 0.3)); chip(240, 366, 'name', ACC, at(c, 5, 0.5)); chip(360, 366, 'source', ACC, at(c, 5, 0.7));
     if (k === 5) { tx(560, 330, '이 모듈만의 값만 적는다', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.2) });
-      tx(560, 358, 'company · region 은 다시 안 적는다', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) }); return; }
+      tx(560, 358, 'company · region은 다시 안 적는다', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) }); return; }
     // 오른쪽: 합친 결과
     zone(520, 30, 420, 370, '모듈에 전달되는 inputs', { fill: SOFT });
     const RES = [['company', '"mycompany"', INFO], ['region', '"ap-northeast-2"', INFO], ['env', '"dev"', WARN], ['vpc_cidr', '"10.10.0.0/16"', ACC], ['name', '"dev-vpc"', ACC]];
@@ -198,7 +198,7 @@
       for (let i = 0; i < 4; i++) el('rect', { x: 60 + i * 46, y: 318, width: 40, height: 26, rx: 5, fill: i < (u > 1.05 && u < 1.8 ? 2 : u > 0.3 ? 1 : 0) ? ACC : SOFT, stroke: GRID });
       tx(60, 376, '동시에 최대 4개 · 승인 프롬프트 없이', { 'font-size': 14.5, fill: MUT }); }
     if (k === 2) say('지정한 두 모듈만 plan  (terraform plan × 2)', ACC, 1.8);
-    if (k === 3) { say('eks 를 빼고 apply', ACC, 1.6); tx(720, 220, 'eks output 이 필요하면 mock 이 있어야 한다', { 'font-size': 14, fill: WARN, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.0) }); }
+    if (k === 3) { say('eks를 빼고 apply', ACC, 1.6); tx(720, 220, 'eks output이 필요하면 mock이 있어야 한다', { 'font-size': 14, fill: WARN, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.0) }); }
     if (k === 4) say('확인 한 번에 환경 전체가 지워진다 · 운영에서는 쓰지 않는다', BAD, 1.6);
     if (k === 5) say('생성의 역순으로 하나씩, 매번 무엇이 지워지는지 본다', INK, 2.4); }
 
@@ -216,8 +216,8 @@
     if (k >= 1) depArrow('rds', 'vpc', gr(c, 1, 0.4, 1.2), '../vpc', 1);
     const ry = 230;
     if (k === 0) { tx(380, ry, 'inputs.subnet_ids =', { 'font-size': 15, class: 'mono' }); mono(560, ry, '???', { 'font-size': 18, 'font-weight': 800, fill: BAD, opacity: fade(u, 0.8) });
-      tx(380, ry + 40, '이대로면 vpc 의 ID 를 손으로 옮겨 적는다', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) }); }
-    if (k === 1) tx(480, ry, 'rds 는 vpc 에 의존한다 → vpc 가 먼저', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.4) });
+      tx(380, ry + 40, '이대로면 vpc의 ID를 손으로 옮겨 적는다', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) }); }
+    if (k === 1) tx(480, ry, 'rds는 vpc에 의존한다 → vpc가 먼저', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.4) });
     if (k === 2) { ['vpc_id = "vpc-mock-000"', 'subnet_ids = ["subnet-mock-a", "subnet-mock-b"]'].forEach((s, i) => mono(250, ry + i * 26, s, { 'font-size': 14, fill: WARN, 'font-weight': 700, opacity: fade(u, 0.3 + i * 0.3) }));
       mono(250, ry - 30, 'mock_outputs', { 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: fade(u, 0.2) });
       [['plan', true], ['validate', true], ['apply', false]].forEach(([n, ok], i) => { const x = 330 + i * 150;
@@ -229,7 +229,7 @@
       ['vpc_id', 'subnet_ids'].forEach((n, i) => { chip(U.vpc, 210 + i * 40, n, INFO, k === 3 ? pop(u, 0.2 + i * 0.2) : 1);
         if (k === 3) dot([[U.vpc + 60, 210 + i * 40], [U.rds - 80, 210 + i * 40]], seg(u, 0.8 + i * 0.3, 1.6 + i * 0.3), INFO, 6);
         mono(U.rds - 80, 215 + i * 40, 'dependency.vpc.outputs.' + n, { 'font-size': 13.5, fill: INFO, opacity: k === 3 ? fade(u, 1.5 + i * 0.3) : 0.5 }); });
-      if (k === 3) { tx(480, 360, '참조 한 줄이 곧 배선 · 사람이 ID 를 옮겨 적지 않는다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.2) }); return; } }
+      if (k === 3) { tx(480, 360, '참조 한 줄이 곧 배선 · 사람이 ID를 옮겨 적지 않는다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.2) }); return; } }
     if (k >= 4) { ucard('app', at(c, 4, 0.2), { col: ACC, sub: ['dependency "vpc"'].concat(k >= 5 ? ['dependency "rds"'] : []) });
       depArrow('app', 'vpc', gr(c, 4, 0.5, 1.5), 'app → vpc', 1); }
     if (k >= 5) { depArrow('app', 'rds', gr(c, 5, 0.3, 1.0), null, 1);
@@ -238,9 +238,9 @@
     if (k === 6) { ['vpc_id', 'subnet_ids', 'db_endpoint'].forEach((n, i) => { const col = i < 2 ? INFO : WARN, from = i < 2 ? [U.vpc + 60, 210 + i * 40] : [U.rds + 60, 300];
         dot([from, [U.app - 40, 250 + i * 40]], seg(u, 0.3 + i * 0.4, 1.2 + i * 0.4), col, 6);
         chip(U.app + 20, 250 + i * 40, n, col, pop(u, 1.2 + i * 0.4)); });
-      tx(480, 400, '두 모듈의 output 이 app 의 inputs 에서 만난다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.3) }); }
+      tx(480, 400, '두 모듈의 output이 app의 inputs에서 만난다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.3) }); }
     if (k === 7) { ['vpc', 'rds', 'app'].forEach((n, i) => card(U[n] + 105, 52, 34, 34, { rx: 17, text: String(i + 1), fs: 16, fw: 800, mono: true, stroke: GOOD, color: GOOD, fill: GOODBG, s: pop(u, 0.3 + i * 0.4) }));
-      tx(480, 400, '선언된 dependency 를 모아 순서를 스스로 정한다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.8) }); } }
+      tx(480, 400, '선언된 dependency를 모아 순서를 스스로 정한다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.8) }); } }
 
   const quiz = [
     { q: 'terragrunt apply를 치면 실제로 인프라를 바꾸는 것은 무엇인가?',

@@ -31,14 +31,14 @@
     const PX = 300, PY = 60, PW = 360, PH = 210;
     const split = k === 3 ? E(u, 0.3, 1.2) : k >= 4 ? 1 : 0;
     gpanel(PX, PY, PW, PH, 'p99 Latency', { type: k >= 1 ? 'timeseries' : null, stroke: k === 0 ? ACC : GRID, op: k === 0 ? fade(u, 0.2) : 1 });
-    if (k === 0) { pill(PX + PW - 30, PY - 2, 'id 1', ACC, pop(u, 0.6), { mono: true, fs: 13.5 }); sub(480, 320, 'id 는 보드 안 번호, title 은 사람이 읽는 이름', fade(u, 1.3), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+    if (k === 0) { pill(PX + PW - 30, PY - 2, 'id 1', ACC, pop(u, 0.6), { mono: true, fs: 13.5 }); sub(480, 320, 'id는 보드 안 번호, title은 사람이 읽는 이름', fade(u, 1.3), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     const gx = PX + 20, gy = PY + 40, gw = PW - 40, gh = PH - 70;
     el('line', { x1: gx, y1: gy + gh, x2: gx + gw, y2: gy + gh, stroke: GRID, 'stroke-width': 1.4 });
     spark(gx, gy, gw, gh, SER, 0.3, k === 1 ? E(u, 0.4, 1.5) : 1, ACC);
     if (k === 1) { // 미니 보드: 24칸 중 12칸
       const bx = 700, by = 90, cw = 10; for (let i = 0; i < 24; i++) el('rect', { x: bx + i * cw, y: by, width: cw - 1.5, height: 50, fill: i < 12 * E(u, 1.0, 1.8) ? ACC : SOFT, opacity: 0.85 });
       mono(bx + 120, by + 76, 'gridPos w 12 / 24', { 'font-size': 14, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 1.6) });
-      sub(480, 320, 'type 을 바꾸면 같은 데이터가 다른 그림이 된다', fade(u, 2.0), { 'font-size': 15 }); return; }
+      sub(480, 320, 'type을 바꾸면 같은 데이터가 다른 그림이 된다', fade(u, 2.0), { 'font-size': 15 }); return; }
     // 데이터소스
     R.dbIcon(120, 170, 'Prometheus', { s: k === 2 ? pop(u, 0.3) : 1 });
     if (k === 2) { grow(168, 165, PX - 6, 165, E(u, 0.8, 1.4), ACC); mono(230, 150, 'uid prom-default', { 'font-size': 13.5, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1.3) });
@@ -52,7 +52,7 @@
       card(x, y + 30, 250, 62, { rx: 10, stroke: col, sw: 2.4, fill: PANEL, s: Math.max(0.3, s0), op: s0 });
       tx(x - 110, y + 24, a, { 'font-size': 15, 'font-weight': 800, fill: col, opacity: s0 }); mono(x - 110, y + 48, bb, { 'font-size': 13.5, opacity: s0 }); });
     if (k === 3) { fly(PX + 40, PY + 60, 160, 82, seg(u, 1.2, 2.2), 'histogram_quantile(0.99, …)', { mono: true, fill: INFO });
-      sub(480, 405, 'targets 가 데이터를 가져오는 부분', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
+      sub(480, 405, 'targets가 데이터를 가져오는 부분', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
     if (k === 4) { [['unit', 's'], ['decimals', '2'], ['legend', 'on']].forEach(([a, v], i) => pill(PX + 60 + i * 120, PY + PH + 0, `${a} ${v}`, WARN, pop(u, 0.9 + i * 0.3), { mono: true, fs: 13.5 }));
       sub(480, 405, '옵션은 보이는 방식만 바꾼다. 데이터는 그대로', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
     if (k === 5) { [200, 480, 760].forEach((x, i) => grow(x, 300, lerp(x, PX + PW / 2, 0.55), PY + PH + 4, E(u, 0.2 + i * 0.2, 0.9 + i * 0.2), ACC));
@@ -89,10 +89,10 @@
     if (k >= 2) { mono(560, 84, 'count(*) AS orders   WHERE status = \'paid\'', { 'font-size': 14, fill: k === 2 ? ACC : MUT, opacity: k === 2 ? fade(u, 0.2) : 1 });
       PAID.forEach((v, i) => { const g = k === 2 ? E(u, 0.4 + i * 0.3, 1.0 + i * 0.3) : 1; el('rect', { x: X(i) - 18, y: Y(v * g), width: 36, height: AY + AH - Y(v * g), rx: 3, fill: ACCBG, stroke: ACC, 'stroke-width': 1.5 });
         mono(X(i), Y(v) - 8, String(v), { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', fill: ACC, opacity: k === 2 ? fade(u, 1.0 + i * 0.3) : 1 }); }); }
-    if (k === 2) { sub(730, 400, 'failed 행은 WHERE 에서 빠진다', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+    if (k === 2) { sub(730, 400, 'failed 행은 WHERE에서 빠진다', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k === 3) { mono(30, 380, '$__timeFilter(created_at)', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 0.2) });
       mono(30, 406, "→ created_at BETWEEN '…T09:03:00Z' AND '…T10:03:00Z'", { 'font-size': 14, fill: INK, opacity: fade(u, 0.7) });
-      sub(730, 350, '보드 시간창(last 1h)이 WHERE 로 들어간다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(730, 350, '보드 시간창(last 1h)이 WHERE로 들어간다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     // k4: 정렬 전 지그재그 → 정렬 후 선
     const order = [2, 0, 1], pos = (i) => lerp(X(order.indexOf(i) === -1 ? i : order[i]), X(i), sortU);
     if (k >= 4) { const pts = [0, 1, 2].map((i) => [k === 4 ? lerp(X(order[i]), X(i), sortU) : X(i), Y(PAID[i])]);
@@ -131,7 +131,7 @@
       sub(680, 200, '시계열이 숫자 하나로 접힌다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     else { const txt = k === 1 ? (u < 1.0 ? '0.042' : '4.20%') : '4.20%'; mono(230, 200, txt, { 'font-size': 48, 'font-weight': 800, 'text-anchor': 'middle', fill: k >= 3 ? (k === 3 && u < 1.6 ? INK : WARN) : INK }); }
     if (k === 1) { card(680, 120, 300, 70, { rx: 10, text: 'unit percentunit\ndecimals 2', fs: 16, mono: true, stroke: ACC, color: ACC, s: pop(u, 0.3) });
-      mono(680, 240, '0.042 × 100 → 4.20%', { 'font-size': 18, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.2) }); sub(680, 280, 'decimals 2 라 끝 0 까지 쓴다', fade(u, 1.8), { 'font-size': 15 }); return; }
+      mono(680, 240, '0.042 × 100 → 4.20%', { 'font-size': 18, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.2) }); sub(680, 280, 'decimals 2라 끝 0까지 쓴다', fade(u, 1.8), { 'font-size': 15 }); return; }
     // 임계값 수직선 0 ~ 0.06
     const x0 = 500, W = 400, X = (v) => x0 + (v / 0.06) * W, y = 150;
     if (k >= 2) { el('line', { x1: x0, y1: y + 11, x2: x0 + W, y2: y + 11, stroke: MUT, 'stroke-width': 1.6 });
@@ -159,7 +159,7 @@
     if (k === 6) { // 순서와 비용
       [['쿼리', '집계로 행을 줄인다', GOOD, 'DB'], ['transform', '표시용 손질만', ACC, '브라우저']].forEach(([a, bb, col, wh], i) => { const x = 250 + i * 440, s = pop(u, 0.3 + i * 0.5);
         card(x, 200, 360, 120, { rx: 12, stroke: col, sw: 2.4, s }); lbl(x, 180, a, fade(u, 0.4 + i * 0.5), { 'font-size': 20, class: 'mono', fill: col }); sub(x, 214, bb, fade(u, 0.5 + i * 0.5), { 'font-size': 15, fill: INK }); sub(x, 244, '실행 위치: ' + wh, fade(u, 0.6 + i * 0.5), { 'font-size': 14 }); });
-      grow(440, 200, 500, 200, E(u, 1.2, 1.6), MUT); sub(480, 340, 'transform 은 위에서 아래로 차례대로', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 });
+      grow(440, 200, 500, 200, E(u, 1.2, 1.6), MUT); sub(480, 340, 'transform은 위에서 아래로 차례대로', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 });
       sub(480, 370, '행이 많으면 브라우저가 느려진다', fade(u, 2.2), { 'font-size': 15, fill: BAD, 'font-weight': 700 }); return; }
     if (k === 0) { const sl = E(u, 0.2, 1.0);
       table(lerp(10, 60, sl), 110, ['time', 'total'], TT.map((x, i) => [x, TOT[i]]), { col: (j) => (j ? INFO : INK), op: fade(u, 0.2) }); lbl(lerp(95, 145, sl), 96, 'A · 전체', fade(u, 0.2), { fill: INFO });
@@ -168,7 +168,7 @@
     if (k === 1) { const m = E(u, 0.3, 1.3);
       if (m < 1) { table(lerp(60, 230, m), 110, ['time', 'total'], TT.map((x, i) => [x, TOT[i]]), { col: (j) => (j ? INFO : INK), op: 1 - m * 0.5 }); table(lerp(560, 402, m), 110, ['time', 'success'], TT.map((x, i) => [x, SUC[i]]), { col: (j) => (j ? GOOD : INK), op: 1 - m * 0.5 }); }
       else table(230, 110, ['time', 'total', 'success'], TT.map((x, i) => [x, TOT[i], SUC[i]]), { col: (j) => [INK, INFO, GOOD][j] });
-      sub(480, 330, '같은 time 끼리 한 줄로 붙는다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(480, 330, '같은 time끼리 한 줄로 붙는다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     const showRate = k === 2 ? 0 : k === 3 ? 1 : 1, hide = k === 5 ? E(u, 0.3, 1.1) : 0, ren = k === 5 && u > 1.2;
     const cols = ['time', 'total', 'success', ren ? '성공률' : 'success_rate'];
     table(150, 110, cols, TT.map((x, i) => [x, TOT[i], SUC[i], k >= 3 ? RATE[i] : null]), { cw: 130, col: (j) => [INK, INFO, GOOD, ACC][j], head: (j) => j === 3,
@@ -179,7 +179,7 @@
     if (k === 4) { mono(480, 290, 'excludeByName · renameByName', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 0.4) }); sub(480, 320, '숨길 컬럼과 새 이름을 한 번에', fade(u, 1.2), { 'font-size': 15 }); return; }
     // k5: stat 하나
     gpanel(640, 260, 260, 140, '성공률', { type: 'stat', stroke: ACC, op: fade(u, 1.6) }); mono(770, 350, '0.987', { 'font-size': 36, 'font-weight': 800, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 1.9) });
-    sub(330, 330, '남은 컬럼 하나를 stat 이 보여 준다', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
+    sub(330, 330, '남은 컬럼 하나를 stat이 보여 준다', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
 
   // ========== 5. 편집·복제·재배치 ==========
   function board(x, y, w, rowH, rows) { const cw = w / 24; el('rect', { x, y, width: w, height: rows * rowH, rx: 6, fill: SOFT, stroke: GRID, 'stroke-width': 1.2 });
@@ -192,7 +192,7 @@
       T.forEach(([n, z, hh], i) => { const x = 250 + i * 460; R.person(x - 110, 170, null, { s: pop(u, 0.3 + i * 0.3) }); tx(x - 70, 160, n, { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 0.4 + i * 0.3) }); mono(x - 70, 186, z, { 'font-size': 14, fill: MUT, opacity: fade(u, 0.4 + i * 0.3) });
         const show = fix > 0.5 ? '09:00' : hh; card(x, 270, 200, 64, { rx: 10, text: show, fs: 28, mono: true, stroke: fix > 0.5 ? GOOD : i ? INK : BAD, color: fix > 0.5 ? GOOD : i ? INK : BAD, s: pop(u, 0.6 + i * 0.3) }); });
       if (u < 1.4) sub(480, 360, 'timezone browser: 사람마다 시각이 다르다', fade(u, 1.0), { 'font-size': 15, fill: BAD, 'font-weight': 700 });
-      else sub(480, 360, 'timezone "utc" 로 고정: 모두 같은 시각', fade(u, 1.5), { 'font-size': 15, fill: GOOD, 'font-weight': 700 }); return; }
+      else sub(480, 360, 'timezone "utc"로 고정: 모두 같은 시각', fade(u, 1.5), { 'font-size': 15, fill: GOOD, 'font-weight': 700 }); return; }
     const B = board(40, 70, 560, 20, 15);
     const pr = (x, y, w, h) => [B.X(x) + 3, B.Y(y) + 3, B.X(x + w) - B.X(x) - 6, h * 20 - 6];
     // 기본 배치: Latency(0,0,12,8), RPS(12,0,6,8), Error Rate 는 k0 에서 (0,8,6,6) → (18,0,6,8)
@@ -222,7 +222,7 @@
     KEYS.forEach(([kk, a, at], i) => { const y = 110 + i * 70; card(RX + 50, y, 80, 46, { rx: 8, text: kk, fs: 18, mono: true, fill: SOFT, s: pop(u, at) }); tx(RX + 110, y + 6, a, { 'font-size': 17, 'font-weight': 700, opacity: fade(u, at + 0.2), fill: i === 2 ? BAD : INK }); });
     if (u > 0.9) { const d = E(u, 0.9, 1.5); gpanel(lerp(lx, lx + 20, d), lerp(ly, ly + 175, d), lw * 0.5, 70, 'p99 Latency', { stroke: ACC, op: d * 0.9, fs: 13.5 }); }
     if (u > 1.6 && !removed) cross(B.X(15), B.Y(4), 16, pop(u, 1.7));
-    sub(RX + 150, 340, 'p r 은 새로고침이 아니라 패널 제거', fade(u, 2.1), { 'font-size': 15, fill: BAD, 'font-weight': 700 }); }
+    sub(RX + 150, 340, 'p r은 새로고침이 아니라 패널 제거', fade(u, 2.1), { 'font-size': 15, fill: BAD, 'font-weight': 700 }); }
 
   const quiz = [
     { q: '패널을 복제했을 때 함께 복사되는 것은 무엇인가?',
@@ -252,9 +252,9 @@
     { q: '주문 패널 선이 앞뒤로 엉켜 그려지고 시간창을 바꿔도 모양이 같다. 쿼리에서 먼저 볼 것은?',
       o: ['ORDER BY와 $__timeFilter가 빠졌는지', 'thresholds 경계값', 'colorMode 설정'], a: 0,
       why: '정렬이 없으면 점이 시간 순서가 아니라 선이 엉키고, $__timeFilter가 없으면 시간창이 WHERE에 들어가지 않는다.' },
-    { q: '성공률 stat이 0.987 대신 success 값 148을 보여 준다. 어느 단계를 고쳐야 하나?',
+    { q: '성공률 stat에 0.987 말고 total·success 숫자까지 같이 찍힌다. 어느 단계를 고쳐야 하나?',
       o: ['쿼리 B의 WHERE 조건', 'organize에서 success·total을 숨기지 않은 것', 'gridPos의 w 값'], a: 1,
-      why: 'stat은 남아 있는 숫자 컬럼을 보여 준다. organize로 success와 total을 빼야 성공률 하나만 남는다.' },
+      why: 'stat은 기본으로 숫자 컬럼마다 값을 하나씩 보여 준다. organize로 success와 total을 빼야 성공률 하나만 남는다.' },
     { q: 'Error Rate를 복제해 Latency 패널을 만들었는데 4.20%처럼 퍼센트로 찍힌다. 왜인가?',
       o: ['Prometheus가 퍼센트로 돌려줘서', 'timezone이 browser라서', '복제할 때 unit percentunit 옵션도 같이 따라와서'], a: 2,
       why: '복제는 query·type·옵션을 통째로 가져온다. 쿼리만 바꾸고 unit을 s로 바꾸지 않으면 표시 방식이 그대로 남는다.' },

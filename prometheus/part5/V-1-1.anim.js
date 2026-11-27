@@ -52,7 +52,7 @@
       typed(A[0] - 168, 380, cmd, seg(u, 0.3, 1.4), { 'font-size': 13.5, fill: INK }); typed(Bs[0] - 168, 380, cmd, seg(u, 1.2, 2.3), { 'font-size': 13.5, fill: INK }); }
     // 공유 스토리지 없음
     if (k <= 3) { const s = k === 0 ? pop(u, 1.4) : 1; pill(480, 392, '공유 스토리지 · 조율 계층', MUT, s, { fs: 13.5 }); el('line', { x1: 380, y1: 392, x2: 580, y2: 392, stroke: BAD, 'stroke-width': 2.5, opacity: s > 0.5 ? (k === 0 ? fade(u, 1.8) : 1) : 0 }); }
-    if (k === 5) { if (dead) cross(A[0], A[1], 22, pop(u, 0.6)); banner(480, 392, '조율이 없으니 prom-b 는 하던 수집을 계속한다', pop(u, 1.3)); } }
+    if (k === 5) { if (dead) cross(A[0], A[1], 22, pop(u, 0.6)); banner(480, 392, '조율이 없으니 prom-b는 하던 수집을 계속한다', pop(u, 1.3)); } }
 
   // ── 2. 각자 스크랩한 두 벌 — 타임스탬프가 어긋난다
   const T0 = 175, TS = 40, X0 = 140, XW = 660, XT = (v) => X0 + ((v - T0) / TS) * XW, RA_ = 150, RB = 270;
@@ -124,7 +124,7 @@
       if (merge > 0.9) check(150, 205, 9, pop(u, 2.2));
       inbox(u < 2.2 ? 2 : 1, u < 2.2 ? BAD : GOOD); return; }
     inbox(k <= 2 ? 2 : 2, BAD);
-    if (k === 5) sub(300, 392, '--cluster.peer 를 빼면 gossip 이 끊긴다', fade(u, 0.8), { fill: BAD, 'font-weight': 700 }); }
+    if (k === 5) sub(300, 392, '--cluster.peer를 빼면 gossip이 끊긴다', fade(u, 0.8), { fill: BAD, 'font-weight': 700 }); }
 
   // ── 4. 로드밸런서 뒤에서 조회
   const GF = [120, 170], LB = [430, 170], SA4 = [790, 90], SB4 = [790, 250];
@@ -136,7 +136,7 @@
     sub(LB[0], LB[1] + 18, 'nginx', 1);
     const aDead = k >= 4, aOp = k === 0 ? 0.35 : 1;
     prom(SA4[0], SA4[1], 'prom-a', { w: 150, op: aOp, dead: aDead && (k > 4 || u > 1.6) }); prom(SB4[0], SB4[1], 'prom-b', { w: 150, op: aOp });
-    if (k === 0) sub(LB[0], LB[1] + 62, 'Grafana 가 아는 주소는 이것 하나', fade(u, 1.3), { 'font-weight': 700, fill: INK });
+    if (k === 0) sub(LB[0], LB[1] + 62, 'Grafana가 아는 주소는 이것 하나', fade(u, 1.3), { 'font-weight': 700, fill: INK });
     if (k >= 1) { const g = k === 1 ? E(u, 0.2, 1.0) : 1;
       [[SA4, aDead && (k > 4 || u > 1.6)], [SB4, false]].forEach(([p, off]) => el('line', { x1: LB[0] + 80, y1: LB[1], x2: lerp(LB[0] + 80, p[0] - 76, g), y2: lerp(LB[1], p[1], g), stroke: off ? OFF : INK, 'stroke-width': 2.2, 'stroke-dasharray': off ? '4 6' : null }));
       [SA4, SB4].forEach((p, i) => mono(p[0] - 76, p[1] + 50, 'max_fails=2 fail_timeout=10s', { 'font-size': 13.5, fill: MUT, opacity: k === 1 ? fade(u, 1.0 + i * 0.3) : 1 })); }
@@ -187,7 +187,7 @@
       if (sOf(3) > 0.6) { card(P[3][0] - 140, P[3][1] + 4, 120, 44, { rx: 8, text: '로컬 TSDB', fs: 14.5, stroke: INK });
         grow(P[3][0] - 78, P[3][1] + 4, P[3][0] + 20, P[3][1] + 4, k === 3 ? E(u, 0.8, 1.6) : 1, ACC, {});
         card(P[3][0] + 110, P[3][1] + 4, 170, 44, { rx: 8, text: 'mimir:9009', fs: 14.5, mono: true, stroke: ACC, s: k === 3 ? pop(u, 1.5) : 1 });
-        sub(P[3][0], P[3][1] + 52, 'remote_write 는 V-2-1 에서', k === 3 ? fade(u, 1.9) : 1); } }
+        sub(P[3][0], P[3][1] + 52, 'remote_write는 V-2-1에서', k === 3 ? fade(u, 1.9) : 1); } }
     if (k === 4) { banner(480, 372, '동일 설정 2대 + Alertmanager 클러스터 + LB 조회', pop(u, 0.4)); sub(480, 408, '단순함이 곧 튼튼함', fade(u, 1.2), { 'font-weight': 700, fill: INK }); } }
 
   const quiz = [

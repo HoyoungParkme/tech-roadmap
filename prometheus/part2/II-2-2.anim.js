@@ -109,7 +109,7 @@
     const ax = cdfAxes();
     cdf(ax, k === 2 ? E(u, 0.3, 1.8) : 1);
     if (k === 2) { PTS.slice(1).forEach(([x, y], i) => mono(ax.X(x) + 8, ax.Y(y) + (i < 3 ? 16 : -8), String(y), { 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.5 + i * 0.25) }));
-      tx(700, 130, '입력 = sum by (le) 로', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.6) }); tx(700, 156, '합친 버킷 분포', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.7) });
+      tx(700, 130, '입력 = sum by (le)로', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.6) }); tx(700, 156, '합친 버킷 분포', { 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.7) });
       sub(700, 190, '(+Inf 1000은 그림 밖)', fade(u, 1.9), { 'text-anchor': 'start', 'font-size': 14 }); return; }
     const y950 = ax.Y(950), xp = ax.X(0.9474);
     const g = k === 3 ? E(u, 0.2, 1.0) : 1; grow(ax.X(0), y950, lerp(ax.X(0), xp, g), y950, g, BAD, { plain: true, dash: '6 4' });

@@ -48,11 +48,11 @@
     if (k === 2) { const g = R.G(600, 110, pop(u, 0.3)); el('path', { d: 'M0,0 h40 l12,12 h60 v60 h-112 z', fill: WARNBG, stroke: WARN, 'stroke-width': 2.4 }, g);
       const rn = E(u, 1.4, 2.0); tx(740, 135, 'Platform', { 'font-size': 18, 'font-weight': 800, fill: rn > 0.4 ? MUT : INK, 'text-decoration': rn > 0.4 ? 'line-through' : null, opacity: fade(u, 0.5) });
       tx(740, 162, '→ Platform Team (예시)', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: rn }); mono(740, 200, 'folderUid: platform', { 'font-size': 15, fill: GOOD, 'font-weight': 700, opacity: fade(u, 0.8) });
-      sub(725, 270, '이름이 바뀌어도 uid 가 같으면 같은 폴더', fade(u, 2.0), { fill: INK, 'font-size': 14.5 }); return; }
+      sub(725, 270, '이름이 바뀌어도 uid가 같으면 같은 폴더', fade(u, 2.0), { fill: INK, 'font-size': 14.5 }); return; }
     if (k === 3) { const T = [['/etc/grafana/dashboards/platform/', INK, 700], ['  service-health.json', ACC, 700], ['  latency-slo.json', ACC, 700], ['  README.md', MUT, 400]];
       T.forEach(([s, col, fw], i) => mono(RX + 10, 110 + i * 40, s, { 'font-size': 15, fill: col, 'font-weight': fw, opacity: fade(u, 0.3 + i * 0.3) }));
       check(RX + 270, 145, 9, pop(u, 1.2)); check(RX + 250, 185, 9, pop(u, 1.4)); cross(RX + 150, 225, 8, pop(u, 1.6));
-      sub(725, 300, '*.json 만 대시보드가 된다', fade(u, 1.8), { fill: INK, 'font-size': 15, 'font-weight': 700 }); return; }
+      sub(725, 300, '*.json만 대시보드가 된다', fade(u, 1.8), { fill: INK, 'font-size': 15, 'font-weight': 700 }); return; }
     if (k === 4) { clock(640, 150, 48, (u % 1.5) / 1.5, ACC, '30초마다 다시 읽기');
       card(810, 120, 200, 48, { rx: 10, text: '> 10 → 그 주기로 폴링', fs: 14, stroke: ACC, s: pop(u, 0.8) }); card(810, 190, 200, 48, { rx: 10, text: '≤ 10 → 파일 변경 감시', fs: 14, stroke: INFO, s: pop(u, 1.2) });
       sub(725, 300, '파일을 고친 뒤 화면에 닿기까지의 지연', fade(u, 1.6), { fill: INK, 'font-size': 14.5 }); return; }
@@ -72,7 +72,7 @@
       el('rect', { x: BX, y: BY, width: BW, height: 300, rx: 10, fill: PANEL, stroke: GRID, 'stroke-width': 1.8 }); el('rect', { x: BX, y: BY, width: BW, height: 34, rx: 10, fill: INK }); el('rect', { x: BX, y: BY + 24, width: BW, height: 10, fill: INK });
       tx(BX + 14, BY + 23, k >= 0 ? 'Service Health' : '', { 'font-size': 15, 'font-weight': 700, fill: PANEL });
       mono(BX + 14, BY + 60, '/d/service-health', { 'font-size': 14.5, 'font-weight': 700, fill: ACC, opacity: k === 0 ? fade(u, 0.6) : 1 });
-      if (k === 0) sub(BX + BW / 2, BY + 150, 'uid 가 URL 이 된다 — 환경이 달라도 같은 주소', fade(u, 1.2), { fill: INK, 'font-size': 14 });
+      if (k === 0) sub(BX + BW / 2, BY + 150, 'uid가 URL이 된다 — 환경이 달라도 같은 주소', fade(u, 1.2), { fill: INK, 'font-size': 14 });
       if (k >= 1) ['platform', 'prod', 'now-1h', '30s'].forEach((s, i) => pill(BX + 50 + i * 86, BY + 92, s, i < 2 ? INFO : MUT, k === 1 ? pop(u, 0.3 + i * 0.2) : 1, { fs: 13.5, mono: true }));
       if (k >= 2) { const pw = (k === 2 ? E(u, 0.3, 1.3) : 1) * (BW - 32); el('rect', { x: BX + 16, y: BY + 120, width: pw, height: 140, rx: 7, fill: PANEL, stroke: k === 2 ? ACC : GRID, 'stroke-width': 2 });
         tx(BX + 26, BY + 142, 'p99 Latency', { 'font-size': 14, 'font-weight': 700, opacity: k === 2 ? fade(u, 1.0) : 1 });
@@ -88,7 +88,7 @@
     st.forEach(([s, col], i) => card(480, 90 + i * 66, 210, 46, { rx: 23, text: s, fs: 14.5, stroke: col, sw: 2, s: k === 4 ? pop(u, 0.3 + i * 0.4) : 1 }));
     dot([[330, 90], [375, 90], [375, 222], [585, 222], [630, 160]], ((t * 0.4) % 1), ACC, 7);
     folders(640, 50, 290, c, { h: 220 });
-    if (k === 5) { zone(30, 290, 900, 120, 'uid 를 빼먹으면 (예시)', { stroke: BAD });
+    if (k === 5) { zone(30, 290, 900, 120, 'uid를 빼먹으면 (예시)', { stroke: BAD });
       [['staging', '/d/a81xk2', 230], ['prod', '/d/q93mf0', 600]].forEach(([n, url, x], i) => { tx(x - 160, 345, n, { 'font-size': 15, 'font-weight': 800, opacity: fade(u, 0.8 + i * 0.3) }); mono(x - 60, 345, url, { 'font-size': 15, fill: BAD, 'font-weight': 700, opacity: fade(u, 0.8 + i * 0.3) }); });
       sub(480, 390, '같은 파일인데 환경마다 주소가 달라 링크가 깨진다', fade(u, 1.6), { fill: INK, 'font-size': 14.5 }); }
     else sub(480, 330, '매 주기 이 세 단계를 되풀이한다', fade(u, 1.6), { fill: INK, 'font-size': 15 }); }
@@ -102,7 +102,7 @@
     mono(30, 120, b.gitCommit || '', { 'font-size': 14, fill: INFO, 'font-weight': 700 });
     if (k === 0) { code(30, 140, 440, ['- name: gitops-dashboards', '  disableDeletion: false', '  updateIntervalSeconds: 20'], { fs: 15, lh: 32, hl: [1] });
       fileCard(620, 200, 'old.json', '파일 삭제', { w: 170, stroke: BAD, dash: '6 5', op: 1 - E(u, 1.0, 1.8) * 0.6 }); grow(708, 200, 770, 200, E(u, 1.2, 1.6), BAD);
-      card(850, 200, 140, 44, { rx: 8, text: '보드도 삭제', fs: 14.5, stroke: BAD, color: BAD, s: pop(u, 1.6) }); sub(480, 320, 'Git 에 있는 것만 Grafana 에 남는다', fade(u, 2.0), { fill: INK, 'font-size': 15 }); return; }
+      card(850, 200, 140, 44, { rx: 8, text: '보드도 삭제', fs: 14.5, stroke: BAD, color: BAD, s: pop(u, 1.6) }); sub(480, 320, 'Git에 있는 것만 Grafana에 남는다', fade(u, 2.0), { fill: INK, 'font-size': 15 }); return; }
     disk(30, 140, 330, c, { h: 190, title: '/etc/grafana/dashboards/git' });
     if (k === 2) card(480, 200, 200, 70, { rx: 10, text: 'foldersFromFilesStructure\n: true', fs: 14, mono: true, stroke: ACC, sw: 2.2, s: pop(u, 0.2) });
     if (k === 3) { card(480, 200, 210, 90, { rx: 10, stroke: INFO, sw: 2.2, s: pop(u, 0.2) }); mono(395, 186, 'PR #142', { 'font-size': 16, 'font-weight': 800, fill: INFO }); tx(395, 214, '리뷰 → main 머지', { 'font-size': 14.5, opacity: fade(u, 0.6) }); }
@@ -117,22 +117,22 @@
   function uiBoard(x, y, o) { o = o || {}; el('rect', { x, y, width: 400, height: 230, rx: 10, fill: PANEL, stroke: GRID, 'stroke-width': 1.8 }); el('rect', { x, y, width: 400, height: 34, rx: 10, fill: INK }); el('rect', { x, y: y + 24, width: 400, height: 10, fill: INK });
     tx(x + 14, y + 23, 'Platform › Service Health', { 'font-size': 14.5, 'font-weight': 700, fill: PANEL });
     el('rect', { x: x + 16, y: y + 50, width: 368, height: 120, rx: 7, fill: o.edited ? WARNBG : SOFT, stroke: o.edited ? WARN : 'none', 'stroke-width': 2 });
-    tx(x + 28, y + 74, o.edited ? 'p99 Latency (UI 에서 고침)' : 'p99 Latency', { 'font-size': 14, 'font-weight': 700, fill: o.edited ? WARN : INK });
+    tx(x + 28, y + 74, o.edited ? 'p99 Latency (UI에서 고침)' : 'p99 Latency', { 'font-size': 14, 'font-weight': 700, fill: o.edited ? WARN : INK });
     card(x + 340, y + 200, 80, 34, { rx: 8, text: 'Save', fs: 15, stroke: INK, sw: 2 }); }
   function s4(t, c) { const { k, u } = c;
     const Y = ['- name: platform-dashboards', '  disableDeletion: true', '  allowUiUpdates: false', '  updateIntervalSeconds: 30'];
     if (k <= 2) { code(30, 50, 400, Y, { fs: 15, lh: 32, hl: [[0], [1], [2]][k], rowOp: (i) => (i <= k + (k ? 1 : 0) ? 1 : 0.15) });
-      if (k === 0) { uiBoard(500, 50, {}); lock(890, 67, true, PANEL, pop(u, 0.6)); sub(700, 330, '적지 않아도 allowUiUpdates 기본값은 false', fade(u, 1.0), { fill: INK, 'font-size': 14.5 }); }
+      if (k === 0) { uiBoard(500, 50, {}); lock(874, 71, true, PANEL, 0.7 * pop(u, 0.6)); sub(700, 330, '적지 않아도 allowUiUpdates 기본값은 false', fade(u, 1.0), { fill: INK, 'font-size': 14.5 }); }
       if (k === 1) { fileCard(560, 130, 'service-health.json', '파일 삭제', { w: 230, stroke: BAD, dash: '6 5', op: 1 - E(u, 0.4, 1.2) * 0.6 }); cross(560, 130, 16, pop(u, 1.0));
         dbIcon(820, 140, 'grafana.db', {}); card(820, 250, 190, 40, { rx: 8, text: 'Service Health 남음', fs: 14, stroke: GOOD, color: GOOD, s: pop(u, 1.5) });
-        sub(690, 340, 'true: 파일이 사라져도 보드는 DB에 남는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 }); sub(230, 260, '기본값 false 면 함께 지워진다', fade(u, 2.1), { fill: MUT, 'font-size': 14 }); }
+        sub(690, 340, 'true: 파일이 사라져도 보드는 DB에 남는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 }); sub(230, 260, '기본값 false면 함께 지워진다', fade(u, 2.1), { fill: MUT, 'font-size': 14 }); }
       if (k === 2) { uiBoard(500, 50, { edited: true }); el('circle', { cx: lerp(700, 840, E(u, 0.1, 0.6)), cy: lerp(160, 250, E(u, 0.1, 0.6)), r: 7, fill: ACC, opacity: 1 - fade(u, 0.8) });
         card(560, 330, 420, 100, { rx: 12, stroke: BAD, sw: 2.6, s: pop(u, 0.8) }); tx(560, 314, 'Cannot save provisioned dashboard', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.0) });
-        tx(560, 344, 'JSON 을 복사해 provisioning 파일에 반영하라', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 1.2) }); }
+        tx(560, 344, 'JSON을 복사해 provisioning 파일에 반영하라', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 1.2) }); }
       return; }
-    if (k === 3 || k === 5) { const P = [['UI 에서 고쳐 보기', 140], ['JSON 복사', 330], ['PR · 리뷰', 520], ['파일 머지', 710], ['재스캔', 880]];
+    if (k === 3 || k === 5) { const P = [['UI에서 고쳐 보기', 140], ['JSON 복사', 330], ['PR · 리뷰', 520], ['파일 머지', 710], ['재스캔', 880]];
       P.forEach(([s, x], i) => { card(x, 160, i === 4 ? 120 : 160, 52, { rx: 26, text: s, fs: 14.5, stroke: i === 3 ? ACC : INK, color: i === 3 ? ACC : INK, sw: 2, s: k === 3 ? pop(u, 0.2 + i * 0.3) : 1 }); if (i) grow(P[i - 1][1] + (i === 4 ? 82 : 82), 160, x - (i === 4 ? 62 : 82), 160, k === 3 ? E(u, 0.4 + i * 0.3, 0.7 + i * 0.3) : 1, ACC); });
-      if (k === 3) { banner(480, 260, '변경 통로는 PR 하나', pop(u, 1.8)); sub(480, 320, '급한 hotfix 도 파일을 고쳐 배포해야 한다', fade(u, 2.1), { fill: WARN, 'font-weight': 700, 'font-size': 15 }); }
+      if (k === 3) { banner(480, 260, '변경 통로는 PR 하나', pop(u, 1.8)); sub(480, 320, '급한 hotfix도 파일을 고쳐 배포해야 한다', fade(u, 2.1), { fill: WARN, 'font-weight': 700, 'font-size': 15 }); }
       else { lock(480, 270, true, ACC, pop(u, 0.4)); banner(480, 340, '진실은 파일 하나 — allowUiUpdates: false', pop(u, 0.8)); }
       return; }
     // k4 true 를 고르면
@@ -140,12 +140,12 @@
     zone(520, 60, 400, 250, 'Grafana DB', { stroke: WARN }); mono(540, 130, '"title": "p99 Latency (UI)"', { 'font-size': 15, fill: WARN, 'font-weight': 700, opacity: fade(u, 0.4) });
     tx(480, 190, '≠', { 'text-anchor': 'middle', 'font-size': 36, 'font-weight': 800, fill: BAD, opacity: fade(u, 0.9) }); sub(480, 230, '진실이 둘', fade(u, 1.0), { fill: BAD, 'font-weight': 700, 'font-size': 15 });
     fly(240, 260, 720, 260, seg(u, 1.6, 2.5), '파일이 바뀌면 덮어쓴다', { fill: INK });
-    sub(480, 360, '실험·임시 보드에만 true 를 쓴다', fade(u, 2.3), { fill: INK, 'font-size': 15 }); }
+    sub(480, 360, '실험·임시 보드에만 true를 쓴다', fade(u, 2.3), { fill: INK, 'font-size': 15 }); }
 
   // 5. dashboard as code 종합
   function s5(t, c) { const { k, u } = c, b = c.beat;
     zone(30, 46, 420, 360, 'docker-compose · grafana:11.2.0', { stroke: INK });
-    const V = [['./provisioning → /etc/grafana/provisioning', 'provider yaml', 1], ['./dashboards → /etc/grafana/dashboards', 'Git 의 json', 2]];
+    const V = [['./provisioning → /etc/grafana/provisioning', 'provider yaml', 1], ['./dashboards → /etc/grafana/dashboards', 'Git의 json', 2]];
     V.forEach(([a, d, kk], i) => { const on = k >= kk, op = k === kk ? fade(u, 0.3) : on ? 1 : 0.2, y = 80 + i * 70;
       el('rect', { x: 46, y, width: 388, height: 56, rx: 8, fill: on ? ACCBG : SOFT, stroke: on ? ACC : GRID, 'stroke-dasharray': on ? null : '6 5', opacity: op });
       mono(58, y + 24, a, { 'font-size': 13.5, 'font-weight': 700, fill: on ? ACC : MUT, opacity: op }); tx(58, y + 45, d, { 'font-size': 13.5, fill: MUT, opacity: op }); });
@@ -177,7 +177,7 @@
   ];
 
   const summary = [
-    'provider yaml 하나에 folder, options.path, updateIntervalSeconds를 적어 어느 경로를 몇 초마다 볼지 정한다.',
+    'provider yaml의 options.path와 updateIntervalSeconds가 어느 경로를 몇 초마다 볼지 정한다.',
     'path 아래 *.json은 파일마다 보드 하나가 되고, 파일 안의 uid가 환경마다 같은 URL을 준다.',
     'Git 머지가 배포가 되고, foldersFromFilesStructure를 켜면 디렉터리 이름이 그대로 폴더가 된다.',
     'allowUiUpdates: false로 두면 UI 저장이 막혀 파일이 유일한 진실로 남는다.',

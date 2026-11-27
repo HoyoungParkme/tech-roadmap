@@ -36,7 +36,7 @@
     if (k === 0) { el('rect', { x: 200, y: 90, width: 560, height: 260, rx: 12, fill: SOFT, opacity: fade(u, 0.1) });
       mono(224, 122, '- name: api-error-rate', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 0.3) });
       mono(224, 152, '  rules:', { 'font-size': 16, opacity: fade(u, 0.6) });
-      [0, 1].forEach((i) => card(480, 210 + i * 70, 460, 50, { rx: 8, dash: '5 5', stroke: GRID, text: i ? '룰 …' : '여기에 alert 가 들어간다', fs: 15, color: MUT, s: pop(u, 0.9 + i * 0.3) }));
+      [0, 1].forEach((i) => card(480, 210 + i * 70, 460, 50, { rx: 8, dash: '5 5', stroke: GRID, text: i ? '룰 …' : '여기에 alert가 들어간다', fs: 15, color: MUT, s: pop(u, 0.9 + i * 0.3) }));
       note(200, 390, '같은 그룹의 룰은 한 평가 주기에 차례로 계산된다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
     if (k === 1) { const x0 = 100, W = 760, X = (v) => x0 + W * v / 0.025;
       el('line', { x1: x0, y1: 280, x2: x0 + W, y2: 280, stroke: MUT, 'stroke-width': 2 });
@@ -47,11 +47,11 @@
         el('line', { x1: X(v), y1: 280, x2: X(v), y2: 280 - h * lu, stroke: col, 'stroke-width': 3 });
         tx(X(v) + (i === 0 ? -6 : 6), 280 - h - 22, s, { 'font-size': 15, 'font-weight': 800, fill: col, opacity: lu, 'text-anchor': i === 0 ? 'end' : 'start' });
         tx(X(v) + (i === 0 ? -6 : 6), 280 - h - 2, d, { 'font-size': 13.5, fill: MUT, opacity: lu, 'text-anchor': i === 0 ? 'end' : 'start' }); });
-      note(100, 380, '임계치는 감이 아니라 SLO 의 에러 예산에서 거꾸로 구한다', fade(u, 2.0), { 'font-size': 14.5 }); return; }
+      note(100, 380, '임계치는 감이 아니라 SLO의 에러 예산에서 거꾸로 구한다', fade(u, 2.0), { 'font-size': 14.5 }); return; }
     if (k === 2) { card(300, 170, 380, 56, { rx: 10, text: '- alert: HighErrorRate', fs: 18, fw: 800, mono: true, s: pop(u, 0.2) });
       mono(130, 238, '    expr: |', { 'font-size': 16, opacity: fade(u, 0.6) });
       el('rect', { x: 170, y: 254, width: 400, height: 90, rx: 8, fill: 'none', stroke: GRID, 'stroke-dasharray': '6 5', opacity: fade(u, 0.8) });
-      sub(370, 304, 'PromQL 을 여러 줄로', fade(u, 1.0));
+      sub(370, 304, 'PromQL을 여러 줄로', fade(u, 1.0));
       fly(490, 170, 790, 170, seg(u, 1.2, 2.0), 'alertname="HighErrorRate"', { mono: true, stay: true, fill: INFO });
       sub(790, 210, '이 이름이 알림의 alertname 라벨이 된다', fade(u, 2.0), { 'font-size': 14 }); return; }
     if (k >= 3 && k <= 5) { ratioRows(k, u);
@@ -89,7 +89,7 @@
         mono(ax.X(4.5), 392, 'for: 5m = 5분 동안 계속 참이어야', { 'font-size': 15, 'font-weight': 800, fill: WARN, 'text-anchor': 'middle', opacity: fade(u, 1.3) }); return; }
       if (k === 2) { const m = E(u, 0.3, 1.8) * 4; clock(ax.X(2) - 4, 392, 16, m / 5, WARN); mono(ax.X(2) + 20, 398, `pending ${m.toFixed(0)}분 경과 / 5분`, { 'font-size': 15, 'font-weight': 800, fill: WARN });
         mono(ax.X(8), 398, '아직 아무도 모른다', { 'font-size': 14, fill: MUT, opacity: fade(u, 1.6) }); return; }
-      clock(ax.X(7), 392, 16, 1, BAD); fly(ax.X(7) + 20, 392, 700, 392, seg(u, 0.6, 1.5), 'Alertmanager 로', { fill: BAD, stay: true });
+      clock(ax.X(7), 392, 16, 1, BAD); fly(ax.X(7) + 20, 392, 700, 392, seg(u, 0.6, 1.5), 'Alertmanager로', { fill: BAD, stay: true });
       mono(ax.X(7) + 24, 242, '7분: firing', { 'font-size': 14, 'font-weight': 800, fill: BAD, opacity: fade(u, 0.3) }); return; }
     if (k === 4) { const ax = chart(SP, 1, 90, 140); tx(110, 78, '짧은 스파이크 (3분)', { 'font-size': 14.5, 'font-weight': 700 }); ex(760, 78, 1);
       lane(ax, states(5, SP), 260, Math.round(E(u, 0.2, 1.4) * 12), 'spike');
@@ -101,7 +101,7 @@
       L.forEach(([n, m, col], i) => { const y = 130 + i * 62; tx(80, y + 18, n, { 'font-size': 15, 'font-weight': 700 }); R.hbar(360, y, 440, m, 10, { col, text: m + 'm', h: 24, u: E(u, 0.2 + i * 0.25, 0.9 + i * 0.25) }); });
       note(80, 400, '길수록 오탐은 줄고, 알아채는 시간은 그만큼 늦다', fade(u, 2.0), { 'font-size': 14.5 }); return; }
     terminal(120, 110, 720, 150, ['$ promtool test rules tests/error-rate.test.yml', 'Unit Testing:  tests/error-rate.test.yml', '  SUCCESS'], lerp(0, 3, E(u, 0.2, 1.8)), { title: 'bash' });
-    note(120, 320, '언제 pending 이고 언제 firing 인지 테스트로 못 박는다', fade(u, 2.0)); }
+    note(120, 320, '언제 pending이고 언제 firing 인지 테스트로 못 박는다', fade(u, 2.0)); }
 
   // ---------- 3. labels / annotations ----------
   function alertCard(k, u, o) { o = o || {}; const x = 30, y = 90, w = 390;
@@ -122,7 +122,7 @@
     if (k >= 4) [['runbook', 120], ['dashboard', 300]].forEach(([s, dx], i) => card(x + dx, y + 210, 150, 40, { rx: 8, text: s + ' ↗', fs: 15, stroke: ACC, color: ACC, s: k === 4 ? pop(u, 0.3 + i * 0.4) : 1 })); }
   function s3(t, c) { const { k, u } = c;
     if (k <= 4) { alertCard(k, u); slack(k, u);
-      if (k === 0) { note(470, 200, 'Alertmanager 는 어디로 보낼지 알 길이 없다', fade(u, 0.6), { fill: WARN, 'font-size': 14.5 }); pill(690, 260, '→ 기본 수신자로 샌다', WARN, pop(u, 1.4), { fs: 14 }); }
+      if (k === 0) { note(470, 200, 'Alertmanager는 어디로 보낼지 알 길이 없다', fade(u, 0.6), { fill: WARN, 'font-size': 14.5 }); pill(690, 260, '→ 기본 수신자로 샌다', WARN, pop(u, 1.4), { fs: 14 }); }
       if (k === 1) note(470, 380, '라벨 값은 문자열로 정확히 비교된다', fade(u, 1.8), { 'font-size': 14 });
       if (k === 4) note(470, 360, '새벽에 받은 사람이 검색하지 않게', fade(u, 1.4), { 'font-size': 14 });
       return; }
@@ -131,15 +131,15 @@
         const col = i === 0 ? (j === 2 ? BAD : j === 1 ? WARN : INK) : j === 2 ? BAD : INK;
         tx(x, y, s, { 'font-size': i === 0 ? 17 : 16, 'font-weight': i === 0 || j === 0 ? 800 : 600, class: j > 0 ? 'mono' : null, fill: col, 'text-anchor': j ? 'middle' : 'start', opacity: j === 2 ? fade(u, 0.4 + i * 0.3) : 1 }); });
         if (i) el('line', { x1: 100, y1: y - 38, x2: 860, y2: y - 38, stroke: GRID }); });
-      note(120, 390, '같은 expr 를 두 단으로: warning 은 관찰, critical 은 호출', fade(u, 1.8), { 'font-size': 14.5 }); return; }
+      note(120, 390, '같은 expr를 두 단으로: warning은 관찰, critical은 호출', fade(u, 1.8), { 'font-size': 14.5 }); return; }
     if (k === 6) { [['severity=warning', WARN, 160, 'Slack #ops'], ['severity=critical', BAD, 300, 'PagerDuty 호출']].forEach(([s, col, y, r], i) => {
         card(200, y, 250, 44, { rx: 22, text: s, fs: 15, mono: true, stroke: col, color: col, s: pop(u, 0.2 + i * 0.3) });
         grow(330, y, 600, y, E(u, 0.7 + i * 0.4, 1.3 + i * 0.4), col === BAD ? BAD : MUT);
         card(720, y, 220, 50, { rx: 10, text: r, fs: 16, stroke: col, s: pop(u, 1.2 + i * 0.4) }); });
       server(480, 230, null, { s: 0.6, op: fade(u, 0.5) }); sub(480, 270, 'Alertmanager route', fade(u, 0.5));
-      note(200, 390, 'critical 을 남발하면 호출기가 울려도 아무도 안 일어난다', fade(u, 2.0), { fill: BAD, 'font-size': 14.5 }); return; }
+      note(200, 390, 'critical을 남발하면 호출기가 울려도 아무도 안 일어난다', fade(u, 2.0), { fill: BAD, 'font-size': 14.5 }); return; }
     // k7: 린터
-    [['severity ∈ {critical, warning, info}', true], ['team · service · runbook_url 필수', true], ['summary 는 한 줄, 값과 단위 포함', true], ['severity: "high"', false]].forEach(([s, ok], i) => {
+    [['severity ∈ {critical, warning, info}', true], ['team · service · runbook_url 필수', true], ['summary는 한 줄, 값과 단위 포함', true], ['severity: "high"', false]].forEach(([s, ok], i) => {
       const y = 130 + i * 62, sc = pop(u, 0.2 + i * 0.35); card(480, y, 560, 48, { rx: 10, stroke: ok ? GOOD : BAD, s: sc });
       (ok ? check : cross)(232, y, 11, sc); tx(262, y + 6, s, { 'font-size': 15.5, 'font-weight': 700, class: ok ? null : 'mono', opacity: fade(u, 0.3 + i * 0.35) }); });
     note(240, 400, 'CI 린터가 합의되지 않은 값을 막는다', fade(u, 2.0), { 'font-size': 14.5 }); }
@@ -157,7 +157,7 @@
     if (k === 0) { const N = [['가짜 시계열', 'input_series'], ['룰 평가', '../alert-rules.yml · 1m'], ['기대값과 비교', 'exp_alerts']];
       N.forEach(([a, b], i) => { const x = 170 + i * 310; card(x, 200, 240, 90, { rx: 12, s: pop(u, 0.2 + i * 0.4) }); tx(x, 192, a, { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 0.3 + i * 0.4) });
         mono(x, 220, b, { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 0.3 + i * 0.4) }); if (i < 2) grow(x + 124, 200, x + 186, 200, E(u, 0.6 + i * 0.4, 0.9 + i * 0.4), ACC); });
-      note(130, 330, 'evaluation_interval 이 운영과 다르면 for 계산도 달라진다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
+      note(130, 330, 'evaluation_interval이 운영과 다르면 for 계산도 달라진다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
     const ax = k < 6 ? testChart(u, k === 1 ? E(u, 0.2, 1.6) : 1) : null;
     if (k === 1) { mono(700, 150, "'920+920x10'", { 'font-size': 15, 'font-weight': 800, fill: INFO, opacity: fade(u, 0.8) }); mono(700, 176, '매분 +920', { 'font-size': 14, fill: MUT, opacity: fade(u, 0.9) });
       mono(700, 226, "'80+80x10'", { 'font-size': 15, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.2) }); mono(700, 252, '매분 +80', { 'font-size': 14, fill: MUT, opacity: fade(u, 1.3) });
@@ -165,7 +165,7 @@
     if (k <= 3) { tlane(ax, k === 2 ? 2 : 4); const at = k === 2 ? 1 : 3, col = k === 2 ? WARN : BAD;
       el('line', { x1: ax.X(at), y1: 100, x2: ax.X(at), y2: 340, stroke: col, 'stroke-width': 2.5, opacity: fade(u, 0.2) });
       mono(ax.X(at), 96, 'eval_time ' + at + 'm', { 'font-size': 14, 'font-weight': 800, fill: col, 'text-anchor': 'middle', opacity: fade(u, 0.3) });
-      const lines = k === 2 ? ['결과: pending', '(for 2m 미충족)', 'exp_alerts: []'] : ['결과: firing', '(1m 부터 2분 지남)', 'exp_alerts: 1건'];
+      const lines = k === 2 ? ['결과: pending', '(for 2m 미충족)', 'exp_alerts: []'] : ['결과: firing', '(1m부터 2분 지남)', 'exp_alerts: 1건'];
       lines.forEach((s, i) => mono(720, 180 + i * 30, s, { 'font-size': 15, 'font-weight': i ? 600 : 800, fill: i === 2 ? INK : col, opacity: fade(u, 0.7 + i * 0.3) }));
       check(740, 300, 14, pop(u, 1.9)); tx(764, 306, '기대와 같음', { 'font-size': 15, 'font-weight': 700, fill: GOOD, opacity: fade(u, 1.9) });
       if (k === 2) sub(400, 380, '"울리면 안 된다"를 확인하는 단언이 더 중요하다', fade(u, 2.2), { 'font-size': 14 }); return; }
@@ -185,7 +185,7 @@
     if (k === 6) return;
     el('line', { x1: ax2.X(10), y1: 112, x2: ax2.X(10), y2: 330, stroke: GOOD, 'stroke-width': 2.5 }); mono(ax2.X(10), 108, 'eval_time 10m', { 'font-size': 14, 'font-weight': 800, fill: GOOD, 'text-anchor': 'middle' });
     mono(720, 290, 'exp_alerts: []', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 0.4) }); check(890, 284, 11, pop(u, 0.8));
-    pill(480, 392, 'promtool test rules tests/*.yml 이 CI 게이트', GOOD, pop(u, 1.6), { fs: 14 }); }
+    pill(480, 392, 'promtool test rules tests/*.yml이 CI 게이트', GOOD, pop(u, 1.6), { fs: 14 }); }
 
   // ---------- 5. runbook · 카탈로그 · DeadManSwitch ----------
   function s5(t, c) { const { k, u } = c;
@@ -201,7 +201,7 @@
         sub(690, 388, '넓게 보고 점점 좁힌다. 쿼리까지 적어 둔다', fade(u, 1.9), { 'font-size': 14 }); return; }
       [['최근 배포 → 롤백 검토', ACC], ['결제 게이트웨이 상태 확인', INFO]].forEach(([s, col], i) => card(690, 140 + i * 70, 400, 50, { rx: 10, text: s, fs: 15, stroke: col, s: pop(u, 0.2 + i * 0.4) }));
       clock(560, 320, 26, E(u, 1.2, 2.2), WARN); mono(600, 314, 'silence ≤ 1시간', { 'font-size': 16, 'font-weight': 800, fill: WARN, opacity: fade(u, 1.2) }); mono(600, 338, '+ 티켓 필수', { 'font-size': 14, fill: MUT, opacity: fade(u, 1.5) });
-      sub(690, 392, '기한 없는 silence 가 다음 장애를 삼킨다', fade(u, 2.1), { 'font-size': 14 }); return; }
+      sub(690, 392, '기한 없는 silence가 다음 장애를 삼킨다', fade(u, 2.1), { 'font-size': 14 }); return; }
     if (k === 3) { const rows = [['alertname', 'severity', 'team', 'runbook'], ['HighErrorRate', 'warning', 'ops', '#HER'], ['CriticalErrorRate', 'critical', 'ops', '#HER'], ['HighLatency', 'critical', 'ops', '#HL']];
       tx(120, 110, 'alerts.md', { 'font-size': 15, 'font-weight': 800, fill: MUT, class: 'mono' });
       rows.forEach((r, i) => { const y = 160 + i * 54, op = i ? fade(u, 0.2 + i * 0.35) : 1;
@@ -217,7 +217,7 @@
     for (let i = 0; i < 6; i++) { const s0 = i * 0.45; if (s0 > stopAt) break; dot([[190, 210], [383, 210]], seg(u, s0, s0 + 0.6), GOOD, 6); dot([[557, 210], [703, 210]], seg(u, s0 + 0.6, s0 + 1.1), GOOD, 6); }
     mono(130, 120, 'expr: vector(1)', { 'font-size': 15, 'font-weight': 800, 'text-anchor': 'middle', fill: GOOD });
     if (k === 4) { pill(470, 140, 'DeadManSwitch · 늘 firing', GOOD, pop(u, 0.5), { fs: 14 });
-      note(130, 330, 'severity: info 라 사람에게는 안 가고 외부 모니터만 받는다', fade(u, 1.6), { 'font-size': 14.5 }); return; }
+      note(130, 330, 'severity: info라 사람에게는 안 가고 외부 모니터만 받는다', fade(u, 1.6), { 'font-size': 14.5 }); return; }
     const f = E(u, 0.8, 2.2); clock(800, 320, 26, f, BAD); mono(840, 326, Math.round(f * 5) + '분 / 5분', { 'font-size': 16, 'font-weight': 800, fill: BAD });
     banner(480, 395, '신호가 끊기면 Prometheus 자체가 죽은 것', pop(u, 2.2)); }
 

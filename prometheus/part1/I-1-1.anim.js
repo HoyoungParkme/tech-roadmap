@@ -207,7 +207,7 @@
       const bx = 120 + 3 * 68 + 25; el('circle', { cx: bx, cy: lerp(40, 100, E(u, 0.3, 1.3)), r: 10, fill: WARN, opacity: u < 1.4 ? 1 : 0 });
       mono(bx + 18, lerp(40, 100, E(u, 0.3, 1.3)) + 5, '0.3초', { 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: u < 1.4 ? fade(u, 0.3) : 0 });
       mono(720, 120, '예: 0.3초 걸린 요청 하나', { 'font-size': 15, 'font-weight': 700, fill: WARN, opacity: fade(u, 0.2) });
-      tx(720, 160, 'le ≥ 0.5 인 bucket 전부 +1', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.5) });
+      tx(720, 160, 'le ≥ 0.5인 bucket 전부 +1', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.5) });
       mono(720, 200, '_sum   180.42 → 180.72', { 'font-size': 15, fill: INFO, opacity: fade(u, 1.9) });
       mono(720, 226, '_count 1000 → 1001', { 'font-size': 15, fill: INFO, opacity: fade(u, 2.1) }); return; }
     // k6 p95 = 1.0
@@ -217,7 +217,7 @@
     mono(96, yR - 12, '950 = 1000 × 0.95', { 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.9) });
     const tl = ['950번째는 le="1.0" 구간 안', '0.5 + (1.0−0.5) × (950−810)/(950−810)', '= 1.0초'];
     tl.forEach((s, i) => (i === 1 ? mono : tx)(600, 90 + i * 30, s, { 'font-size': i === 2 ? 20 : 14.5, 'font-weight': i === 1 ? 400 : 800, fill: i === 2 ? ACC : INK, opacity: fade(u, 1.2 + i * 0.4) }));
-    pill(740, 200, 'sum by (le) 로 instance 합산', INFO, pop(u, 2.2), { fs: 14 }); }
+    pill(740, 200, 'sum by (le)로 instance 합산', INFO, pop(u, 2.2), { fs: 14 }); }
 
   // ───────── 4. Summary ─────────
   const EXPO_S = ['# TYPE rpc_duration_seconds summary', 'rpc_duration_seconds{quantile="0.5"} 0.012', 'rpc_duration_seconds{quantile="0.9"} 0.041',
@@ -251,7 +251,7 @@
     if (k === 4) { snippet(30, 50, ['rpc_latency = Summary(', '    "rpc_duration_seconds",', '    "RPC latency",', ')'], { op: fade(u, 0.1) });
       grow(400, 110, 500, 110, E(u, 0.6, 1.0), MUT);
       expo(520, 40, 420, ['rpc_duration_seconds{quantile="0.99"} …', 'rpc_duration_seconds_count 1.0', 'rpc_duration_seconds_sum 0.012'], E(u, 0.8, 1.6) * 3,
-        { strike: (i) => i === 0, title: 'Python 이 실제로 내는 줄', h: 120 });
+        { strike: (i) => i === 0, title: 'Python이 실제로 내는 줄', h: 120 });
       if (u > 1.6) cross(910, 86, 10);
       tx(480, 260, '파이썬 Summary는 _sum과 _count만 낸다', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.8) });
       sub(480, 290, 'quantile 줄은 Go·Java SDK에서 목표 quantile을 지정할 때 나온다', fade(u, 2.1), { 'font-size': 14.5 });

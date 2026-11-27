@@ -47,7 +47,7 @@
         pill(660, y, p, i === 2 ? WARN : ACC, s, { mono: true, fs: 14 });
         mono(712, y + 5, d, { 'font-size': 14, opacity: s > 0.3 ? 1 : 0 }); });
       lock(930, 250, true, WARN, pop(u, 1.6)); tx(930, 290, 'CAP_NET_RAW', { 'font-size': 13.5, 'text-anchor': 'end', fill: WARN, 'font-weight': 700, opacity: fade(u, 1.7), class: 'mono' });
-      note(40, 360, '무엇으로 찌를지는 module 이 고른다', fade(u, 2.0)); return; }
+      note(40, 360, '무엇으로 찌를지는 module이 고른다', fade(u, 2.0)); return; }
     // k4: 결과는 메트릭으로 돌아온다
     card(800, 210, 220, 54, { rx: 10, text: 'example.com', fs: 15, mono: true, stroke: GOOD });
     dot([[BB.x + 96, BB.y], [690, 210]], seg(u, 0.1, 0.5), ACC, 7);
@@ -69,8 +69,8 @@
       tx(52, y + 17, d, { 'font-size': 13.5, fill: MUT, opacity: s > 0.3 ? 1 : 0 }); });
     if (k === 0) { const g = fade(u, 0.8); mono(52, 140, 'targets: …', { 'font-size': 15, fill: BAD, opacity: g });
       if (E(u, 1.0, 1.4) > 0) el('line', { x1: 48, y1: 135, x2: 48 + 110 * E(u, 1.0, 1.4), y2: 135, stroke: BAD, 'stroke-width': 3 });
-      card(520, 150, 300, 70, { rx: 10, text: 'module = 찌르는 방법\n여기 blackbox.yml 에 둔다', fs: 15, stroke: ACC, s: pop(u, 1.3) });
-      card(760, 290, 300, 70, { rx: 10, text: 'target = 찌를 대상\nPrometheus 가 URL 로 넘긴다', fs: 15, stroke: INFO, s: pop(u, 1.8) }); return; }
+      card(520, 150, 300, 70, { rx: 10, text: 'module = 찌르는 방법\n여기 blackbox.yml에 둔다', fs: 15, stroke: ACC, s: pop(u, 1.3) });
+      card(760, 290, 300, 70, { rx: 10, text: 'target = 찌를 대상\nPrometheus가 URL로 넘긴다', fs: 15, stroke: INFO, s: pop(u, 1.8) }); return; }
     const RX = 640;
     if (k === 1) { clock(RX, 170, 46, E(u, 0.3, 2.6), WARN); mono(RX, 250, 'timeout 5s', { 'font-size': 18, 'font-weight': 800, 'text-anchor': 'middle', fill: WARN, opacity: fade(u, 0.5) });
       mono(RX, 290, Math.min(5, Math.floor(E(u, 0.3, 2.6) * 5 + 0.0001)) + 's 째', { 'font-size': 15, 'text-anchor': 'middle', fill: MUT });
@@ -86,12 +86,12 @@
       tx(380, 70, 'fail_if_not_ssl', { 'font-size': 15, 'font-weight': 800, class: 'mono', fill: ACC });
       card(480, 120, 200, 44, { rx: 8, text: 'http://…  (평문)', fs: 14, mono: true, stroke: GRID, s: pop(u, 0.3) });
       card(760, 120, 200, 44, { rx: 8, text: 'https://…', fs: 14, mono: true, stroke: GRID, s: pop(u, 0.5) });
-      tx(480, 170, 'true 면 실패', { 'text-anchor': 'middle', 'font-size': 14, fill: BAD, 'font-weight': 700, opacity: fade(u, 0.8) });
+      tx(480, 170, 'true면 실패', { 'text-anchor': 'middle', 'font-size': 14, fill: BAD, 'font-weight': 700, opacity: fade(u, 0.8) });
       tx(760, 170, '통과', { 'text-anchor': 'middle', 'font-size': 14, fill: GOOD, 'font-weight': 700, opacity: fade(u, 0.8) });
       tx(380, 230, 'preferred_ip_protocol (기본 ip6)', { 'font-size': 15, 'font-weight': 800, class: 'mono', fill: ACC, opacity: fade(u, 1.1) });
       card(480, 290, 200, 50, { rx: 8, text: 'AAAA → IPv6', fs: 14, mono: true, stroke: BAD, s: pop(u, 1.3) }); cross(580, 268, 9, pop(u, 1.6));
       card(760, 290, 200, 50, { rx: 8, text: 'A → IPv4', fs: 14, mono: true, stroke: GOOD, s: pop(u, 1.8) }); check(860, 268, 9, pop(u, 2.0));
-      note(380, 370, 'ip4 로 고정하면 IPv6 경로 문제로 헛도는 일이 없다', fade(u, 2.2), { 'font-size': 14.5 }); return; }
+      note(380, 370, 'ip4로 고정하면 IPv6 경로 문제로 헛도는 일이 없다', fade(u, 2.2), { 'font-size': 14.5 }); return; }
     if (k === 4) { // 본문 정규식
       mono(380, 70, '"status"\\s*:\\s*"ok"', { 'font-size': 16, 'font-weight': 800, fill: ACC, opacity: fade(u, 0.2) });
       [['200  {"status":"ok"}', GOOD, 1], ['200  {"status":"down"}', BAD, 0]].forEach(([s, col, ok], i) => { const y = 150 + i * 110, sc = pop(u, 0.5 + i * 0.6);
@@ -102,13 +102,13 @@
       card(450, 200, 140, 60, { rx: 10, text: 'blackbox', fs: 15, mono: true, stroke: ACC });
       card(830, 200, 150, 60, { rx: 10, text: 'db:5432', fs: 15, mono: true, stroke: INK });
       fly(520, 170, 755, 170, seg(u, 0.3, 1.0), 'SYN', { mono: true, fill: INFO }); fly(755, 230, 520, 230, seg(u, 1.0, 1.7), 'SYN-ACK', { mono: true, fill: GOOD });
-      check(830, 280, 12, pop(u, 1.8)); note(470, 340, '포트가 열려 있으면 성공 — HTTP 는 없다', fade(u, 2.0)); return; }
+      check(830, 280, 12, pop(u, 1.8)); note(470, 340, '포트가 열려 있으면 성공 — HTTP는 없다', fade(u, 2.0)); return; }
     // k6: icmp
     card(450, 200, 140, 60, { rx: 10, text: 'blackbox', fs: 15, mono: true, stroke: ACC });
     card(830, 200, 150, 60, { rx: 10, text: '10.0.0.1', fs: 15, mono: true, stroke: INK });
     fly(520, 170, 755, 170, seg(u, 0.3, 1.0), 'echo request', { mono: true, fill: INFO }); fly(755, 230, 520, 230, seg(u, 1.0, 1.7), 'echo reply', { mono: true, fill: GOOD });
     check(830, 280, 12, pop(u, 1.8)); lock(450, 130, true, WARN, pop(u, 1.6)); mono(480, 136, 'CAP_NET_RAW', { 'font-size': 14, 'font-weight': 700, fill: WARN, opacity: fade(u, 1.7) });
-    note(400, 340, '컨테이너면 이 권한을 줘야 ping 을 보낼 수 있다', fade(u, 2.0)); }
+    note(400, 340, '컨테이너면 이 권한을 줘야 ping을 보낼 수 있다', fade(u, 2.0)); }
 
   // ---------- 3. relabel 3단 ----------
   const ROWS = ['job', '__metrics_path__', '__param_module', '__address__', '__param_target', 'instance'];
@@ -129,7 +129,7 @@
     const addr4 = k >= 4, ov = k === 4 ? E(u, 0.4, 1.2) : addr4 ? 1 : 0;
     if (!addr4 || ov < 1) val(3, 'https://example.com', INK, { opacity: k === 1 ? fade(u, 0.3) : 1 - ov });
     if (addr4) val(3, 'blackbox:9115', ACC, { opacity: ov });
-    if (k === 1) { tx(600, 70, 'targets 에 적은 것 = 찌를 URL', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.6) });
+    if (k === 1) { tx(600, 70, 'targets에 적은 것 = 찌를 URL', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.6) });
       TG.forEach(([url], i) => { pill(760, 120 + i * 50, url, INFO, pop(u, 0.8 + i * 0.3), { mono: true, fs: 13.5 }); });
       note(600, 300, '대상마다 이런 표가 하나씩 생긴다', fade(u, 2.0), { fill: MUT }); return; }
     // 1단: __address__ → __param_target
@@ -144,7 +144,7 @@
       el('rect', { x: 590, y: 60, width: 356, height: 150, rx: 10, fill: INK, opacity: fade(u, 0.2) });
       [['http://blackbox:9115', ACC], ['  /probe', ACC], ['  ?module=http_2xx', 'var(--term)'], ['  &target=https://example.com', 'var(--term)']].forEach(([s, col], i) =>
         mono(606, 92 + i * 30, s, { 'font-size': 14.5, fill: col, 'font-weight': 700, opacity: fade(u, 0.4 + i * 0.25) }));
-      tx(600, 252, '__ 로 시작하는 라벨은 끝나면 사라진다', { 'font-size': 14.5, fill: MUT, 'font-weight': 600, opacity: fade(u, 1.6) });
+      tx(600, 252, '__로 시작하는 라벨은 끝나면 사라진다', { 'font-size': 14.5, fill: MUT, 'font-weight': 600, opacity: fade(u, 1.6) });
       spans(600, 300, [['probe_success', { 'font-weight': 700 }], ['{instance=', { fill: INFO }]], { 'font-size': 14.5, opacity: fade(u, 2.0) });
       spans(600, 326, [['  "https://example.com",', { fill: INFO }]], { 'font-size': 14.5, opacity: fade(u, 2.1) });
       spans(600, 352, [['  job="blackbox_http"}', { fill: INFO }], [' 1', { fill: GOOD, 'font-weight': 800 }]], { 'font-size': 14.5, opacity: fade(u, 2.2) }); } }
@@ -155,7 +155,7 @@
       T.forEach(([s, d], i) => { const x = 80 + d * 60, y = 90 + i * 70, sc = pop(u, 0.3 + i * 0.4);
         if (i) { const px = 80 + (d - 1) * 60 + 20; el('path', { d: `M${px},${y - 48} V${y} H${x - 10}`, fill: 'none', stroke: GRID, 'stroke-width': 2, opacity: sc > 0.3 ? 1 : 0 }); }
         card(x + tw(s, 15) * 0.5 + 16, y, tw(s, 15) + 32, 42, { rx: 8, text: s, fs: 15, mono: true, stroke: i === 3 ? ACC : GRID, color: i === 3 ? ACC : INK, s: sc }); });
-      note(560, 200, 'probe_success 를 그대로', fade(u, 1.9)); note(560, 230, '알람 식으로 쓴다', fade(u, 2.1)); return; }
+      note(560, 200, 'probe_success를 그대로', fade(u, 1.9)); note(560, 230, '알람 식으로 쓴다', fade(u, 2.1)); return; }
     if (k === 1 || k === 2) { // for: 5m — pending → firing (평가 1분 간격 가정, 예시)
       const x0 = 80, w = 800, X = (m) => x0 + (m / 8) * w, yS = 120, yA = 230;
       tx(40, 50, 'probe_success  (checkout.myshop.io, 15초 간격)', { 'font-size': 14.5, 'font-weight': 700, class: 'mono' });
@@ -167,7 +167,7 @@
       [[0, 1, '정상', GOOD], [1, 6, 'pending', WARN], [6, 8, 'firing', BAD]].forEach(([a, b, s, col]) => { const e = Math.min(b, cur); if (e <= a) return;
         el('rect', { x: X(a), y: yA - 22, width: X(e) - X(a) - 2, height: 44, rx: 6, fill: col, opacity: 0.85 });
         if (e - a > 0.6) tx((X(a) + X(e)) / 2, yA + 6, s, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: PANEL }); });
-      tx(40, 340, '0 이 된 뒤 첫 평가에서 pending, 5분 내내 0 이면 firing (평가 1분 간격, 예시)', { 'font-size': 14, fill: MUT, opacity: k === 1 ? fade(u, 2.2) : 1 });
+      tx(40, 340, '0이 된 뒤 첫 평가에서 pending, 5분 내내 0이면 firing (평가 1분 간격, 예시)', { 'font-size': 14, fill: MUT, opacity: k === 1 ? fade(u, 2.2) : 1 });
       if (k === 2) { card(480, 384, 560, 52, { rx: 10, stroke: BAD, fill: BADBG, sw: 2, s: pop(u, 0.3) });
         spans(214, 380, [['EndpointDown ', { 'font-weight': 800, fill: BAD }], ['severity=page', { fill: INK }]], { 'font-size': 14.5, opacity: fade(u, 0.5) });
         tx(214, 400, '프로브 실패: https://checkout.myshop.io', { 'font-size': 14, opacity: fade(u, 1.0), class: 'mono' }); }
@@ -180,12 +180,12 @@
       const L = [['30일 × 86400 ÷ 15초 = 172800번', 1.5], ['실패 120번 (예시)', 1.8], ['(172800 − 120) ÷ 172800', 2.1]];
       L.forEach(([s, a], i) => mono(40, 230 + i * 34, s, { 'font-size': 16, 'font-weight': 700, opacity: fade(u, a) }));
       mono(640, 300, '99.93%', { 'font-size': 40, 'font-weight': 800, fill: ACC, opacity: fade(u, 2.3) });
-      note(640, 340, '1 과 0 의 평균 = 성공 비율', fade(u, 2.4), { fill: MUT }); return; }
+      note(640, 340, '1과 0의 평균 = 성공 비율', fade(u, 2.4), { fill: MUT }); return; }
     if (k === 4) { // 전체 소요
       tx(40, 50, 'probe_duration_seconds (예시)', { 'font-size': 15, 'font-weight': 700, class: 'mono' });
       TG.forEach(([url, ok, d], i) => { const y = 110 + i * 80; mono(40, y + 14, url, { 'font-size': 14.5, 'font-weight': 700, fill: ok ? INK : BAD });
         hbar(40, y + 26, 640, d, 5, { col: ok ? ACC : BAD, text: d.toFixed(2) + 's', u: E(u, 0.3 + i * 0.3, 1.2 + i * 0.3), h: 22 }); });
-      note(40, 384, 'checkout 은 5초 timeout 에 걸렸다 — success 0', fade(u, 2.0), { fill: BAD }); return; }
+      note(40, 384, 'checkout은 5초 timeout에 걸렸다 — success 0', fade(u, 2.0), { fill: BAD }); return; }
     if (k === 5) { // phase 분해
       tx(40, 50, 'probe_http_duration_seconds{phase=…}  example.com (예시)', { 'font-size': 15, 'font-weight': 700, class: 'mono' });
       const PH = [['resolve', 0.012, 'DNS'], ['connect', 0.031, 'TCP'], ['tls', 0.078, 'TLS'], ['processing', 0.104, '서버 처리'], ['transfer', 0.015, '본문 전송']];
@@ -204,7 +204,7 @@
     mono(470, 150, '>= 500  → 서버 오류', { 'font-size': 16, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.2) });
     mono(470, 210, 'probe_success 0', { 'font-size': 15, fill: MUT, opacity: fade(u, 1.6) });
     tx(470, 236, '→ 다운인 것만 안다', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 1.7) });
-    note(40, 330, '성공 코드를 넓게 잡은 모듈은 5xx 를 성공으로 넘길 수 있다', fade(u, 2.0));
+    note(40, 330, '성공 코드를 넓게 잡은 모듈은 5xx를 성공으로 넘길 수 있다', fade(u, 2.0));
     note(40, 360, '상태 코드를 따로 보면 원인까지 보인다', fade(u, 2.3), { fill: GOOD }); }
 
   // ---------- 5. 인증서 만료 · 함정 ----------
@@ -230,10 +230,10 @@
       el('line', { x1: X(14), y1: 70, x2: X(14), y2: 300, stroke: BAD, 'stroke-width': 2, 'stroke-dasharray': '5 4' });
       mono(X(14), 320, '14일', { 'font-size': 14, 'font-weight': 800, fill: BAD, 'text-anchor': 'middle' });
       if (k === 1) note(40, 380, '두 곳이 14일 밑 — 1시간 이어지면 경보 (값은 예시)', fade(u, 2.0), { fill: BAD });
-      if (k === 2) note(40, 380, '예고된 사고 — 호출(page)이 아니라 warning 으로 충분하다', fade(u, 1.4));
+      if (k === 2) note(40, 380, '예고된 사고 — 호출(page)이 아니라 warning으로 충분하다', fade(u, 1.4));
       if (k === 3) { const g = E(u, 0.3, 1.8);
         mono(40, 370, Math.round(lerp(950400, 11, g)) + (g < 1 ? ' …' : ''), { 'font-size': 18, 'font-weight': 800, fill: INFO });
-        mono(40, 400, '(cert_expiry − time()) / 86400 = 11 일', { 'font-size': 15, fill: INK, opacity: fade(u, 1.9) }); }
+        mono(40, 400, '(cert_expiry − time()) / 86400 = 11일', { 'font-size': 15, fill: INK, opacity: fade(u, 1.9) }); }
       return; }
     if (k === 4) { // 프로브 위치
       el('rect', { x: 466, y: 40, width: 28, height: 330, rx: 4, fill: WARN, opacity: 0.85 }); tx(480, 396, '방화벽', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: WARN });
@@ -248,11 +248,11 @@
       tx(40, 50, '실제 기다리는 시간 = 둘 중 짧은 쪽', { 'font-size': 16, 'font-weight': 800 });
       [['module timeout', 15, WARN], ['scrape_timeout (기본)', 10, INFO]].forEach(([n, v, col], i) => { const y = 92 + i * 52;
         tx(40, y + 16, n, { 'font-size': 14.5, 'font-weight': 700 }); hbar(260, y, 420, v, 15, { col, text: v + 's' + (i ? '' : ' (예시)'), u: E(u, 0.3 + i * 0.3, 1.0 + i * 0.3), h: 22 }); });
-      note(40, 222, '10초보다 느린 대상은 module timeout 을 늘려도 실패', fade(u, 1.3), { fill: BAD, 'font-size': 14.5 });
+      note(40, 222, '10초보다 느린 대상은 module timeout을 늘려도 실패', fade(u, 1.3), { fill: BAD, 'font-size': 14.5 });
       el('line', { x1: 20, y1: 250, x2: 940, y2: 250, stroke: GRID, 'stroke-width': 1.5 });
       tx(40, 284, 'relabel 3단을 빼먹으면', { 'font-size': 16, 'font-weight': 800, opacity: fade(u, 1.5) });
       mono(40, 322, 'GET https://example.com/probe?module=http_2xx', { 'font-size': 15, fill: BAD, opacity: fade(u, 1.8) });
-      tx(40, 356, '3단이 없으면 exporter 가 아니라 대상 URL 을 직접 긁는다', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 2.1) });
+      tx(40, 356, '3단이 없으면 exporter가 아니라 대상 URL을 직접 긁는다', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 2.1) });
       tx(40, 384, '1단이 없으면 target 파라미터가 비어 프로브가 실패한다', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 2.3) }); return; }
     // k6: 권한 · IP
     card(250, 160, 380, 150, { rx: 12, stroke: WARN, s: pop(u, 0.2) }); lock(110, 130, true, WARN, pop(u, 0.4));
@@ -260,7 +260,7 @@
     tx(90, 186, 'CAP_NET_RAW 없으면', { 'font-size': 15, opacity: fade(u, 0.7), class: 'mono' }); tx(90, 212, '항상 success 0', { 'font-size': 15, fill: BAD, 'font-weight': 700, opacity: fade(u, 0.9) });
     card(700, 160, 380, 150, { rx: 12, stroke: INFO, s: pop(u, 1.2) });
     tx(540, 138, 'preferred_ip_protocol', { 'font-size': 16, 'font-weight': 800, class: 'mono', opacity: fade(u, 1.4) });
-    tx(540, 186, '안 정하면 기본 ip6 부터', { 'font-size': 15, opacity: fade(u, 1.6) }); mono(540, 212, '"ip4" 로 고정', { 'font-size': 15, fill: GOOD, 'font-weight': 700, opacity: fade(u, 1.8) });
+    tx(540, 186, '안 정하면 기본 ip6부터', { 'font-size': 15, opacity: fade(u, 1.6) }); mono(540, 212, '"ip4" 로 고정', { 'font-size': 15, fill: GOOD, 'font-weight': 700, opacity: fade(u, 1.8) });
     note(60, 380, '둘 다 설정은 맞아 보이는데 조용히 실패하는 함정', fade(u, 2.2)); }
 
   const quiz = [

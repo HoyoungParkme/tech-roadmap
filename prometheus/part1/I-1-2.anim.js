@@ -104,7 +104,7 @@
       else sub(480, 330, '느린 대상은 interval과 timeout을 함께 늘린다', fade(u, 1.7), { 'font-size': 15 });
       return; }
     if (k === 5) { const xs = [0, 1, 2, 3, 4, 5].map((i) => 200 + i * 120), ok = [1, 1, 1, 0, 1, 1];
-      lbl(480, 40, 'cron:9090 의 scrape 6번 (4번째 실패)', fade(u, 0.1));
+      lbl(480, 40, 'cron:9090의 scrape 6번 (4번째 실패)', fade(u, 0.1));
       [['대상 시계열', 100], ['up', 190], ['scrape_duration_seconds', 280]].forEach(([nm, y], r) => {
         mono(180, y + 5, nm, { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'end', fill: r === 0 ? INK : INFO });
         xs.forEach((x, i) => { const s = clamp(E(u, 0.2 + r * 0.5, 1.0 + r * 0.5) * 6 - i); if (s <= 0) return;
@@ -133,7 +133,7 @@
   const JI = [', job="api", instance="api:9090"', { fill: GOOD, 'font-weight': 700 }];
   function s3(t, c) { const { k, u } = c;
     const show = [2, 4, 7, 9, 9, 9, 9, 9][k], from = [0, 2, 4, 7, 9, 9, 9, 9][k];
-    if (k <= 4) expo(16, 24, 500, BODY, from + (show - from) * E(u, 0.2, 1.4), { hi: (i) => i >= from && i < show, h: 270, title: 'api:9090 의 응답 본문' });
+    if (k <= 4) expo(16, 24, 500, BODY, from + (show - from) * E(u, 0.2, 1.4), { hi: (i) => i >= from && i < show, h: 270, title: 'api:9090의 응답 본문' });
     if (k === 0) { server(735, 160, 'Prometheus', { lamp: ACC }); dot([[520, 60], [675, 140]], seg(u, 1.0, 1.8), ACC, 7);
       tx(735, 270, '특별한 프로토콜 없이 텍스트 한 덩어리', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) }); return; }
     if (k === 1) { card(735, 140, 330, 84, { rx: 12, stroke: WARN, sw: 2, s: pop(u, 1.2), text: '메타데이터\n이름 http_requests_total · counter', fs: 14.5 });
@@ -189,7 +189,7 @@
       return; }
     if (k === 3) { // for: 5m — 예시 타임라인 (분)
       const X = (m) => 120 + m * 50, f = E(u, 0.2, 2.2);
-      lbl(480, 40, 'api-3 의 up (예시, 1칸 = 1분)', fade(u, 0.1));
+      lbl(480, 40, 'api-3의 up (예시, 1칸 = 1분)', fade(u, 0.1));
       const UP = [1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
       UP.forEach((v, m) => { if (m / UP.length > f) return; el('rect', { x: X(m), y: v ? 90 : 130, width: 46, height: 30, rx: 4, fill: v ? GOOD : BAD, opacity: 0.75 }); });
       mono(110, 110, '1', { 'font-size': 14, fill: MUT, 'text-anchor': 'end' }); mono(110, 150, '0', { 'font-size': 14, fill: MUT, 'text-anchor': 'end' });

@@ -66,7 +66,7 @@
     // flow log 요청이 세 파일에 각각 도착
     xs.forEach((x, i) => { const a = 1.7 + i * 0.25; fly(480, 335, x + 140, 260, seg(u, a, a + 0.6), '+ flow log', { fill: WARN });
       if (u > a + 0.6) card(x + 140, 262, 110, 28, { rx: 14, text: '+ flow log', fs: 13.5, fw: 700, fill: WARNBG, stroke: WARN, color: WARN, s: pop(u, a + 0.6) }); });
-    tx(480, 322, '보안팀: 모든 VPC 에 flow log', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 1.5) });
+    tx(480, 322, '보안팀: 모든 VPC에 flow log', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, opacity: fade(u, 1.5) });
     tx(480, 392, '수정 지점', { 'text-anchor': 'end', 'font-size': 16, 'font-weight': 700, opacity: fade(u, 2.2) });
     mono(492, 392, '1곳 → 3곳', { 'font-size': 18, 'font-weight': 800, fill: BAD, opacity: fade(u, 2.3) }); }
 
@@ -185,9 +185,9 @@
       ['terraform-aws-modules/vpc/aws', 'terraform-aws-modules/eks/aws', 'terraform-aws-modules/rds/aws'].forEach((s, i) => {
         const y = 200 + i * 52, sp = pop(u, 0.8 + i * 0.3); card(270, y, 430, 42, { rx: 8, stroke: i === 0 ? ACC : GRID, sw: i === 0 ? 2.4 : 1.5, s: sp });
         mono(70, y + 5, s, { 'font-size': 14, 'font-weight': i === 0 ? 800 : 500, fill: i === 0 ? ACC : INK, opacity: clamp(sp) }); });
-      tx(560, 120, 'Partner 필터: HashiCorp 가 검토한', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
-      tx(560, 144, '배포자의 module 만 남긴다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
-      [['VPC · EKS · RDS 는', '이미 표준 module 이 있다'], ['직접 짜기는', '마지막 수단']].forEach(([a, b], i) => {
+      tx(560, 120, 'Partner 필터: HashiCorp가 검토한', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
+      tx(560, 144, '배포자의 module만 남긴다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
+      [['VPC · EKS · RDS는', '이미 표준 module이 있다'], ['직접 짜기는', '마지막 수단']].forEach(([a, b], i) => {
         tx(560, 216 + i * 70, a, { 'font-size': 15, fill: MUT, opacity: fade(u, 2.0 + i * 0.3) }); tx(560, 240 + i * 70, b, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2.0 + i * 0.3) }); });
       return; }
     if (k === 1) { snippet(30, 60, ['module "vpc" {', '  source  = "../modules/vpc"', '}'], { op: 1 - fade(u, 0.6) });
@@ -202,7 +202,7 @@
         mono(X(v), 292, s, { 'font-size': 14, 'text-anchor': 'middle', 'font-weight': 700, fill: ok ? GOOD : BAD, opacity: op });
         (ok ? check : cross)(X(v), 318, 8, op); });
       tx(x0, 360, '5.13 이상 6.0 미만 · 버전 번호는 예시', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 2.3) });
-      tx(30, 240, 'init 때 .terraform/modules/ 에 내려받는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.8) });
+      tx(30, 240, 'init 때 .terraform/modules/에 내려받는다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.8) });
       return; }
     // k 2~3: 인자 → 3 AZ 네트워크
     if (k === 2 || k === 3) { const lines = k === 2
@@ -220,7 +220,7 @@
         mono(539, 284, 'single_nat_gateway', { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 0.9) });
         const f = pop(u, 1.3); card(820, 265, 180, 40, { rx: 8, text: 'VPC flow log', fs: 14, fw: 800, stroke: GOOD, color: GOOD, fill: GOODBG, s: f });
         for (let i = 0; i < 3; i++) dot([[700, 200], [770, 245]], ((t * 0.7 + i / 3) % 1) * (u > 1.4 ? 1 : 0), GOOD, 5);
-        tx(695, 340, 'Step 1 에서 세 파일을 고치던 flow log 가 true 한 줄', { 'font-size': 14.5, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.9) }); }
+        tx(695, 340, 'Step 1에서 세 파일을 고치던 flow log가 true 한 줄', { 'font-size': 14.5, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.9) }); }
       return; }
     if (k === 4) { const src = [['로컬 경로', '"./modules/vpc"'], ['공식 registry', '"terraform-aws-modules/vpc/aws"'], ['Git + 태그', '"git::https://…//vpc?ref=v1.0.0"']];
       src.forEach(([a, b], i) => { const y = 90 + i * 100, s = pop(u, 0.2 + i * 0.5);
@@ -228,7 +228,7 @@
         grow(330, y + 6, 640, 190, seg(u, 0.5 + i * 0.5, 1.0 + i * 0.5), MUT); });
       snippet(650, 150, ['module "vpc" {', '  source = …', '}'], { op: fade(u, 0.2) });
       tx(780, 300, '어디서 오든 호출은 같다', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.0) });
-      mono(780, 326, 'version 은 registry 에서만', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.2) });
+      mono(780, 326, 'version은 registry에서만', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.2) });
       return; }
     // k = 5: 다섯 단계 정리
     const st = ['복붙', '추출', '호출', '체이닝', 'registry'];
@@ -238,14 +238,14 @@
       tx(x, 206, s, { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', opacity: clamp(sp) }); });
     tx(480, 290, '수정 지점', { 'font-size': 18, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 1.9) });
     mono(494, 290, '3곳 → 1곳', { 'font-size': 22, 'font-weight': 800, fill: GOOD, opacity: fade(u, 2.0) });
-    tx(480, 340, '표준 인프라는 registry 부터, 회사 고유 패턴만 직접', { 'font-size': 15, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.3) }); }
+    tx(480, 340, '표준 인프라는 registry부터, 회사 고유 패턴만 직접', { 'font-size': 15, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.3) }); }
 
   const quiz = [
     { q: '같은 VPC 코드를 dev/staging/prod 폴더에 복붙했다. 보안팀이 flow log를 켜라고 하면 무엇이 문제인가?',
       o: ['Terraform이 같은 코드를 세 번 apply하지 못한다', '같은 수정을 세 파일에 해야 하고 한 곳을 빠뜨리면 환경이 어긋난다', 'state 파일이 하나로 합쳐진다'], a: 1,
       why: '복붙한 세 벌은 서로 모른다. 수정 지점이 1곳에서 3곳으로 늘고, 빠뜨린 환경만 조용히 달라진다.' },
     { q: 'module 안의 aws_internet_gateway.this를 호출자가 쓰려면 무엇이 필요한가?',
-      o: ['module 의 outputs.tf에 그 값을 output으로 선언한다', '호출자에서 aws_internet_gateway.this를 바로 참조한다', 'variable로 선언한다'], a: 0,
+      o: ['module의 outputs.tf에 그 값을 output으로 선언한다', '호출자에서 aws_internet_gateway.this를 바로 참조한다', 'variable로 선언한다'], a: 0,
       why: 'module 안의 리소스는 밖에서 보이지 않는다. output으로 선언한 값만 module.<이름>.<output>으로 읽힌다.' },
     { q: 'prod만 서브넷이 3개 필요하다. module을 쓰는 올바른 방법은 무엇인가?',
       o: ['modules/vpc/main.tf에 prod 전용 서브넷 블록을 더한다', 'prod용 module 폴더를 따로 복사한다', 'prod 호출에서 public_subnets 목록에 하나를 더 넘긴다'], a: 2,
@@ -254,7 +254,7 @@
       o: ['vpc가 끝난 뒤 eks와 rds가 동시에 만들어진다', 'vpc, eks, rds 순서로 하나씩 만들어진다', '셋이 처음부터 동시에 만들어진다'], a: 0,
       why: '참조가 의존 간선이 된다. eks와 rds 사이에는 간선이 없으므로 vpc 다음에 병렬로 간다.' },
     { q: 'registry module에 version = "~> 5.13"을 걸었다. 받아들이는 버전은 무엇인가?',
-      o: ['5.13.x 만', '5.13 이상 6.0 미만', '5.13 이상 모든 버전'], a: 1,
+      o: ['5.13.x만', '5.13 이상 6.0 미만', '5.13 이상 모든 버전'], a: 1,
       why: '~> 는 맨 오른쪽 자리만 올라가게 둔다. "~> 5.13"은 5.x 안에서 5.13 이상이고 6.0은 막는다.' },
   ];
 

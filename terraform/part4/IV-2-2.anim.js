@@ -34,10 +34,10 @@
       el('rect', { x: 540, y: 60, width: 380, height: 200, rx: 12, fill: k === 2 ? BADBG : 'none', stroke: k === 2 ? BAD : MUT, 'stroke-width': 2, 'stroke-dasharray': '7 6', opacity: k === 0 ? fade(u, 1.4) : 1 });
       tx(730, 150, 'plan 출력', { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle', fill: k === 2 ? BAD : MUT, opacity: k === 0 ? fade(u, 1.4) : 1 });
       tx(730, 178, 'PR 어디에도 없다', { 'font-size': 15, 'text-anchor': 'middle', fill: k === 2 ? BAD : MUT, opacity: k === 0 ? fade(u, 1.6) : 1 });
-      if (k === 0) tx(250, 340, '리뷰어는 코드 diff 만 보고 머지했다', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.0) });
+      if (k === 0) tx(250, 340, '리뷰어는 코드 diff만 보고 머지했다', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.0) });
       if (k === 2) { el('rect', { x: 30, y: 168, width: 300, height: 24, rx: 4, fill: 'none', stroke: BAD, 'stroke-width': 2, opacity: fade(u, 0.4) });
         mono(560, 226, '(있었다면) Plan: 2 to add', { 'font-size': 14, fill: MUT, opacity: fade(u, 1.0) });
-        tx(480, 360, '무엇이 만들어지는지 건수와 값으로 보여 줄 plan 이 검토에서 빠졌다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 1.8) }); }
+        tx(480, 360, '무엇이 만들어지는지 건수와 값으로 보여 줄 plan이 검토에서 빠졌다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 1.8) }); }
       return; }
     if (k === 1) { terminal(20, 40, 330, 130, ['$ terraform apply', 'Apply complete! (10:35)'], 1 + E(u, 0.2, 0.8), { fs: 14, title: '내 노트북' });
       zone(420, 30, 520, 300, 'AWS', { fill: SOFT });
@@ -54,13 +54,13 @@
         tx(x, 214, n, { 'font-size': 14, 'text-anchor': 'middle', fill: MUT, opacity: clamp(s) }); });
       tx(225, 270, '노트북마다 버전이 다르면 결과도 갈린다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.0) });
       zone(520, 50, 410, 250, 'apply 기록', { fill: SOFT });
-      ['누가', '언제', '어떤 plan 으로', '무엇을'].forEach((h, i) => { const y = 100 + i * 48;
+      ['누가', '언제', '어떤 plan으로', '무엇을'].forEach((h, i) => { const y = 100 + i * 48;
         tx(545, y, h, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.2 + i * 0.2) });
         mono(880, y, '?', { 'font-size': 20, 'font-weight': 800, fill: BAD, 'text-anchor': 'end', opacity: fade(u, 1.4 + i * 0.2) }); });
       tx(725, 340, '감사 로그가 남지 않는다', { 'font-size': 16, 'font-weight': 800, fill: BAD, 'text-anchor': 'middle', opacity: fade(u, 2.2) });
       return; }
     // k = 4: 바꿀 흐름
-    const F = ['PR push', 'bot 이 plan', 'PR 코멘트', '승인', 'apply 코멘트'];
+    const F = ['PR push', 'bot이 plan', 'PR 코멘트', '승인', 'apply 코멘트'];
     F.forEach((s, i) => { const x = 100 + i * 190, sp = pop(u, 0.2 + i * 0.3);
       card(x, 150, 160, 56, { rx: 28, text: s, fs: 15, fw: 800, stroke: i === 3 ? GOOD : ACC, color: i === 3 ? GOOD : ACC, s: sp });
       if (i) grow(x - 110, 150, x - 82, 150, seg(u, 0.2 + i * 0.3, 0.5 + i * 0.3), MUT); });
@@ -96,9 +96,9 @@
     if (k === 2) { snippet(370, 70, ['- name: prod-infra', '  dir: infra/prod', '  workspace: prod', '  terraform_version: v1.7.5'], { fs: 13.5, op: fade(u, 0.2) });
       [['1.5.7', 120], ['1.7.2', 290]].forEach(([v, x], i) => { mono(x, 300, 'terraform ' + v, { 'font-size': 14.5, 'font-weight': 700, fill: MUT, opacity: 1 - 0.7 * fade(u, 1.0) }); if (u > 1.0) cross(x + 150, 294, 9, pop(u, 1.0 + i * 0.2)); });
       card(700, 300, 260, 56, { rx: 10, text: '봇의 terraform v1.7.5 하나', fs: 15, fw: 800, stroke: GOOD, color: GOOD, fill: GOODBG, s: pop(u, 1.5) });
-      tx(480, 380, '모든 plan 이 같은 버전으로 돈다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.1) });
+      tx(480, 380, '모든 plan이 같은 버전으로 돈다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.1) });
       return; }
-    if (k === 3) { tx(40, 220, 'PR 이 바꾼 파일', { 'font-size': 15, 'font-weight': 800 });
+    if (k === 3) { tx(40, 220, 'PR이 바꾼 파일', { 'font-size': 15, 'font-weight': 800 });
       [['infra/prod/main.tf', '"*.tf"', true], ['modules/vpc/main.tf', '"../modules/**/*.tf"', true], ['README.md', '규칙 밖', false]].forEach(([f, r, ok], i) => { const y = 256 + i * 44, s = pop(u, 0.2 + i * 0.3);
         mono(40, y, f, { 'font-size': 14.5, opacity: clamp(s) }); mono(300, y, r, { 'font-size': 13.5, fill: ok ? GOOD : MUT, opacity: clamp(s) });
         (ok ? check : cross)(540, y - 5, 9, pop(u, 0.6 + i * 0.3)); });
@@ -107,13 +107,13 @@
       mono(275, 98, 'PR opened', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.4) });
       pill(760, 110, 'terraform plan 실행 중', ACC, pop(u, 2.1), { fs: 14 }); grow(602, 110, 655, 110, E(u, 2.0, 2.3), ACC);
       return; }
-    if (k === 4) { [['approved', 'PR 승인'], ['mergeable', '머지 가능 상태'], ['undiverged', 'main 과 어긋나지 않음']].forEach(([n, d], i) => { const x = 160 + i * 230, s = pop(u, 0.3 + i * 0.3);
+    if (k === 4) { [['approved', 'PR 승인'], ['mergeable', '머지 가능 상태'], ['undiverged', 'main과 어긋나지 않음']].forEach(([n, d], i) => { const x = 160 + i * 230, s = pop(u, 0.3 + i * 0.3);
         card(x, 290, 200, 70, { rx: 10, stroke: WARN, sw: 2.2, s }); lock(x - 70, 290, true, WARN, clamp(s));
         mono(x + 10, 286, n, { 'font-size': 15, 'font-weight': 800, 'text-anchor': 'middle', fill: WARN, opacity: clamp(s) });
         tx(x + 10, 310, d, { 'font-size': 13.5, 'text-anchor': 'middle', fill: MUT, opacity: clamp(s) }); });
-      tx(160, 375, 'apply_requirements 를 모두 채워야 apply 가 열린다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
+      tx(160, 375, 'apply_requirements를 모두 채워야 apply가 열린다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 1.6) });
       lock(780, 110, true, ACC, pop(u, 1.4)); mono(810, 116, 'prod 잠금', { 'font-size': 14.5, 'font-weight': 800, fill: ACC, opacity: fade(u, 1.5) });
-      tx(780, 160, '다른 PR 의 prod plan 은 기다린다', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
+      tx(780, 160, '다른 PR의 prod plan은 거절된다', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
       return; }
     // k = 5: staging + webhook
     [['prod-infra', ['approved', 'mergeable', 'undiverged']], ['staging-infra', ['approved']]].forEach(([n, req], i) => { const y = 240 + i * 80;
@@ -141,15 +141,15 @@
       mono(36, y, text, { 'font-size': 14, 'font-weight': i === 0 || i === 11 ? 800 : i === 10 ? 800 : 500, fill: cc, opacity: s }); });
     if (k >= 3) { card(790, 120, 300, 110, { rx: 12, stroke: WARN, sw: 2.2, fill: WARNBG, s: at(c, 3, 0.8) });
       tx(655, 98, '@senior', { 'font-size': 14.5, 'font-weight': 800, fill: WARN, opacity: fa(c, 3, 1.0) });
-      tx(655, 124, '0.0.0.0/0 은 위험합니다.', { 'font-size': 14.5, opacity: fa(c, 3, 1.1) });
+      tx(655, 124, '0.0.0.0/0은 위험합니다.', { 'font-size': 14.5, opacity: fa(c, 3, 1.1) });
       tx(655, 148, '사내 VPN 대역으로', { 'font-size': 14.5, opacity: fa(c, 3, 1.2) });
       mono(655, 172, '10.20.0.0/16', { 'font-size': 14.5, 'font-weight': 800, fill: GOOD, opacity: fa(c, 3, 1.3) }); }
-    if (k === 1) tx(790, 200, '코드 diff 가 아니라 실제로 생길 값', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
-    if (k === 2) tx(790, 200, 'SG 와 ingress 규칙이 함께 생긴다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.6) });
+    if (k === 1) tx(790, 200, '코드 diff가 아니라 실제로 생길 값', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.8) });
+    if (k === 2) tx(790, 200, 'SG와 ingress 규칙이 함께 생긴다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.6) });
     if (k >= 4) { [['+2', GOOD], ['~0', WARN], ['-0', BAD]].forEach(([s, col], i) => card(690 + i * 90, 260, 76, 50, { rx: 10, text: s, fs: 20, fw: 800, mono: true, stroke: col, color: col, s: k === 4 ? pop(u, 0.3 + i * 0.2) : 1 }));
       ['atlantis apply -d infra/prod -w prod', 'atlantis plan -d infra/prod -w prod'].forEach((s, i) => mono(650, 330 + i * 26, (i ? '↻ ' : '▶ ') + s, { 'font-size': 13.5, fill: ACC, opacity: k === 4 ? fade(u, 1.2 + i * 0.3) : 1 })); }
     if (k === 4) tx(790, 400, '아직 apply 하지 않는다', { 'font-size': 14.5, 'font-weight': 700, fill: WARN, 'text-anchor': 'middle', opacity: fade(u, 2.0) });
-    if (k === 5) { pill(790, 400, 'push → 봇이 plan 을 다시 돌렸다', GOOD, pop(u, 1.4), { fs: 13.5 }); } }
+    if (k === 5) { pill(790, 400, 'push → 봇이 plan을 다시 돌렸다', GOOD, pop(u, 1.4), { fs: 13.5 }); } }
 
   // ---------- 4. apply 승인 ----------
   function s4(t, c) { const { k, u } = c;
@@ -170,7 +170,7 @@
         tx(520, y + 5, b, { 'font-size': 15, opacity: clamp(s) }); });
       return; }
     if (k === 3) { tx(40, 46, '시각', { 'font-size': 14, 'font-weight': 800, fill: MUT }); tx(116, 46, '누가 · 무엇', { 'font-size': 14, 'font-weight': 800, fill: MUT });
-      const L = [['10:12', '@junior-dev', 'EC2 + SG 커밋', MUT], ['10:14', 'atlantis-bot', 'Plan: 2 to add', ACC], ['10:22', '@senior', '0.0.0.0/0 변경 요청', WARN], ['10:35', '@junior-dev', 'SG 를 VPN 대역으로', MUT], ['10:40', '@senior', 'Approved', GOOD], ['10:41', '@senior', 'atlantis apply', ACC], ['10:43', 'atlantis-bot', 'Apply complete!', GOOD], ['10:44', '@senior', 'Merged', INFO]];
+      const L = [['10:12', '@junior-dev', 'EC2 + SG 커밋', MUT], ['10:14', 'atlantis-bot', 'Plan: 2 to add', ACC], ['10:22', '@senior', '0.0.0.0/0 변경 요청', WARN], ['10:35', '@junior-dev', 'SG를 VPN 대역으로', MUT], ['10:40', '@senior', 'Approved', GOOD], ['10:41', '@senior', 'atlantis apply', ACC], ['10:43', 'atlantis-bot', 'Apply complete!', GOOD], ['10:44', '@senior', 'Merged', INFO]];
       el('line', { x1: 32, y1: 60, x2: 32, y2: lerp(60, 380, E(u, 0.2, 2.2)), stroke: GRID, 'stroke-width': 3 });
       L.forEach(([a, b, d, col], i) => row(24, 80 + i * 40, a, b, d, col, fade(u, 0.2 + i * 0.25)));
       tx(860, 200, '별도 감사 시스템 없이', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 2.2) });
@@ -181,7 +181,7 @@
     if (u > 0.6) { el('polyline', { points: '80,280 120,280 135,250 150,310 165,280 240,280', fill: 'none', stroke: BAD, 'stroke-width': 2.4, opacity: fade(u, 0.6) }); }
     R.dbIcon(480, 160, 'S3 + DynamoDB lock', { s: pop(u, 0.8), stroke: WARN }); lock(480, 160, true, WARN, pop(u, 1.0));
     [0, 1, 2].forEach((i) => person(740 + i * 60, 160, null, { s: 0.8 * pop(u, 1.3 + i * 0.15) }));
-    tx(800, 230, 'RBAC · SSO 는 약하다', { 'font-size': 14.5, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.6) });
+    tx(800, 230, 'RBAC · SSO는 약하다', { 'font-size': 14.5, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.6) });
     tx(480, 360, '셀프호스팅이라 운영 책임은 우리에게 남는다', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.1) }); }
 
   // ---------- 5. 대안 비교 ----------
@@ -216,12 +216,12 @@
       tx(480, 400, '흐름이 같아서 옮기는 비용은 학습과 설정 정도다', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 2.3) });
       return; }
     // k = 4: 네 단계 정리
-    const S = [['수동 로컬 apply', BAD], ['bot 이 plan 을 PR 에', ACC], ['조건 검사 후 apply', GOOD], ['규모에 맞춰 SaaS', INFO]];
+    const S = [['수동 로컬 apply', BAD], ['bot이 plan을 PR에', ACC], ['조건 검사 후 apply', GOOD], ['규모에 맞춰 SaaS', INFO]];
     S.forEach(([s, col], i) => { const x = 130 + i * 233, sp = pop(u, 0.2 + i * 0.4);
       card(x, 170, 200, 90, { rx: 12, text: s, fs: 15, fw: 800, stroke: col, color: col, s: sp });
       mono(x, 108, 'Step ' + (i === 0 ? '1' : i === 1 ? '2~3' : i === 2 ? '4' : '5'), { 'font-size': 14, 'text-anchor': 'middle', fill: MUT, opacity: clamp(sp) });
       if (i) grow(x - 133, 170, x - 102, 170, seg(u, 0.2 + i * 0.4, 0.5 + i * 0.4), MUT); });
-    tx(480, 320, 'plan 을 PR 에 보이는 것이 출발점이다', { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.0) }); }
+    tx(480, 320, 'plan을 PR에 보이는 것이 출발점이다', { 'font-size': 17, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.0) }); }
 
   const quiz = [
     { q: '이 사고에서 22번 포트가 열린 것을 리뷰에서 놓친 직접 원인은 무엇인가?',
@@ -248,16 +248,16 @@
     'apply는 approved, mergeable, undiverged를 통과해야 열리고 모든 단계가 PR에 기록된다.',
   ];
   const review = [
-    { q: '봇이 plan을 올렸는데 다른 PR이 같은 prod를 plan하려 하자 기다리라는 답이 왔다. 이유는?',
+    { q: '봇이 plan을 올렸는데 다른 PR이 같은 prod를 plan하려 하자 잠겨 있다는 답이 왔다. 이유는?',
       o: ['Atlantis가 prod 워크스페이스를 잠가 동시 작업을 막고 있다', 'GitHub webhook이 끊겼다', 'terraform 버전이 달라서'], a: 0,
       why: 'plan을 돌린 PR이 그 디렉터리와 워크스페이스를 잠근다. 앞 PR이 끝나거나 atlantis unlock으로 풀어야 한다.' },
     { q: 'atlantis.yaml에 automerge: false를 두었다. apply가 성공한 뒤 PR은 어떻게 되는가?',
-      o: ['봇이 바로 머지한다', 'PR이 자동으로 닫힌다', '열린 채로 남고 사람이 머지한다'], a: 2,
+      o: ['봇이 바로 머지한다', '열린 채로 남고 사람이 머지한다', 'PR이 자동으로 닫힌다'], a: 1,
       why: '자동 머지를 껐으므로 apply 결과를 확인한 리뷰어가 머지한다. 그 시각도 타임라인에 남는다.' },
     { q: '보안팀이 지난달 prod 변경을 누가 언제 적용했는지 물었다. 이 흐름에서 가장 빨리 찾는 곳은?',
       o: ['각 개발자 노트북의 셸 기록', 'Terraform state 파일의 주석', '해당 PR 타임라인의 apply 코멘트와 결과 코멘트'], a: 2,
       why: 'apply는 PR 코멘트로만 실행되므로 작성자와 시각, 결과가 같은 PR에 남는다.' },
   ];
 
-  R.page({ title: 'PR 위의 plan 과 apply', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
+  R.page({ title: 'PR 위의 plan과 apply', scenes: [s1, s2, s3, s4, s5], quiz, summary, review });
 })();

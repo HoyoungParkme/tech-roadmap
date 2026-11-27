@@ -1,5 +1,5 @@
 /* III-1-1 Alert Rule 만들기 — 장면 5개 (../../anim/engine.js 규칙을 따른다)
- * 값(5xx 비율·for 누적·상태)은 페이지 STEPS 의 valueNow · threshold · forDuration · currentFor · state 를 읽는다. */
+ * 값(5xx 비율·for 누적·상태)은 페이지 STEPS의 valueNow · threshold · forDuration · currentFor · state를 읽는다. */
 (function () {
   const R = window.RA, { C, el, tx, E, lerp, clamp, seg, pop, fade, tw, tween, card, mono, sub, lbl, pill, banner, grow, fly, dot, zone, cross, check, clock, axes, line } = R;
   const { INK, MUT, OFF, GRID, SOFT, PANEL, ACC, ACCBG, BAD, BADBG, GOOD, GOODBG, WARN, WARNBG, INFO, INFOBG } = C;
@@ -62,7 +62,7 @@
       tagL(150, BY + 84, 'title', ACC, { mono: true, s: pop(u, 1.9) }); tx(220, BY + 89, '알림에 찍히는 사람용 이름', { 'font-size': 15, opacity: fade(u, 2.0) }); }
     if (k === 2) { el('rect', { x: SL[1].x - SW / 2 - 4, y: SY - SH / 2 - 4, width: SW + 8, height: SH + 8, rx: 14, fill: 'none', stroke: INFO, 'stroke-width': 2.6, opacity: fade(u, 0.8) });
       mono(SL[1].x - SW / 2 + 14, SY + 8, 'condition: C', { 'font-size': 16, 'font-weight': 800, fill: INFO, opacity: fade(u, 1.0) });
-      tx(SL[1].x - SW / 2 + 14, SY + 34, '판정할 노드 C 를 가리킨다', { 'font-size': 14, fill: INFO, opacity: fade(u, 1.6) });
+      tx(SL[1].x - SW / 2 + 14, SY + 34, '판정할 노드 C를 가리킨다', { 'font-size': 14, fill: INFO, opacity: fade(u, 1.6) });
       sub(480, BY + 70, '알람은 패널 그림이 아니라 쿼리가 돌려준 숫자를 본다', fade(u, 2.0), { 'font-size': 15 }); }
     if (k === 3) { const cx = 330, g = E(u, 0.3, 1.2);
       mono(cx, BY + 30, 'sum(rate(http_requests_total{status=~"5.."}[5m]))', { 'font-size': 14.5, 'text-anchor': 'middle', fill: BAD, opacity: fade(u, 0.2) });
@@ -122,7 +122,7 @@
   function s2(t, c) { const { k, u } = c;
     machine(c, (i) => (k === 0 ? pop(u, 0.2 + i * 0.35) : 1));
     if (k === 0) { const p = el('path', { d: 'M 840 92 C 820 140, 150 140, 122 92', fill: 'none', stroke: GOOD, 'stroke-width': 2, 'stroke-dasharray': '5 5', opacity: fade(u, 1.9) });
-      sub(480, 150, '해소되면 다시 Normal — 그 순간을 Resolved 라고 부른다', fade(u, 2.1), { 'font-size': 15 });
+      sub(480, 150, '해소되면 다시 Normal — 그 순간을 Resolved라고 부른다', fade(u, 2.1), { 'font-size': 15 });
       sub(480, 240, '상태는 평가 주기(1m)마다 다시 계산된다', fade(u, 2.3), { 'font-size': 15 }); return; }
     gauge(c, 170); forBar(c, 170);
     const Y = 300;
@@ -169,7 +169,7 @@
     if (k === 0) { card(560, 120, 140, 50, { rx: 25, text: 'Firing', fs: 17, fw: 800, stroke: BAD, color: BAD, fill: BADBG, s: pop(u, 0.2) });
       fly(560, 160, 820, 260, seg(u, 0.8, 2.0), '{ JSON }', { fill: ACC, stay: true, mono: true });
       card(830, 300, 190, 54, { rx: 10, text: 'slack-backend', fs: 15, mono: true, stroke: ACC, color: ACC, s: pop(u, 1.6) });
-      sub(RX, 390, '채널이 받는 것은 그래프가 아니라 이 JSON 이다', fade(u, 2.2), { 'font-size': 15 }); }
+      sub(RX, 390, '채널이 받는 것은 그래프가 아니라 이 JSON이다', fade(u, 2.2), { 'font-size': 15 }); }
     if (k === 1) { [['severity=warning', 70], ['team=backend', 120], ['instance=api-prod-3:8080', 170]].forEach(([s, y], i) => tagL(480, y, s, ACC, { mono: true, fs: 13.5, s: pop(u, 0.2 + i * 0.25) }));
       const sx = 560, sy = 270; card(sx, sy, 110, 40, { rx: 8, text: '정책 트리', fs: 14, s: pop(u, 1.0) });
       [['team=backend', 230, GOOD], ['team=database', 320, MUT]].forEach(([s, y, col], i) => { grow(sx + 55, sy, 700, y, E(u, 1.2 + i * 0.2, 1.7 + i * 0.2), col);
@@ -183,7 +183,7 @@
       el('circle', { cx: x0 + 60, cy: y, r: 7, fill: BAD });
       mono(x0 + 60, y - 26, 'startsAt 10:23:15', { 'font-size': 14, 'font-weight': 700, fill: BAD });
       tx(x0 + w, y + 40, 'endsAt 비어 있음 → 진행 중', { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 1.6) });
-      sub(RX, 300, '0001-01-01 은 "아직 없음" 자리표시', fade(u, 2.0), { 'font-size': 15 }); }
+      sub(RX, 300, '0001-01-01은 "아직 없음" 자리표시', fade(u, 2.0), { 'font-size': 15 }); }
     if (k === 4) { const x0 = 500, w = 380, X = (v) => x0 + (w * v) / 0.15;
       tx(x0, 100, 'A (쿼리 값)', { 'font-size': 15, 'font-weight': 700 });
       el('rect', { x: x0, y: 116, width: w, height: 28, rx: 6, fill: SOFT }); el('rect', { x: x0, y: 116, width: (X(0.12) - x0) * E(u, 0.2, 1.2), height: 28, rx: 6, fill: BAD });
@@ -265,10 +265,10 @@
     if (k <= 6) { OUT.forEach((s, i) => { const y = 54 + i * 44, on = i === k, past = i < k;
         if (on) el('rect', { x: x0 - 10, y: y - 22, width: 380 * E(u, 0.1, 0.6), height: 36, rx: 8, fill: ACCBG });
         mono(x0, y + 2, s, { 'font-size': 14.5, 'font-weight': on ? 800 : 500, fill: on ? INK : past ? INK : OFF }); });
-      if (k === 3) sub(750, 380, 'for 는 발화 쪽에만 · 내려오면 바로 Normal', fade(u, 1.4), { 'font-size': 14.5 });
+      if (k === 3) sub(750, 380, 'for는 발화 쪽에만 · 내려오면 바로 Normal', fade(u, 1.4), { 'font-size': 14.5 });
       if (k === 6) { env(840, 380, pop(u, 1.2), GOOD); tx(810, 386, 'resolved 알림', { 'font-size': 15, 'font-weight': 700, fill: GOOD, 'text-anchor': 'end', opacity: fade(u, 1.4) }); } return; }
     if (k === 7) { tx(x0, 50, '좋은 알람 5가지', { 'font-size': 17, 'font-weight': 800 });
-      ['할 일이 있다', '제때 온다', '조용하다 (for 5m+)', '런북 링크가 있다', 'severity 가 나뉜다'].forEach((s, i) => { const y = 96 + i * 52; check(x0 + 12, y, 10, pop(u, 0.3 + i * 0.3)); tx(x0 + 36, y + 6, s, { 'font-size': 15.5, 'font-weight': 600, opacity: fade(u, 0.35 + i * 0.3) }); }); return; }
+      ['할 일이 있다', '제때 온다', '조용하다 (for 5m+)', '런북 링크가 있다', 'severity가 나뉜다'].forEach((s, i) => { const y = 96 + i * 52; check(x0 + 12, y, 10, pop(u, 0.3 + i * 0.3)); tx(x0 + 36, y + 6, s, { 'font-size': 15.5, 'font-weight': 600, opacity: fade(u, 0.35 + i * 0.3) }); }); return; }
     tx(x0, 50, '피할 것 4가지', { 'font-size': 17, 'font-weight': 800 });
     ['for: 0 → 깜빡임', 'severity 없음 → 무뎌짐', '런북 없음 → 새벽에 헤맴', '차원 폭발 → 알람 100개'].forEach((s, i) => { const y = 96 + i * 56; cross(x0 + 12, y, 9, pop(u, 0.3 + i * 0.3)); tx(x0 + 36, y + 6, s, { 'font-size': 15.5, 'font-weight': 600, opacity: fade(u, 0.35 + i * 0.3) }); });
     banner(740, 360, '사이클 끝 — 다시 Normal', pop(u, 1.8)); }

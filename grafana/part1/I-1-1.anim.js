@@ -70,7 +70,7 @@
     const RX = 650;
     if (k === 0) { el('rect', { x: RX, y: 70, width: 290, height: 34, rx: 6, fill: SOFT, stroke: GRID });
       mono(RX + 12, 92, '/d/' + 'service-health'.slice(0, Math.round(lerp(0, 14, E(u, 0.6, 1.4)))), { 'font-size': 14.5, fill: INK });
-      lbl(RX + 145, 56, 'URL 에 박히는 uid', fade(u, 0.5), { fill: ACC });
+      lbl(RX + 145, 56, 'URL에 박히는 uid', fade(u, 0.5), { fill: ACC });
       const ren = E(u, 1.7, 2.3);
       tx(RX, 160, 'title', { 'font-size': 13.5, fill: MUT, 'font-weight': 700, opacity: fade(u, 1.5) });
       mono(RX + 60, 160, ren > 0.5 ? '"Service Health v2"' : '"Service Health"', { 'font-size': 14.5, opacity: fade(u, 1.5), fill: ren > 0.5 ? WARN : INK });
@@ -81,7 +81,7 @@
     if (k === 1) { [['tags', '["platform"]', ACC], ['timezone', '"browser"', INK], ['schemaVersion', '39', INK], ['version', '1', INK]].forEach(([a, v, col], i) => {
         const y = 92 + i * 52, s = pop(u, 0.3 + i * 0.35); card(RX + 145, y, 290, 40, { rx: 8, stroke: i ? GRID : ACC, s });
         tx(RX + 14, y + 5, a, { 'font-size': 14.5, 'font-weight': 700, fill: MUT, opacity: fade(u, 0.4 + i * 0.35) }); mono(RX + 276, y + 5, v, { 'font-size': 15, 'font-weight': 700, fill: col, 'text-anchor': 'end', opacity: fade(u, 0.4 + i * 0.35) }); });
-      sub(RX + 145, 320, 'tag 는 검색, 나머지는 보드 메타', fade(u, 1.9), { 'font-size': 15 }); return; }
+      sub(RX + 145, 320, 'tag는 검색, 나머지는 보드 메타', fade(u, 1.9), { 'font-size': 15 }); return; }
     if (k === 2) { // 6시간 창이 1시간으로 줄어든다
       const x0 = RX, w = 290, f = lerp(1, 1 / 6, E(u, 0.4, 1.3));
       tx(x0, 80, '보드 시간창', { 'font-size': 14.5, 'font-weight': 700, fill: MUT });
@@ -95,7 +95,7 @@
     if (k === 3) { mono(RX, 110, '"templating": { "list": [] }', { 'font-size': 14.5, fill: INFO, opacity: fade(u, 0.4) });
       mono(RX, 150, '"annotations": { "list": [] }', { 'font-size': 14.5, fill: WARN, opacity: fade(u, 0.9) });
       sub(RX + 145, 210, '자리만 잡아 둔 빈 배열', fade(u, 1.4), { 'font-size': 15, fill: INK, 'font-weight': 700 });
-      sub(RX + 145, 240, '변수는 Part II 에서 채운다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
+      sub(RX + 145, 240, '변수는 Part II에서 채운다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
     if (k === 4) { card(RX + 145, 130, 250, 64, { rx: 10, text: 'dashboard 자체 데이터\n0 행', fs: 16, stroke: BAD, color: BAD, s: pop(u, 0.6) });
       sub(RX + 145, 210, '보드는 패널을 담는 껍데기', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     // k5 저장 흐름
@@ -113,7 +113,7 @@
           const gap = sp * 6; el('rect', { x: x + (i ? gap : 0), y, width: ww - (i ? gap : 0) - (i < row.length - 1 ? gap : 0), height: 50, rx: 6, fill: r === 0 ? ACCBG : PANEL, stroke: ACC, 'stroke-width': 2 });
           if (sp > 0.5 || r === 0) mono(x + ww / 2, y + 31, 'w ' + w, { 'font-size': 15, 'text-anchor': 'middle', 'font-weight': 700, fill: ACC }); });
         tx(x0 - 20, y + 31, ['풀 폭', '절반', '1/3', '1/4'][r], { 'font-size': 15, 'font-weight': 700, 'text-anchor': 'end', opacity: fade(u, 0.3 + r * 0.45) }); });
-      sub(420, 395, '한 줄의 w 합이 24 가 되게 나눈다', fade(u, 2.2), { 'font-size': 15.5, fill: INK, 'font-weight': 700 }); return; }
+      sub(420, 395, '한 줄의 w 합이 24가 되게 나눈다', fade(u, 2.2), { 'font-size': 15.5, fill: INK, 'font-weight': 700 }); return; }
     const B = board(30, 70, 560, 24, 10, { ruler: true });
     const w = k < 2 ? 12 : k === 2 ? lerp(12, 24, E(u, 0.4, 1.4)) : 24, PX = B.X(0) + 3, PY = B.Y(0) + 3, PW = B.X(w) - B.X(0) - 6, PH = 8 * 24 - 6;
     gpanel(PX, PY, PW, PH, k >= 1 ? 'p99 Latency' : null, { type: k >= 1 ? 'timeseries' : null, dash: k === 0 ? '6 5' : null, stroke: k === 0 || k === 2 ? ACC : GRID, s: 1, op: k === 0 ? pop(u, 0.3) : 1 });
@@ -130,9 +130,9 @@
     if (k === 0) { mono(RX, 110, '"panels": [', { 'font-size': 15, opacity: fade(u, 0.2) }); mono(RX + 20, 140, '{ "id": 1 }', { 'font-size': 15, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.6) }); mono(RX, 170, ']', { 'font-size': 15, opacity: fade(u, 0.2) });
       sub(RX + 150, 230, '배열에 객체 하나 = 패널 하나', fade(u, 1.3), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k === 1) { pill(RX + 150, 110, 'title  p99 Latency', INK, pop(u, 0.3), { fs: 14.5 }); pill(RX + 150, 160, 'type  timeseries', ACC, pop(u, 0.8), { mono: true, fs: 14.5 });
-      sub(RX + 150, 220, 'type 이 그리는 방식을 정한다', fade(u, 1.4), { 'font-size': 15 }); return; }
+      sub(RX + 150, 220, 'type이 그리는 방식을 정한다', fade(u, 1.4), { 'font-size': 15 }); return; }
     if (k === 2) { mono(RX + 20, 120, '"gridPos": {', { 'font-size': 14.5 }); mono(RX + 40, 150, `"x": 0, "y": 0,`, { 'font-size': 14.5 }); mono(RX + 40, 180, `"w": ${Math.round(w)}, "h": 8`, { 'font-size': 14.5, fill: ACC, 'font-weight': 700 }); mono(RX + 20, 210, '}', { 'font-size': 14.5 });
-      sub(RX + 150, 260, 'h 는 높이 칸 수', fade(u, 1.6), { 'font-size': 15 }); return; }
+      sub(RX + 150, 260, 'h는 높이 칸 수', fade(u, 1.6), { 'font-size': 15 }); return; }
     // 데이터소스
     const DX = 860, DY = 250; R.dbIcon(DX, DY, 'Prometheus', { s: k === 3 ? pop(u, 0.3) : 1 });
     if (k === 3) { grow(PX + PW, PY + 120, DX - 48, DY, E(u, 0.8, 1.5), ACC, { dash: '6 5' }); pill(DX - 40, 120, 'uid prom-default', ACC, pop(u, 1.4), { mono: true, fs: 13.5 }); return; }
@@ -176,8 +176,8 @@
     // 오른쪽 설명
     const RX = 660;
     if (k === 2) { sub(RX + 135, 140, 'x 12 · w 6', fade(u, 0.8), { class: 'mono', 'font-size': 16, fill: ACC, 'font-weight': 700 });
-      sub(RX + 135, 176, 'Traffic 을 값 하나로', fade(u, 1.2), { 'font-size': 15, fill: INK, 'font-weight': 700 });
-      sub(RX + 135, 214, 'reqps 는 1000 을 넘으면 K 를 붙인다', fade(u, 1.8), { 'font-size': 14 }); }
+      sub(RX + 135, 176, 'Traffic을 값 하나로', fade(u, 1.2), { 'font-size': 15, fill: INK, 'font-weight': 700 });
+      sub(RX + 135, 214, 'reqps는 1000을 넘으면 K를 붙인다', fade(u, 1.8), { 'font-size': 14 }); }
     if (k === 3) { sub(RX + 135, 140, 'x 18 · w 6', fade(u, 0.8), { class: 'mono', 'font-size': 16, fill: ACC, 'font-weight': 700 });
       sub(RX + 135, 176, '5xx ÷ 전체 요청', fade(u, 1.2), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
     if (k === 4) { // 임계값 수직선: 0 ~ 0.06
@@ -187,14 +187,14 @@
       const mx = X(0.0042); el('line', { x1: mx, y1: y - 14, x2: mx, y2: y + 30, stroke: INK, 'stroke-width': 3, opacity: fade(u, 1.2) });
       mono(mx, y - 22, '0.0042', { 'font-size': 14.5, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 1.2) });
       tx(x0, 250, '0.0042 < 0.01 → 초록', { 'font-size': 16, 'font-weight': 800, fill: GOOD, opacity: fade(u, 1.6) });
-      sub(x0 + 130, 286, '1% 를 넘으면 노랑, 5% 부터 빨강', fade(u, 2.0), { 'font-size': 14.5 }); }
+      sub(x0 + 130, 286, '1%를 넘으면 노랑, 5%부터 빨강', fade(u, 2.0), { 'font-size': 14.5 }); }
     if (k === 5) { sub(RX + 135, 170, 'y 8 · w 24 · h 6', fade(u, 0.6), { class: 'mono', 'font-size': 16, fill: ACC, 'font-weight': 700 });
       sub(RX + 135, 206, '둘째 줄로 내려간다', fade(u, 1.0), { 'font-size': 15, fill: INK, 'font-weight': 700 });
-      sub(RX + 135, 242, 'max 100 이 눈금 끝', fade(u, 1.6), { 'font-size': 14.5 }); }
+      sub(RX + 135, 242, 'max 100이 눈금 끝', fade(u, 1.6), { 'font-size': 14.5 }); }
     if (k === 6) { P4.forEach((gp, i) => { const [x, y, w] = rect(gp); pill(x + w / 2, y + (i === 3 ? 30 : 58), gp.join(','), INK, pop(u, 0.2 + i * 0.25), { mono: true, fs: 13.5, fill: PANEL }); });
       P4.forEach((gp, i) => { const [x, y, w] = rect(gp); dot([[820, 34], [x + w - 20, y + 12]], seg(u, 1.3 + i * 0.1, 2.1 + i * 0.1), ACC, 6); });
       sub(RX + 135, 140, '시간창 1번 = 4패널 동시 갱신', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); }
-    if (k === 0) { sub(RX + 135, 150, 'tag 하나 더', fade(u, 0.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); sub(RX + 135, 184, 'uid 도 새 보드용으로', fade(u, 1.2), { 'font-size': 14.5 }); }
+    if (k === 0) { sub(RX + 135, 150, 'tag 하나 더', fade(u, 0.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); sub(RX + 135, 184, 'uid도 새 보드용으로', fade(u, 1.2), { 'font-size': 14.5 }); }
   }
 
   // ========== 4. Folder & Tag ==========
@@ -206,15 +206,18 @@
       mono(F[0] - 72, F[1] - 14, 'dashboards.yml', { 'font-size': 14, 'font-weight': 700 }); mono(F[0] - 72, F[1] + 10, 'apiVersion: 1', { 'font-size': 13.5, fill: MUT }); mono(F[0] - 72, F[1] + 30, 'providers:', { 'font-size': 13.5, fill: MUT });
       const G0 = [380, 92]; card(G0[0], G0[1], 150, 56, { rx: 10, text: 'Grafana', fs: 17, stroke: ACC, color: ACC, fill: ACCBG, s: k === 0 ? pop(u, 0.6) : 1 });
       el('line', { x1: F[0] + 86, y1: F[1], x2: G0[0] - 76, y2: G0[1], stroke: GRID, 'stroke-width': 2.5 });
-      if (k === 0) { dot([[F[0] + 86, F[1]], [G0[0] - 76, G0[1]]], seg(u, 0.9, 1.7), ACC, 7); sub(380, 170, 'UI 로 만들지 않아도 보드가 뜬다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      if (k === 0) { dot([[F[0] + 86, F[1]], [G0[0] - 76, G0[1]]], seg(u, 0.9, 1.7), ACC, 7); sub(380, 170, 'UI로 만들지 않아도 보드가 뜬다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
       // 폴더
       const PF = [700, 120], YF = [700, 300], showY = k >= 3;
       folderIcon(PF[0], PF[1], 300, 130, 'Team-Platform', { s: k === 1 ? pop(u, 0.3) : 1, stroke: k === 2 ? WARN : INK });
       mono(PF[0] + 150, PF[1] - 74, 'folderUid team-platform', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'end', opacity: k === 1 ? fade(u, 1.0) : 1 });
       ['Service Health', 'Node Exporter'].forEach((n, i) => card(PF[0] - 70 + i * 140, PF[1] + 22, 128, 36, { rx: 6, text: n, fs: 13.5, stroke: GRID, s: k === 1 ? pop(u, 0.8 + i * 0.3) : 1 }));
       grow(G0[0] + 76, G0[1], PF[0] - 152, PF[1], k === 1 ? E(u, 0.4, 0.9) : 1, MUT);
-      if (k === 2) { lock(PF[0] + 120, PF[1] - 50, true, WARN, pop(u, 0.3));
-        card(380, 230, 210, 44, { rx: 8, text: 'Save', fs: 16, stroke: OFF, color: OFF, s: pop(u, 0.6) }); cross(380, 230, 16, pop(u, 1.0));
+      if (k === 1) { lock(PF[0] + 178, PF[1] - 24, false, INFO, pop(u, 1.4));
+        sub(380, 250, '폴더 이름이 곧 권한 단위', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 });
+        sub(380, 284, 'folderUid는 이름이 바뀌어도 그대로', fade(u, 2.0), { 'font-size': 14.5 }); return; }
+      if (k === 2) { lock(PF[0] + 178, PF[1] - 24, true, WARN, pop(u, 0.3));
+        card(380, 230, 210, 44, { rx: 8, text: 'Save', fs: 16, stroke: OFF, color: OFF, s: pop(u, 0.6) }); cross(510, 230, 13, pop(u, 1.0));
         sub(380, 280, 'Cannot save provisioned dashboard', fade(u, 1.2), { class: 'mono', 'font-size': 13.5, fill: BAD });
         clock(110, 250, 30, (u / 3) % 1, ACC, null); mono(110, 256, '30s', { 'font-size': 14, 'font-weight': 800, 'text-anchor': 'middle' });
         sub(110, 304, '30초마다 파일을 다시 읽는다', fade(u, 1.6), { 'font-size': 14 });
@@ -251,8 +254,8 @@
       el('rect', { x: 40, y, width: 880, height: 52, rx: 8, fill: sel.length && ok ? ACCBG : PANEL, stroke: GRID, 'stroke-width': 1.4, opacity: op });
       tx(60, y + 32, n, { 'font-size': 16, 'font-weight': 700, opacity: op }); tx(250, y + 32, f === 'P' ? 'Team-Platform' : 'Team-Payment', { 'font-size': 13.5, fill: MUT, opacity: op });
       let tx0 = 420; tags.forEach((s0) => { const isNew = i === 0 && s0 === 'prod' && k === 5; tx0 += chip(tx0, y + 26, s0, isNew ? WARN : ACC, isNew ? pop(u, 0.6) : 1, { op, fill: isNew ? WARNBG : ACCBG }) + 8; }); });
-    if (k === 5) sub(480, 390, 'Service Health 에 prod 를 더해 tag 3개', fade(u, 1.4), { 'font-size': 15, fill: INK, 'font-weight': 700 });
-    if (k === 6) sub(480, 390, '/api/search?tag=prod&tag=golden-signals 와 같다', fade(u, 2.1), { class: 'mono', 'font-size': 14 }); }
+    if (k === 5) sub(480, 390, 'Service Health에 prod를 더해 tag 3개', fade(u, 1.4), { 'font-size': 15, fill: INK, 'font-weight': 700 });
+    if (k === 6) sub(480, 390, '/api/search?tag=prod&tag=golden-signals와 같다', fade(u, 2.1), { class: 'mono', 'font-size': 14 }); }
 
   // 장면마다 확인 문제 하나
   const quiz = [
@@ -284,7 +287,7 @@
       o: ['보드의 tags 목록', 'Team-Payment 폴더의 권한', '보드의 time range'], a: 1,
       why: '편집 권한은 폴더 단위로 붙는다. tag와 시간창은 누가 고칠 수 있는지와 관계가 없다.' },
     { q: 'provisioning으로 올린 보드를 화면에서 고친 뒤 저장했더니 거부됐다. 왜인가?',
-      o: ['uid가 바뀌어서', '폴더에 tag가 없어서', 'allowUiUpdates가 false라 파일만 원본으로 인정해서'], a: 2,
+      o: ['uid가 바뀌어서', '폴더에 tag가 없어서', 'allowUiUpdates가 false라서'], a: 2,
       why: 'allowUiUpdates: false인 provider의 보드는 UI 저장을 막는다. 고치려면 파일을 바꾸고, Grafana는 30초마다 파일을 다시 읽는다.' },
   ];
 

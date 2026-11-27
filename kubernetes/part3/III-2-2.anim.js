@@ -51,11 +51,11 @@
       dot([[F[0] + 28, F[1]], [A[0] - 28, A[1]]], seg(u, 0.3, 1.6), ACC, 8); if (u > 1.6) { check(A[0] + 56, A[1] - 30, 11, pop(u, 1.6)); mono(A[0] + 74, A[1] - 24, '200', { 'font-size': 16, fill: GOOD, 'font-weight': 800 }); } }
     if (k === 3) { dot([[F[0] + 28, F[1]], [A[0] - 72, A[1]]], seg(u, 0.2, 1.4), BAD, 8);
       if (u > 1.4) { cross(A[0] - 72, A[1], 12, pop(u, 1.4)); pill(A[0] - 200, A[1] - 50, 'connection refused', BAD, pop(u, 1.6), { mono: true, fs: 14 }); } }
-    if (k === 4) { tx(470, 44, '모두 IP 가 바뀌는 경우', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: fade(u, 0.2) });
-      [['HPA 스케일 아웃', '새 Pod 가 추가된다'], ['롤링 업데이트', '이전 Pod 종료'], ['Node drain', '다른 노드로 이주'], ['CrashLoop 회복', '같은 Pod 도 새 IP']].forEach(([a, d], i) => {
+    if (k === 4) { tx(470, 44, '모두 IP가 바뀌는 경우', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: WARN, opacity: fade(u, 0.2) });
+      [['HPA 스케일 아웃', '새 Pod가 추가된다'], ['롤링 업데이트', '이전 Pod 종료'], ['Node drain', '다른 노드로 이주'], ['CrashLoop 회복', '같은 Pod도 새 IP']].forEach(([a, d], i) => {
       const x = 375 + (i % 2) * 200, y = 90 + Math.floor(i / 2) * 76, s = pop(u, 0.3 + i * 0.35); card(x, y, 188, 64, { rx: 10, stroke: WARN, sw: 2, s, fill: PANEL });
       tx(x, y - 5, a, { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 800, opacity: fade(u, 0.4 + i * 0.35) }); tx(x, y + 17, d, { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.4 + i * 0.35) }); }); }
-    if (k === 5) { pill(470, 70, 'Service 이름으로 부르자', GOOD, pop(u, 0.6), { fs: 15 }); sub(470, 104, 'IP 하드코딩은 PoC 에서만', fade(u, 1.0), { 'font-size': 14 }); }
+    if (k === 5) { pill(470, 70, 'Service 이름으로 부르자', GOOD, pop(u, 0.6), { fs: 15 }); sub(470, 104, 'IP 하드코딩은 PoC에서만', fade(u, 1.0), { 'font-size': 14 }); }
     problem(c, u); }
 
   // ---------- 2. CoreDNS ----------
@@ -76,13 +76,13 @@
     sub(Q.svc[0] + 210, Q.svc[1] + 6, 'kube-proxy', 1, { 'font-size': 13.5 });
     pill(Q.f[0], Q.f[1] - 70, 'http://api-svc', ACC, ap(k, 0, u, 0.6), { mono: true, fs: 14 });
     if (k === 1) { const s = '10.96.180.21'; el('rect', { x: Q.svc[0] - 70, y: Q.svc[1] + 6, width: 140, height: 20, rx: 4, fill: 'var(--hl)', opacity: 0.6 * (1 - fade(u, 1.6)) });
-      sub(Q.svc[0], Q.svc[1] + 52, 'Pod 가 바뀌어도 이 IP 는 그대로', fade(u, 1.2), { 'font-size': 14, fill: ACC, 'font-weight': 700 }); }
+      sub(Q.svc[0], Q.svc[1] + 52, 'Pod가 바뀌어도 이 IP는 그대로', fade(u, 1.2), { 'font-size': 14, fill: ACC, 'font-weight': 700 }); }
     if (k === 2) { dot([[Q.f[0] + 26, Q.f[1] - 20], [Q.dns[0] - 126, Q.dns[1] + 20]], seg(u, 0.3, 1.3), WARN, 8); fly(Q.f[0] + 40, Q.f[1] - 110, 250, 150, seg(u, 0.3, 1.3), 'nslookup api-svc', { mono: true, fill: WARN, stay: true }); }
     if (k === 3) { fly(Q.dns[0] - 120, Q.dns[1] + 40, 250, 160, seg(u, 0.2, 1.0), '→ 10.96.180.21', { mono: true, fill: GOOD, stay: true });
       mono(Q.dns[0] + 140, Q.dns[1] + 70, 'api-svc.default.svc.cluster.local', { 'font-size': 14, fill: GOOD, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 1.0) }); }
     if (k === 4) { dot([[Q.f[0] + 26, Q.f[1]], [Q.svc[0] - 92, Q.svc[1]], [Q.svc[0] + 92, Q.svc[1]], [Q.p2[0] - 26, Q.p2[1]]], seg(u, 0.3, 1.9), ACC, 8);
       if (u > 1.9) { check(Q.p2[0] + 40, Q.p2[1] - 34, 10, pop(u, 1.9)); mono(Q.p2[0] + 58, Q.p2[1] - 28, '200 OK', { 'font-size': 15, fill: GOOD, 'font-weight': 800 }); }
-      sub(Q.f[0] + 30, Q.f[1] + 80, 'IP 는 몰라도 된다', fade(u, 1.2), { 'font-size': 14, fill: ACC, 'font-weight': 700 }); }
+      sub(Q.f[0] + 30, Q.f[1] + 80, 'IP는 몰라도 된다', fade(u, 1.2), { 'font-size': 14, fill: ACC, 'font-weight': 700 }); }
     if (k === 5) terminal(20, 318, 920, 98, ['$ kubectl logs -n kube-system coredns-558bd4d5db-4gh2k | tail -1   (예시)', '[INFO] 10.244.1.5:50284 - 4373 "A IN api-svc.default.svc.cluster.local. udp 51 false 512"', '       NOERROR qr,aa,rd 102 0.0012s'], Math.min(3, 0.6 + u * 1.4), { lh: 18, fs: 13.5 }); }
 
   // ---------- 3. resolv.conf ----------
@@ -101,10 +101,10 @@
     if (k >= 2 && k <= 3) { tx(580, 56, '"api-svc" 에 차례로 붙여 본다', { 'font-size': 14, fill: MUT, 'font-weight': 700 });
       SR.forEach((s, i) => { const y = 90 + i * 52, op = k === 2 ? fade(u, 0.3 + i * 0.4) : i === 0 ? 1 : 0.35;
         el('rect', { x: 580, y: y - 22, width: 360, height: 38, rx: 8, fill: k === 3 && i === 0 ? 'var(--goodbg)' : PANEL, stroke: k === 3 && i === 0 ? GOOD : GRID, 'stroke-width': 1.8, opacity: op });
-        mono(594, y + 2, 'api-svc.', { 'font-size': 14.5, 'font-weight': 700, opacity: op }); mono(594 + tw('api-svc.', 14.5), y + 2, s, { 'font-size': 14.5, fill: [ACC, INFO, WARN][i], 'font-weight': 700, opacity: op });
+        R.spans(594, y + 2, [['api-svc.', { fill: INK }], [s, { fill: [ACC, INFO, WARN][i] }]], { 'font-size': 14.5, 'font-weight': 700, opacity: op });
         mono(568, y + 2, String(i + 1), { 'font-size': 14, fill: MUT, 'text-anchor': 'end', 'font-weight': 800, opacity: op }); });
       if (k === 3) { check(925, 90, 9, pop(u, 0.5)); mono(760, 268, '→ 10.96.180.21   200 OK', { 'font-size': 15, fill: GOOD, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 0.9) });
-        sub(760, 296, '같은 default ns 라 1번에서 끝', fade(u, 1.4), { 'font-size': 14 }); } }
+        sub(760, 296, '같은 default ns라 1번에서 끝', fade(u, 1.4), { 'font-size': 14 }); } }
     if (k === 4) { el('rect', { x: 580, y: 40, width: 350, height: 230, rx: 12, fill: SOFT, stroke: GRID, 'stroke-width': 1.5, 'stroke-dasharray': '5 5' });
       tx(596, 64, 'kube-system', { 'font-size': 14, fill: MUT, 'font-weight': 700 });
       svc(755, 112, 'kube-dns', '10.96.0.10', { s: pop(u, 0.3), w: 200 });
@@ -136,22 +136,22 @@
   function s4(t, c) { const { k, u } = c, b = c.beat;
     if (k === 4) { [['default', 'dev 버전'], ['staging', 'staging 버전'], ['production', 'prod 버전']].forEach(([n, v], i) => { const x = 40 + i * 300, s = pop(u, 0.2 + i * 0.35);
         nsBox([x, 90, 280, 230], n + ' ns', [MUT, INFO, WARN][i], s > 0.3 ? 1 : 0); svc(x + 140, 190, 'api-svc', v, { s, stroke: [ACC, INFO, WARN][i], w: 190 }); });
-      sub(480, 360, '이름은 같고 ns 가 버전을 가른다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
-    if (k === 5) { [['api-svc', 'default ns 로 간다', BAD], ['api-svc.production', 'ns 명시', GOOD], ['api-svc.production.svc', '객체 종류까지', GOOD], ['api-svc.production.svc.cluster.local', '풀 FQDN', GOOD]].forEach(([s, d, col], i) => {
+      sub(480, 360, '이름은 같고 ns가 버전을 가른다', fade(u, 1.6), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+    if (k === 5) { [['api-svc', 'default ns로 간다', BAD], ['api-svc.production', 'ns 명시', GOOD], ['api-svc.production.svc', '객체 종류까지', GOOD], ['api-svc.production.svc.cluster.local', '풀 FQDN', GOOD]].forEach(([s, d, col], i) => {
         const y = 70 + i * 74, w = 200 + i * 150, op = fade(u, 0.2 + i * 0.4);
         el('rect', { x: 60, y: y - 26, width: w * E(u, 0.2 + i * 0.4, 0.8 + i * 0.4), height: 40, rx: 8, fill: col === BAD ? 'var(--badbg)' : 'var(--goodbg)', stroke: col, 'stroke-width': 1.8 });
         mono(76, y, s, { 'font-size': 15, 'font-weight': 800, opacity: op });
         (col === BAD ? cross : check)(40, y - 6, 9, op); tx(Math.min(80 + w, 930), y + 34, d, { 'font-size': 13.5, fill: col, 'font-weight': 700, 'text-anchor': 'end', opacity: op }); });
-      tx(480, 400, '뒤로 갈수록 명시적이고 search 에 덜 기댄다', { 'font-size': 14.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.0) }); return; }
+      tx(480, 400, '뒤로 갈수록 명시적이고 search에 덜 기댄다', { 'font-size': 14.5, fill: MUT, 'text-anchor': 'middle', opacity: fade(u, 2.0) }); return; }
     nsBox(NS.def, 'default ns', MUT); nsBox(NS.prod, 'production ns', WARN);
     pod(130, 230, 'frontend-aa1', {});
     svc(330, 160, 'api-svc', '10.96.180.21', {});
     svc(720, 160, 'api-svc', '10.96.207.42', { stroke: WARN, fill: PANEL, s: ap(k, 0, u, 0.3) });
-    if (k === 0) sub(720, 216, '이름은 같고 ClusterIP 는 다르다', fade(u, 1.0), { 'font-size': 14 });
+    if (k === 0) sub(720, 216, '이름은 같고 ClusterIP는 다르다', fade(u, 1.0), { 'font-size': 14 });
     // 호출 문자열
     const nParts = b.parts.length; callBar(60, 50, b.parts, { fs: 17, show: (i) => (k === 2 && i > 0 ? fade(u, 0.3 + i * 0.3) : 1) });
     if (k === 1) { dot([[156, 214], [240, 175]], seg(u, 0.3, 1.2), ACC, 8);
-      if (u > 1.4) { pill(720, 260, 'production 에 닿지 않음', BAD, pop(u, 1.4), { fs: 14 }); } }
+      if (u > 1.4) { pill(720, 260, 'production에 닿지 않음', BAD, pop(u, 1.4), { fs: 14 }); } }
     if (k >= 2 && k <= 3) { const g = k === 2 ? seg(u, 1.0, 2.2) : 1; dot([[156, 220], [480, 250], [630, 175]], k === 2 ? g : seg(u, 0.2, 1.4), WARN, 8);
       if (k === 2) mono(720, 230, '→ 10.96.207.42', { 'font-size': 15, fill: WARN, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 2.2) }); }
     if (k === 3 && u > 1.4) { check(820, 140, 10, pop(u, 1.4)); terminal(540, 236, 370, 92, ['HTTP/1.1 200 OK', ['X-Pod-Namespace: production', WARN]], Math.min(2, (u - 1.4) * 2 + 0.5), { lh: 20, fs: 14 }); }
@@ -177,9 +177,10 @@
       mono(-130, -44, 'kind: ConfigMap', { 'font-size': 15, 'font-weight': 800 }, g); mono(-130, -18, 'name: coredns', { 'font-size': 15, fill: ACC, 'font-weight': 700 }, g);
       mono(-130, 8, 'namespace: kube-system', { 'font-size': 15, fill: MUT, 'font-weight': 700 }, g); mono(-130, 40, 'data.Corefile: |', { 'font-size': 15, fill: INFO, 'font-weight': 700 }, g);
       grow(452, 150, 600, 150, seg(u, 0.9, 1.5), ACC); card(720, 150, 200, 70, { rx: 12, text: 'CoreDNS 동작', fs: 16, stroke: ACC, fill: ACCBG, color: ACC, s: pop(u, 1.4) });
-      sub(480, 290, '이 ConfigMap 하나가 클러스터 DNS 를 정한다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(480, 290, '이 ConfigMap 하나가 클러스터 DNS를 정한다', fade(u, 1.8), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k <= 3) { chain(k, u, k === 2 ? 'kubernetes' : k === 3 ? 'forward' : null);
-      if (k === 1) sub(480, 230, '53번으로 온 질의를 플러그인이 순서대로 처리한다', fade(u, 1.5), { 'font-size': 15, fill: INK, 'font-weight': 700 });
+      if (k === 1) sub(480, 230, '53번으로 온 질의를 이 블록의 플러그인들이 처리한다', fade(u, 1.5), { 'font-size': 15, fill: INK, 'font-weight': 700 });
+      if (k === 1) sub(480, 258, '실행 순서는 Corefile에 적은 순서가 아니라 빌드 때 정해진다', fade(u, 2.0), { 'font-size': 14 });
       if (k === 2) { pill(220, 250, '*.cluster.local', ACC, pop(u, 0.2), { mono: true, fs: 15 }); grow(320, 230, 360, 165, seg(u, 0.5, 1.0), ACC);
         card(500, 330, 200, 54, { rx: 10, text: 'API 서버', fs: 15, stroke: INK, s: pop(u, 1.1) }); grow(406, 165, 470, 302, seg(u, 1.0, 1.6), MUT);
         mono(700, 330, 'ttl 30', { 'font-size': 16, 'font-weight': 800, fill: ACC, opacity: fade(u, 1.8) }); sub(700, 356, '답을 30초 기억', fade(u, 1.9), { 'font-size': 13.5 }); }
@@ -189,11 +190,9 @@
       return; }
     if (k === 4 || k === 5) { const parts = b.parts, fs = 26, x0 = 60;
       callBar(x0, 130, parts, { fs, labels: true, show: (i) => (k === 4 ? fade(u, 0.2 + i * 0.22) : 1) });
-      if (k === 5) { mono(x0, 240, '10-244-1-5.default.', { 'font-size': 20, 'font-weight': 700, fill: INK, opacity: fade(u, 0.3) });
-        mono(x0 + tw('10-244-1-5.default.', 20), 240, 'pod', { 'font-size': 20, 'font-weight': 800, fill: INFO, opacity: fade(u, 0.6) });
-        mono(x0 + tw('10-244-1-5.default.pod', 20), 240, '.cluster.local', { 'font-size': 20, 'font-weight': 700, fill: GOOD, opacity: fade(u, 0.6) });
-        sub(x0 + 300, 274, 'Pod 레코드는 svc 대신 pod, IP 의 점을 대시로', fade(u, 1.0), { 'font-size': 14, 'text-anchor': 'start' });
-        sub(480, 340, 'cluster.local 은 kubeadm 기본값, kubelet --cluster-domain 으로 바꾼다', fade(u, 1.6), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
+      if (k === 5) { R.spans(x0, 240, [['10-244-1-5.default.', { fill: INK, 'font-weight': 700, 'fill-opacity': fade(u, 0.3) }], ['pod', { fill: INFO, 'font-weight': 800, 'fill-opacity': fade(u, 0.6) }], ['.cluster.local', { fill: GOOD, 'font-weight': 700, 'fill-opacity': fade(u, 0.6) }]], { 'font-size': 20 });
+        sub(x0 + 300, 274, 'Pod 레코드는 svc 대신 pod, IP의 점을 대시로', fade(u, 1.0), { 'font-size': 14, 'text-anchor': 'start' });
+        sub(480, 340, 'cluster.local은 kubeadm 기본값, kubelet --cluster-domain으로 바꾼다', fade(u, 1.6), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
       return; }
     if (k === 6) { mono(60, 90, 'nslookup -q=SRV _http._tcp.api-svc.production', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.2) });
       const F5 = [['0', 'priority'], ['100', 'weight'], ['80', 'port'], ['api-svc.production.svc.cluster.local', 'host']]; let x = 60;
@@ -201,11 +200,11 @@
         el('rect', { x, y: 150, width: w, height: 44, rx: 8, fill: i === 2 ? ACCBG : PANEL, stroke: col, 'stroke-width': 2, opacity: op });
         mono(x + w / 2, 179, v, { 'font-size': 20, 'font-weight': 800, fill: col, 'text-anchor': 'middle', opacity: op });
         tx(x + w / 2, 222, l, { 'font-size': 14, fill: MUT, 'text-anchor': 'middle', 'font-weight': 700, opacity: op }); x += w + 10; });
-      sub(480, 300, 'IP 가 아니라 포트와 호스트 이름이 온다 (포트 이름 http)', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(480, 300, 'IP가 아니라 포트와 호스트 이름이 온다 (포트 이름 http)', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k === 7) { terminal(60, 60, 840, 250, ['$ kubectl run -it --rm dnsutils --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 \\', '    --restart=Never -- bash',
         '$ nslookup api-svc.production.svc.cluster.local', '$ dig +short api-svc.production.svc.cluster.local', '$ getent hosts api-svc.production'], Math.min(5, 0.5 + u * 2), { lh: 30, fs: 14.5 });
-      sub(480, 350, '임시 Pod 에서 이름 해석을 직접 확인한다', fade(u, 2.2), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
-    [['<svc>.<ns> 로 부른다', 'search 의존을 줄인다'], ['ndots 를 낮춘다', '외부 도메인 지연 감소'], ['CoreDNS Pod 2개 이상', '단일 장애점 피하기'], ['도메인 변경은 동시에', 'kubelet + Corefile']].forEach(([a, d], i) => {
+      sub(480, 350, '임시 Pod에서 이름 해석을 직접 확인한다', fade(u, 2.2), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+    [['<svc>.<ns>로 부른다', 'search 의존을 줄인다'], ['ndots를 낮춘다', '외부 도메인 지연 감소'], ['CoreDNS Pod 2개 이상', '단일 장애점 피하기'], ['도메인 변경은 동시에', 'kubelet + Corefile']].forEach(([a, d], i) => {
       const x = 250 + (i % 2) * 460, y = 120 + Math.floor(i / 2) * 140, s = pop(u, 0.2 + i * 0.35);
       card(x, y, 420, 100, { rx: 12, stroke: ACC, sw: 2, s, fill: PANEL }); mono(x - 190, y - 6, String(i + 1), { 'font-size': 22, 'font-weight': 800, fill: ACC, opacity: fade(u, 0.3 + i * 0.35) });
       tx(x - 160, y - 6, a, { 'font-size': 17, 'font-weight': 800, opacity: fade(u, 0.3 + i * 0.35) }); tx(x - 160, y + 22, d, { 'font-size': 14.5, fill: MUT, opacity: fade(u, 0.4 + i * 0.35) }); }); }
@@ -236,10 +235,10 @@
   ];
   const review = [
     { q: 'staging의 frontend가 api-svc를 불렀는데 production 데이터가 아니라 staging 응답이 왔다. 이유는?',
-      o: ['CoreDNS 캐시가 오래돼서', '짧은 이름은 자기 namespace의 search 도메인부터 붙여 찾기 때문', 'ClusterIP가 두 namespace에서 같아서'], a: 1,
+      o: ['CoreDNS 캐시에 옛 응답이 남아서', '짧은 이름에 자기 namespace가 먼저 붙어서', 'ClusterIP가 두 namespace에서 같아서'], a: 1,
       why: 'search 첫 줄이 staging.svc.cluster.local이라 같은 ns의 api-svc가 먼저 맞는다. 다른 ns는 .production을 붙여야 한다.' },
     { q: '외부 API를 자주 부르는 Pod에서 DNS 지연이 크다. 로그에 NXDOMAIN이 여러 번 보인다. 먼저 손볼 것은?',
-      o: ['CoreDNS의 kubernetes 플러그인 ttl', 'Pod의 dnsConfig로 ndots를 낮추기', 'Service를 ExternalName으로 바꾸기'], a: 1,
+      o: ['CoreDNS의 kubernetes 플러그인 ttl', 'Service를 ExternalName으로 바꾸기', 'Pod의 dnsConfig로 ndots를 낮추기'], a: 2,
       why: 'ndots:5에서는 점이 적은 외부 이름도 search 후보부터 헛돈다. ndots를 낮추면 점이 충분한 이름은 바로 조회한다.' },
     { q: 'api-svc.production이 잘 풀리는데 실제 호출은 timeout이다. 다음으로 확인할 것은?',
       o: ['NetworkPolicy가 namespace 간 통신을 막는지', 'search 도메인 순서', 'FQDN의 cluster.local 철자'], a: 0,

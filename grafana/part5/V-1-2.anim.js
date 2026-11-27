@@ -159,7 +159,7 @@
     const vCut = k >= 2 ? (k === 2 ? seg(u, 1.0, 1.6) : 1) : 0;
     grow(160, 100, 760, 108, 1, GOOD, { plain: true }); if (k >= 5) for (let i = 0; i < 3; i++) dot([[160, 100], [760, 108]], ((t * 0.6 + i / 3) % 1), GOOD, 5);
     if (vCut < 1) grow(160, 106, 760, 282, 1, GOOD, { plain: true, op: 1 - vCut * 0.7 }); else { el('line', { x1: 160, y1: 106, x2: 450, y2: 192, stroke: OFF, 'stroke-width': 2, 'stroke-dasharray': '4 4' }); }
-    if (k === 2) { cross(460, 195, 14, pop(u, 1.4)); req(300, 400, 'POST', '…/datasources/pg-billing-prod/builtInRoles/Viewer', { op: fade(u, 0.1), fs: 13 }); }
+    if (k === 2) { cross(460, 195, 14, pop(u, 1.4)); req(300, 400, 'POST', '…/datasources/pg-billing-prod/builtInRoles/Viewer', { op: fade(u, 0.1), fs: 13.5 }); }
     if (k === 1) { pill(110, 300, 'PAYMENT_TEAM_ID=34', ACC, pop(u, 0.8), { mono: true, fs: 13.5 }); tx(700, 400, '민감 소스부터 목록으로 뽑는다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.2) }); }
     // pg 의 권한 목록
     if (k >= 2) { zone(480, 220, 230, 110, 'pg-billing-prod 권한', { fill: SOFT });
@@ -167,7 +167,7 @@
       mono(500, 272, 'Viewer: Query', { 'font-size': 14, fill: gone > 0.5 ? OFF : GOOD, 'text-decoration': gone > 0.5 ? 'line-through' : null });
       if (k === 3) { mono(500, 300, 'permission: ""', { 'font-size': 14, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.2) }); tx(595, 360, '빈 문자열 = 삭제', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.6) }); }
       if (k >= 4) mono(500, 300, '결제팀: Query', { 'font-size': 14, 'font-weight': 700, fill: GOOD, opacity: k === 4 ? fade(u, 1.2) : 1 }); }
-    if (k >= 4) { grow(150, 226, 760, 286, k === 4 ? seg(u, 0.3, 1.1) : 1, GOOD); if (k === 4) { req(300, 400, 'POST', '…/datasources/pg-billing-prod/teams/34', { op: fade(u, 0.1), fs: 13 }); for (let i = 0; i < 2; i++) dot([[150, 226], [760, 286]], ((t * 0.7 + i / 2) % 1), GOOD, 5); } }
+    if (k >= 4) { grow(150, 226, 760, 286, k === 4 ? seg(u, 0.3, 1.1) : 1, GOOD); if (k === 4) { req(300, 400, 'POST', '…/datasources/pg-billing-prod/teams/34', { op: fade(u, 0.1), fs: 13.5 }); for (let i = 0; i < 2; i++) dot([[150, 226], [760, 286]], ((t * 0.7 + i / 2) % 1), GOOD, 5); } }
     if (k === 5) { pill(260, 380, 'Explore 임의 쿼리', WARN, pop(u, 0.3), { fs: 13.5 }); const f = seg(u, 0.6, 1.6); grow(150, 336, lerp(150, 740, f), lerp(336, 300, f), f < 1 ? 1 : 1, BAD, { plain: true });
       if (f >= 1) cross(745, 300, 14); tx(620, 400, 'Platform 팀은 결제 DB를 못 건드린다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.8) }); } }
 
@@ -181,7 +181,7 @@
       if (st === 'done') check(305, y, 10); else if (st === 'run') el('circle', { cx: 305, cy: y, r: 7, fill: ACC, opacity: 0.4 + 0.6 * Math.abs(Math.sin(t * 4)) }); else tx(305, y + 5, '대기', { 'text-anchor': 'middle', 'font-size': 13.5, fill: OFF }); });
     if (k === 0) { lock(420, 200, true, ACC, pop(u, 0.2)); mono(380, 400, 'H=(-H "Authorization: Bearer …")  토큰 하나, 조회 네 번', { 'font-size': 14, fill: ACC, opacity: fade(u, 0.4) });
       ['/api/org/users', '/api/folders/…/permissions', '/api/dashboards/public-dashboards', '/api/search?folderIds=0'].forEach((p, i) => { const y = 80 + i * 90 - (i > 1 ? 0 : 0);
-        grow(440, 215, 560, y + 2, seg(u, 0.8 + i * 0.25, 1.3 + i * 0.25), ACC); req(570, y, 'GET', p, { op: fade(u, 1.0 + i * 0.25), fs: 13 }); }); return; }
+        grow(440, 215, 560, y + 2, seg(u, 0.8 + i * 0.25, 1.3 + i * 0.25), ACC); req(570, y, 'GET', p, { op: fade(u, 1.0 + i * 0.25), fs: 13.5 }); }); return; }
     const X = 380;
     if (k === 1) { tx(X, 56, 'GET /api/org/users  (예시 응답)', { 'font-size': 14, 'font-weight': 700, fill: MUT });
       [['admin', 'Admin'], ['kim.dev', 'Viewer'], ['dana', 'Editor']].forEach(([n, r], i) => { const y = 100 + i * 46, hit = r !== 'Viewer', f = fade(u, 0.8 + i * 0.2);
@@ -195,16 +195,18 @@
       tx(cx, 290, '로그인 없이 누구나 보는 보드', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: INFO, opacity: fade(u, 0.6) });
       mono(cx, 340, '.publicDashboards[]  →  (없음)', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.2) }); check(cx + 170, 336, 12, pop(u, 1.6));
       tx(cx, 380, '목록이 비어 있는 것이 정상이다', { 'text-anchor': 'middle', 'font-size': 14.5, fill: GOOD, 'font-weight': 700, opacity: fade(u, 1.8) }); }
-    if (k === 4) { folder(780, 300, 240, 120, 'team-platform', { fs: 15, mono: true });
-      ['Cost', 'Latency', 'Old test'].forEach((n, i) => { const f = seg(u, 1.0 + i * 0.35, 1.8 + i * 0.35), x0 = 430 + i * 150, y0 = 110;
-        dash(lerp(x0, 720 + i * 60, E(f, 0, 1)), lerp(y0, 300, E(f, 0, 1)), 110, 64, f < 0.3 ? n : null, { stroke: f < 1 ? BAD : WARN, s: lerp(1, 0.4, f) }); });
-      tx(580, 210, 'General (폴더 없음) · 상속받을 권한도 없다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: 1 - fade(u, 1.6) }); }
+    if (k === 4) { folder(780, 318, 260, 120, null, {}); mono(780, 290, 'team-platform', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700 });
+      mono(580, 58, '/api/search?folderIds=0  →  3건', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.2) });
+      ['Cost', 'Latency', 'Old test'].forEach((n, i) => { const f = seg(u, 1.0 + i * 0.35, 1.8 + i * 0.35), x0 = 430 + i * 150, y0 = 120;
+        dash(lerp(x0, 715 + i * 65, E(f, 0, 1)), lerp(y0, 336, E(f, 0, 1)), 110, 64, f < 0.3 ? n : null, { stroke: f < 1 ? BAD : WARN, s: lerp(1, 0.45, f) }); });
+      tx(580, 220, 'General (폴더 없음) · 상속받을 권한도 없다', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: 1 - fade(u, 1.6) });
+      tx(560, 220, '폴더로 옮기면 팀 권한을 물려받는다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: GOOD, opacity: fade(u, 2.0) }); }
     if (k === 5) [['기본은 Viewer', INFO], ['부여는 팀·폴더', WARN], ['개별 권한·공개는 예외', BAD]].forEach(([n, col], i) => { const y = 110 + i * 100, a = pop(u, 0.3 + i * 0.4);
       card(650, y, 470, 70, { rx: 12, stroke: col, sw: 2.5, s: a }); tx(650, y + 7, n, { 'text-anchor': 'middle', 'font-size': 20, 'font-weight': 800, fill: col, opacity: a }); }); }
 
   const quiz = [
     { q: '신규 입사자의 기본 조직 역할로 Viewer가 안전한 이유는 무엇인가?',
-      o: ['Viewer는 데이터소스를 쿼리할 수 없어서', '조회만 가능해 운영 보드를 실수로 망가뜨릴 여지가 없어서', 'Viewer는 폴더 권한을 받을 수 없어서'], a: 1,
+      o: ['Viewer는 데이터소스를 쿼리할 수 없어서', 'Viewer는 폴더 권한을 받을 수 없어서', '조회만 되어 운영 보드를 망가뜨릴 수 없어서'], a: 2,
       why: 'Viewer는 canView만 켜져 있어 저장 버튼 자체가 없다. 필요한 사람만 나중에 올리면 된다.' },
     { q: '조직 역할이 Viewer인 kim.dev가 team-platform 폴더에서만 편집할 수 있는 까닭은 무엇인가?',
       o: ['조직 역할이 자동으로 Editor로 바뀌어서', '그 폴더에 개별 Edit 권한이 있고, 두 축 중 높은 쪽이 적용되어서', '폴더 권한이 조직 역할을 지워서'], a: 1,
@@ -213,13 +215,13 @@
       o: ['폴더에 teamId 12 Edit을 한 번 건다', '보드 100개에 팀원 이름을 하나씩 건다', '팀원 모두를 조직 Editor로 올린다'], a: 0,
       why: '폴더 권한은 안의 모든 대시보드에 상속된다. 관리 지점이 폴더 한 곳이고, 사람 변화는 팀 멤버십으로 처리한다.' },
     { q: 'team-platform 폴더(Platform 팀 Edit) 안의 prod-billing에 lee.pay·park.pay Edit을 추가했다. Platform 팀의 다른 사람은 이 보드에서 어떻게 되나?',
-      o: ['View로 내려간다', '여전히 Edit이다', '아예 볼 수 없다'], a: 1,
+      o: ['여전히 Edit이다', 'View로 내려간다', '아예 볼 수 없다'], a: 0,
       why: 'Grafana는 가장 높은 권한을 적용하므로 대시보드 권한으로 상속된 Edit을 낮출 수 없다. 좁히려면 보드를 다른 폴더로 옮긴다.' },
     { q: 'pg-billing-prod에서 Viewer 기본 역할의 쿼리권을 없애려면 builtInRoles/Viewer에 무엇을 보내나?',
       o: ['{"permission": "Query"}', '{"permission": ""}', '{"permission": "Admin"}'], a: 1,
       why: 'permission을 빈 문자열로 보내면 그 대상의 권한이 지워진다. 그다음 teams/34에 Query를 줘 결제팀만 연다.' },
     { q: '감사 스크립트에서 폴더 권한의 개인 부여만 골라내는 jq 조건은 무엇인가?',
-      o: ['select(.userId != null)', 'select(.userId > 0)', 'select(.teamId > 0)'], a: 1,
+      o: ['select(.userId != null)', 'select(.teamId > 0)', 'select(.userId > 0)'], a: 2,
       why: '팀·역할 항목도 userId 필드를 0으로 갖고 있어서 != null은 모두 걸린다. 0보다 큰 항목만 실제 개인 부여다.' },
   ];
 
@@ -234,7 +236,7 @@
       o: ['보드에 Platform 팀 View를 추가한다', '보드를 Platform 팀 권한이 없는 폴더로 옮긴다', 'Platform 팀원의 조직 역할을 Viewer로 바꾼다'], a: 1,
       why: '폴더에서 받은 Edit은 보드 권한으로 낮출 수 없다. 조직 역할을 낮춰도 폴더의 팀 Edit이 남으므로 폴더를 나눠야 한다.' },
     { q: 'Viewer인 직원이 결제 대시보드는 못 보는데 Explore에서 결제 DB를 쿼리했다. 빠진 설정은?',
-      o: ['결제 폴더에 Viewer View 추가', 'pg-billing-prod의 기본 역할 쿼리권 회수', '대시보드 개별 권한 추가'], a: 1,
+      o: ['결제 폴더에 Viewer View 추가', '대시보드 개별 권한 추가', 'pg-billing-prod의 기본 역할 쿼리권 회수'], a: 2,
       why: '대시보드 권한과 데이터소스 쿼리 권한은 서로 다른 축이다. Explore는 대시보드를 거치지 않으므로 소스 쪽을 잠가야 한다.' },
     { q: '분기 감사에서 폴더 권한에 old.user 개인 항목이 나왔다. 가장 알맞은 조치는?',
       o: ['그 항목을 지우고 필요한 권한은 팀으로 다시 준다', '그대로 두고 메모만 남긴다', '조직을 새로 만든다'], a: 0,

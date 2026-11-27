@@ -124,7 +124,7 @@
     mono(cx - w / 2 + 14, cy - (o.h || 96) / 2 + 50, nameLine, { 'font-size': 14.5, 'font-weight': 700, fill: o.ncol || INK, opacity: o.op }); }
   function s2(t, c) { const { k, u } = c;
     if (k === 0) { gantt(u);
-      planBox(330, 76, 'plan 이 쓰는 기호', fade(u, 1.9));
+      planBox(330, 76, 'plan이 쓰는 기호', fade(u, 1.9));
       planRow(44, 386, '-/+', '', 'destroy and then create replacement', fade(u, 2.0), { dcol: INK });
       planRow(500, 386, '+/-', '', 'create replacement and then destroy', fade(u, 2.2), { dcol: INK }); return; }
     if (k === 1) { tx(250, 44, 'name = "web-sg" (고정)', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, class: 'mono' });
@@ -181,7 +181,7 @@
     el('rect', { x: 520, y: 70, width: 416, height: 120, rx: 10, fill: INK, opacity: fade(u, 0.7) });
     mono(540, 110, 'Error: EntityAlreadyExists', { 'font-size': 15, 'font-weight': 800, fill: '#f87171', opacity: fade(u, 0.9) });
     mono(540, 140, 'Role with name app-role', { 'font-size': 14, fill: 'var(--term)', opacity: fade(u, 1.1) }); mono(540, 166, 'already exists.', { 'font-size': 14, fill: 'var(--term)', opacity: fade(u, 1.1) });
-    chip(728, 250, 'name_prefix = "app-role-"', GOOD, pop(u, 1.6)); chip(728, 300, 'name 에 random_id 붙이기', GOOD, pop(u, 1.9));
+    chip(728, 250, 'name_prefix = "app-role-"', GOOD, pop(u, 1.6)); chip(728, 300, 'name에 random_id 붙이기', GOOD, pop(u, 1.9));
     note(520, 360, 'CBD와 name_prefix는 한 세트로 쓴다', fade(u, 2.2)); }
 
   // ================= 3. ignore_changes =================
@@ -208,7 +208,7 @@
       mono(ax.X(0.2), ax.Y(2) - 12, '생성: 코드값 2', { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.3) });
       mono(ax.X(4.3), ax.Y(8) - 12, 'AutoScaling이 8로', { 'font-size': 14, 'font-weight': 700, fill: ACC, opacity: fade(u, 1.2) });
       note(90, 395, 'ignore_changes가 있으면 다음 plan은 No changes', fade(u, 2.3), { fill: GOOD }); return; }
-    if (k === 5) { tx(480, 40, 'Terraform 밖에 주인이 있는 속성', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800 });
+    if (k === 5) { tx(480, 40, 'Terraform밖에 주인이 있는 속성', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800 });
       [['ECS service', 'desired_count', '배포 도구'], ['Lambda', 'source_code_hash', 'CI'], ['EC2', 'ami', 'Image Builder'], ['EKS', 'kubernetes_version', '수동 업그레이드']].forEach(([r, a, who], i) => {
         const x = 130 + (i % 2) * 400, y = 100 + Math.floor(i / 2) * 96, s = pop(u, 0.2 + i * 0.3);
         card(x + 100, y, 360, 74, { rx: 10, stroke: WARN, sw: 2, s, fill: WARNBG });
@@ -347,11 +347,11 @@
     { q: '운영 DB에 prevent_destroy를 걸어 두었는데, 누군가 그 resource 블록을 코드에서 지우고 apply했더니 DB가 삭제 계획에 올랐다. 이유는?',
       o: ['prevent_destroy는 코드에 블록이 있을 때만 막는다', 'state에 가드가 저장되지 않아서 apply 때 풀린다', 'destroy 명령이 아니라서 가드가 반응하지 않는다'], a: 0,
       why: '가드는 resource 블록 안의 설정이다. 블록이 없어지면 Terraform은 그 리소스를 지울 계획을 세우고 막을 근거도 없다.' },
-    { q: 'Launch Template 교체에 create_before_destroy를 걸었더니 ASG가 참조하는 다른 리소스도 같은 순서로 교체된다. 무엇 때문인가?',
+    { q: 'Launch Template에만 create_before_destroy를 걸었는데, LT가 참조하는 보안 그룹을 교체할 때도 새 SG가 먼저 생긴다. 무엇 때문인가?',
       o: ['ignore_changes가 기본으로 켜져 있어서', 'CBD가 의존하는 리소스로 전파되어서', 'name_prefix가 순서를 바꿔서'], a: 1,
-      why: 'Terraform은 create_before_destroy를 의존 관계에 있는 리소스에도 적용한다. 영향 범위를 plan에서 미리 확인해야 한다.' },
+      why: 'A가 B에 의존하고 A에 create_before_destroy가 있으면 Terraform은 B에도 같은 순서를 적용한다. 그래서 영향 범위를 plan의 +/- 기호로 미리 본다.' },
     { q: '앱 설정이 든 SSM 파라미터를 바꿀 때마다 EC2를 무중단으로 새로 띄우고 싶다. 알맞은 조합은?',
-      o: ['ignore_changes + prevent_destroy', 'replace_triggered_by + create_before_destroy', 'prevent_destroy + create_before_destroy'], a: 1,
+      o: ['ignore_changes + prevent_destroy', 'prevent_destroy + create_before_destroy', 'replace_triggered_by + create_before_destroy'], a: 2,
       why: '트리거로 재생성을 일으키고, CBD로 새 인스턴스를 먼저 띄운 뒤 헌 것을 지운다. plan에는 SSM update와 EC2 교체가 함께 잡힌다.' },
   ];
 

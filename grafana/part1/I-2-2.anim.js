@@ -27,12 +27,12 @@
     gbox(G0[0], G0[1], { s: k === 0 ? pop(u, 0.5) : 1, sub: k === 0 ? null : 'view layer' });
     if (k === 0) { dbIcon(G0[0], G0[1] + 120, null, { s: 0.55 * pop(u, 1.1), stroke: MUT }); cross(G0[0], G0[1] + 120, 22, pop(u, 1.5));
       note(G0[0] + 60, G0[1] + 128, '자체 저장소 없음', fade(u, 1.7), { fill: BAD });
-      sub(780, 120, 'yaml 은 "무엇을 붙일지" 적는 목록', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(780, 120, 'yaml은 "무엇을 붙일지" 적는 목록', fade(u, 2.0), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     // Prometheus 연결
     const PS = [800, 200]; src('prom', PS[0], PS[1], { s: k === 1 ? pop(u, 0.3) : 1 });
     if (k === 1) { const g = E(u, 0.7, 1.4); el('line', { x1: G0[0] + 86, y1: G0[1], x2: lerp(G0[0] + 86, PS[0] - 50, g), y2: PS[1], stroke: BAD, 'stroke-width': 3 });
       card(650, G0[1] + 44, 170, 36, { rx: 6, text: 'type: prometheus', fs: 13.5, mono: true, stroke: BAD, color: BAD, s: pop(u, 1.3) });
-      sub(650, 290, '플러그인이 PromQL 을 대신 말한다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
+      sub(650, 290, '플러그인이 PromQL을 대신 말한다', fade(u, 1.8), { 'font-size': 14.5 }); return; }
     el('line', { x1: G0[0] + 86, y1: G0[1], x2: PS[0] - 50, y2: PS[1], stroke: BAD, 'stroke-width': 3 });
     const BR = [150, 290];
     if (k === 2) { browser(BR[0], BR[1], 150, 90, '브라우저', { s: pop(u, 0.2) });
@@ -60,7 +60,7 @@
     const tested = k >= 1 && !(k === 1 && u < 1.8);
     // Save & Test 버튼 + 결과
     card(160, 70, 200, 44, { rx: 8, text: 'Save & test', fs: 16, stroke: tested ? GOOD : OFF, color: tested ? GOOD : MUT });
-    if (k === 0) { mono(60, 140, 'url 만 있다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.3) }); mono(60, 168, '인증·timeout 없음', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 0.7) });
+    if (k === 0) { mono(60, 140, 'url만 있다', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.3) }); mono(60, 168, '인증·timeout 없음', { 'font-size': 14.5, fill: MUT, opacity: fade(u, 0.7) });
       tx(160, 230, '?', { 'font-size': 48, 'font-weight': 800, 'text-anchor': 'middle', fill: OFF, opacity: fade(u, 1.0) }); sub(160, 270, '도달하는지 아직 모른다', fade(u, 1.4), { 'font-size': 15 }); return; }
     if (k === 1) { dot([[G0[0] + 86, G0[1]], [PS[0] - 50, PS[1]]], seg(u, 0.4, 1.0), ACC, 7); dot([[PS[0] - 50, PS[1]], [G0[0] + 86, G0[1]]], seg(u, 1.1, 1.7), GOOD, 7);
       mono(60, 150, 'httpMethod: POST', { 'font-size': 14.5, opacity: fade(u, 0.2) }); mono(60, 176, 'timeout: 30   # 초', { 'font-size': 14.5, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.4) });
@@ -71,12 +71,12 @@
     const gl = k === 2 ? E(u, 0.7, 1.3) : 1; el('line', { x1: G0[0] + 80, y1: G0[1] + 20, x2: lerp(G0[0] + 80, DB[0] - 50, gl), y2: lerp(G0[1] + 20, DB[1], gl), stroke: INFO, 'stroke-width': 2.5 });
     if (k === 2) { mono(560, 380, 'name: AppDB · type: postgres · url: postgres:5432', { 'font-size': 14, opacity: fade(u, 1.0) }); sub(160, 330, '연결 소스 1 → 2', fade(u, 1.5), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     if (k === 3) { R.person(330, 330, null, { s: 0.7 * pop(u, 0.2) }); mono(360, 326, 'user: grafana_ro', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.3) });
-      pill(420, 362, '읽기 전용', GOOD, pop(u, 0.7), { fs: 13.5 }); pill(520, 362, 'INSERT', BAD, pop(u, 1.0), { mono: true, fs: 13.5 }); cross(520, 362, 10, pop(u, 1.3));
+      pill(420, 362, '읽기 전용', GOOD, pop(u, 0.7), { fs: 13.5 }); pill(520, 362, 'INSERT', BAD, pop(u, 1.0), { mono: true, fs: 13.5 }); cross(580, 362, 9, pop(u, 1.3));
       lock(DB[0] - 80, DB[1] + 10, true, INFO, pop(u, 1.6)); mono(DB[0] - 60, DB[1] + 92, 'sslmode: require', { 'font-size': 13.5, fill: INFO, 'font-weight': 700, opacity: fade(u, 1.6), 'text-anchor': 'middle' });
       sub(160, 330, 'database: app', fade(u, 1.9), { class: 'mono', 'font-size': 14 }); return; }
     if (k === 4) { card(140, 340, 220, 50, { rx: 8, text: 'env APP_DB_PASSWORD', fs: 14, mono: true, stroke: WARN, color: WARN, s: pop(u, 0.2) });
       fly(250, 340, G0[0] - 20, G0[1] + 40, seg(u, 0.5, 1.3), '••••••', { fill: WARN, stay: true });
-      lock(G0[0] + 60, G0[1] + 54, true, ACC, pop(u, 1.4)); sub(G0[0], G0[1] + 84, 'secureJsonData 로 암호화 저장', fade(u, 1.5), { 'font-size': 14 });
+      lock(G0[0] + 60, G0[1] + 54, true, ACC, pop(u, 1.4)); sub(G0[0], G0[1] + 84, 'secureJsonData로 암호화 저장', fade(u, 1.5), { 'font-size': 14 });
       card(560, 400 - 14, 300, 30, { rx: 6, text: 'API: secureJsonFields.password = true', fs: 13.5, mono: true, stroke: GRID, s: pop(u, 2.0) }); return; }
     // k5 함정 두 가지
     el('rect', { x: 30, y: 280, width: 300, height: 110, rx: 10, fill: BADBG, stroke: BAD, 'stroke-width': 2, opacity: fade(u, 0.2) });
@@ -113,7 +113,7 @@
     const TA = [150, 110], TB = [150, 330];
     if (k === 1) { ['target A', 'target B'].forEach((s0, i) => card([TA, TB][i][0] + 60, [TA, TB][i][1] + (i ? 0 : 20), 130, 36, { rx: 6, text: s0, fs: 14, mono: true, stroke: MUT, color: MUT, dash: '5 4', s: pop(u, 1.4 + i * 0.2) }));
       grow(PX + PW / 2 - 60, PY + PH + 30, TA[0] + 80, TA[1] + 20, E(u, 0.9, 1.5), MUT, { dash: '5 4' }); grow(PX + PW / 2 - 60, PY + PH + 34, TB[0] + 80, TB[1], E(u, 1.1, 1.7), MUT, { dash: '5 4' });
-      sub(PX + PW / 2, PY + PH / 2, '소스 선택권이 target 으로 넘어간다', fade(u, 1.5), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
+      sub(PX + PW / 2, PY + PH / 2, '소스 선택권이 target으로 넘어간다', fade(u, 1.5), { 'font-size': 15, fill: INK, 'font-weight': 700 }); return; }
     const gx = PX + 20, gy = PY + 40, gw = PW - 40, gh = PH - 60;
     src('prom', TA[0] - 70, TA[1], { s: k === 2 ? pop(u, 0.2) : 1 }); card(TA[0] + 60, TA[1], 130, 36, { rx: 6, text: 'A · PromQL', fs: 14, mono: true, stroke: BAD, color: BAD });
     spark(gx, gy, gw, gh, k === 2 ? E(u, 0.8, 2.0) : 1, BAD);
@@ -127,8 +127,8 @@
     [['A', 0.25, BAD], ['B', 1, INFO]].forEach(([r, len, col], i) => { const y = 330 + i * 40, g = E(u, 0.2, 2.2), w = 300 * Math.min(1, g / len);
       mono(380, y + 18, r, { 'font-size': 15, 'font-weight': 800, fill: col }); el('rect', { x: 410, y, width: 300, height: 24, rx: 4, fill: SOFT }); el('rect', { x: 410, y, width: w, height: 24, rx: 4, fill: col, opacity: 0.8 });
       if (g >= len) check(730, y + 12, 9, 1); });
-    if (u < 2.2) { el('rect', { x: gx, y: gy, width: gw, height: gh, fill: PANEL, opacity: 0.8 }); tx(PX + PW / 2, PY + PH / 2 + 10, '모든 target 을 기다리는 중', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', fill: MUT }); }
-    sub(840, 400, '가장 느린 B 가 로딩 시간을 정한다', fade(u, 1.0), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
+    if (u < 2.2) { el('rect', { x: gx, y: gy, width: gw, height: gh, fill: PANEL, opacity: 0.8 }); tx(PX + PW / 2, PY + PH / 2 + 10, '모든 target을 기다리는 중', { 'font-size': 16, 'font-weight': 700, 'text-anchor': 'middle', fill: MUT }); }
+    sub(840, 400, '가장 느린 B가 로딩 시간을 정한다', fade(u, 1.0), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
 
   // ========== 5. datasource 변수 ==========
   const ENV = ['Prometheus dev', 'Prometheus staging', 'Prometheus prod'];
@@ -175,7 +175,7 @@
       why: '쿼리 언어는 PromQL·LogQL·SQL로 다르지만 플러그인이 결과를 시간·값 표인 data frame으로 바꿔 넘긴다.' },
     { q: 'Mixed 패널에서 A는 빨리 끝나고 B가 느리면 패널은 언제 그려지는가?',
       o: ['B까지 끝난 뒤', 'A가 끝나자마자 A만', 'B는 건너뛰고 A만 영구히'], a: 0,
-      why: '이 장의 설명처럼 패널은 모든 target 결과를 기다린다. 가장 느린 쿼리가 로딩 시간을 정한다.' },
+      why: 'Mixed 소스는 모든 target 결과가 모인 뒤에 한꺼번에 패널로 넘긴다. 그래서 가장 느린 B가 로딩 시간을 정한다.' },
     { q: 'datasource 변수 ds를 만들었을 때 패널의 datasource uid 자리에 넣는 값은 무엇인가?',
       o: ['"prom-default"', '"${ds}"', '"-- Mixed --"'], a: 1,
       why: 'uid를 하드코딩하지 않고 ${ds}로 두면 보드 위 드롭다운에서 고른 소스로 바뀐다.' },
@@ -195,7 +195,7 @@
       o: ['패널이 소스를 이름이 아니라 uid로 가리키는데 uid가 달라서', 'isDefault가 false라서', 'timeout이 30초라서'], a: 0,
       why: '대시보드 JSON은 datasource의 uid를 참조한다. provisioning에서 uid를 같은 값으로 고정하면 옮겨도 연결이 유지된다.' },
     { q: '지표 그래프에 배포 시각을 겹치려고 PostgreSQL 쿼리를 PromQL 패널 target에 그대로 붙였더니 에러가 났다. 바른 방법은?',
-      o: ['쿼리를 PromQL로 다시 쓴다', 'timeout을 늘린다', '패널 소스를 -- Mixed -- 로 두고 그 target의 소스를 PostgreSQL로 지정한다'], a: 2,
+      o: ['쿼리를 PromQL로 다시 쓴다', 'timeout을 늘린다', '패널 소스를 Mixed로 두고 그 target만 PostgreSQL로'], a: 2,
       why: '한 소스에는 그 소스의 언어만 통한다. Mixed로 두면 target마다 자기 소스와 언어를 따로 고를 수 있다.' },
   ];
 

@@ -24,7 +24,7 @@
     if (inst) { const bw = w * 0.35; el('rect', { x: w / 2 - 10 - bw, y: 9, width: bw, height: 7, rx: 3, fill: SOFT }, g); el('rect', { x: w / 2 - 10 - bw, y: 9, width: bw * (o.prog ?? 0.5), height: 7, rx: 3, fill: ACC }, g); }
     return g; }
   function shelf(x, y, w, list, c, o) { o = o || {}; const prev = (c.prev && c.prev[o.key || 'plugins']) || [];
-    zone(x, y, w, (o.h || 50 + list.length * 54), o.title || 'Grafana 에서 쓸 수 있는 확장', { stroke: o.stroke || GRID });
+    zone(x, y, w, (o.h || 50 + list.length * 54), o.title || 'Grafana에서 쓸 수 있는 확장', { stroke: o.stroke || GRID });
     list.forEach((p, i) => { const q = prev.find((z) => z.id === p.id), isNew = !q, ch = q && q.state !== p.state;
       chip(x + w / 2, y + 58 + i * 54, p, { w: w - 28, s: isNew ? pop(c.u, 0.3 + i * 0.1) : 1, prog: E(c.u, 0.2, 2.4), dash: o.dash }); }); }
   const PJSON = { id: 'clock', name: 'Clock', kind: 'panel', sig: 'signed' };
@@ -36,7 +36,7 @@
       terminal(40, 50, 470, 200, L, k === 0 ? lerp(0, 2, E(u, 0.2, 1.6)) : 2 + lerp(0, 2, E(u, 0.2, 1.6)), { title: 'bash', fs: 14 });
       shelf(560, 46, 360, b.plugins, c, { title: '설치됨 (내장)' });
       if (k === 1) { zone(40, 280, 470, 110, '카탈로그 (미설치)', { stroke: GRID }); (b.catalog || []).forEach((p) => chip(275, 340, { ...p, name: 'grafana-clock-panel' }, { w: 430, s: pop(u, 1.6), dash: '6 4' })); }
-      else sub(275, 300, '내장 플러그인은 plugins ls 에 나오지 않는다', fade(u, 1.8), { 'font-size': 14.5, fill: INK });
+      else sub(275, 300, '내장 플러그인은 plugins ls에 나오지 않는다', fade(u, 1.8), { 'font-size': 14.5, fill: INK });
       return; }
     // 가운데 Grafana 몸통에 세 가지 꽂는 자리
     const SX = [200, 480, 760], KS = ['panel', 'datasource', 'app'], DESC = ['새 시각화', '새 백엔드', 'panel + data source + 페이지'];
@@ -55,7 +55,7 @@
     code(60, 70, 420, ['{', '  "type": "panel",', '  "id": "grafana-clock-panel",', '  "name": "Clock",', '  …', '}'], { fs: 15, lh: 30, hl: [1, 2] });
     grow(482, 115, 640, 170, E(u, 0.6, 1.3), ACC); card(740, 190, 180, 50, { rx: 10, text: 'panel 자리에 꽂힘', fs: 15, stroke: ACC, color: ACC, sw: 2.2, s: pop(u, 1.2) });
     chip(740, 290, { ...PJSON, ver: '2.1.3' }, { w: 260, s: pop(u, 1.6) });
-    sub(270, 330, 'type 과 id 로 자기를 Grafana 에 알린다', fade(u, 0.8), { 'font-size': 15, fill: INK }); }
+    sub(270, 330, 'type과 id로 자기를 Grafana에 알린다', fade(u, 0.8), { 'font-size': 15, fill: INK }); }
 
   // 2. grafana-cli install
   const VIZ = ['Time series', 'Bar chart', 'Pie chart', 'Stat'];
@@ -78,7 +78,7 @@
     if (k === 5) { server(200, 170, '서버 A', { lamp: GOOD }); chip(200, 300, { ...PJSON, ver: '2.1.3' }, { w: 240 });
       server(700, 170, '새 서버 B', { lamp: OFF, s: pop(u, 0.4) }); el('rect', { x: 580, y: 277, width: 240, height: 46, rx: 8, fill: 'none', stroke: BAD, 'stroke-dasharray': '6 5', opacity: fade(u, 0.8) });
       tx(700, 306, '플러그인 없음', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) });
-      sub(450, 380, '서버를 새로 띄우면 install 을 또 손으로 친다', fade(u, 1.4), { fill: INK, 'font-size': 15, 'font-weight': 700 }); } }
+      sub(450, 380, '서버를 새로 띄우면 install을 또 손으로 친다', fade(u, 1.4), { fill: INK, 'font-size': 15, 'font-weight': 700 }); } }
 
   // 3. GF_INSTALL_PLUGINS
   function container(x, y, w, h, title, o) { o = o || {}; el('rect', { x, y, width: w, height: h, rx: 12, fill: o.fill || PANEL, stroke: o.stroke || INK, 'stroke-width': 2.2, 'stroke-dasharray': o.dash, opacity: o.op ?? 1 });
@@ -86,7 +86,7 @@
   function s3(t, c) { const { k, u } = c, b = c.beat;
     if (k === 0) { container(40, 60, 320, 220, 'grafana (old)', { stroke: BAD, dash: '6 5', op: 1 - E(u, 0.6, 1.4) * 0.6 }); chip(200, 140, { name: 'Clock', kind: 'panel', ver: '수동 설치', sig: 'signed' }, { w: 280, op: 1 - E(u, 0.6, 1.4) });
       cross(200, 200, 22, pop(u, 1.0)); grow(370, 170, 470, 170, E(u, 1.0, 1.5), MUT);
-      container(480, 60, 440, 220, 'grafana:11.2.0 (new)', { op: fade(u, 1.3) }); sub(700, 170, 'image 와 ports 만 있다', fade(u, 1.6), { fill: INK, 'font-size': 15 });
+      container(480, 60, 440, 220, 'grafana:11.2.0 (new)', { op: fade(u, 1.3) }); sub(700, 170, 'image와 ports만 있다', fade(u, 1.6), { fill: INK, 'font-size': 15 });
       sub(480, 340, '컨테이너는 언제든 다시 만들어진다', fade(u, 1.9), { fill: BAD, 'font-weight': 700, 'font-size': 15 }); return; }
     if (k <= 4) { container(40, 50, 880, 300, 'grafana:11.2.0', {});
       const ids = k >= 3 ? ['grafana-clock-panel 2.1.3', 'grafana-worldmap-panel'] : k === 2 ? ['grafana-clock-panel', 'grafana-worldmap-panel'] : ['…'];
@@ -94,7 +94,7 @@
       ids.forEach((s, i) => card(250, 170 + i * 46, 380, 38, { rx: 6, text: s, fs: 14.5, mono: true, stroke: k === 3 && i === 0 ? ACC : GRID, sw: 1.6, s: k === 2 && i === 1 ? pop(u, 0.3) : k === 3 && i === 0 ? pop(u, 0.2) : 1 }));
       grow(442, 170, 540, 170, k === 1 ? E(u, 0.8, 1.4) : 1, ACC); pill(495, 148, 'entrypoint', INK, 1, { fs: 13.5, mono: true });
       const pl = (b.plugins || []).filter((p) => p.note !== '내장'); pl.forEach((p, i) => chip(730, 120 + i * 60, p, { w: 330, s: 1, prog: E(u, 0.3, 2.4) }));
-      if (k === 1) sub(730, 250, '부팅할 때 grafana cli install 을 대신 실행', fade(u, 1.4), { fill: INK, 'font-size': 14 });
+      if (k === 1) sub(730, 250, '부팅할 때 grafana cli install을 대신 실행', fade(u, 1.4), { fill: INK, 'font-size': 14 });
       if (k === 3) sub(250, 290, '"id 버전" 꼴 — 공백으로 구분', fade(u, 1.0), { fill: ACC, 'font-weight': 700, 'font-size': 14.5 });
       if (k === 4) { R.dbIcon(250, 280, 'grafana-storage', { s: pop(u, 0.3), stroke: ACC }); grow(300, 270, 600, 270, E(u, 0.7, 1.3), ACC);
         mono(620, 276, '/var/lib/grafana', { 'font-size': 15, 'font-weight': 700, fill: ACC, opacity: fade(u, 1.1) }); sub(480, 385, '재부팅마다 다시 받지 않는다', fade(u, 1.6), { fill: INK, 'font-size': 15 }); }
@@ -112,7 +112,7 @@
     if (k === 0) { zone(60, 70, 380, 250, '설치 = GF_INSTALL_PLUGINS', { stroke: ACC }); zone(520, 70, 380, 250, '설정 = provisioning yaml', { stroke: INFO, op: fade(u, 0.6) });
       chip(250, 150, { name: 'Zabbix', kind: 'app', ver: 'alexanderzobnin-zabbix-app', sig: 'signed' }, { w: 340, sig: false }); check(250, 230, 12, pop(u, 0.3));
       mono(540, 140, 'apiVersion: 1', { 'font-size': 15, fill: INFO, 'font-weight': 700, opacity: fade(u, 0.9) }); sub(710, 220, '접속 주소·계정은 아직 없다', fade(u, 1.3), { fill: INK, 'font-size': 14.5 });
-      sub(480, 370, '플러그인을 깔았다고 data source 가 생기지는 않는다', fade(u, 1.8), { fill: INK, 'font-size': 15, 'font-weight': 700 }); return; }
+      sub(480, 370, '플러그인을 깔았다고 data source가 생기지는 않는다', fade(u, 1.8), { fill: INK, 'font-size': 15, 'font-weight': 700 }); return; }
     if (k === 6) { zone(60, 60, 400, 250, 'Git 저장소', { stroke: GOOD }); [['docker-compose.yml', '설치 (env)'], ['provisioning/datasources/zabbix.yml', '설정'], ['provisioning/plugins/zabbix.yml', 'app 켜기']].forEach(([a, bb], i) => {
         mono(80, 112 + i * 62, a, { 'font-size': 14, 'font-weight': 700, opacity: fade(u, 0.2 + i * 0.3) }); tx(80, 134 + i * 62, bb, { 'font-size': 13.5, fill: MUT, opacity: fade(u, 0.2 + i * 0.3) }); });
       grow(470, 185, 600, 185, E(u, 1.2, 1.7), ACC); pill(535, 160, 'docker up', ACC, pop(u, 1.2), { mono: true, fs: 13.5 }); container(610, 90, 300, 200, '새 환경', { stroke: GOOD, op: fade(u, 1.6) });
@@ -143,23 +143,23 @@
         const x = pass ? lerp(200, 720, mv) : lerp(200, GX - 150, mv);
         chip(x, y, isU && !pass ? { ...p, state: 'blocked' } : p, { w: 250 }); if (isU && !pass) cross(GX - 2, y, 14, pop(u, 1.6));
         if (isU && pass) pill(x, y + 38, '허용 목록', WARN, 1, { fs: 13.5 }); });
-      if (k === 0) sub(GX, 380, '[plugins] 허용 목록이 비어 있으면 unsigned 는 로드되지 않는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 });
+      if (k === 0) sub(GX, 380, '[plugins] 허용 목록이 비어 있으면 unsigned는 로드되지 않는다', fade(u, 1.8), { fill: INK, 'font-size': 14.5 });
       if (k >= 1) { const L = k === 3 ? 'GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=my-org-panel' : k === 2 ? 'allow_loading_unsigned_plugins = my-org-panel,my-org-datasource' : 'allow_loading_unsigned_plugins = my-org-panel';
         card(480, 390, tw(L, 14) + 40, 36, { rx: 8, text: L, fs: 14, mono: true, stroke: WARN, sw: 2, s: pop(u, 0.2) }); }
       if (k === 2) { const r = E(u, 0.8, 1.8); tx(820, 40, '허용 개수 ↑ = 위험 ↑', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, fill: BAD, opacity: fade(u, 0.8) }); el('rect', { x: 900, y: 60, width: 16, height: 280, rx: 8, fill: SOFT }); el('rect', { x: 900, y: 340 - 280 * (0.3 + 0.35 * r), width: 16, height: 280 * (0.3 + 0.35 * r), rx: 8, fill: BAD }); }
       return; }
     if (k === 4) { tx(480, 46, '서명 종류', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800 });
-      [['grafana', 'Grafana Labs 가 만든 플러그인', GOOD, 'Clock · Worldmap'], ['commercial', '상용 플러그인', GOOD, ''], ['community', '카탈로그의 오픈소스 플러그인', GOOD, ''], ['private', '지정한 주소의 Grafana 에서만', INFO, ''], ['unsigned', '서명 없음 → 기본 차단', BAD, 'my-org-panel']].forEach(([a, d, col, ex], i) => {
+      [['grafana', 'Grafana Labs가 만든 플러그인', GOOD, 'Clock · Worldmap'], ['commercial', '상용 플러그인', GOOD, ''], ['community', '카탈로그의 오픈소스 플러그인', GOOD, ''], ['private', '지정한 주소의 Grafana에서만', INFO, ''], ['unsigned', '서명 없음 → 기본 차단', BAD, 'my-org-panel']].forEach(([a, d, col, ex], i) => {
         const y = 90 + i * 62, s = pop(u, 0.2 + i * 0.25); card(180, y, 200, 48, { rx: 24, text: a, fs: 15, mono: true, stroke: col, color: col, sw: 2.2, s });
         tx(300, y + 5, d, { 'font-size': 15, opacity: fade(u, 0.3 + i * 0.25) }); if (ex) mono(900, y + 5, ex, { 'font-size': 14, fill: col, 'text-anchor': 'end', 'font-weight': 700, opacity: fade(u, 0.4 + i * 0.25) }); }); return; }
     if (k === 5) { el('rect', { x: 120, y: 60, width: 720, height: 260, rx: 14, fill: SOFT, stroke: INK, 'stroke-width': 2.2 }); tx(140, 90, 'Grafana 프로세스 안', { 'font-size': 15, 'font-weight': 800 });
       chip(330, 170, { ...PL[2] }, { w: 280 }); grow(470, 170, 640, 170, E(u, 0.6, 1.2), BAD);
       ['로그인 세션', 'data source 응답', '사용자 화면'].forEach((s, i) => card(730, 130 + i * 56, 180, 42, { rx: 8, text: s, fs: 14.5, stroke: BAD, s: pop(u, 1.0 + i * 0.25) }));
-      sub(480, 360, '검증되지 않은 코드가 Grafana 와 같은 권한으로 돈다', fade(u, 1.8), { fill: BAD, 'font-weight': 700, 'font-size': 15 }); return; }
+      sub(480, 360, '검증되지 않은 코드가 Grafana와 같은 권한으로 돈다', fade(u, 1.8), { fill: BAD, 'font-weight': 700, 'font-size': 15 }); return; }
     // k6 운영 함정
     [['버전 호환', '플러그인마다 지원하는 Grafana 버전이 다르다'], ['플러그인 과다', '시작이 느려지고 메모리가 는다'], ['수동 install', '환경마다 셋이 달라진다']].forEach(([a, d], i) => {
       const y = 100 + i * 90, s = pop(u, 0.2 + i * 0.4); card(200, y, 220, 58, { rx: 10, text: a, fs: 16, stroke: WARN, color: INK, sw: 2.2, s }); tx(340, y + 6, d, { 'font-size': 15, opacity: fade(u, 0.4 + i * 0.4) }); });
-    banner(480, 385, 'env 와 provisioning 으로 정리하면 크게 준다', pop(u, 1.8)); }
+    banner(480, 385, 'env와 provisioning으로 정리하면 크게 준다', pop(u, 1.8)); }
 
   const quiz = [
     { q: 'Zabbix처럼 panel·data source·페이지를 한데 묶은 플러그인 종류는 무엇인가?',
@@ -170,7 +170,7 @@
       why: '플러그인은 Grafana가 기동할 때 스캔된다. grafana-cli 설치 뒤에는 재시작해야 목록에 나타난다.' },
     { q: 'GF_INSTALL_PLUGINS로 Clock 버전을 고정하는 값은 어느 것인가?',
       o: ['grafana-clock-panel@2.1.3', 'grafana-clock-panel:2.1.3', 'grafana-clock-panel 2.1.3'], a: 2,
-      why: 'GF_INSTALL_PLUGINS는 id와 버전을 공백으로 나눈다. @ 꼴은 Grafana 11.5부터 쓰는 preinstall 설정의 형식이다.' },
+      why: 'GF_INSTALL_PLUGINS는 id와 버전을 공백으로 나눈다. @ 꼴은 GF_PLUGINS_PREINSTALL 같은 preinstall 설정이 쓰는 형식이다.' },
     { q: 'Zabbix 플러그인을 깐 뒤 data source를 쓰려면 무엇이 더 필요한가?',
       o: ['grafana.ini에서 unsigned 허용', 'type·url·jsonData 등을 적은 provisioning yaml', '플러그인 폴더 이름 바꾸기'], a: 1,
       why: '설치는 플러그인 파일만 깐다. 접속 주소와 계정은 provisioning yaml이 등록해야 실제로 쓸 수 있다.' },

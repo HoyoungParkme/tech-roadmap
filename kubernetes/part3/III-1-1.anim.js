@@ -90,7 +90,7 @@
     // 포트 자리
     ND.forEach((n, i) => { const sIn = k === 0 ? pop(u, 0.8 + i * 0.25) : 1, filled = k >= 2 || (k === 1 && u > 0.4 + i * 0.3);
       port(i, filled ? ':30080' : null, k === 1 && filled ? pop(u, 0.4 + i * 0.3) : sIn, k === 4 ? BAD : ACC); });
-    if (k === 0) sub(150, 120, '내부 ClusterIP 는 그대로', fade(u, 1.6), { 'font-size': 14, fill: ACC, 'font-weight': 700 });
+    if (k === 0) sub(150, 120, '내부 ClusterIP는 그대로', fade(u, 1.6), { 'font-size': 14, fill: ACC, 'font-weight': 700 });
     // 30000~32767 범위 눈금
     if (k === 1) { const x0 = 30, x1 = 270, y = 370, g = E(u, 0.3, 1.2);
       el('line', { x1: x0, y1: y, x2: lerp(x0, x1, g), y2: y, stroke: MUT, 'stroke-width': 6, 'stroke-linecap': 'round' });
@@ -106,7 +106,7 @@
       mono(132, y + 28, sw < 0.5 ? '80/TCP' : '80:30080/TCP', { 'font-size': 14.5, fill: sw < 0.5 ? INK : ACC, 'font-weight': 800, opacity: Math.abs(sw - 0.5) * 2 });
       mono(28, y + 60, 'EXTERNAL-IP', { 'font-size': 13.5, fill: MUT, 'font-weight': 700 });
       mono(132, y + 60, '<none>', { 'font-size': 14.5, fill: BAD, 'font-weight': 800, opacity: fade(u, 1.5) });
-      tx(28, y + 88, '대표 IP 없이 노드 IP 를 쓴다', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 1.9) }); }
+      tx(28, y + 88, '대표 IP 없이 노드 IP를 쓴다', { 'font-size': 13.5, fill: MUT, opacity: fade(u, 1.9) }); }
     // 세 노드 어디로 와도 Pod 로
     if (k >= 3) ND.forEach((n, i) => { const col = k === 4 ? BAD : ACC, g = k === 3 ? seg(u, 0.2 + i * 0.25, 0.9 + i * 0.25) : 1;
       grow(P[0] + 28, P[1], NX - 40, n.y, g, col, { sw: 2.2 });
@@ -131,7 +131,7 @@
     person(70, LB.y, '인터넷', {});
     if (k === 0) { card(LB.x, LB.y, 170, 70, { rx: 12, stroke: GRID, dash: '6 6', text: 'LB 없음', color: MUT, s: pop(u, 0.4) });
       svc(LB.x, 60, 'Service web', null, { s: pop(u, 0.2) });
-      sub(LB.x, 290, 'ClusterIP · NodePort 와 같은 선언', fade(u, 1.0), { 'font-size': 14 }); return; }
+      sub(LB.x, 290, 'ClusterIP · NodePort와 같은 선언', fade(u, 1.0), { 'font-size': 14 }); return; }
     if (k === 1) { mono(LB.x - 10, 70, 'aws-load-balancer-type: nlb', { 'font-size': 14, fill: ACC, 'font-weight': 700, 'text-anchor': 'middle', opacity: fade(u, 0.2) });
       card(LB.x, 150, 150, 44, { rx: 10, text: 'CLB (기본)', fs: 15, stroke: GRID, color: MUT, s: pop(u, 0.4) });
       if (u > 1.0) el('line', { x1: LB.x - 70, y1: 150, x2: lerp(LB.x - 70, LB.x + 70, E(u, 1.0, 1.5)), y2: 150, stroke: BAD, 'stroke-width': 3 });
@@ -161,7 +161,7 @@
       ['api', 'admin', 'web'].forEach((s, i) => { const sc = pop(u, 0.3 + i * 0.3);
         card(84 + i * 117, 340, 108, 34, { rx: 8, text: 'LB · ' + s, fs: 14, stroke: BAD, color: BAD, s: sc });
         mono(84 + i * 117, 382, '$20/월', { 'font-size': 14, 'text-anchor': 'middle', fill: BAD, 'font-weight': 700, opacity: fade(u, 0.5 + i * 0.3) }); });
-      sub(201, 404, 'NLB 약 $20/월 + 트래픽, Service 마다', fade(u, 1.3), { 'font-size': 13.5 });
+      sub(201, 404, 'NLB 약 $20/월 + 트래픽, Service마다', fade(u, 1.3), { 'font-size': 13.5 });
       pill(LB.x, 120, 'Ingress 1개 + 뒤는 ClusterIP', GOOD, pop(u, 1.8), { fs: 14 }); } }
 
   // ---------- 4. ExternalName ----------
@@ -197,11 +197,11 @@
       sub(450, 324, '연결은 직접 맺는다', fade(u, 2.0), { 'font-size': 14, fill: ACC, 'font-weight': 700 }); }
     if (k === 4) { pill(X4.app[0], X4.app[1] - 64, 'psql -h legacy-db', INK, 1, { mono: true, fs: 13.5 }); check(X4.app[0] + 96, X4.app[1] - 64, 10, pop(u, 1.6));
       sub(X4.app[0] + 20, X4.app[1] + 74, '앱 코드 · 배포 그대로', fade(u, 1.8), { 'font-size': 14, fill: GOOD, 'font-weight': 700 }); }
-    if (k === 5) { card(X4.kp[0], X4.kp[1], 130, 38, { rx: 8, text: 'kube-proxy', fs: 14, stroke: GRID, color: MUT }); cross(X4.kp[0], X4.kp[1], 16, pop(u, 0.3));
+    if (k === 5) { card(X4.kp[0], X4.kp[1], 130, 38, { rx: 8, text: 'kube-proxy', fs: 14, stroke: GRID, color: MUT }); cross(X4.kp[0] + 92, X4.kp[1], 13, pop(u, 0.3)); el('line', { x1: X4.kp[0] - 58, y1: X4.kp[1], x2: lerp(X4.kp[0] - 58, X4.kp[0] + 58, E(u, 0.2, 0.7)), y2: X4.kp[1], stroke: BAD, 'stroke-width': 2.4 });
       ['포트 매핑', '헬스체크', '부하 분산'].forEach((s, i) => { const y = 316 + i * 34; cross(640, y, 8, pop(u, 0.7 + i * 0.25)); tx(658, y + 5, s + ' 없음', { 'font-size': 15, 'font-weight': 700, opacity: fade(u, 0.7 + i * 0.25) }); });
       tx(640, 60, 'SNI: legacy-db', { 'font-size': 14.5, class: 'mono', 'font-weight': 700, fill: INK, opacity: fade(u, 1.6) });
       tx(640, 86, '인증서: db.example.com', { 'font-size': 14.5, class: 'mono', 'font-weight': 700, fill: BAD, opacity: fade(u, 1.9) });
-      sub(745, 110, 'HTTPS 는 이름이 어긋날 수 있다', fade(u, 2.2), { 'font-size': 13.5, fill: BAD }); }
+      sub(745, 110, 'HTTPS는 이름이 어긋날 수 있다', fade(u, 2.2), { 'font-size': 13.5, fill: BAD }); }
     if (k === 6) grow(X4.name[0] + 86, X4.name[1], 636, 200, seg(u, 0.2, 0.8), WARN, { sw: 2.4, dash: '7 5' });
     if (k === 6) [['클라우드 RDS', 'RDS 엔드포인트'], ['사내 레거시 DB', 'db.example.com'], ['SaaS API', 'api.stripe.com']].forEach(([a, h], i) => {
       const y = 90 + i * 110, s = pop(u, 0.3 + i * 0.4); card(640 + 125, y, 250, 70, { rx: 10, stroke: ACC, s });
@@ -234,7 +234,7 @@
           el('rect', { x: xx, y, width: cw[j], height: rh - 10, rx: 8, fill: j === 0 ? PANEL : good ? 'var(--goodbg)' : bad ? 'var(--badbg)' : SOFT, stroke: GRID, opacity: s });
           tx(xx + (j === 0 || j === 4 ? 14 : cw[j] / 2), y + rh / 2, v, { 'font-size': j === 0 ? 15.5 : 15, 'font-weight': j === 0 ? 800 : 700, 'text-anchor': j === 0 || j === 4 ? 'start' : 'middle', fill: j === 0 ? (i === 3 ? WARN : ACC) : good ? GOOD : bad ? BAD : INK, opacity: s, class: j === 0 ? 'mono' : null });
           xx += cw[j] + 8; }); });
-      sub(480, 405, 'ExternalName 만 성격이 다르다: 들어오는 문이 아니라 나가는 이름표', fade(u, 2.2), { 'font-size': 14 }); return; }
+      sub(480, 405, 'ExternalName만 성격이 다르다: 들어오는 문이 아니라 나가는 이름표', fade(u, 2.2), { 'font-size': 14 }); return; }
     if (k <= 3) { tree(k, u); return; }
     if (k === 4) { person(60, 210, '인터넷', {});
       card(250, 210, 170, 70, { rx: 12, stroke: ACC, fill: ACCBG, sw: 2.6, s: pop(u, 0.2) }); tx(250, 204, 'Ingress', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 800, fill: ACC }); sub(250, 226, 'LoadBalancer 1개', 1, { 'font-size': 13.5 });
@@ -244,7 +244,7 @@
         svc(700, y, s, 'ClusterIP', { s: pop(u, 0.9 + i * 0.3), w: 180, ipCol: MUT });
         dot([[90, 210], [336, 210], [600, y]], seg(u, 1.8 + i * 0.25, 2.6 + i * 0.25), ACC, 6); });
       return; }
-    if (k === 5) { [['Service 마다 LoadBalancer', '비용 폭발'], ['production 에서 NodePort', '노드 IP 노출 · 관리 부담'], ['ExternalName 에 포트 적기', '무시된다 (DNS 만)']].forEach(([a, b], i) => {
+    if (k === 5) { [['Service마다 LoadBalancer', '비용 폭발'], ['production에서 NodePort', '노드 IP 노출 · 관리 부담'], ['ExternalName에 포트 적기', '무시된다 (DNS만)']].forEach(([a, b], i) => {
         const y = 90 + i * 110, s = pop(u, 0.2 + i * 0.45); card(480, y, 560, 78, { rx: 12, stroke: BAD, sw: 2, s }); cross(240, y, 12, s);
         tx(270, y - 6, a, { 'font-size': 16.5, 'font-weight': 800, opacity: fade(u, 0.3 + i * 0.45) }); tx(270, y + 20, b, { 'font-size': 14.5, fill: MUT, opacity: fade(u, 0.4 + i * 0.45) }); }); return; }
     // 다음: Ingress
@@ -283,10 +283,10 @@
       o: ['모든 노드 IP의 30000번대 포트로 밖에서도 닿게 됐다', '클러스터 안의 Pod가 더는 부를 수 없게 됐다', '클라우드 LB 비용이 생겼다'], a: 0,
       why: 'NodePort는 ClusterIP를 그대로 두고 노드 포트를 하나 더 연다. 내부 전용이면 ClusterIP로 충분하다.' },
     { q: 'Service 20개를 모두 type: LoadBalancer로 만들었더니 청구서가 크게 늘었다. 먼저 바꿀 것은?',
-      o: ['LB를 NLB에서 CLB로 바꾼다', 'Ingress 하나만 LB로 두고 나머지는 ClusterIP로 돌린다', '모두 ExternalName으로 바꾼다'], a: 1,
+      o: ['LB 종류를 NLB에서 CLB로 바꾼다', 'Ingress 하나 뒤에 ClusterIP로 모은다', '모두 ExternalName으로 바꾼다'], a: 1,
       why: 'LB는 Service마다 하나씩 과금된다. Ingress 하나를 앞에 두면 LB는 1개분만 남는다.' },
     { q: 'ExternalName legacy-db로 HTTPS API를 불렀더니 인증서 오류가 났다. 먼저 의심할 것은?',
-      o: ['kube-proxy의 부하 분산 설정', '클라이언트가 legacy-db라는 이름으로 접속해 인증서 이름과 어긋남', 'ClusterIP가 모자람'], a: 1,
+      o: ['kube-proxy의 부하 분산 설정', 'ClusterIP 대역의 부족', '접속 이름과 인증서 이름의 불일치'], a: 2,
       why: 'ExternalName은 DNS만 바꾼다. 클라이언트는 부른 이름을 그대로 보내므로 db.example.com 인증서와 맞지 않을 수 있다.' },
   ];
 

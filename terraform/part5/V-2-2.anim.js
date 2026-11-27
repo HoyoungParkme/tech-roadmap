@@ -131,7 +131,7 @@
     if (k === 4) { ticks(40, 170, ['plan 결과 PR 코멘트 게시', 'rollback 계획 (이전 git tag)', 'runbook (사고 대응 SOP)'], u, 0.4);
       note(560, 210, '이미 체크: plan 자동 실행,', fade(u, 1.6), { fill: MUT }); note(560, 240, 'prod 수동 승인, env 분리', fade(u, 1.8), { fill: MUT });
       note(560, 300, 'runbook이 없으면 사고 때', fade(u, 2.1)); note(560, 330, '가장 바쁜 사람이 문서를 쓴다', fade(u, 2.3)); return; }
-    ticks(40, 160, ['drift detection 일 1회 (cron)', 'apply 결과 Slack · Email 알림', '모듈 · provider 버전 고정 (~> 5.0)', '.terraform.lock.hcl 커밋', 'on-call 담당 + 인수인계 문서'], u, 0.3);
+    ticks(40, 160, ['drift detection일 1회 (cron)', 'apply 결과 Slack · Email 알림', '모듈 · provider 버전 고정 (~> 5.0)', '.terraform.lock.hcl 커밋', 'on-call 담당 + 인수인계 문서'], u, 0.3);
     note(620, 280, '48칸이 모두 찼다', fade(u, 2.2), { fill: GOOD }); }
 
   // ================= 5. 종합 =================
@@ -183,10 +183,10 @@
       o: ['tflint 경고 0건', 'state lock', 'Infracost 비용 리포트'], a: 1,
       why: 'lock이 있으면 두 번째 apply는 기다리거나 실패한다. 동시 쓰기로 state가 깨지는 일은 lock이 막는다.' },
     { q: 'gitleaks는 통과했는데 state 파일에서 DB 비밀번호가 평문으로 발견됐다. 어떻게 보는 게 맞는가?',
-      o: ['state에는 원래 값이 들어가므로 저장소 암호화와 접근 권한을 따로 지킨다', 'gitleaks 설정이 잘못되었으니 다시 돌린다', 'sensitive = true를 붙이면 state에서 사라진다'], a: 0,
+      o: ['state 저장소의 암호화와 접근 권한을 따로 지킨다', 'gitleaks 설정을 고쳐 다시 돌린다', 'sensitive = true를 붙여 state에서 지운다'], a: 0,
       why: 'gitleaks는 코드를 본다. 리소스에 들어간 값은 sensitive여도 state에 남으므로 state 축의 암호화와 권한이 따로 필요하다.' },
     { q: '승인 후 apply했더니 PR에서 본 plan과 다른 변경이 적용됐다. 운영 절차에서 먼저 고칠 것은?',
-      o: ['plan -out으로 저장한 계획 파일을 apply한다', 'fmt -check를 추가한다', '모듈 README를 쓴다'], a: 0,
+      o: ['fmt -check를 추가한다', '모듈 README를 쓴다', 'plan -out으로 저장한 계획 파일을 apply한다'], a: 2,
       why: 'plan을 파일로 남겨 두고 그 파일을 apply하면 승인한 계획 그대로 적용된다. 다시 plan을 세우면 그사이 바뀐 것이 끼어든다.' },
   ];
 

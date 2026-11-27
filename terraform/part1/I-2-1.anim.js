@@ -49,7 +49,7 @@
     if (k === 0) { lock(642, 34, true, ACC, pop(u, 0.4)); mono(680, 104, '>= 1.6.0', { 'text-anchor': 'middle', 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 0.5) });
       lock(560, 122, true, ACC, pop(u, 0.9)); mono(590, 182, '~> 5.0', { 'text-anchor': 'middle', 'font-size': 14, fill: ACC, 'font-weight': 700, opacity: fade(u, 1.0) });
       note('본체와 provider 버전을 파일에 고정한다', 1.6, u); return; }
-    if (k === 1) { grow(590, 165, 590, 188, E(u, 0.3, 1.0), ACC); note('provider 만 바꿔 끼우면 다른 클라우드', 1.4, u); return; }
+    if (k === 1) { grow(590, 165, 590, 188, E(u, 0.3, 1.0), ACC); note('provider만 바꿔 끼우면 다른 클라우드', 1.4, u); return; }
     if (k === 2) { fly(300, 150, 680, 60, seg(u, 0.3, 1.4), 'var.instance_type = "t3.micro"', { mono: true });
       pill(690, 270, 'instance_type ← var', ACC, pop(u, 1.5), { mono: true }); note('환경마다 달라질 값을 변수 한곳에', 1.8, u); return; }
     // k3 이후: 인스턴스가 있다
@@ -65,8 +65,8 @@
       return; }
     // k7: 대가 — state 와 lock 을 직접 챙긴다
     lock(918, 30, true, BAD, pop(u, 0.4));
-    card(690, 330, 440, 44, { rx: 10, stroke: BAD, sw: 2.2, fill: C.BADBG, text: 'state 백엔드 · lock 을 직접 챙겨야 한다', fs: 15, color: BAD, s: pop(u, 0.8) });
-    note('HCL 의 반복·조건 표현은 제한적', 1.6, u, WARN); }
+    card(690, 330, 440, 44, { rx: 10, stroke: BAD, sw: 2.2, fill: C.BADBG, text: 'state 백엔드 · lock을 직접 챙겨야 한다', fs: 15, color: BAD, s: pop(u, 0.8) });
+    note('HCL의 반복·조건 표현은 제한적', 1.6, u, WARN); }
 
   // =========================================================
   // 2. CloudFormation — YAML 템플릿 → AWS 안의 서비스 → 스택
@@ -92,14 +92,14 @@
         node(720, y, v, { col, s }); (ok ? check : cross)(820, y, 9, s); });
       note('AllowedValues 밖의 값은 배포 전에 거절', 1.8, u); return; }
     if (k >= 2 && k <= 4) inst(k === 2 ? pop(u, 0.4) : 1);
-    if (k === 2) { pill(520, 210, '!Ref InstanceType', ACC, pop(u, 0.9), { mono: true }); grow(590, 210, 660, 210, E(u, 1.1, 1.6), ACC); note('!Ref · !GetAtt · !Sub 를 알아야 한다', 1.8, u); return; }
-    if (k === 3) { tx(690, 352, 'tags 를 적는 데 드는 줄 수', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, 'font-weight': 700, opacity: fade(u, 0.2) });
+    if (k === 2) { pill(520, 210, '!Ref InstanceType', ACC, pop(u, 0.9), { mono: true }); grow(590, 210, 660, 210, E(u, 1.1, 1.6), ACC); note('!Ref · !GetAtt · !Sub를 알아야 한다', 1.8, u); return; }
+    if (k === 3) { tx(690, 352, 'tags를 적는 데 드는 줄 수', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, 'font-weight': 700, opacity: fade(u, 0.2) });
       [['HCL', 5, GOOD], ['YAML', 7, WARN]].forEach(([n, v, col], i) => { const x = 480 + i * 240; tx(x, 384, n, { 'font-size': 14.5, 'font-weight': 700, fill: col });
         hbar(x + 46, 372, 120, v, 7, { u: E(u, 0.4 + i * 0.4, 1.4 + i * 0.4), col, text: v + '줄' }); });
       return; }
     if (k === 4) { grow(800, 230, 880, 290, E(u, 0.3, 1.0), ACC); pill(840, 270, 'demo-PublicIp', ACC, pop(u, 1.0), { mono: true, fs: 13.5 });
       node(770, 360, '다른 스택 · !ImportValue', { s: pop(u, 1.5), mono: false }); grow(840, 286, 800, 340, E(u, 1.6, 2.2), ACC); return; }
-    if (k === 5) { inst(1); doc(860, 260, 'state', { col: GOOD, op: fade(u, 0.3) }); tx(860, 296, 'AWS 가 보관', { 'text-anchor': 'middle', 'font-size': 13.5, fill: GOOD, 'font-weight': 700, opacity: fade(u, 0.5) });
+    if (k === 5) { inst(1); doc(860, 260, 'state', { col: GOOD, op: fade(u, 0.3) }); tx(860, 296, 'AWS가 보관', { 'text-anchor': 'middle', 'font-size': 13.5, fill: GOOD, 'font-weight': 700, opacity: fade(u, 0.5) });
       pill(530, 160, '실패하면 자동 롤백', WARN, pop(u, 1.0)); pill(530, 220, 'IAM 권한과 1:1', INFO, pop(u, 1.4)); return; }
     if (k === 6) { cloudBox(450, 40, 140, 120, 'AWS', { col: GOOD }); check(520, 110, 14, pop(u, 0.3));
       [['GCP', 680], ['Azure', 850]].forEach(([n, x], i) => { cloudBox(x - 70, 40, 140, 120, n, { col: BAD }); cross(x, 110, 22, pop(u, 0.6 + i * 0.4)); });
@@ -108,18 +108,18 @@
       return; }
     // k7: 옮겨 가는 방향
     node(520, 200, 'CloudFormation', { mono: false, s: pop(u, 0.2) });
-    [['AWS 만 쓰는 조직', 'AWS CDK', 110], ['멀티클라우드 조직', 'Terraform', 290]].forEach(([who, to, y], i) => { grow(600, 200, 760, y, E(u, 0.5 + i * 0.5, 1.2 + i * 0.5), ACC);
+    [['AWS만 쓰는 조직', 'AWS CDK', 110], ['멀티클라우드 조직', 'Terraform', 290]].forEach(([who, to, y], i) => { grow(600, 200, 760, y, E(u, 0.5 + i * 0.5, 1.2 + i * 0.5), ACC);
       node(840, y, to, { mono: false, hot: true, s: pop(u, 1.1 + i * 0.5) }); tx(690, y + (i ? 34 : -22), who, { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, 'font-weight': 700, opacity: fade(u, 1.2 + i * 0.5) }); }); }
 
   // =========================================================
   // 3. Pulumi — 파이썬 코드가 그대로 실행되어 자원을 등록한다
   // =========================================================
   const PUL = [[0, 'import pulumi'], [0, 'import pulumi_aws as aws'],
-    [1, 'config = pulumi.Config()'], [1, 'instance_type = config.get("instanceType") or "t3.micro"'],
-    [2, 'def make_tags(name: str, env: str) -> dict[str, str]:'], [2, '    return {"Name": name, "Environment": env, ...}'],
-    [3, 'web = aws.ec2.Instance("web", ami=..., '], [3, '    instance_type=instance_type, tags=make_tags(...))'],
+    [1, 'config = pulumi.Config()'], [1, 'instance_type = (config.get("instanceType")'], [1, '                 or "t3.micro")'],
+    [2, 'def make_tags(name: str, env: str) -> dict:'], [2, '    return {"Name": name, "Environment": env, ...}'],
+    [3, 'web = aws.ec2.Instance("web", ami=..., '], [3, '    instance_type=instance_type,'], [3, '    tags=make_tags(...))'],
     [4, 'for i in range(3):'], [4, '    worker = aws.ec2.Instance(f"worker-{i}", ...)'], [4, '    workers.append(worker)'],
-    [5, 'pulumi.export("public_ip", web.public_ip)'], [5, 'pulumi.export("worker_ids", [w.id for w in workers])']];
+    [5, 'pulumi.export("public_ip", web.public_ip)'], [5, 'pulumi.export("worker_ids",'], [5, '              [w.id for w in workers])']];
   function s3(t, c) { const { k, u } = c;
     codePanel('pulumi.py (줄인 모양)', PUL, k, u, { w: 420 });
     // 오른쪽 흐름: 파이썬 → Pulumi 엔진 → AWS
@@ -145,7 +145,7 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
       return; }
     // k7 대가
     card(700, 316, 460, 54, { rx: 10, stroke: BAD, sw: 2.2, fill: C.BADBG, s: pop(u, 0.4), text: '인프라 코드인지 앱 코드인지 흐려진다', fs: 15, color: BAD });
-    note('생태계는 Terraform 보다 작다', 1.4, u, WARN); }
+    note('생태계는 Terraform보다 작다', 1.4, u, WARN); }
 
   // =========================================================
   // 4. AWS CDK — TypeScript → cdk synth → CloudFormation 템플릿
@@ -154,7 +154,7 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
     [1, 'interface DemoStackProps extends cdk.StackProps {'], [1, '  instanceType?: ec2.InstanceType; ... }'],
     [2, 'export class DemoStack extends cdk.Stack {'],
     [3, 'const vpc = new ec2.Vpc(this, "DemoVpc",'], [3, '  { maxAzs: 2 });'],
-    [4, 'const sg = new ec2.SecurityGroup(this, "WebSg", ...);'], [4, 'sg.addIngressRule(..., ec2.Port.tcp(80));'],
+    [4, 'const sg = new ec2.SecurityGroup(this, "WebSg",'], [4, '  { vpc, ... });'], [4, 'sg.addIngressRule(..., ec2.Port.tcp(80));'],
     [5, 'const web = new ec2.Instance(this, "WebInstance", {'], [5, '  vpc, instanceType, securityGroup: sg, ... });'],
     [6, 'cdk.Tags.of(web).add("ManagedBy", "CDK");'], [6, 'new cdk.CfnOutput(this, "PublicIp", ...);'],
     [7, 'const app = new cdk.App();'], [7, 'new DemoStack(app, "DemoStack", ...);'], [8, '// TS 에러 → CFN 에러, 두 단계']];
@@ -177,7 +177,7 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
       const parts = [['Subnet', '×4'], ['RouteTable', '×4'], ['NAT GW', '×2'], ['EIP', '×2'], ['IGW', '×1']];
       parts.forEach(([n, q], i) => { const m = E(u, 0.5 + i * 0.25, 1.2 + i * 0.25), x = lerp(560, 520 + (i % 3) * 140, m), y = lerp(140, 230 + Math.floor(i / 3) * 62, m);
         if (m <= 0) return; card(x, y, 124, 46, { rx: 8, stroke: INFO, sw: 1.8, op: clamp(m * 2) }); tx(x - 8, y + 5, n, { 'text-anchor': 'middle', 'font-size': 14, 'font-weight': 700, opacity: clamp(m * 2) }); mono(x + 54, y + 5, q, { 'text-anchor': 'end', 'font-size': 13.5, fill: INFO, opacity: clamp(m * 2) }); });
-      sub(690, 390, '기본값 기준 (AZ 2개, AZ 마다 public·private 서브넷과 NAT)', fade(u, 2), { 'font-size': 13.5 }); return; }
+      sub(690, 390, '기본값 기준 (AZ 2개, AZ마다 public·private 서브넷과 NAT)', fade(u, 2), { 'font-size': 13.5 }); return; }
     if (k === 4) { node(560, 180, 'WebSg', { hot: true, s: pop(u, 0.2) }); grow(610, 180, 700, 180, E(u, 0.6, 1.2), ACC);
       pill(800, 180, '.addIngressRule(80)', ACC, pop(u, 1.0), { mono: true }); note('규칙 추가가 메서드 호출 한 번', 1.6, u); return; }
     if (k === 5) { node(560, 150, 'ec2.Instance', { hot: true, s: pop(u, 0.2) });
@@ -186,11 +186,11 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
       tx(460, 300, '적지 않아도', { 'font-size': 15, 'font-weight': 700, fill: MUT, opacity: fade(u, 1.8) }); tx(460, 322, '따라 생긴다', { 'font-size': 15, 'font-weight': 700, fill: MUT, opacity: fade(u, 1.9) }); return; }
     if (k === 6) { tagChips(560, 170, ['Name = demo-web', 'ManagedBy = CDK'], 0.3, u, 1);
       grow(660, 250, 740, 250, E(u, 0.9, 1.4), ACC); node(560, 250, 'CfnOutput PublicIp', { s: pop(u, 0.6) }); doc(840, 250, 'Outputs:', { s: 1, op: fade(u, 1.4), w: 140 });
-      note('합성하면 CFN 의 Outputs 가 된다', 1.8, u); return; }
+      note('합성하면 CFN의 Outputs가 된다', 1.8, u); return; }
     if (k === 7) { dot([[500, 54], [620, 54], [755, 54]], seg(u, 0.2, 1.3), ACC, 8);
       card(755, 210, 290, 200, { rx: 6, fill: PANEL, stroke: GRID, s: pop(u, 1.2) });
       ['Resources:', '  DemoVpc…: AWS::EC2::VPC', '  WebSg…: AWS::EC2::SecurityGroup', '  WebInstance…: AWS::EC2::Instance', 'Outputs:', '  PublicIp: ...'].forEach((s, i) => mono(622, 134 + i * 22, s, { 'font-size': 13.5, opacity: fade(u, 1.4 + i * 0.15) }));
-      note('cdk synth 가 만든 CFN 템플릿 (예시)', 2.2, u); return; }
+      note('cdk synth가 만든 CFN 템플릿 (예시)', 2.2, u); return; }
     // k8: 두 단계 디버깅
     card(560, 200, 200, 60, { rx: 10, stroke: WARN, sw: 2, text: 'TS 컴파일 에러', fs: 15, s: pop(u, 0.3) });
     card(830, 200, 200, 60, { rx: 10, stroke: BAD, sw: 2, text: 'CFN 배포 에러', fs: 15, s: pop(u, 0.7) });
@@ -201,12 +201,12 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
   // =========================================================
   // 5. 시나리오별 선택
   // =========================================================
-  const PICK = [['멀티클라우드', 'Terraform'], ['AWS 만 · TS/Python 팀', 'AWS CDK'], ['멀티 + 테스트 필수', 'Pulumi'], ['AWS 만 · CFN 자산 많음', 'CFN 유지'], ['온프레미스 혼합', 'Terraform']];
+  const PICK = [['멀티클라우드', 'Terraform'], ['AWS만 · TS/Python 팀', 'AWS CDK'], ['멀티 + 테스트 필수', 'Pulumi'], ['AWS만 · CFN 자산 많음', 'CFN 유지'], ['온프레미스 혼합', 'Terraform']];
   const MX = { cols: ['Terraform', 'CFN', 'Pulumi', 'CDK'], rows: [['멀티클라우드', '◎', '✕', '◎', '△'], ['벤더 락인', '낮음', '높음', '낮음', '높음'], ['학습곡선', '중', '중', '낮음', '낮음'],
     ['언어', 'HCL', 'YAML', 'Py/TS/Go', 'TS/Py'], ['State', '직접', 'AWS', '직접/클라우드', 'AWS'], ['비용', '무료', '무료', '유료 옵션', '무료'], ['생태계', '★★★★★', '★★★', '★★★', '★★★★'], ['신규 서비스', '대기', '즉시', '대기', '즉시']] };
   const GOODV = new Set(['◎', '낮음', '무료', '즉시', '★★★★★', 'AWS']);
   function tree(k, u) { // 결정 트리
-    const N = { q1: [480, 60, '클라우드가 AWS 하나뿐?'], q2: [250, 180, '팀이 TS/Python 에 능숙?'], q3: [710, 180, '무엇을 먼저 보나?'],
+    const N = { q1: [480, 60, '클라우드가 AWS 하나뿐?'], q2: [250, 180, '팀이 TS/Python에 능숙?'], q3: [710, 180, '무엇을 먼저 보나?'],
       cdk: [150, 320, 'AWS CDK'], cfn: [350, 320, 'CloudFormation'], tf: [610, 320, 'Terraform'], pu: [810, 320, 'Pulumi'] };
     const at = (id, a) => (k === 2 && ['q1', 'q2', 'cdk', 'cfn'].includes(id) ? pop(u, a) : k === 3 && ['q3', 'tf', 'pu'].includes(id) ? pop(u, a) : 1);
     const show = (id) => k >= 3 || ['q1', 'q2', 'cdk', 'cfn'].includes(id);
@@ -230,7 +230,7 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
       if (k === 0) tx(480, 260, '첫 질문은 클라우드가 몇 개인가', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, fill: MUT, opacity: fade(u, 1.6) });
       return; }
     if (k <= 3) { tree(k, u); return; }
-    if (k === 4) { matrix(MX.rows.slice(0, 3), u, 0.2); tx(480, 250, '락인이 낮은 쪽은 Terraform 과 Pulumi', { 'text-anchor': 'middle', 'font-size': 15.5, 'font-weight': 700, opacity: fade(u, 1.6) }); return; }
+    if (k === 4) { matrix(MX.rows.slice(0, 3), u, 0.2); tx(480, 250, '락인이 낮은 쪽은 Terraform과 Pulumi', { 'text-anchor': 'middle', 'font-size': 15.5, 'font-weight': 700, opacity: fade(u, 1.6) }); return; }
     if (k === 5) { matrix(MX.rows.slice(3), u, 0.2); return; }
     if (k === 6) { // 한 자원을 두 도구가 관리하면
       server(480, 220, null, { s: 0.9, lamp: BAD }); tx(480, 300, 'aws_instance.web', { 'text-anchor': 'middle', 'font-size': 14.5, 'font-weight': 700, class: 'mono' });
@@ -243,7 +243,7 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
       const mods = ['network', 'security', 'compute', 'database', 'dns'], moved = Math.floor(lerp(0, 2.99, E(u, 0.3, 2.3)));
       mods.forEach((m, i) => { const done = i < moved, mv = i === moved ? E(u, 0.3 + i * 0.7, 0.9 + i * 0.7) : 0, x = done ? 760 : lerp(200, 760, mv);
         card(x, 100 + i * 56, 180, 44, { rx: 8, text: m, fs: 15, mono: true, stroke: done || mv > 0.5 ? ACC : INK, fill: done ? ACCBG : PANEL }); });
-      pill(480, 380, 'import 로 흡수 (예: terraform import, cdk migrate)', INFO, pop(u, 1.2), { fs: 13.5 }); return; }
+      pill(480, 380, 'import로 흡수 (예: terraform import, cdk migrate)', INFO, pop(u, 1.2), { fs: 13.5 }); return; }
     // k8: 5년 유지보수
     tx(480, 70, '도구를 고르는 기준', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800 });
     const tilt = E(u, 0.6, 1.8) * 0.16; el('line', { x1: 480, y1: 120, x2: 480, y2: 300, stroke: INK, 'stroke-width': 3 });
@@ -251,7 +251,7 @@ node(x, 250, v, { hot: i === 1, s: pop(u, 0.9 + i * 0.4) }); tx(x, 290, a, { 'te
     el('line', { x1: L[0], y1: L[1], x2: Rr[0], y2: Rr[1], stroke: INK, 'stroke-width': 4 });
     card(L[0], L[1] + 40, 220, 60, { rx: 10, stroke: ACC, sw: 2.5, fill: ACCBG, text: '팀 학습 비용 + 5년 유지보수', fs: 14.5, fw: 800, color: ACC });
     card(Rr[0], Rr[1] + 70, 200, 60, { rx: 10, stroke: GRID, sw: 2, text: '기술적 우월성', fs: 15, color: MUT });
-    tx(480, 380, '큰 조직은 Terraform 으로 표준화, 작은 AWS 팀은 CDK 로 빠르게', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2) }); }
+    tx(480, 380, '큰 조직은 Terraform으로 표준화, 작은 AWS 팀은 CDK로 빠르게', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, opacity: fade(u, 2) }); }
 
   const quiz = [
     { q: 'terraform.tf에서 provider "aws" 블록이 정하는 것은 무엇인가?',

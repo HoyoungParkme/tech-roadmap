@@ -72,7 +72,7 @@
         const pr = [[PX - 88, PY], [x + 78, y]], ph = (t * 0.6 + i * 0.33) % 1;
         el('line', { x1: PX - 88, y1: PY, x2: x + 78, y2: y, stroke: GRID, 'stroke-width': 2 });
         if (i < 2) { dot(pr, ph < 0.5 ? ph * 2 : -1, ACC, 6); dot(pr.slice().reverse(), ph >= 0.5 ? (ph - 0.5) * 2 : -1, INFO, 6); } });
-      cross(130 + 92, 190, 10, pop(u, 0.8)); tx(780, 110, 'Prometheus 가 직접 GET', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700 });
+      cross(130 + 92, 190, 10, pop(u, 0.8)); tx(780, 110, 'Prometheus가 직접 GET', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700 });
       tx(780, 140, '긁기 실패도 기록되는 신호다', { 'text-anchor': 'middle', 'font-size': 14.5, fill: BAD, opacity: fade(u, 1) });
       tx(780, 196, 'scrape 주기: 차트 기본 30s', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT, class: 'mono', opacity: fade(u, 1.4) }); } }
 
@@ -84,8 +84,8 @@
     tx(50, 66, 'ServiceMonitor', { 'font-size': 15, 'font-weight': 800, fill: ACC }); mono(50, 92, 'web-monitor', { 'font-size': 14 });
     const fl = [['release: prom', 0, WARN], ['matchLabels app: web', 1, ACC], ['port: metrics · 15s', 2, INFO]];
     fl.forEach(([s, kk, col], i) => { if (k < kk) return; pill(150, 124 + i * 40, s, col, k === kk ? pop(u, 0.3) : 1, { mono: true, fs: 13.5 }); });
-    if (k === 0) { card(150, 250, 210, 44, { rx: 22, stroke: WARN, sw: 2, text: 'Operator 가 발견', fs: 14.5, s: pop(u, 0.9) }); grow(150, 228, 150, 150, E(u, 1.1, 1.6), WARN);
-      tx(600, 140, '라벨 release: prom 이 없으면', { 'text-anchor': 'middle', 'font-size': 15, opacity: fade(u, 1.4) }); tx(600, 168, '조용히 무시된다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.7) }); return; }
+    if (k === 0) { card(150, 250, 210, 44, { rx: 22, stroke: WARN, sw: 2, text: 'Operator가 발견', fs: 14.5, s: pop(u, 0.9) }); grow(150, 228, 150, 150, E(u, 1.1, 1.6), WARN);
+      tx(600, 140, '라벨 release: prom이 없으면', { 'text-anchor': 'middle', 'font-size': 15, opacity: fade(u, 1.4) }); tx(600, 168, '조용히 무시된다', { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 700, fill: BAD, opacity: fade(u, 1.7) }); return; }
     // 오른쪽: 네임스페이스와 Service
     const NS = [['default', [['web', 'app: web', true], ['api', 'app: api', false]]], ['prod', [['web', 'app: web', true]]]];
     let row = 0; const pts = [];
@@ -99,8 +99,8 @@
         if (ok) pts.push([365, y]); else if (k >= 1) cross(372, y, 8, pop(u, 0.8)); }); });
     if (k >= 1) pts.forEach(([x, y], i) => { el('path', { d: `M265,${120 + 40 * 1} C 300,${120 + 40} 320,${y} ${x},${y}`, fill: 'none', stroke: GOOD, 'stroke-width': 2.2, pathLength: 1, 'stroke-dasharray': `${k === 1 ? E(u, 0.3 + i * 0.3, 1 + i * 0.3) : 1} 1` }); });
     if (k === 2) { for (let i = 0; i < 4; i++) dot([[265, 204], [700, 86 + (i % 2) * 136]], (t * 0.5 + i / 4) % 1, INFO, 5); }
-    if (k === 3) { el('rect', { x: 560, y: 34, width: 0, height: 0 }); mono(560, 278, 'Service 쪽에도 app: web 라벨과 이름이 metrics 인 포트(9100)', { 'font-size': 13.5, fill: INK, 'text-anchor': 'middle', opacity: fade(u, 0.6) }); }
-    if (k === 4) mono(560, 278, 'Pod 가 2개든 200개든 ServiceMonitor 는 하나', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1) }); }
+    if (k === 3) { el('rect', { x: 560, y: 34, width: 0, height: 0 }); mono(560, 278, 'Service 쪽에도 app: web 라벨과 이름이 metrics인 포트(9100)', { 'font-size': 13.5, fill: INK, 'text-anchor': 'middle', opacity: fade(u, 0.6) }); }
+    if (k === 4) mono(560, 278, 'Pod가 2개든 200개든 ServiceMonitor는 하나', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'middle', opacity: fade(u, 1) }); }
 
   // 4. PromQL
   function s4(t, c) { const { k, u } = c;
@@ -162,7 +162,7 @@
     row4(c, 316, 92);
     if (k === 0) { card(300, 150, 420, 200, { rx: 12, stroke: ACC, sw: 2.5 });
       ['kind: PrometheusRule', 'metadata.name: web-alerts', 'spec.groups[web].rules:', '  (아직 비어 있다)'].forEach((s, i) => mono(110, 100 + i * 32, s, { 'font-size': 15, fill: i === 3 ? MUT : INK, 'font-weight': i === 0 ? 800 : 500, opacity: fade(u, 0.2 + i * 0.3) }));
-      tx(720, 150, '규칙도 CRD 로 선언한다', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.4) }); return; }
+      tx(720, 150, '규칙도 CRD로 선언한다', { 'text-anchor': 'middle', 'font-size': 16, 'font-weight': 700, opacity: fade(u, 1.4) }); return; }
     if (k === 1 || k === 3) { const isCpu = k === 1, dur = isCpu ? 5 : 3, ax = R.axes(90, 70, 520, 190, { x: [0, 8], y: isCpu ? [0, 100] : [0, 5], xt: [0, 2, 4, 6, 8], xl: '분', yt: isCpu ? [0, 80] : [0, 1, 5] });
       const thr = isCpu ? 80 : 1, ser = (isCpu ? m.cpu : m.err).series.slice(-9).map((v, i) => [i, v]);
       el('line', { x1: ax.X(0), y1: ax.Y(thr), x2: ax.X(8), y2: ax.Y(thr), stroke: BAD, 'stroke-width': 1.8, 'stroke-dasharray': '5 4' });
@@ -174,7 +174,7 @@
       tx(780, 110, isCpu ? 'HighCPU' : 'HighErrorRate', { 'text-anchor': 'middle', 'font-size': 18, 'font-weight': 800 });
       mono(780, 140, isCpu ? 'expr: … > 0.8' : 'expr: 5xx 비율 > 0.01', { 'text-anchor': 'middle', 'font-size': 14, fill: MUT });
       ['Inactive', 'Pending', 'Firing'].forEach((s, i) => pill(700 + i * 0, 180 + i * 40, s, s === stt ? (i === 2 ? BAD : i === 1 ? WARN : INK) : OFF, s === stt ? 1.08 : 1, { mono: true, fs: 14 }));
-      tx(780, 300, isCpu ? '넘는 순간이 아니라 5분 내내 넘어야' : 'CPU 보다 짧게: 사용자 영향에 빨리', { 'text-anchor': 'middle', 'font-size': 14, opacity: fade(u, 1.8) }); return; }
+      tx(780, 300, isCpu ? '넘는 순간이 아니라 5분 내내 넘어야' : 'CPU보다 짧게: 사용자 영향에 빨리', { 'text-anchor': 'middle', 'font-size': 14, opacity: fade(u, 1.8) }); return; }
     if (k === 2) { card(260, 160, 400, 150, { rx: 12, stroke: ACC, sw: 2.2 }); tx(80, 112, 'annotations', { 'font-size': 15, 'font-weight': 800, fill: ACC });
       mono(80, 150, 'summary: "CPU > 80% (5min)"', { 'font-size': 14.5, opacity: fade(u, 0.4) }); mono(80, 184, 'runbook: https://wiki/runbook/HighCPU', { 'font-size': 14, fill: INFO, opacity: fade(u, 0.8) });
       person(700, 160, '새벽에 깬 사람', { s: pop(u, 1.2) }); grow(470, 184, 660, 170, E(u, 1.4, 2), MUT);
@@ -189,7 +189,7 @@
       if (!(k === 6 && i === 0)) card(700, y, 190, 52, { rx: 10, stroke: col, sw: 2.2, text: rc, fs: 15, mono: true, s: k === 4 ? pop(u, 1 + i * 0.4) : 1 });
       grow(rx + 390, y, 600, y, k === 4 ? E(u, 1, 1.5) : 1, col); });
     if (k === 5) { tx(820, 140, 'service_key', { 'font-size': 13.5, fill: MUT, class: 'mono', opacity: fade(u, 0.4) }); tx(820, 286, '#ops-alerts', { 'font-size': 13.5, fill: MUT, class: 'mono', opacity: fade(u, 0.6) });
-      sub(480, 300, '알림 제목 = annotations 의 summary', fade(u, 1.2), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
+      sub(480, 300, '알림 제목 = annotations의 summary', fade(u, 1.2), { 'font-size': 14.5, fill: INK, 'font-weight': 700 }); }
     if (k === 6) { const sh = Math.sin(t * 30) * 3 * (u > 0.6 ? 1 : 0);
       card(700 + sh, 90, 190, 52, { rx: 10, stroke: BAD, sw: 3, fill: 'var(--badbg)', text: 'PagerDuty 호출', fs: 15, color: BAD });
       el('rect', { x: 40, y: 250, width: 520, height: 56, rx: 8, fill: INK, opacity: fade(u, 0.8) });

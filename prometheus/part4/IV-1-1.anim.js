@@ -76,7 +76,7 @@
         el('circle', { cx: x, cy: y, r: 8 * s, fill: ACC }); }
       note(120, 290, 'scrape 한 번 = 점 하나', fade(u, 0.6));
       note(120, 400, '짧으면 부하·저장량이 늘고, 길면 장애를 늦게 안다', fade(u, 2.1), { fill: MUT, 'font-size': 14.5 });
-      note(560, 70, 'global 값이 모든 job 의 기본', fade(u, 1.0), { fill: MUT, 'font-size': 14.5 }); return; }
+      note(560, 70, 'global 값이 모든 job의 기본', fade(u, 1.0), { fill: MUT, 'font-size': 14.5 }); return; }
     zone(560, 30, 384, 262, 'job="node"', { stroke: ACC, dash: '6 5', fill: ACCBG, color: ACC, op: fa(c, 1) });
     if (k >= 2) TG.forEach(([n, a, y], i) => { const s = k === 2 ? pop(u, 0.3 + i * 0.3) : 1;
       grow(PS.x + 58, PS.y, 584, y + 14, k === 2 ? E(u, 0.3 + i * 0.3, 1.0 + i * 0.3) : 1, GRID, { plain: true });
@@ -93,10 +93,10 @@
     const jobOp = fa(c, 1, 0.8), envOp = fa(c, 3, 1.2), insOp = fa(c, 4, 0.4);
     spans(40, 368, [['up', { 'font-weight': 700 }], ['{', { fill: INFO }], ['job="node"', { fill: ACC, opacity: jobOp }],
       [', instance="10.0.1.11:9100"', { fill: INFO, opacity: insOp }], [', env="prod"', { fill: WARN, opacity: envOp }], ['}', { fill: INFO }],
-      [k === 5 ? '  1' : '', { fill: GOOD, 'font-weight': 800 }]], { 'font-size': 16 });
-    if (k === 4) { note(40, 404, 'host:port 는 손대지 않아도 instance 로 붙는다', fade(u, 0.8), { fill: INFO, 'font-size': 14.5 });
+      [k === 5 ? '  1' : '', { fill: GOOD, 'font-weight': 800 }]].filter(([, a]) => a.opacity == null || a.opacity > 0), { 'font-size': 16 });
+    if (k === 4) { note(40, 404, 'host:port는 손대지 않아도 instance로 붙는다', fade(u, 0.8), { fill: INFO, 'font-size': 14.5 });
       note(600, 330, '서버가 수백 대라면', fade(u, 1.6), { fill: MUT, 'font-size': 14.5 }); note(600, 356, '→ Service Discovery (IV-2)', fade(u, 1.9), { fill: INK, 'font-size': 14.5 }); }
-    if (k === 5) note(40, 404, 'up 은 Prometheus 가 스스로 만드는 시계열 (1 = 성공)', fade(u, 2.0), { fill: GOOD, 'font-size': 14.5 }); }
+    if (k === 5) note(40, 404, 'up은 Prometheus가 스스로 만드는 시계열 (1 = 성공)', fade(u, 2.0), { fill: GOOD, 'font-size': 14.5 }); }
 
   // ---------- 3. collector ----------
   const MODS = [['cpu', 1, 'node_cpu_*'], ['meminfo', 1, 'node_memory_*'], ['filesystem', 1, 'node_filesystem_*'], ['netdev', 1, 'node_network_*'],
@@ -126,7 +126,7 @@
     if (FL[k]) { el('rect', { x: 14, y: 300, width: 566, height: 44, rx: 8, fill: INK, opacity: fade(u, 0.2) });
       mono(30, 328, FL[k].slice(0, Math.round(FL[k].length * E(u, 0.2, 1.2))), { 'font-size': 13.5, fill: 'var(--term)' }); }
     if (k === 1) note(14, 380, '끈 만큼 노출 계열이 사라진다', fade(u, 1.6));
-    if (k === 2) note(14, 380, 'systemd 는 기본 off — 필요할 때 켠다', fade(u, 1.6));
+    if (k === 2) note(14, 380, 'systemd는 기본 off — 필요할 때 켠다', fade(u, 1.6));
     if (k === 4) note(14, 380, '전부 끄고 다섯 개만: 무엇이 나가는지 확실해진다', fade(u, 1.8));
     if (k === 3) { // 마운트 → 시계열 수 (예시)
       const keep = ['/', '/boot', '/data'], drop = ['tmpfs /run', 'overlay × 40'];
@@ -134,7 +134,7 @@
       keep.forEach((m, i) => pill(50 + i * 80, 330, m, GOOD, pop(u, 0.2 + i * 0.1), { mono: true, fs: 13.5 }));
       drop.forEach((m, i) => { const x = 330 + i * 140, f = E(u, 1.4, 1.8); pill(x, 330, m, BAD, pop(u, 0.5 + i * 0.1), { mono: true, fs: 13.5 });
         if (f > 0) el('line', { x1: x - 56, y1: 330, x2: x - 56 + 112 * f, y2: 330, stroke: BAD, 'stroke-width': 3 }); });
-      note(14, 384, 'mount-points-exclude · fs-types-exclude 로 가상 마운트를 뺀다', fade(u, 1.6), { 'font-size': 14 });
+      note(14, 384, 'mount-points-exclude · fs-types-exclude로 가상 마운트를 뺀다', fade(u, 1.6), { 'font-size': 14 });
       // 오른쪽 막대
       const base = 380, top = 110, H = base - top, a = 301, b = 21, g = E(u, 0.4, 1.4), g2 = E(u, 1.6, 2.4);
       el('line', { x1: 620, y1: base, x2: 930, y2: base, stroke: MUT, 'stroke-width': 1.8 });
@@ -146,7 +146,7 @@
       tx(845, 404, '3 마운트 × 7', { 'font-size': 14, 'text-anchor': 'middle', fill: MUT, opacity: g2 });
       tx(780, 52, 'node_filesystem 시계열 수 (지표 7종)', { 'font-size': 14, 'font-weight': 700, 'text-anchor': 'middle', fill: INK }); return; }
     // 오른쪽: 노출되는 계열 목록
-    tx(612, 46, '/metrics 에 나가는 계열', { 'font-size': 14, 'font-weight': 700, fill: MUT });
+    tx(612, 46, '/metrics에 나가는 계열', { 'font-size': 14, 'font-weight': 700, fill: MUT });
     MODS.forEach(([n, def, fam], i) => { const v = modState(k, n, def, u), y = 76 + i * 28.5, on = v > 0.5;
       const changed = (k === 1 && ['nfs', 'infiniband', 'zfs'].includes(n)) || (k === 2 && n === 'systemd') || (k === 4 && (WL.includes(n) || on !== !!def));
       mono(612, y, fam, { 'font-size': 14, 'font-weight': changed ? 800 : 500, fill: on ? (changed ? ACC : INK) : OFF, 'text-decoration': on ? null : 'line-through', opacity: k === 0 ? fade(u, 0.3 + i * 0.08) : 1 }); }); }
@@ -168,11 +168,11 @@
       el('line', { x1: x1, y1: y0, x2: x1, y2: lerp(y0, y1, E(u, 0.8, 1.3)), stroke: ACC, 'stroke-width': 2.5 });
       mono((x0 + x1) / 2, y0 + 22, '285초', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'middle', opacity: g });
       mono(x1 - 8, (y0 + y1) / 2, '176.7', { 'font-size': 14, 'font-weight': 700, fill: ACC, 'text-anchor': 'end', opacity: fade(u, 1.2) });
-      const L = [['176.7 ÷ 285 = 0.62 /초', INK, 1.3], ['cpu1 은 0.58 /초', MUT, 1.6], ['평균 0.60 → 100 − 60', INK, 1.9]];
+      const L = [['176.7 ÷ 285 = 0.62 /초', INK, 1.3], ['cpu1은 0.58 /초', MUT, 1.6], ['평균 0.60 → 100 − 60', INK, 1.9]];
       L.forEach(([s, col, a]) => mono(590, 100 + L.findIndex((q) => q[0] === s) * 36, s, { 'font-size': 15.5, 'font-weight': 700, fill: col, opacity: fade(u, a) }));
       mono(590, 228, 'CPU 사용률 40%', { 'font-size': 22, 'font-weight': 800, fill: ACC, opacity: fade(u, 2.2) });
       R.hbar(590, 246, 300, 40, 100, { u: E(u, 2.2, 2.8), label: false });
-      note(590, 300, 'rate 는 창 끝까지 외삽해도 같은 0.62', fade(u, 2.3), { fill: MUT, 'font-size': 14 }); return; }
+      note(590, 300, 'rate는 창 끝까지 외삽해도 같은 0.62', fade(u, 2.3), { fill: MUT, 'font-size': 14 }); return; }
     if (k <= 3) { // 메모리(위) · 디스크(아래)
       const bar = (y, total, part, title, lab, pct, op, gg) => { tx(60, y - 16, title, { 'font-size': 15, 'font-weight': 700, opacity: op });
         el('rect', { x: 60, y, width: 760, height: 40, rx: 6, fill: SOFT, stroke: GRID, opacity: op });
@@ -181,12 +181,12 @@
         mono(900, y + 27, pct, { 'font-size': 22, 'font-weight': 800, fill: ACC, 'text-anchor': 'end', opacity: op * gg }); };
       const mOp = k === 3 ? 0.45 : 1;
       bar(80, 1.6e10, 6.12e9, 'MemAvailable / MemTotal', '6.12e+09 / 1.6e+10', '38.3%', mOp, k === 2 ? E(u, 0.3, 1.3) : 1);
-      if (k === 2) { note(60, 160, 'MemFree 만 보면 회수할 수 있는 캐시를 빼먹는다', fade(u, 1.6), { fill: BAD });
-        note(60, 196, 'MemTotal 1.6e+10 은 예시 값', fade(u, 2.0), { fill: MUT, 'font-size': 14 }); }
+      if (k === 2) { note(60, 160, 'MemFree만 보면 회수할 수 있는 캐시를 빼먹는다', fade(u, 1.6), { fill: BAD });
+        note(60, 196, 'MemTotal 1.6e+10은 예시 값', fade(u, 2.0), { fill: MUT, 'font-size': 14 }); }
       if (k === 3) { ['/', '/boot', '/data'].forEach((m, i) => pill(90 + i * 90, 210, m, i === 0 ? ACC : GRID, pop(u, 0.2 + i * 0.1), { mono: true, fs: 14, color: i === 0 ? ACC : MUT }));
         tx(330, 215, 'mountpoint="/" 만 고른다', { 'font-size': 14, fill: MUT, opacity: fade(u, 0.6) });
         bar(280, 2.0e11, 4.21e10, 'avail_bytes / size_bytes  (mountpoint="/")', '4.21e+10 / 2.0e+11', '21.1%', 1, E(u, 0.8, 1.8));
-        note(60, 360, 'size 2.0e+11 은 예시 값 — avail 은 curl 출력 그대로', fade(u, 2.0), { fill: MUT, 'font-size': 14 }); }
+        note(60, 360, 'size 2.0e+11은 예시 값 — avail은 curl 출력 그대로', fade(u, 2.0), { fill: MUT, 'font-size': 14 }); }
       return; }
     // k4: predict_linear
     const ax = axes(90, 46, 520, 280, { x: [-6, 4], y: [-15, 120], xt: [-6, -4, -2, 0, 2, 4], yt: [0, 50, 100], xl: '시간 (h)', grid: true });
@@ -228,12 +228,12 @@
     mono(720, 146, '--collector.textfile.directory', { 'font-size': 13.5, fill: MUT, 'text-anchor': 'middle', opacity: fa(c, 0, 0.6) });
     el('line', { x1: 532, y1: 100, x2: 612, y2: 92, stroke: ACC, 'stroke-width': 2, 'stroke-dasharray': '5 4', opacity: fa(c, 0, 1.0) });
     tx(572, 80, '*.prom 감시', { 'font-size': 13.5, fill: ACC, 'text-anchor': 'middle', 'font-weight': 700, opacity: fa(c, 0, 1.2) });
-    if (k === 0) note(220, 250, '이 디렉터리의 *.prom 을 /metrics 에 합친다', fade(u, 1.6));
+    if (k === 0) note(220, 250, '이 디렉터리의 *.prom을 /metrics에 합친다', fade(u, 1.6));
     if (k >= 1) { // OUT · TMP
       const moved = k >= 5 ? E(c.k === 5 ? u : 3, 0.3, 1.2) : 0;
       card(365, 80, 240, 40, { rx: 6, text: 'backup.prom', fs: 14, mono: true, fw: 700, stroke: moved > 0.99 ? GOOD : GRID, dash: moved > 0.99 ? null : '6 4', color: moved > 0.99 ? GOOD : MUT, s: at(c, 1) });
       if (moved < 0.99) card(365, lerp(150, 80, moved), 240, 40, { rx: 6, text: 'backup.prom.$$', fs: 14, mono: true, fw: 700, stroke: WARN, fill: WARNBG, s: at(c, 1, 0.6) });
-      if (k === 1) note(220, 250, '임시 파일도 같은 디렉터리에 (.prom 이 아니라 안 읽힌다)', fade(u, 1.2), { 'font-size': 14.5 }); }
+      if (k === 1) note(220, 250, '임시 파일도 같은 디렉터리에 (.prom이 아니라 안 읽힌다)', fade(u, 1.2), { 'font-size': 14.5 }); }
     if (k >= 2) { card(96, 90, 150, 56, { rx: 10, text: 'cron\nbackup_metrics.sh', fs: 13.5, stroke: INK, s: at(c, 2) });
       pill(96, 152, 'SIZE=4.2e10', INFO, at(c, 2, 0.8), { mono: true, fs: 13.5 }); pill(96, 190, 'NOW=1723000000', INFO, at(c, 2, 1.2), { mono: true, fs: 13.5 });
       if (k === 2) note(30, 250, '값은 스크립트가 직접 구한다 (값은 예시)', fade(u, 1.6)); }
@@ -249,11 +249,11 @@
       tx(562, 258, 'curl :9100/metrics', { 'font-size': 13.5, fill: OFF, class: 'mono' });
       [['node_cpu_seconds_total{…} 918273.4', 0], ['backup_last_success_timestamp_seconds', 1], ['  1723000000', 1], ['backup_size_bytes 42000000000', 1]].forEach(([s, nw], i) =>
         mono(562, 288 + i * 26, s, { 'font-size': 13.5, fill: nw ? 'var(--term)' : OFF, opacity: nw ? fade(u, 1.4 + i * 0.2) : 1 }));
-      note(560, 216, 'rename 은 한 번에 바뀐다', fade(u, 1.2), { fill: GOOD, 'font-size': 14.5 }); } }
+      note(560, 216, 'rename은 한 번에 바뀐다', fade(u, 1.2), { fill: GOOD, 'font-size': 14.5 }); } }
 
   // ---------- 6. 익스포터 패턴 · USE ----------
   const ROWS = ['CPU', 'Memory', 'Disk', 'Network'], COLS = [['U', '사용률'], ['S', '포화 · 대기'], ['E', '오류']];
-  const CELL = { '0,0': ['100 − idle%', '40%', 1], '0,1': ['load1 ÷ 코어 수', '6.0 ÷ 4 = 1.5', 2], '1,0': ['1 − Avail/Total', '61.8%', 3], '1,1': ['Swap Total − Free', '> 0 이면 포화', 3],
+  const CELL = { '0,0': ['100 − idle%', '40%', 1], '0,1': ['load1 ÷ 코어 수', '6.0 ÷ 4 = 1.5', 2], '1,0': ['1 − Avail/Total', '61.8%', 3], '1,1': ['Swap Total − Free', '> 0이면 포화', 3],
     '2,1': ['io_time_weighted', '대기열 길이', 4], '3,2': ['receive_errs', '초당 에러', 4] };
   function s6(t, c) { const { k, u } = c;
     tx(40, 34, 'USE — 자원마다 세 칸을 채운다', { 'font-size': 17, 'font-weight': 800, opacity: k === 0 ? fade(u, 0.1) : 1 });
@@ -268,7 +268,7 @@
         mono(cx(j), cy(i) - 5, cell[0], { 'font-size': 14, 'text-anchor': 'middle', fill: INK, opacity: sc > 0.3 ? 1 : 0 });
         mono(cx(j), cy(i) + 17, cell[1], { 'font-size': 15, 'font-weight': 800, 'text-anchor': 'middle', fill: bad ? BAD : ACC, opacity: sc > 0.3 ? 1 : 0 }); }); });
     if (k === 0) note(40, 404, '사용률만 보면 기다림(포화)과 오류를 놓친다', fade(u, 2.0), { fill: MUT });
-    if (k === 1) note(40, 404, '앞 장면의 CPU 사용률 40% 가 U 칸에 들어간다', fade(u, 1.4), { fill: MUT });
+    if (k === 1) note(40, 404, '앞 장면의 CPU 사용률 40%가 U 칸에 들어간다', fade(u, 1.4), { fill: MUT });
     if (k === 2) banner(480, 398, 'U 40% 인데 S 1.5 — 여유 있어 보여도 느리다 (예시)', pop(u, 1.6));
     if (k === 3) note(40, 404, '메모리 여유 38.3% → 사용률 61.8% · 스왑을 쓰기 시작하면 포화', fade(u, 1.6), { fill: MUT });
     if (k === 4) note(40, 404, '빈 칸이 남아도 된다 — 볼 축을 빠뜨리지 않는 것이 목적', fade(u, 1.8), { fill: MUT }); }

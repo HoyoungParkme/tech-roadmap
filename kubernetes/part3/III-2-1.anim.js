@@ -12,7 +12,7 @@
     const pts = [0, 1, 2, 3, 4, 5].map((i) => { const a = Math.PI / 3 * i + Math.PI / 6; return (r * Math.cos(a)).toFixed(1) + ',' + (r * Math.sin(a)).toFixed(1); }).join(' ');
     el('polygon', { points: pts, fill: o.fill || PANEL, stroke: col, 'stroke-width': 2.6 }, g);
     el('rect', { x: -7, y: -7, width: 14, height: 14, rx: 3, fill: 'none', stroke: col, 'stroke-width': 1.8 }, g);
-    tx(0, 46, name, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: col }, g); return g; }
+    tx(0, 58, name, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 800, fill: col, stroke: SOFT, 'stroke-width': 5, 'paint-order': 'stroke' }, g); return g; }
   // 선 위의 점 (직선은 a→b, web→db 는 위로 휜 곡선)
   function at(a, b, f) { const [x1, y1] = P[a], [x2, y2] = P[b];
     if (a === 'web' && b === 'db') { const cx = 300, cy = -12, s = 1 - f; return [s * s * x1 + 2 * s * f * cx + f * f * x2, s * s * y1 + 2 * s * f * cy + f * f * y2]; }
@@ -77,7 +77,7 @@
     graph(t, c, { ports: true, fresh: PROBE1[k] ? [PROBE1[k].join('→')] : null, freshAt: 1.3 });
     if (PROBE1[k]) probe(PROBE1[k][0], PROBE1[k][1], 'allow', u, 0.2);
     if (k === 5) { const r = lerp(40, 330, E(u, 0.3, 1.8)); el('circle', { cx: P.attacker[0], cy: P.attacker[1], r, fill: 'var(--badbg)', stroke: BAD, 'stroke-width': 2, 'stroke-dasharray': '6 5', opacity: 0.35 });
-      tx(420, 240, 'attacker 가 닿는 범위', { 'font-size': 14, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.5) }); }
+      tx(420, 240, 'attacker가 닿는 범위', { 'font-size': 14, 'font-weight': 800, fill: BAD, opacity: fade(u, 1.5) }); }
     policies(0, false, u); counter(c, u); bannerLine(c, u); bottom(T1[k], u); }
 
   // ---------- 2. default-deny ----------
@@ -102,9 +102,9 @@
   // ---------- 3. web → api 만 ----------
   const T3 = [
     { yaml: ['  podSelector:', '    matchLabels:', '      app: api                 # 대상: api Pod'] },
-    { yaml: ['  ingress:', '    - from:', '              app: web         # 출처: web Pod 만'] },
+    { yaml: ['  ingress:', '    - from:', '              app: web         # 출처: web Pod만'] },
     { yaml: ['      ports:', '        - protocol: TCP', '          port: 8080'] },
-    { yaml: ['  podSelector: {}              # 모든 Pod 의 나가는 통신', '        - podSelector: {}      # 같은 ns Pod 로 나가기 허용', '              kubernetes.io/metadata.name: kube-system   # DNS 53'] },
+    { yaml: ['  podSelector: {}              # 모든 Pod의 나가는 통신', '        - podSelector: {}      # 같은 ns Pod로 나가기 허용', '              kubernetes.io/metadata.name: kube-system   # DNS 53'] },
     { term: ['$ kubectl exec web-7d9      -- curl -s api:8080/health', '{"status":"ok"}              # 허용'] },
     { term: ['$ kubectl exec attacker-cc  -- curl -m 2 api:8080', '# (timeout)                  # 차단 (default-deny + 매칭 안됨)', '$ kubectl exec cache-r4     -- curl -m 2 api:8080', '# (timeout)                  # 차단 (label 불일치)'] },
   ];
@@ -112,11 +112,11 @@
     graph(t, c, { area: true, ing: 1, eg: 1, egOpen, dns: k >= 3, doors: k >= 1 ? { api: Math.PI } : {}, ports: true, fresh: k === 1 || k === 3 ? ['web→api'] : null, freshAt: 1.2 });
     if (k === 0) { el('circle', { cx: P.api[0], cy: P.api[1], r: 50 + 6 * Math.sin(t * 5), fill: 'none', stroke: ACC, 'stroke-width': 3 }); pill(P.api[0] + 80, P.api[1] + 62, 'app=api', ACC, pop(u, 0.4), { mono: true, fs: 14 }); }
     if (k === 1) pill(P.web[0] + 100, P.web[1] + 48, 'from: app=web', GOOD, pop(u, 0.3), { mono: true, fs: 14 });
-    if (k === 2) pill(200, 52, ':8080 만', GOOD, pop(u, 0.4), { mono: true, fs: 14 });
+    if (k === 2) pill(200, 52, ':8080만', GOOD, pop(u, 0.4), { mono: true, fs: 14 });
     if (k >= 3) [['web', GOOD], ['api', GOOD]].forEach(([n], i) => { const [x, y] = P[n], g = k === 3 ? seg(u, 0.4 + i * 0.3, 1.2 + i * 0.3) : 1;
       if (g > 0) el('path', { d: `M${x + 30},${y + 26} Q${(x + P.dns[0]) / 2 + 40},${(y + P.dns[1]) / 2 + 60} ${lerp(x + 30, P.dns[0] - 28, g)},${lerp(y + 26, P.dns[1] - 12, g)}`, fill: 'none', stroke: GOOD, 'stroke-width': 1.8, 'stroke-dasharray': '3 4', opacity: k === 3 ? 1 : 0.6 }); });
     if (k === 3) { mono(500, 228, 'DNS 53 허용', { 'font-size': 14, fill: GOOD, 'font-weight': 800, 'text-anchor': 'middle', opacity: fade(u, 1.4) });
-      tx(300, 20, '출발지 egress 와 도착지 ingress 가 둘 다 허용해야 통한다', { 'font-size': 14, 'font-weight': 700, fill: INK, 'text-anchor': 'middle', opacity: fade(u, 1.8) }); }
+      tx(300, 20, '출발지 egress와 도착지 ingress가 둘 다 허용해야 통한다', { 'font-size': 14, 'font-weight': 700, fill: INK, 'text-anchor': 'middle', opacity: fade(u, 1.8) }); }
     if (k === 4) probe('web', 'api', 'allow', u, 0.3);
     if (k === 5) { probe('attacker', 'api', 'block', u, 0.2); probe('api', 'cache', 'block', u, 99);
       const g = seg(u, 0.9, 2.0); if (g > 0) { const f = lerp(F0, 0.72, E(g, 0, 1)); el('circle', { cx: lerp(P.cache[0], P.api[0], f), cy: lerp(P.cache[1], P.api[1], f), r: 8, fill: BAD, stroke: PANEL, 'stroke-width': 2 }); } }
@@ -125,16 +125,16 @@
   // ---------- 4. api → db 만 ----------
   const T4 = [
     { yaml: ['  podSelector:', '    matchLabels:', '      app: db                  # 대상: db Pod'] },
-    { yaml: ['  ingress:', '    - from:', '              app: api         # 출처: api Pod 만'] },
+    { yaml: ['  ingress:', '    - from:', '              app: api         # 출처: api Pod만'] },
     { yaml: ['      ports:', '        - protocol: TCP', '          port: 5432'] },
-    { term: ['$ kubectl exec api-5b2      -- nc -zv db 5432', 'db (10.244.1.7:5432) open    # 허용', '$ kubectl exec web-7d9      -- nc -zv -w 2 db 5432', '# (timeout)                  # 차단 (web 은 db 직접 접근 불가)'] },
-    { term: ['$ kubectl exec attacker-cc  -- nc -zv -w 2 db 5432', '# (timeout)                  # 차단 (label 불일치)', '', '# Policy as Code — 누가 누구에게 접근할지 yaml 로 명시'] },
+    { term: ['$ kubectl exec api-5b2      -- nc -zv db 5432', 'db (10.244.1.7:5432) open    # 허용', '$ kubectl exec web-7d9      -- nc -zv -w 2 db 5432', '# (timeout)                  # 차단 (web은 db 직접 접근 불가)'] },
+    { term: ['$ kubectl exec attacker-cc  -- nc -zv -w 2 db 5432', '# (timeout)                  # 차단 (label 불일치)', '', '# Policy as Code — 누가 누구에게 접근할지 yaml로 명시'] },
   ];
   function s4(t, c) { const { k, u } = c;
     graph(t, c, { area: true, ing: 1, eg: 1, egOpen: true, dns: true, doors: k >= 1 ? { api: Math.PI, db: Math.PI } : { api: Math.PI }, ports: true, fresh: k === 1 ? ['api→db'] : null, freshAt: 1.2 });
     if (k === 0) { el('circle', { cx: P.db[0], cy: P.db[1], r: 50 + 6 * Math.sin(t * 5), fill: 'none', stroke: ACC, 'stroke-width': 3 }); pill(P.db[0] - 10, P.db[1] + 76, 'app=db', ACC, pop(u, 0.4), { mono: true, fs: 14 }); }
     if (k === 1) pill(P.api[0] + 100, P.api[1] + 48, 'from: app=api', GOOD, pop(u, 0.3), { mono: true, fs: 14 });
-    if (k === 2) pill(400, 52, ':5432 만', GOOD, pop(u, 0.4), { mono: true, fs: 14 });
+    if (k === 2) pill(400, 112, ':5432만', GOOD, pop(u, 0.4), { mono: true, fs: 14 });
     if (k === 3) { probe('api', 'db', 'allow', u, 0.2); probe('web', 'db', 'block', u, 1.2); }
     if (k === 4) probe('attacker', 'db', 'block', u, 0.3);
     policies(5, k === 0, u); counter(c, u); bannerLine(c, u); bottom(T4[k], u); }
@@ -145,7 +145,7 @@
     { term: ['$ kubectl exec web-7d9      -- curl -s api:8080/health', '{"status":"ok"}', '$ kubectl exec api-5b2      -- nc -zv db 5432', 'db (10.244.1.7:5432) open'] },
     { term: ['$ kubectl exec web-7d9      -- nc -zv -w 2 db 5432', '# (timeout)', '$ kubectl exec attacker-cc  -- nc -zv -w 2 db 5432', '# (timeout)'] },
     { term: ['$ kubectl exec attacker-cc  -- curl -m 2 api:8080', '# (timeout)'] },
-    { term: ['#   1) default deny: 기본은 모두 차단', '#   2) explicit allow: 필요한 것만 명시 허용', '#   3) least privilege: 최소 권한 그래프', '#   4) policy as code: yaml 로 검토/리뷰 가능'] },
+    { term: ['#   1) default deny: 기본은 모두 차단', '#   2) explicit allow: 필요한 것만 명시 허용', '#   3) least privilege: 최소 권한 그래프', '#   4) policy as code: yaml로 검토/리뷰 가능'] },
   ];
   function s5(t, c) { const { k, u } = c;
     graph(t, c, { area: true, ing: 1, eg: 1, egOpen: true, dns: true, doors: { api: Math.PI, db: Math.PI }, ports: k === 1 });
@@ -185,11 +185,11 @@
     { q: 'default-deny 두 개를 적용한 뒤 api가 db 이름을 못 찾는다며 실패한다. 먼저 의심할 것은?',
       o: ['db Pod의 메모리 부족', '나가는 DNS 53 통신이 막혀 있다', 'attacker Pod가 살아 있다'], a: 1,
       why: '규칙이 빈 egress 정책은 DNS 조회까지 막는다. kube-system으로 나가는 53번을 열어야 이름이 풀린다.' },
-    { q: 'allow-web-to-api만 추가했는데 web → api가 여전히 timeout이다. default-deny-egress도 있다. 빠진 것은?',
-      o: ['web에서 나가는 쪽을 허용하는 egress 정책', 'api의 포트를 5432로 바꾸기', 'default-deny-ingress 지우기'], a: 0,
+    { q: 'allow-web-to-api만 추가했는데 web에서 api 호출이 여전히 timeout이다. default-deny-egress도 있다. 빠진 것은?',
+      o: ['web의 나가는 쪽 egress 허용', 'api 포트를 5432로 바꾸기', 'default-deny-ingress 지우기'], a: 0,
       why: 'ingress 허용은 api가 받는 쪽만 연다. web이 내보내는 쪽도 egress 정책으로 열어야 연결이 된다.' },
     { q: 'cache Pod가 api를 부르지 못한다는 보고가 왔다. 현재 정책에서 이것은 무엇인가?',
-      o: ['버그라서 default-deny를 지워야 한다', '의도된 차단이며, 필요하면 cache 출처를 허용하는 정책을 더한다', 'CNI가 고장 난 것이다'], a: 1,
+      o: ['버그라서 default-deny를 지운다', 'CNI가 고장 난 것이다', '정책대로 막힌 의도된 차단이다'], a: 2,
       why: 'api로 들어오는 출처는 app=web뿐이라 cache는 막힌다. 새 통신은 정책을 추가해 명시적으로 연다.' },
   ];
 

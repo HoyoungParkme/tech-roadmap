@@ -1,5 +1,5 @@
 /* III-2-1 Multi-dimensional Alert — 장면 5개 (../../anim/engine.js 규칙을 따른다)
- * 인스턴스 값·알람 수는 페이지 STEPS 의 instances · alertCount 와 코드 주석의 값을 그린다. */
+ * 인스턴스 값·알람 수는 페이지 STEPS의 instances · alertCount와 코드 주석의 값을 그린다. */
 (function () {
   const R = window.RA, { C, el, tx, E, lerp, clamp, seg, pop, fade, tw, tween, card, mono, sub, lbl, pill, banner, grow, fly, dot, zone, cross, check, clock, dbIcon, axes, line } = R;
   const { INK, MUT, OFF, GRID, SOFT, PANEL, ACC, ACCBG, BAD, BADBG, GOOD, GOODBG, WARN, WARNBG, INFO, INFOBG } = C;
@@ -12,7 +12,7 @@
   function env(cx, cy, s, col, o) { o = o || {}; const g = R.G(cx, cy, s ?? 1, o.op); col = col || ACC;
     el('rect', { x: -19, y: -13, width: 38, height: 26, rx: 3, fill: PANEL, stroke: col, 'stroke-width': 2.4 }, g);
     el('path', { d: 'M-19,-13 L0,3 L19,-13', fill: 'none', stroke: col, 'stroke-width': 2.2 }, g); return g; }
-  // 왼쪽 규칙 쌓기: rows [[글, 색, 보일 beat]] — 지금 beat 의 줄을 강조
+  // 왼쪽 규칙 쌓기: rows [[글, 색, 보일 beat]] — 지금 beat의 줄을 강조
   function ruleStack(k, u, rows) { rows.forEach(([s, col, at], i) => { if (k < at) return; const y = 46 + i * 62, hot = k === at;
       card(170, y, 290, 48, { rx: 10, stroke: hot ? (col || ACC) : GRID, sw: hot ? 2.8 : 1.6, fill: hot ? PANEL : PANEL, s: hot ? pop(u, 0.2) : 1 });
       mono(38, y + 5, s, { 'font-size': 14, 'font-weight': hot ? 800 : 600, fill: hot ? INK : MUT }); }); }
@@ -25,7 +25,7 @@
     if (k === 1) { pill(640, 150, 'condition: C', INFO, pop(u, 0.6), { mono: true }); sub(640, 200, 'C 노드 결과가 알람 여부를 정한다', fade(u, 1.2), { 'font-size': 15 }); return; }
     if (k === 2) { dbIcon(560, 190, 'Prometheus', { s: pop(u, 0.3) }); grow(610, 190, 700, 190, E(u, 0.8, 1.2), MUT);
       card(780, 190, 150, 50, { rx: 10, text: 'by ( … )', fs: 16, mono: true, stroke: GRID, color: MUT, dash: '6 5', s: pop(u, 1.2) }); cross(780, 190, 20, pop(u, 1.7));
-      sub(670, 290, 'by 가 없으면 결과는 시계열 하나', fade(u, 2.0), { 'font-size': 15 }); return; }
+      sub(670, 290, 'by가 없으면 결과는 시계열 하나', fade(u, 2.0), { 'font-size': 15 }); return; }
     // 평균 막대
     const BX = 560, BW = 330, X = (v) => BX + (BW * v) / 100, b = c.beat.instances, avg = 51.7;
     if (k === 3 || k === 4 || k === 5) {
@@ -40,7 +40,7 @@
       if (k === 5) { pill(730, 320, 'Normal', GOOD, pop(u, 0.6), { fs: 16 }); sub(730, 366, '5분 연속 넘어야 Firing', fade(u, 1.0), { 'font-size': 15 }); }
       return; }
     if (k === 6) { const g = E(u, 0.2, 1.2);
-      card(RX + 60, 200, 100 + 40 * g, 60 + 200 * g, { rx: 12, stroke: GRID, sw: 2, dash: '6 5' }); tx(RX + 60, 200 - 30 - 100 * g, 'avg 를 열어 보면', { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: g });
+      card(RX + 60, 200, 100 + 40 * g, 60 + 200 * g, { rx: 12, stroke: GRID, sw: 2, dash: '6 5' }); tx(RX + 60, 200 - 30 - 100 * g, 'avg를 열어 보면', { 'text-anchor': 'middle', 'font-size': 13.5, fill: MUT, opacity: g });
       [['api-1', 95], ['api-2', 30], ['api-3', 30]].forEach(([n, v], i) => { const y = 120 + i * 80, s = clamp((g - 0.6) * 3 - i * 0.3);
         if (s <= 0) return; mono(RX + 30, y + 6, n, { 'font-size': 15, 'font-weight': 800, opacity: s, 'text-anchor': 'middle' });
         el('rect', { x: BX, y: y - 12, width: BW, height: 24, rx: 6, fill: SOFT, opacity: s }); el('rect', { x: BX, y: y - 12, width: (X(v) - BX) * s, height: 24, rx: 6, fill: pctC(v) });
@@ -74,12 +74,12 @@
       if (k >= 5) mono(780, y - (k >= 6 && m.fires ? 4 : -5), 'host=' + m.name, { 'font-size': 13.5, fill: ACC, 'font-weight': 700, opacity: k === 5 ? fade(u, 0.3 + i * 0.3) : 1 });
       if (k >= 6 && m.fires) tx(780, y + 18, '현재 값: ' + m.value + '%', { 'font-size': 13.5, fill: INK, opacity: k === 6 ? fade(u, 0.8) : 1 }); });
     if (k === 3) { mono(660, 300, 'by (instance) → 시계열 3개', { 'font-size': 16, 'font-weight': 800, 'text-anchor': 'middle', fill: ACC, opacity: fade(u, 1.8) }); }
-    if (k === 4) sub(645, 300, '판정은 시계열마다 따로 · 95 만 80 을 넘었다', fade(u, 1.6), { 'font-size': 15 });
+    if (k === 4) sub(645, 300, '판정은 시계열마다 따로 · 95 하나만 80을 넘었다', fade(u, 1.6), { 'font-size': 15 });
     if (k === 5) sub(645, 300, 'host 라벨로 정책에서 라우팅할 수 있다', fade(u, 1.6), { 'font-size': 15 });
     if (k === 6) mono(645, 300, '{{ humanize $values.A.Value }}%', { 'font-size': 14.5, 'text-anchor': 'middle', fill: MUT, opacity: fade(u, 1.4) });
     if (k === 7) { const n = c.beat.alertCount; banner(645, 300, `알람 ${n}개 · Firing 1 · Normal 2`, pop(u, 0.4)); sub(645, 346, '해소도 인스턴스별로 따로 일어난다', fade(u, 1.2), { 'font-size': 15 }); }
     if (k === 8) { const g = E(u, 0.4, 1.5); for (let i = 0; i < 3; i++) env(lerp(420 + i * 90, 600, g), lerp(320, 330, g), 1, BAD, { op: i ? 1 - g * 0.8 : 1 });
-      card(760, 330, 220, 46, { rx: 10, text: 'group_by 로 한 메시지', fs: 15, stroke: BAD, color: BAD, s: pop(u, 1.5) }); sub(645, 380, '부분 장애는 잡히지만 알람 수가 늘어난다', fade(u, 1.8), { 'font-size': 15 }); } }
+      card(760, 330, 220, 46, { rx: 10, text: 'group_by로 한 메시지', fs: 15, stroke: BAD, color: BAD, s: pop(u, 1.5) }); sub(645, 380, '부분 장애는 잡히지만 알람 수가 늘어난다', fade(u, 1.8), { 'font-size': 15 }); } }
 
   // ---------- 3. 다차원 격자 ----------
   const SV = ['api', 'worker', 'batch'], GX = 400, GY = 70, CS = 52;
@@ -98,7 +98,7 @@
       card(640, 330, 340, 50, { rx: 10, text: '못 줄이면 group_by: [service]', fs: 15, mono: true, stroke: ACC, color: ACC, s: pop(u, 1.6) }); return; }
     if (k === 8) { mono(380, 40, 'topk(5, avg by (pod) (…))', { 'font-size': 15, 'font-weight': 800, fill: ACC });
       [92, 88, 85, 76, 45].forEach((v, i) => { const y = 74 + i * 34, w = 240 * v / 100 * E(u, 0.2 + i * 0.12, 0.9 + i * 0.12); el('rect', { x: 380, y: y - 11, width: w, height: 22, rx: 5, fill: pctC(v) }); mono(388 + w, y + 6, String(v), { 'font-size': 14, 'font-weight': 700 }); });
-      [['1) by (service) 로 시작', 0.8], ['2) 부족하면 by (service, instance)', 1.2], ['3) 3차원 이상은 피한다', 1.6]].forEach(([s, a], i) => tx(680, 90 + i * 44, s, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, a) })); return; }
+      [['1) by (service)로 시작', 0.8], ['2) 부족하면 by (service, instance)', 1.2], ['3) 3차원 이상은 피한다', 1.6]].forEach(([s, a], i) => tx(680, 90 + i * 44, s, { 'font-size': 15, 'font-weight': 700, opacity: fade(u, a) })); return; }
     // 격자 3 × 10 (인스턴스 5 × pod 2)
     const fill = k === 3 ? E(u, 0.3, 1.9) : 1;
     SV.forEach((sv, r) => { tx(GX - 12, GY + r * CS + 32, sv, { 'font-size': 15, 'font-weight': 800, 'text-anchor': 'end' });
@@ -136,7 +136,7 @@
     nodeBox('C', 'math', k >= 4 ? (k === 4 ? tween(0, 6.6, u, 1.4) : 6.6).toFixed(1) : null, ACC, k >= 4 ? (k === 4 ? pop(u, 0.2) : 1) : 0, k === 4);
     nodeBox('D', 'threshold', k >= 5 ? '6.6 > 6' : null, BAD, 1, k === 1 || k === 5);
     if (k === 1) { card(ND.D[0], ND.D[1], 220, 92, { rx: 12, stroke: INFO, sw: 2.6, dash: '7 5', fill: 'none' }); pill(ND.D[0], 110, 'condition: D', INFO, pop(u, 0.4), { mono: true });
-      sub(480, 360, '노드를 A → B → C → D 로 잇고, 판정은 마지막 D', fade(u, 1.0), { 'font-size': 15 }); }
+      sub(480, 360, '노드를 A → B → C → D로 잇고, 판정은 마지막 D', fade(u, 1.0), { 'font-size': 15 }); }
     if (k >= 4) { grow(260, 110, 370, 190, k === 4 ? E(u, 0.1, 0.5) : 1, INFO); grow(260, 290, 370, 210, k === 4 ? E(u, 0.1, 0.5) : 1, BAD); }
     if (k === 4) { mono(480, 290, '($B / $A) * 100', { 'font-size': 16, 'text-anchor': 'middle', 'font-weight': 700, opacity: fade(u, 0.5) });
       mono(480, 330, '825 / 12,500 × 100 = 6.6', { 'font-size': 16, 'text-anchor': 'middle', 'font-weight': 800, fill: ACC, opacity: fade(u, 1.4) }); }
@@ -150,7 +150,7 @@
   const REC = ['job:http_requests:rate5m', 'job:http_errors:rate5m', 'job:http_error_ratio:5m'];
   function s5(t, c) { const { k, u } = c, PX = 30, GXp = 640;
     zone(PX, 20, 560, 380, 'Prometheus · group api.rules · 30s', { fill: SOFT, op: k === 0 ? fade(u, 0.1) : 1 });
-    if (k === 0) { clock(310, 200, 46, (t * 2) % 1, INFO, 'interval: 30s'); sub(310, 300, '계산은 Prometheus 가 미리 한다', fade(u, 1.0), { 'font-size': 15 }); }
+    if (k === 0) { clock(310, 200, 46, (t * 2) % 1, INFO, 'interval: 30s'); sub(310, 300, '계산은 Prometheus가 미리 한다', fade(u, 1.0), { 'font-size': 15 }); }
     if (k >= 1) REC.forEach((r, i) => { const at = i + 1; if (k < at) return; const y = 300 + i * 34, hot = k === at;
       el('rect', { x: PX + 16, y: y - 14, width: 528, height: 28, rx: 6, fill: hot ? ACCBG : PANEL, stroke: hot ? ACC : GRID, 'stroke-width': 1.5, opacity: hot ? fade(u, 1.4) : 1 });
       mono(PX + 28, y + 5, 'record: ' + r, { 'font-size': 14, 'font-weight': 700, opacity: hot ? fade(u, 1.4) : 1 }); });
@@ -170,11 +170,11 @@
       el('rect', { x: GXp + 20, y: 140, width: (X(0.07) - GXp - 20) * E(u, 0.2, 1.2), height: 28, rx: 6, fill: BAD });
       el('line', { x1: X(0.05), y1: 128, x2: X(0.05), y2: 180, stroke: INK, 'stroke-width': 2.5, 'stroke-dasharray': '5 4' }); mono(X(0.05), 200, '0.05', { 'font-size': 14, 'text-anchor': 'middle' });
       mono(X(0.07), 120, '0.07', { 'font-size': 17, 'font-weight': 800, fill: BAD, 'text-anchor': 'middle', opacity: fade(u, 1.0) });
-      pill(GXp + 150, 260, 'Firing', BAD, pop(u, 1.5), { fs: 16 }); sub(GXp + 150, 310, '비율(0~1) 이라 0.05 = 5%', fade(u, 1.9), { 'font-size': 14.5 }); }
+      pill(GXp + 150, 260, 'Firing', BAD, pop(u, 1.5), { fs: 16 }); sub(GXp + 150, 310, '비율(0~1)이라 0.05 = 5%', fade(u, 1.9), { 'font-size': 14.5 }); }
     if (k === 7) { [['대시보드 패널', 110], ['알람 규칙', 210]].forEach(([s, y], i) => { card(GXp + 150, y, 220, 50, { rx: 10, text: s, fs: 15, stroke: ACC, s: pop(u, 0.3 + i * 0.4) }); dot([[PX + 544, 368], [GXp + 40, y]], ((t * 0.7 + i * 0.5) % 1), ACC, 6); });
       ['평가가 빠르다', '두 화면 숫자가 같다', '쿼리가 짧다'].forEach((s, i) => { check(GXp + 30, 290 + i * 32, 8, pop(u, 1.2 + i * 0.3)); tx(GXp + 48, 295 + i * 32, s, { 'font-size': 14.5, 'font-weight': 700, opacity: fade(u, 1.3 + i * 0.3) }); }); }
     if (k === 8) { tx(GXp + 16, 70, '평가가 느릴 때', { 'font-size': 16, 'font-weight': 800 });
-      ['Recording 을 안 쓰나', 'interval 이 너무 짧나 (10s)', '차원이 너무 많나', '데이터소스가 느린가'].forEach((s, i) => { const y = 120 + i * 60;
+      ['Recording을 안 쓰나', 'interval이 너무 짧나 (10s)', '차원이 너무 많나', '데이터소스가 느린가'].forEach((s, i) => { const y = 120 + i * 60;
         card(GXp + 30, y, 30, 30, { rx: 15, text: String(i + 1), fs: 15, fw: 800, stroke: ACC, color: ACC, s: pop(u, 0.3 + i * 0.4) }); tx(GXp + 56, y + 6, s, { 'font-size': 14.5, 'font-weight': 600, opacity: fade(u, 0.4 + i * 0.4) }); }); } }
 
   const quiz = [
@@ -197,7 +197,7 @@
   const summary = [
     'by 없이 평균을 내면 한 대가 95%여도 평균 51.7%로 알람이 오지 않는다.',
     'by (instance)를 붙이면 시계열마다 알람 인스턴스가 생겨 넘은 장비만 Firing이 된다.',
-    '차원은 곱으로 늘어 3 × 5 × 2만 돼도 30개라, 한두 차원에서 시작한다.',
+    '차원은 곱으로 늘어 3 × 5 × 2로만 잡아도 30개라, 한두 차원에서 시작한다.',
     'Math 노드로 비율을 만들고, 비싼 식은 Recording Rule로 미리 계산해 둔다.',
   ];
   const review = [
